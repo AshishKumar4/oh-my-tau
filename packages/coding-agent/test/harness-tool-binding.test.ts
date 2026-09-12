@@ -118,7 +118,7 @@ describe("harness tool binding through the session surface", () => {
 	test("a codex model keeps natives out of the reserved collaboration namespace and renames only its own bridge", () => {
 		const session = createSession(CODEX_MODEL);
 
-		expect(presented(session, "spawn_agent")).toMatchObject({ namespace: "collaboration", persistAs: "task" });
+		expect(presented(session, "spawn_agent")).toMatchObject({ namespace: "agents", persistAs: "task" });
 		expect(presented(session, "hub").namespace).toBeUndefined();
 		expect(presented(session, "read").namespace).toBeUndefined();
 		expect(presented(session, "eval").wireName).toBe("exec");
@@ -144,7 +144,7 @@ describe("harness tool binding through the session surface", () => {
 		expect(session.agent.state.tools.some(value => value.name === "task")).toBe(false);
 		expect(presented(session, "spawn_agent")).toEqual({
 			wireName: undefined,
-			namespace: "collaboration",
+			namespace: "agents",
 			persistAs: "task",
 		});
 		expect(presented(session, "bash").wireName).toBeUndefined();

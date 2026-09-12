@@ -617,7 +617,7 @@ describe("codex collaboration facades on the wire", () => {
 		const { session, registry } = await codexSession();
 		const tools = session.agent.state.tools;
 		const surface = buildCodexNamespaceTools(tools, CODEX_MODEL as Model<"openai-codex-responses">);
-		const collaboration = surface.find(entry => entry.type === "namespace" && entry.name === "collaboration");
+		const collaboration = surface.find(entry => entry.type === "namespace" && entry.name === "agents");
 		expect(collaboration?.type === "namespace" ? collaboration.description : undefined).toBe(
 			"Tools for spawning and managing sub-agents.",
 		);
@@ -659,7 +659,7 @@ describe("codex spawn_agent facade", () => {
 			},
 		};
 		const plain = facadeFor("codex", "spawn_agent", task);
-		expect(plain.namespace?.name).toBe("collaboration");
+		expect(plain.namespace?.name).toBe("agents");
 
 		const run = await runFacadeCall(CODEX_MODEL, [plain], {
 			name: "spawn_agent",
@@ -717,7 +717,7 @@ describe("codex send_message facade", () => {
 		const inbox = IrcBus.global().wait(PEER, { from: SENDER }, 0);
 		const hub = new HubTool(toolSession()) as unknown as AgentTool;
 		const facade = facadeFor("codex", "send_message", hub);
-		expect(facade.namespace?.name).toBe("collaboration");
+		expect(facade.namespace?.name).toBe("agents");
 
 		const { assistant, result } = await runFacadeCall(CODEX_MODEL, [hub, facade], {
 			name: "send_message",
@@ -750,7 +750,7 @@ describe("codex send_message facade", () => {
 				? {
 						...message,
 						content: message.content.map(block =>
-							block.type === "toolCall" ? { ...block, namespace: "collaboration" } : block,
+							block.type === "toolCall" ? { ...block, namespace: "agents" } : block,
 						),
 					}
 				: message,
@@ -775,7 +775,7 @@ describe("codex send_message facade", () => {
 				: [],
 		);
 		expect(codexCalls).toEqual([
-			{ name: "send_message", arguments: JSON.stringify(vendorArgs), namespace: "collaboration" },
+			{ name: "send_message", arguments: JSON.stringify(vendorArgs), namespace: "agents" },
 		]);
 		expect(await replayedAnthropicToolCalls(NATIVE_ANTHROPIC_MODEL, { messages, tools: [hub] }, false)).toEqual([
 			{ name: "hub", input: nativeArgs },

@@ -118,6 +118,24 @@ function isAmbient(block: string, ambient: readonly string[]): boolean {
 	return false;
 }
 
+/**
+ * `encrypted: true` on a vendor property asks the backend to encrypt the
+ * model's output for that field; omp's tools read the value themselves, so no
+ * served schema carries the marker.
+ */
+function stripEncrypted(schema: Record<string, unknown>): Record<string, unknown> {
+	const properties = schema.properties;
+	if (!isRecord(properties)) return schema;
+	const cleaned: Record<string, unknown> = {};
+	for (const [key, property] of Object.entries(properties)) {
+		if (isRecord(property) && property.encrypted === true) {
+			const { encrypted: _encrypted, ...rest } = property;
+			cleaned[key] = rest;
+		} else cleaned[key] = property;
+	}
+	return { ...schema, properties: cleaned };
+}
+
 export function projectHarnessCapture(profile: HarnessProfile, raw: unknown): CaptureProjection {
 	const capture = captureSchema(raw);
 	if (capture instanceof type.errors) return { ok: false, reason: capture.summary };
@@ -155,7 +173,7 @@ export function projectHarnessCapture(profile: HarnessProfile, raw: unknown): Ca
 	const tools: Record<string, VendorTool> = {};
 	for (const { name, description, input_schema } of capture.declarations ?? []) {
 		if (description.trim().length === 0) continue;
-		tools[name] = { description, ...(isRecord(input_schema) ? { inputSchema: input_schema } : {}) };
+		tools[name] = { description, ...(isRecord(input_schema) ? { inputSchema: stripEncrypted(input_schema) } : {}) };
 	}
 	return {
 		ok: true,

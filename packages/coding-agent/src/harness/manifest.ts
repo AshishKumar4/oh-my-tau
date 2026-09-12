@@ -14,7 +14,16 @@ const CLAUDE_CODE_BINDINGS: Readonly<Record<string, HarnessToolBinding>> = {
 	web_search: { wireName: "WebSearch" },
 };
 
-export const CODEX_COLLABORATION_NAMESPACE = "collaboration";
+/**
+ * Group name for the Codex multi-agent facades. The vendor's own name,
+ * `collaboration`, is reserved server-side: functions declared there must match
+ * the backend's schema byte for byte, and the backend then encrypts their
+ * `message` argument for a server-side consumer, so an omp subagent would
+ * receive ciphertext as its brief. Codex lets the group name be configured
+ * (`features.multi_agent_v2.tool_namespace`); under any other name the same
+ * functions are ordinary, and the model's brief arrives in plaintext.
+ */
+export const CODEX_COLLABORATION_NAMESPACE = "agents";
 
 /**
  * Native tools keep their own names in the default `functions` namespace. The

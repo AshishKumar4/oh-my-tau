@@ -102,7 +102,7 @@ describe("harness surface as the provider request sees it", () => {
 		expect(codex?.names).not.toContain("task");
 		// `collaboration` is reserved server-side for Codex's own functions; natives stay in the default namespace.
 		expect(codex?.namespaces[codex.names.indexOf("hub")]).toBeUndefined();
-		expect(codex?.namespaces[codex.names.indexOf("spawn_agent")]).toBe("collaboration");
+		expect(codex?.namespaces[codex.names.indexOf("spawn_agent")]).toBe("agents");
 		// The identity lives on the presented copies only; the shared registry tools keep their own.
 		for (const t of tools) expect(t.customWireName).toBeUndefined();
 		await session.dispose();
