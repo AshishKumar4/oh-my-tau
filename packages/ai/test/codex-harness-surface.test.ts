@@ -14,6 +14,7 @@ import type {
 	Tool,
 } from "@oh-my-pi/pi-ai/types";
 import { jsonSchemaToTypeScript } from "@oh-my-pi/pi-ai/utils/schema/typescript";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import { createCodexModel } from "./helpers";
 import { loadEvalToolCodexExecFormat } from "./helpers/harness-golden";
 
@@ -236,16 +237,15 @@ async function captureForkRequest(
 ): Promise<CapturedForkRequest> {
 	let captured: { body: Record<string, unknown>; headers: Headers } | undefined;
 	const snapshots: CodexRequestSnapshot[] = [];
-	const fetchMock = (async (input: string | URL, init?: RequestInit) => {
+	const fetchMock: FetchImpl = async (input, init) => {
 		const url = typeof input === "string" ? input : input.toString();
 		if (url.endsWith("/responses")) {
-			captured = {
-				body: JSON.parse(decodeCodexRequestBody(init?.body)) as Record<string, unknown>,
-				headers: new Headers(init?.headers),
-			};
+			const parsed: unknown = JSON.parse(decodeCodexRequestBody(init?.body));
+			if (!isRecord(parsed)) throw new Error("expected a JSON object request body");
+			captured = { body: parsed, headers: new Headers(init?.headers) };
 		}
 		return dataSse(events);
-	}) as unknown as FetchImpl;
+	};
 
 	await streamOpenAICodexResponses(createCodexModel(modelId), context, {
 		apiKey: createCodexTestToken(),
@@ -255,13 +255,16 @@ async function captureForkRequest(
 	}).result();
 
 	if (!captured) throw new Error("no /responses request was captured");
-	const clientMetadata = (captured.body.client_metadata ?? {}) as Record<string, unknown>;
-	const encoded = clientMetadata["x-codex-turn-metadata"];
+	const rawClientMetadata: unknown = captured.body.client_metadata ?? {};
+	if (!isRecord(rawClientMetadata)) throw new Error("expected client_metadata to be an object");
+	const encoded = rawClientMetadata["x-codex-turn-metadata"];
+	const turnMetadata: unknown = typeof encoded === "string" ? JSON.parse(encoded) : {};
+	if (!isRecord(turnMetadata)) throw new Error("expected x-codex-turn-metadata to be an object");
 	return {
 		body: captured.body,
 		headers: captured.headers,
-		clientMetadata,
-		turnMetadata: typeof encoded === "string" ? (JSON.parse(encoded) as Record<string, unknown>) : {},
+		clientMetadata: rawClientMetadata,
+		turnMetadata,
 		snapshots,
 	};
 }
@@ -308,8 +311,8 @@ describe("codex fork lineage", () => {
 		expect(snapshot.baseUrl).toBe("https://api.openai.com/v1");
 		expect(snapshot.accountId).toBe("acc_test");
 		expect(snapshot.sessionId).toBe("child-session");
+		expect(body.prompt_cache_key).toBe(snapshot.promptCacheKey);
 		expect(snapshot.threadId).toBeDefined();
-		expect(snapshot.promptCacheKey).toBe(body.prompt_cache_key as string | undefined);
 		// The snapshot carries the full wire input — tool surface, developer
 		// blocks, and user message — not just the converted messages.
 		expect(snapshot.input).toEqual(inputItems(body));
@@ -358,7 +361,7 @@ describe("codex fork lineage", () => {
 		// The child's own snapshot records the root projection plus the full
 		// inherited+new input, ready to seed a grandchild fork.
 		expect(snapshots[0]?.sessionId).toBe("root-session");
-		expect(snapshots[0]?.threadId).toBe(turnMetadata.thread_id as string);
+		expect(turnMetadata.thread_id).toBe(snapshots[0]?.threadId);
 		expect(snapshots[0]?.input).toEqual(input);
 	});
 
@@ -500,11 +503,9 @@ describe("codex fork lineage", () => {
 			JSON.stringify(source.input),
 		);
 
-		// A terminal event reporting a backend error is not a lineage source.
-		const failed = await captureForkRequest(
-			"gpt-6-astra",
-			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
-			context,
+		// A terminal event reporting a backend error is not a lineage source,
+		// whether the status is explicit or a legacy done event without one.
+		for (const events of [
 			[
 				{
 					type: "response.incomplete",
@@ -515,8 +516,49 @@ describe("codex fork lineage", () => {
 					},
 				},
 			],
+			[
+				{
+					type: "response.done",
+					response: { error: { code: "server_error", message: "upstream exploded" } },
+				},
+			],
+		]) {
+			const failed = await captureForkRequest(
+				"gpt-6-astra",
+				{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
+				context,
+				events,
+			);
+			expect(failed.snapshots).toHaveLength(0);
+		}
+
+		// A legacy response.done without a status still counts as a clean turn.
+		const legacyDone = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
+			context,
+			[{ type: "response.done", response: { status: "completed" } }],
 		);
-		expect(failed.snapshots).toHaveLength(0);
+		expect(legacyDone.snapshots).toHaveLength(1);
+	});
+
+	it("converts every message when the resolved source carries no input", async () => {
+		const source = createForkSource({ input: [] });
+		const context = createForkContext([
+			{ role: "user", content: "Say hello", timestamp: 1 },
+			{ role: "user", content: "Summarize it for the parent", timestamp: 2 },
+		]);
+		const { body, turnMetadata } = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
+			context,
+		);
+
+		// An empty source has nothing to replay: the certified messageCount must
+		// not slice the portable conversion, or history would silently vanish.
+		expect(inputItems(body).filter(item => item.role === "user")).toHaveLength(2);
+		expect(turnMetadata.session_id).toBe("root-session");
+		expect(turnMetadata.forked_from_thread_id).toBe("root-thread-1");
 	});
 });
 
