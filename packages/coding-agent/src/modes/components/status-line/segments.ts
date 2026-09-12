@@ -4,6 +4,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { getTimeBasedPricingPeriod } from "@oh-my-pi/pi-catalog/models";
 import { SPINNER_ADVANCE_MS, TERMINAL } from "@oh-my-pi/pi-tui";
 import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
+import { parseModelString } from "../../../config/model-resolver";
 import { type SymbolKey, type Theme, type ThemeColor, theme } from "../../../modes/theme/theme";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../../tools/render-utils";
 import { fileHyperlink } from "../../../tui/hyperlink";
@@ -209,6 +210,17 @@ const modelSegment: StatusLineSegment = {
 			modelName = modelName.slice(7);
 		}
 		modelName = statusValue(ctx, modelName);
+
+		// Fusion pairs the lead with a sidekick: "<lead> ⚡ <sidekick-id>".
+		// The sidekick setting is a "provider/model-id" selector; only the id is shown.
+		// Optional chaining: lightweight session doubles (test mocks) without
+		// settings render the plain lead instead of crashing.
+		const fusionSettings = ctx.session.settings;
+		const sidekickSelector = fusionSettings?.get("fusion.sidekickModel");
+		if (fusionSettings?.get("fusion.enabled") === true && sidekickSelector) {
+			const sidekickId = parseModelString(sidekickSelector)?.id ?? sidekickSelector;
+			modelName = `${modelName} ${theme.symbol("tab.fusion")} ${statusValue(ctx, sidekickId)}`;
+		}
 
 		// Resolve the current thinking-level display ("◉ xhigh", "⟳ auto", …)
 		// when the model supports thinking and the segment isn't hiding it.

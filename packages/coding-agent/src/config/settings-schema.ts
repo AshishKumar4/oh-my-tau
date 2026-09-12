@@ -163,8 +163,8 @@ export type SettingTab =
 	| "shell"
 	| "tools"
 	| "tasks"
-	| "providers"
-	| "fusion";
+	| "fusion"
+	| "providers";
 
 /** Tab display metadata - icon is resolved via theme.symbol() */
 export type TabMetadata = { label: string; icon: `tab.${string}` };
@@ -180,8 +180,8 @@ export const SETTING_TABS: SettingTab[] = [
 	"shell",
 	"tools",
 	"tasks",
-	"providers",
 	"fusion",
+	"providers",
 ];
 
 /** Tab display metadata - icon is a symbol key from theme.ts (tab.*) */
@@ -195,8 +195,8 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
 	shell: { label: "Shell", icon: "tab.shell" },
 	tools: { label: "Tools", icon: "tab.tools" },
 	tasks: { label: "Tasks", icon: "tab.tasks" },
-	providers: { label: "Providers", icon: "tab.providers" },
 	fusion: { label: "Fusion", icon: "tab.fusion" },
+	providers: { label: "Providers", icon: "tab.providers" },
 };
 
 /**
@@ -236,8 +236,8 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Developer",
 	],
 	tasks: ["Modes", "Subagents", "Isolation", "Commands & Skills"],
-	providers: ["Services", "Fireworks", "Tiny Model", "Protocol", "Timeouts", "Privacy"],
 	fusion: ["Fusion"],
+	providers: ["Services", "Fireworks", "Tiny Model", "Protocol", "Timeouts", "Privacy"],
 };
 
 /** Status line segment identifiers */
@@ -5510,6 +5510,10 @@ export const SETTINGS_SCHEMA = {
 			description: "Load commands from .opencode/commands/",
 		},
 	},
+
+	// ────────────────────────────────────────────────────────────────────────
+	// Fusion
+	// ────────────────────────────────────────────────────────────────────────
 
 	// ────────────────────────────────────────────────────────────────────────
 	// Providers

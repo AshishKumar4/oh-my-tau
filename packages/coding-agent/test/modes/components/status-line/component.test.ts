@@ -269,3 +269,39 @@ describe("StatusLineComponent", () => {
 		}
 	});
 });
+
+describe("model segment fusion indicator", () => {
+	function fusionContext(values: { enabled: boolean; sidekickModel?: string }) {
+		const base = createGallerySegmentContext();
+		const settingValues: Record<string, unknown> = {
+			"fusion.enabled": values.enabled,
+			"fusion.sidekickModel": values.sidekickModel,
+		};
+		const session = {
+			...base.session,
+			settings: { get: (path: string) => settingValues[path] ?? false },
+		} as unknown as AgentSession;
+		return { ...base, session };
+	}
+
+	it("shows the lead paired with the sidekick id when fusion is enabled", () => {
+		const text = Bun.stripANSI(
+			renderSegment("model", fusionContext({ enabled: true, sidekickModel: "devin/swe-2:high" })).content,
+		);
+		// Provider prefix and thinking suffix are stripped; the pair reads "<lead> <glyph> <sidekick>".
+		expect(text).toContain(`Sonnet 4.5 ${theme.symbol("tab.fusion")} swe-2`);
+		expect(text).not.toContain("devin/");
+	});
+
+	it("shows only the lead when fusion is disabled or has no sidekick", () => {
+		const disabled = Bun.stripANSI(
+			renderSegment("model", fusionContext({ enabled: false, sidekickModel: "devin/swe-2" })).content,
+		);
+		expect(disabled).toContain("Sonnet 4.5");
+		expect(disabled).not.toContain("swe-2");
+
+		const noSidekick = Bun.stripANSI(renderSegment("model", fusionContext({ enabled: true })).content);
+		expect(noSidekick).toContain("Sonnet 4.5");
+		expect(noSidekick).not.toContain(theme.symbol("tab.fusion"));
+	});
+});
