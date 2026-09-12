@@ -3778,6 +3778,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						return tools.filter((tool): tool is AgentTool => tool !== null);
 					},
 			createThinkTool: async () => (await HIDDEN_TOOLS.think(toolSession)) ?? null,
+			createSidekickTool: restrictToolNames
+				? undefined
+				: async () => (await BUILTIN_TOOLS.sidekick(toolSession)) ?? null,
 			createVibeTools:
 				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix
 					? () => createVibeTools(toolSession)

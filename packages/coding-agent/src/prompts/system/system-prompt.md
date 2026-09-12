@@ -94,6 +94,7 @@ The `computer` eval prelude is enabled.
 {{/if}}
 
 {{> xdevDevices}}
+{{> fusionLead}}
 
 {{#has tools "think"}}
 § Scratchpad

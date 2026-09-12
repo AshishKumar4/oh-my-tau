@@ -90,6 +90,12 @@ export interface StructuredSubagentRequest {
 	assignment: string;
 	context?: string;
 	agent?: string;
+	/**
+	 * A pre-resolved definition that bypasses agent discovery. The caller owns
+	 * its spawnability (e.g. the Fusion sidekick, which `task` must never list);
+	 * every other policy still applies.
+	 */
+	agentDefinition?: AgentDefinition;
 	model?: string | string[];
 	/** Presence, rather than truthiness, makes this the highest-priority schema. */
 	outputSchema?: unknown;
@@ -267,13 +273,13 @@ export async function resolveEffectiveSubagentPolicy(
 ): Promise<EffectiveSubagentPolicy> {
 	await request.session.settings.reloadFromDisk();
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
-	const agentName = request.agent?.trim() || spawnPolicy.defaultAgent;
+	const agentName = request.agentDefinition?.name ?? (request.agent?.trim() || spawnPolicy.defaultAgent);
 	const planMode = request.session.getPlanModeState?.()?.enabled === true;
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
 
 	const discovery = await discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.());
-	const agent = getAgent(discovery.agents, agentName);
+	const agent = request.agentDefinition ?? getAgent(discovery.agents, agentName);
 	if (!agent) {
 		const available = discovery.agents.map(candidate => candidate.name).join(", ") || "none";
 		throw new StructuredSubagentError("preflight", `Unknown agent "${agentName}". Available: ${available}`);

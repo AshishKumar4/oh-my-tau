@@ -11,6 +11,7 @@ import agentFrontmatterTemplate from "../prompts/agents/frontmatter.md" with { t
 import reviewerMd from "../prompts/agents/reviewer.md" with { type: "text" };
 import scoutMd from "../prompts/agents/scout.md" with { type: "text" };
 import securityReviewerMd from "../prompts/agents/security-reviewer.md" with { type: "text" };
+import sidekickMd from "../prompts/agents/sidekick.md" with { type: "text" };
 import taskMd from "../prompts/agents/task.md" with { type: "text" };
 import { AUTO_THINKING } from "../thinking";
 
@@ -70,6 +71,13 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 		template: taskMd,
 	},
 ];
+
+/**
+ * The Fusion sidekick is deliberately NOT a discoverable bundled agent: the
+ * `sidekick` tool owns its one-per-session lifecycle, so `task` must never be
+ * able to spawn a second one.
+ */
+const SIDEKICK_AGENT_DEF: EmbeddedAgentDef = { fileName: "sidekick.md", template: sidekickMd };
 
 // Computed lazily on first loadBundledAgents() call to avoid eager prompt.render at module load.
 
@@ -154,6 +162,18 @@ export function getBundledAgentsMap(): Map<string, AgentDefinition> {
 		map.set(agent.name, agent);
 	}
 	return map;
+}
+
+let sidekickAgentCache: AgentDefinition | null = null;
+
+/** The Fusion sidekick definition, parsed once. Not part of {@link loadBundledAgents}. */
+export function getSidekickAgent(): AgentDefinition {
+	sidekickAgentCache ??= parseAgent(
+		`embedded:${SIDEKICK_AGENT_DEF.fileName}`,
+		buildAgentContent(SIDEKICK_AGENT_DEF),
+		"bundled",
+	);
+	return sidekickAgentCache;
 }
 
 /**

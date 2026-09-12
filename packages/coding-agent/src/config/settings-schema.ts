@@ -163,7 +163,8 @@ export type SettingTab =
 	| "shell"
 	| "tools"
 	| "tasks"
-	| "providers";
+	| "providers"
+	| "fusion";
 
 /** Tab display metadata - icon is resolved via theme.symbol() */
 export type TabMetadata = { label: string; icon: `tab.${string}` };
@@ -180,6 +181,7 @@ export const SETTING_TABS: SettingTab[] = [
 	"tools",
 	"tasks",
 	"providers",
+	"fusion",
 ];
 
 /** Tab display metadata - icon is a symbol key from theme.ts (tab.*) */
@@ -194,6 +196,7 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
 	tools: { label: "Tools", icon: "tab.tools" },
 	tasks: { label: "Tasks", icon: "tab.tasks" },
 	providers: { label: "Providers", icon: "tab.providers" },
+	fusion: { label: "Fusion", icon: "tab.fusion" },
 };
 
 /**
@@ -234,6 +237,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 	],
 	tasks: ["Modes", "Subagents", "Isolation", "Commands & Skills"],
 	providers: ["Services", "Fireworks", "Tiny Model", "Protocol", "Timeouts", "Privacy"],
+	fusion: ["Fusion"],
 };
 
 /** Status line segment identifiers */
@@ -5356,6 +5360,42 @@ export const SETTINGS_SCHEMA = {
 			label: "Generic Task Prewalk",
 			description:
 				"Arm prewalk for the bundled generic `task` subagent: it starts on its resolved model, plans and begins the implementation, then hands off to the 'smol' role at its first edit/write. Per-agent overrides (task.agentPrewalk, configured from the /agents hub) and user agent `prewalk` frontmatter apply regardless of this toggle.",
+		},
+	},
+
+	// Fusion mode: a frontier lead that plans, briefs, and reviews, paired with
+	// one persistent sidekick subagent that implements and verifies.
+	"fusion.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "fusion",
+			group: "Fusion",
+			label: "Fusion Mode",
+			description:
+				"Pair the lead model with one persistent sidekick subagent that implements and verifies; the lead plans, briefs, and reviews. Mounts the `sidekick` tool when the sidekick model is available.",
+		},
+	},
+	"fusion.sidekickModel": {
+		type: "string",
+		default: "devin/swe-2",
+		ui: {
+			tab: "fusion",
+			group: "Fusion",
+			label: "Sidekick Model",
+			description: "Model selector for the sidekick subagent (provider/id, fuzzy id, or @role alias).",
+		},
+	},
+	"fusion.sidekickThinking": {
+		type: "enum",
+		values: THINKING_EFFORTS,
+		default: "medium",
+		ui: {
+			tab: "fusion",
+			group: "Fusion",
+			label: "Sidekick Thinking",
+			description: "Reasoning depth for the sidekick subagent.",
+			options: THINKING_EFFORTS.map(getThinkingLevelMetadata),
 		},
 	},
 

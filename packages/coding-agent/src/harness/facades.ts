@@ -67,6 +67,15 @@ const claudeCodeSkillSchema = type({
 	"args?": type("string").describe("Not available in this build; leave unset"),
 });
 
+const CLAUDE_CODE_TASK_OUTPUT: HarnessFacadeSpec<typeof claudeCodeTaskOutputSchema> = {
+	target: "hub",
+	wireName: "TaskOutput",
+	description: claudeCodeTaskOutput,
+	parameters: claudeCodeTaskOutputSchema,
+	toParams: (args: typeof claudeCodeTaskOutputSchema.infer) =>
+		args.block ? { op: "wait", ids: [args.task_id], timeoutMs: args.timeout } : { op: "jobs" },
+};
+
 const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 	{
 		target: "task",
@@ -113,14 +122,7 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 			return { op: "list" };
 		},
 	},
-	{
-		target: "hub",
-		wireName: "TaskOutput",
-		description: claudeCodeTaskOutput,
-		parameters: claudeCodeTaskOutputSchema,
-		toParams: (args: typeof claudeCodeTaskOutputSchema.infer) =>
-			args.block ? { op: "wait", ids: [args.task_id], timeoutMs: args.timeout } : { op: "jobs" },
-	},
+	CLAUDE_CODE_TASK_OUTPUT,
 	{
 		target: "hub",
 		wireName: "TaskStop",
@@ -200,6 +202,17 @@ const codexWaitSchema = type({
 	),
 });
 
+const CODEX_WAIT: HarnessFacadeSpec<typeof codexWaitSchema> = {
+	target: "hub",
+	wireName: "wait",
+	description: codexWait,
+	parameters: codexWaitSchema,
+	toParams: (args: typeof codexWaitSchema.infer) =>
+		args.terminate
+			? { op: "cancel", ids: [args.cell_id] }
+			: { op: "wait", ids: [args.cell_id], timeoutMs: args.yield_time_ms ?? CODEX_WAIT_DEFAULT_YIELD_MS },
+};
+
 const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 	{
 		target: "task",
@@ -278,16 +291,7 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 			timeoutMs: args.timeout_ms ?? CODEX_WAIT_AGENT_DEFAULT_TIMEOUT_MS,
 		}),
 	},
-	{
-		target: "hub",
-		wireName: "wait",
-		description: codexWait,
-		parameters: codexWaitSchema,
-		toParams: (args: typeof codexWaitSchema.infer) =>
-			args.terminate
-				? { op: "cancel", ids: [args.cell_id] }
-				: { op: "wait", ids: [args.cell_id], timeoutMs: args.yield_time_ms ?? CODEX_WAIT_DEFAULT_YIELD_MS },
-	},
+	CODEX_WAIT,
 ];
 
 const FACADES: Readonly<Record<HarnessProfile, readonly HarnessFacadeSpec[]>> = {
@@ -298,3 +302,9 @@ const FACADES: Readonly<Record<HarnessProfile, readonly HarnessFacadeSpec[]>> = 
 export function harnessFacadeSpecs(profile: HarnessProfile): readonly HarnessFacadeSpec[] {
 	return FACADES[profile];
 }
+
+/** The facade each profile waits on one background job with (`hub` `op:"wait"` + `ids`). */
+export const HARNESS_JOB_WAIT_FACADE: Readonly<Record<HarnessProfile, HarnessFacadeSpec>> = {
+	"claude-code": CLAUDE_CODE_TASK_OUTPUT,
+	codex: CODEX_WAIT,
+};

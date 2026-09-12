@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import {
 	formatModelString,
 	getModelMatchPreferences,
@@ -6,6 +7,7 @@ import {
 	type ResolveCliModelResult,
 } from "../config/model-resolver";
 import type { SettingPath, Settings } from "../config/settings";
+import { findSidekickRef, resolveSidekickModel } from "../fusion/config";
 import { servedHarnessPrompt } from "../harness/capture";
 import { describeLoopCondition } from "../modes/loop-condition";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
@@ -138,6 +140,64 @@ async function applyComputerUseToggle(session: AgentSession, enable: boolean): P
 		? `Computer use enabled for this session. ${formatComputerUseStatus(session)}`
 		: "Computer use disabled for this session.";
 }
+
+/** `/fusion status`: lead model, sidekick model/thinking, and the live sidekick (id, usage) when one exists. */
+function formatFusionStatus(session: AgentSession): string {
+	const { settings } = session;
+	const lead = session.model;
+	const sidekick = resolveSidekickModel(settings, session.modelRegistry);
+	const lines = [
+		`Fusion: ${settings.get("fusion.enabled") ? "enabled" : "disabled"}`,
+		`lead: ${lead ? formatModelString(lead) : "none selected"}`,
+		`sidekick: ${sidekick.model ? formatModelString(sidekick.model) : `${sidekick.pattern} (${sidekick.error})`} · thinking ${settings.get("fusion.sidekickThinking")}`,
+	];
+	const ref = findSidekickRef(session.getAgentId() ?? "");
+	if (!ref) {
+		lines.push("sidekick agent: not spawned");
+		return lines.join(" · ");
+	}
+	const stats = ref.session?.getSessionStats();
+	const usage = stats
+		? `${formatTokenCount(stats.tokens.total)} tokens, $${stats.cost.toFixed(4)}`
+		: ref.history?.metrics
+			? `${formatTokenCount(ref.history.metrics.tokens)} tokens, $${ref.history.metrics.cost.toFixed(4)}`
+			: "usage unavailable";
+	lines.push(`sidekick agent: ${ref.id} (${ref.status}, ${usage})`);
+	return lines.join(" · ");
+}
+
+/**
+ * Apply a `/fusion` argument (`on`, `off`, empty = toggle, or a sidekick model
+ * selector which also enables) and remount the tool + lead prompt in place.
+ */
+async function applyFusionCommand(session: AgentSession, settings: Settings, args: string): Promise<string> {
+	const arg = args.trim();
+	const lowered = arg.toLowerCase();
+	if (lowered === "status") return formatFusionStatus(session);
+	let enable: boolean;
+	if (!arg || lowered === "toggle") {
+		enable = !settings.get("fusion.enabled");
+	} else if (lowered === "on" || lowered === "off") {
+		enable = lowered === "on";
+	} else {
+		const resolved = resolveSessionModelSelector(arg, session, settings);
+		if (!resolved.model) throw new Error(resolved.error ?? `Unknown model: ${arg}`);
+		settings.set("fusion.sidekickModel", formatModelString(resolved.model));
+		const suffixEffort = THINKING_EFFORTS.find(effort => effort === resolved.thinkingLevel);
+		if (suffixEffort !== undefined) settings.set("fusion.sidekickThinking", suffixEffort);
+		enable = true;
+	}
+	settings.set("fusion.enabled", enable);
+	const mounted = await session.applyFusionMode();
+	if (!enable) return "Fusion mode disabled.";
+	if (!mounted) {
+		const sidekick = resolveSidekickModel(settings, session.modelRegistry);
+		return `Fusion mode enabled, but the sidekick tool is not mounted: ${sidekick.error ?? "unavailable in this session"}`;
+	}
+	return `Fusion mode enabled. ${formatFusionStatus(session)}`;
+}
+
+const FUSION_USAGE = "Usage: /fusion [on|off|status|<sidekick model>]";
 
 const AUTOCOMPLETE_DETAIL_LIMIT = 48;
 
@@ -617,6 +677,40 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			}
 			runtime.ctx.showStatus("Usage: /computer [on|off|status]");
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "fusion",
+		icon: "swap",
+		description: "Toggle Fusion mode (lead plans and reviews; one persistent sidekick implements and verifies)",
+		acpDescription: "Toggle Fusion mode",
+		acpInputHint: "[on|off|status|<sidekick model>]",
+		inlineHint: "[on|off|status|<sidekick model>]",
+		subcommands: [
+			{ name: "on", description: "Enable Fusion mode and mount the sidekick tool" },
+			{ name: "off", description: "Disable Fusion mode and unmount the sidekick tool" },
+			{ name: "status", description: "Show lead and sidekick models and the live sidekick" },
+		],
+		allowArgs: true,
+		getTuiAutocompleteDescription: runtime =>
+			`Fusion: ${runtime.ctx.settings.get("fusion.enabled" as SettingPath) ? "on" : "off"}`,
+		handle: async (command, runtime) => {
+			try {
+				await runtime.output(await applyFusionCommand(runtime.session, runtime.settings, command.args));
+				await runtime.notifyConfigChanged?.();
+				return commandConsumed();
+			} catch (err) {
+				return usage(`${errorMessage(err)}\n${FUSION_USAGE}`, runtime);
+			}
+		},
+		handleTui: async (command, runtime) => {
+			runtime.ctx.editor.setText("");
+			try {
+				runtime.ctx.showStatus(await applyFusionCommand(runtime.ctx.session, runtime.ctx.settings, command.args));
+				refreshStatusLine(runtime.ctx);
+			} catch (err) {
+				runtime.ctx.showError(`${errorMessage(err)}\n${FUSION_USAGE}`);
+			}
 		},
 	},
 	{

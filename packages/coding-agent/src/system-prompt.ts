@@ -26,11 +26,13 @@ import type { Personality, SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
 import { expandAtImports } from "./discovery/at-imports";
 import { loadSkills, type Skill } from "./extensibility/skills";
+import { buildFusionPromptData, SIDEKICK_TOOL_NAME } from "./fusion/config";
 import { type HarnessPrompt, loadHarnessPrompt } from "./harness/capture";
 import { hasObsidian } from "./internal-urls/vault-protocol";
 import activeRepoContextTemplate from "./prompts/system/active-repo-context.md" with { type: "text" };
 import computerSafetyPrompt from "./prompts/system/computer-safety.md" with { type: "text" };
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
+import fusionLeadTemplate from "./prompts/system/fusion-lead.md" with { type: "text" };
 import defaultPersonality from "./prompts/system/personalities/default.md" with { type: "text" };
 import friendlyPersonality from "./prompts/system/personalities/friendly.md" with { type: "text" };
 import pragmaticPersonality from "./prompts/system/personalities/pragmatic.md" with { type: "text" };
@@ -690,6 +692,7 @@ export interface BuildSystemPromptResult {
 }
 
 prompt.registerPartial("xdevDevices", xdevDevicesTemplate);
+prompt.registerPartial("fusionLead", fusionLeadTemplate);
 
 /** Build the system prompt with tools, guidelines, and context */
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
@@ -948,6 +951,12 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		if (!toolPromptNames.has(mounted.name)) toolPromptNames.set(mounted.name, mounted.name);
 	}
 	const toolRefs = Object.fromEntries(toolPromptNames.entries());
+	// The sidekick tool mounts only for a Fusion lead, so its presence IS the
+	// Fusion signal: the lead section renders with the same presented names the
+	// rest of the prompt uses.
+	const fusion = toolPromptNames.has(SIDEKICK_TOOL_NAME)
+		? buildFusionPromptData({ profile: harnessProfile, toolRefs })
+		: undefined;
 	const xdevToolNames = new Set(xdevTools.map(mounted => mounted.name));
 	// A direct custom tool can share a name with a retained built-in device.
 	// Presence in both toolNames and tools proves it still has a top-level definition.
@@ -1011,6 +1020,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		inlineToolDescriptors,
 		toolListMode,
 		toolRefs,
+		fusion,
 		environment,
 		contextFiles,
 		agentsMdSearch: { files: agentsMdFiles },

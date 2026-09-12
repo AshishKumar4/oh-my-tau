@@ -13,6 +13,7 @@ import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { PreparedExtension } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
+import { isFusionLead } from "../fusion/config";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -59,6 +60,7 @@ import { MemoryReflectTool } from "./memory-reflect";
 import { MemoryRetainTool } from "./memory-retain";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
+import { SidekickTool } from "./sidekick";
 import type { PlanProposalHandler } from "./resolve";
 import { SecurityScanTool } from "./security-scan";
 import { supportsExternalThinking, ThinkTool } from "./think";
@@ -103,6 +105,7 @@ export * from "./report-tool-issue";
 export * from "./resolve";
 export * from "./review";
 export * from "./security-scan";
+export * from "./sidekick";
 export * from "./think";
 export * from "./todo";
 export * from "./tts";
@@ -487,6 +490,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	reflect: MemoryReflectTool.createIf,
 	learn: LearnTool.createIf,
 	manage_skill: ManageSkillTool.createIf,
+	sidekick: SidekickTool.createIf,
 };
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {
@@ -627,6 +631,11 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		// active still exposes the tools the nudge points at. Gated to top-level
 		// (taskDepth 0): the controller only runs there, so a subagent's explicit
 		// tool whitelist must never be silently widened with write-capable tools.
+		// The Fusion lead's `sidekick` tool rides the same rule: settings-gated,
+		// top-level only, force-included into an explicit list.
+		if (!restrictToolNames && isFusionLead(session) && !requestedTools.includes("sidekick")) {
+			requestedTools.push("sidekick");
+		}
 		if (session.settings.get("autolearn.enabled") && (session.taskDepth ?? 0) === 0) {
 			if (!requestedTools.includes("manage_skill")) requestedTools.push("manage_skill");
 			if (
@@ -695,6 +704,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "task") {
 			return canSpawnAtDepth(session.settings.get("task.maxRecursionDepth") ?? 2, session.taskDepth ?? 0);
 		}
+		if (name === "sidekick") return !restrictToolNames && isFusionLead(session);
 		return true;
 	};
 	if (includeYield && requestedTools && !requestedTools.includes("yield")) {

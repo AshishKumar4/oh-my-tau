@@ -150,6 +150,7 @@ import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
+import { findSidekickRef, SIDEKICK_TOOL_NAME } from "../fusion/config";
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -172,6 +173,8 @@ import goalModeContextPrompt from "../prompts/goals/goal-mode-context.md" with {
 import goalTodoContextPrompt from "../prompts/goals/goal-todo-context.md" with { type: "text" };
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import checkpointActiveNoticeTemplate from "../prompts/system/checkpoint-active-notice.md" with { type: "text" };
+import fusionDirectEditReminderTemplate from "../prompts/system/fusion-direct-edit-reminder.md" with { type: "text" };
+import fusionReportFirstPrompt from "../prompts/system/fusion-report-first.md" with { type: "text" };
 import interruptedThinkingTemplate from "../prompts/system/interrupted-thinking.md" with { type: "text" };
 import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { type: "text" };
 import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" with { type: "text" };
@@ -181,6 +184,7 @@ import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.
 import skillfulNoticePrompt from "../prompts/system/skillful-notice.md" with { type: "text" };
 import vibeModeActivePrompt from "../prompts/system/vibe-mode-active.md" with { type: "text" };
 import videoAttachmentPrompt from "../prompts/system/video-attachment.md" with { type: "text" };
+import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
 	deobfuscateAssistantContent,
 	deobfuscateSessionContext,
@@ -698,6 +702,8 @@ export class AgentSession {
 	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
+	/** Fusion: the direct-edit nudge fires at most once per turn (reset on `turn_start`). */
+	#fusionEditReminderSent = false;
 	#scoutAllowedBySpawnPolicy = true;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
@@ -1614,6 +1620,7 @@ export class AgentSession {
 			toolRegistry: config.toolRegistry,
 			createVibeTools: config.createVibeTools,
 			createThinkTool: config.createThinkTool,
+			createSidekickTool: config.createSidekickTool,
 			builtInToolNames: config.builtInToolNames,
 			mcpManagerToolNames: config.mcpManagerToolNames,
 			presentationPinnedToolNames: config.presentationPinnedToolNames,
@@ -2943,7 +2950,10 @@ export class AgentSession {
 		}
 		// This must happen before event fan-out awaits: streamed tool-call deltas
 		// can otherwise queue validation that a delayed turn-start reset erases.
-		if (event.type === "turn_start") this.#streamingEditGuard.reset();
+		if (event.type === "turn_start") {
+			this.#streamingEditGuard.reset();
+			this.#fusionEditReminderSent = false;
+		}
 		// Step the mid-run todo counter synchronously, BEFORE any await in this
 		// handler. The agent loop's next-turn `getAsideMessages` poll can run
 		// before queued microtasks drain, so `#takeMidRunTodoNudge` MUST see the
@@ -3259,6 +3269,26 @@ export class AgentSession {
 							content: reminderText,
 							display: false,
 							details: { toolName, errorText },
+						},
+						{ deliverAs: "nextTurn" },
+					);
+				}
+				if (
+					(toolName === "edit" || toolName === "write") &&
+					!isError &&
+					!this.#fusionEditReminderSent &&
+					writeDeviceDispatch(toolName, event.message) === undefined &&
+					this.#isFusionLead()
+				) {
+					this.#fusionEditReminderSent = true;
+					await this.sendCustomMessage(
+						{
+							customType: "fusion-direct-edit-reminder",
+							content: prompt.render(fusionDirectEditReminderTemplate, {
+								browserEnabled: this.getEvalPreludes().some(definition => definition.name === "browser"),
+							}),
+							display: false,
+							details: { toolName },
 						},
 						{ deliverAs: "nextTurn" },
 					);
@@ -5407,6 +5437,35 @@ export class AgentSession {
 		return this.#memory.applyMemoryBackend();
 	}
 
+	/** Reconciles the Fusion `sidekick` tool and lead prompt with current settings; true when mounted. */
+	applyFusionMode(): Promise<boolean> {
+		return this.#tools.applyFusionMode();
+	}
+
+	/** This session leads a Fusion sidekick: top-level, with the `sidekick` tool mounted. */
+	#isFusionLead(): boolean {
+		return this.#agentKind === "main" && this.getActiveToolNames().includes(SIDEKICK_TOOL_NAME);
+	}
+
+	/**
+	 * Fusion: a user message that lands while the sidekick is mid-handoff gets
+	 * the vendor's report-first guidance so the lead can re-brief for an
+	 * immediate report instead of waiting out the handoff.
+	 */
+	#createFusionReportFirstNotice(): CustomMessage | undefined {
+		if (!this.#isFusionLead() || findSidekickRef(this.#agentId ?? MAIN_AGENT_ID)?.status !== "running") {
+			return undefined;
+		}
+		return {
+			role: "custom",
+			customType: "fusion-report-first-guidance",
+			content: fusionReportFirstPrompt.trim(),
+			display: false,
+			attribution: "user",
+			timestamp: Date.now(),
+		};
+	}
+
 	/** Rebuilds the stable base prompt for the current tools and model. */
 	refreshBaseSystemPrompt(): Promise<void> {
 		return this.#tools.refreshBaseSystemPrompt();
@@ -6173,6 +6232,7 @@ export class AgentSession {
 		// user's message that steer this turn. User-authored prompts only — synthetic /
 		// agent-initiated turns never trigger them.
 		const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
+		const reportFirstNotice = options?.synthetic ? undefined : this.#createFusionReportFirstNotice();
 
 		// A user-initiated prompt (typed message or the `.`/`c` continue shortcut)
 		// re-enables advisor auto-resume that a prior user interrupt suppressed.
@@ -6197,6 +6257,8 @@ export class AgentSession {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
 			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, submittedAt);
+			// The report-first guidance refers to "the message above": it follows the user message.
+			if (reportFirstNotice) await this.#queueCustomMessage(reportFirstNotice, streamingBehavior);
 			return true;
 		}
 
@@ -6246,6 +6308,7 @@ export class AgentSession {
 				images: normalizedImages,
 				descriptionNotice: imageDescriptionNotice,
 			});
+			if (reportFirstNotice) await this.#queueCustomMessage(reportFirstNotice, streamingBehavior);
 			return true;
 		}
 
@@ -6297,6 +6360,7 @@ export class AgentSession {
 								...(imageDescriptionNotice ? [imageDescriptionNotice] : []),
 							]
 						: undefined,
+				appendMessages: reportFirstNotice ? [reportFirstNotice] : undefined,
 			});
 		} finally {
 			// Clean up residual eager-todo directive if the prompt never consumed it
@@ -6397,6 +6461,8 @@ export class AgentSession {
 		expandedText: string,
 		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck"> & {
 			prependMessages?: AgentMessage[];
+			/** Hidden context that must read as following the user message (e.g. "the message above"). */
+			appendMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
 		},
@@ -6487,6 +6553,9 @@ export class AgentSession {
 			// whether the final provider prompt still carries the base catalog.
 			const xdevMountNoticeIndex = messages.length;
 			messages.push(message);
+			if (options?.appendMessages) {
+				messages.push(...options.appendMessages);
+			}
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this.#pendingNextTurnMessages) {
 				messages.push(msg);

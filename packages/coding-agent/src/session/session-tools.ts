@@ -14,6 +14,7 @@ import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import type { ExtensionRunner, SourceInfo, ToolInfo } from "../extensibility/extensions";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
+import { SIDEKICK_TOOL_NAME } from "../fusion/config";
 import { harnessFacade, presentedWireName, presentTool } from "../harness/facade";
 import { servedHarnessPrompt, type VendorTool } from "../harness/capture";
 import { harnessFacadeSpecs } from "../harness/facades";
@@ -77,6 +78,8 @@ interface SessionToolsOptions {
 	createVibeTools?: () => AgentTool[];
 	/** Creates the private `think` scratchpad tool for runtime setting changes. */
 	createThinkTool?: () => Promise<AgentTool | null>;
+	/** Creates the Fusion `sidekick` tool, or null when Fusion is off or its model is unavailable. */
+	createSidekickTool?: () => Promise<AgentTool | null>;
 	builtInToolNames?: Iterable<string>;
 	presentationPinnedToolNames?: ReadonlySet<string>;
 	/** MCP tool names whose current registry entries came from the manager snapshot. */
@@ -197,6 +200,7 @@ export class SessionTools {
 	#toolRegistry: Map<string, AgentTool>;
 	#createVibeTools: (() => AgentTool[]) | undefined;
 	#createThinkTool: SessionToolsOptions["createThinkTool"];
+	#createSidekickTool: SessionToolsOptions["createSidekickTool"];
 	#installedVibeToolNames = new Set<string>();
 	#builtInToolNames: Set<string>;
 	#rpcHostToolNames = new Set<string>();
@@ -288,6 +292,7 @@ export class SessionTools {
 		this.#toolRegistry = options.toolRegistry ?? new Map();
 		this.#createVibeTools = options.createVibeTools;
 		this.#createThinkTool = options.createThinkTool;
+		this.#createSidekickTool = options.createSidekickTool;
 		this.#builtInToolNames = new Set(options.builtInToolNames ?? []);
 		this.#mcpManagerToolNames = new Set(options.mcpManagerToolNames ?? []);
 		if (options.mcpManagerToolNames === undefined) {
@@ -1558,6 +1563,34 @@ export class SessionTools {
 			if (!active.includes("think")) {
 				await this.#applyActiveToolsByName([...active, "think"]);
 			}
+			return true;
+		});
+	}
+
+	/**
+	 * Reconciles the Fusion `sidekick` tool with current settings: mounts it
+	 * (rebuilding the prompt so the lead section renders) when Fusion is on
+	 * and the sidekick model resolves, unmounts it otherwise. A remount keeps
+	 * the live sidekick: the tool finds it again through the agent registry.
+	 *
+	 * @returns true when the tool is mounted after the call.
+	 */
+	applyFusionMode(): Promise<boolean> {
+		return this.runToolRegistryMutation(async () => {
+			const tool = await this.#createSidekickTool?.();
+			const active = this.getEnabledToolNames().filter(name => name !== SIDEKICK_TOOL_NAME);
+			if (!tool) {
+				if (this.#builtInToolNames.has(SIDEKICK_TOOL_NAME)) {
+					this.#toolRegistry.delete(SIDEKICK_TOOL_NAME);
+					this.#builtInToolNames.delete(SIDEKICK_TOOL_NAME);
+				}
+				await this.#applyActiveToolsByName(active, true);
+				return false;
+			}
+			const wrapped = this.#wrapRuntimeTool(tool);
+			this.#toolRegistry.set(wrapped.name, wrapped);
+			this.#builtInToolNames.add(wrapped.name);
+			await this.#applyActiveToolsByName([...active, wrapped.name], true);
 			return true;
 		});
 	}

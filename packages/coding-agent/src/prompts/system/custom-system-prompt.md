@@ -40,6 +40,7 @@ If a skill applies, you MUST read `skill://<name>` before proceeding.
 </skills>
 {{/if}}
 {{> xdevDevices}}
+{{> fusionLead}}
 {{#if alwaysApplyRules.length}}
 {{#each alwaysApplyRules}}
 {{content}}
