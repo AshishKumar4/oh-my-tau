@@ -52,10 +52,13 @@ The lead prompt and the sidekick prompt are the ones the Devin CLI ships. The le
 with the same contract: blocking by default, re-briefable while it runs, exactly one sidekick per session. Nothing
 else changes for the lead; it keeps the profile above and omp's full tool layer.
 
+A subagent can lead too: an agent definition that sets `sidekick: true` in its frontmatter gets its own sidekick
+tool and sidekick when Fusion is on, so an expert lane briefs and reviews without doing the edits itself.
+
 ```
 /fusion                 toggle
 /fusion on | off
-/fusion status          lead, sidekick, and the live sidekick's id and usage
+/fusion status          lead, sidekick, and every live sidekick with its owner, id and usage
 /fusion devin/swe-2:high   change the sidekick model or its thinking level
 ```
 

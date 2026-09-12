@@ -6,6 +6,7 @@
 
 - Fusion mode (`/fusion`, `fusion.*` settings): the lead model plans, briefs, and reviews while one persistent `sidekick` subagent (SWE-2 by default) implements and verifies across handoffs.
 - Settings panel gains a Fusion tab, and the status line shows the lead/sidekick pair (`<lead> ⚡ <sidekick>`) when Fusion is enabled.
+- Agent definitions can opt in with `sidekick: true` so a subagent leads a sidekick of its own under Fusion; `/fusion status` lists every live sidekick with its owner.
 
 ### Fixed
 

@@ -33,7 +33,7 @@ import type { SessionManager } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
-import { canSpawnAtDepth, type StructuredSubagentSchemaMode } from "../task/types";
+import { type AgentDefinition, canSpawnAtDepth, type StructuredSubagentSchemaMode } from "../task/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { EventBus } from "../utils/event-bus";
 import { WebSearchTool } from "../web/search";
@@ -262,6 +262,8 @@ export interface ToolSession {
 	restrictToolNames?: boolean;
 	/** Task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
+	/** The agent definition a subagent session runs under; undefined for the top-level session. */
+	agentDefinition?: AgentDefinition;
 	/** Get shared eval executor session ID. Subagents inherit this to share JS/Python state. */
 	getEvalSessionId?: () => string | null;
 	/** Get session file */
@@ -631,8 +633,9 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		// active still exposes the tools the nudge points at. Gated to top-level
 		// (taskDepth 0): the controller only runs there, so a subagent's explicit
 		// tool whitelist must never be silently widened with write-capable tools.
-		// The Fusion lead's `sidekick` tool rides the same rule: settings-gated,
-		// top-level only, force-included into an explicit list.
+		// A Fusion lead's `sidekick` tool rides the same rule: gated on
+		// `isFusionLead` (top-level, or an agent definition with `sidekick: true`),
+		// force-included into an explicit list.
 		if (!restrictToolNames && isFusionLead(session) && !requestedTools.includes("sidekick")) {
 			requestedTools.push("sidekick");
 		}

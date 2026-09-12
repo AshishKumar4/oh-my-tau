@@ -150,7 +150,7 @@ import type { HookCommandContext } from "../extensibility/hooks/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
-import { findSidekickRef, SIDEKICK_TOOL_NAME } from "../fusion/config";
+import { findSidekickRef, type FusionSessionLike, isFusionLead, SIDEKICK_TOOL_NAME } from "../fusion/config";
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -702,6 +702,8 @@ export class AgentSession {
 	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
+	/** What `isFusionLead` needs to know about this session, beyond its settings. */
+	readonly #fusionSession: Pick<FusionSessionLike, "taskDepth" | "agentDefinition">;
 	/** Fusion: the direct-edit nudge fires at most once per turn (reset on `turn_start`). */
 	#fusionEditReminderSent = false;
 	#scoutAllowedBySpawnPolicy = true;
@@ -1464,7 +1466,7 @@ export class AgentSession {
 		};
 		this.#memory = new SessionMemory(memoryHost, {
 			memoryAgentDir: config.memoryAgentDir,
-			memoryTaskDepth: config.memoryTaskDepth,
+			memoryTaskDepth: config.taskDepth,
 			createMemoryTools: config.createMemoryTools,
 		});
 		// Resolve the wire service-tier per request so the Fireworks Priority
@@ -1684,6 +1686,7 @@ export class AgentSession {
 		this.#loopGuards = new LoopGuards(streamGuardsHost);
 		this.#agentId = config.agentId;
 		this.#agentKind = config.agentKind ?? "main";
+		this.#fusionSession = { taskDepth: config.taskDepth, agentDefinition: config.agentDefinition };
 		this.#scoutAllowedBySpawnPolicy = config.scoutAllowedBySpawnPolicy ?? true;
 		this.#providerSessionId = config.providerSessionId;
 		this.#inheritedProviderPromptCacheKey =
@@ -5442,9 +5445,12 @@ export class AgentSession {
 		return this.#tools.applyFusionMode();
 	}
 
-	/** This session leads a Fusion sidekick: top-level, with the `sidekick` tool mounted. */
+	/** This session leads a Fusion sidekick (per `isFusionLead`) and has the `sidekick` tool mounted. */
 	#isFusionLead(): boolean {
-		return this.#agentKind === "main" && this.getActiveToolNames().includes(SIDEKICK_TOOL_NAME);
+		return (
+			isFusionLead({ settings: this.settings, ...this.#fusionSession }) &&
+			this.getActiveToolNames().includes(SIDEKICK_TOOL_NAME)
+		);
 	}
 
 	/**

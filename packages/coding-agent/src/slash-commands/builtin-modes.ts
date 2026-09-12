@@ -7,11 +7,12 @@ import {
 	type ResolveCliModelResult,
 } from "../config/model-resolver";
 import type { SettingPath, Settings } from "../config/settings";
-import { findSidekickRef, resolveSidekickModel } from "../fusion/config";
+import { describeSidekickOwner, listSidekickRefs, resolveSidekickModel } from "../fusion/config";
 import { servedHarnessPrompt } from "../harness/capture";
 import { describeLoopCondition } from "../modes/loop-condition";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
+import type { AgentRef } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import { shortenPath } from "../tools/render-utils";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
@@ -141,7 +142,22 @@ async function applyComputerUseToggle(session: AgentSession, enable: boolean): P
 		: "Computer use disabled for this session.";
 }
 
-/** `/fusion status`: lead model, sidekick model/thinking, and the live sidekick (id, usage) when one exists. */
+/** One live sidekick for `/fusion status`: id, owner (top-level or the subagent lead's label), status, usage. */
+function formatSidekickRef(ref: AgentRef): string {
+	const stats = ref.session?.getSessionStats();
+	const usage = stats
+		? `${formatTokenCount(stats.tokens.total)} tokens, $${stats.cost.toFixed(4)}`
+		: ref.history?.metrics
+			? `${formatTokenCount(ref.history.metrics.tokens)} tokens, $${ref.history.metrics.cost.toFixed(4)}`
+			: "usage unavailable";
+	return `${ref.id} (${describeSidekickOwner(ref)}, ${ref.status}, ${usage})`;
+}
+
+/**
+ * `/fusion status`: lead model, sidekick model/thinking, and every live
+ * sidekick with its owner. There is one per lead: the top-level session and
+ * each subagent whose agent definition opted in with `sidekick: true`.
+ */
 function formatFusionStatus(session: AgentSession): string {
 	const { settings } = session;
 	const lead = session.model;
@@ -151,18 +167,12 @@ function formatFusionStatus(session: AgentSession): string {
 		`lead: ${lead ? formatModelString(lead) : "none selected"}`,
 		`sidekick: ${sidekick.model ? formatModelString(sidekick.model) : `${sidekick.pattern} (${sidekick.error})`} · thinking ${settings.get("fusion.sidekickThinking")}`,
 	];
-	const ref = findSidekickRef(session.getAgentId() ?? "");
-	if (!ref) {
-		lines.push("sidekick agent: not spawned");
-		return lines.join(" · ");
-	}
-	const stats = ref.session?.getSessionStats();
-	const usage = stats
-		? `${formatTokenCount(stats.tokens.total)} tokens, $${stats.cost.toFixed(4)}`
-		: ref.history?.metrics
-			? `${formatTokenCount(ref.history.metrics.tokens)} tokens, $${ref.history.metrics.cost.toFixed(4)}`
-			: "usage unavailable";
-	lines.push(`sidekick agent: ${ref.id} (${ref.status}, ${usage})`);
+	const refs = listSidekickRefs();
+	lines.push(
+		refs.length === 0
+			? "sidekick agent: not spawned"
+			: `sidekick agent${refs.length === 1 ? "" : "s"}: ${refs.map(formatSidekickRef).join(", ")}`,
+	);
 	return lines.join(" · ");
 }
 
@@ -689,7 +699,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		subcommands: [
 			{ name: "on", description: "Enable Fusion mode and mount the sidekick tool" },
 			{ name: "off", description: "Disable Fusion mode and unmount the sidekick tool" },
-			{ name: "status", description: "Show lead and sidekick models and the live sidekick" },
+			{ name: "status", description: "Show lead and sidekick models and every live sidekick with its owner" },
 		],
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime =>

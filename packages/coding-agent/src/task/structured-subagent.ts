@@ -91,9 +91,10 @@ export interface StructuredSubagentRequest {
 	context?: string;
 	agent?: string;
 	/**
-	 * A pre-resolved definition that bypasses agent discovery. The caller owns
-	 * its spawnability (e.g. the Fusion sidekick, which `task` must never list);
-	 * every other policy still applies.
+	 * A pre-resolved definition that bypasses agent discovery and the session's
+	 * `spawns` allow-list. The caller owns its spawnability (e.g. the Fusion
+	 * sidekick, which `task` must never list); every other policy, including
+	 * `task.maxRecursionDepth`, still applies.
 	 */
 	agentDefinition?: AgentDefinition;
 	model?: string | string[];
@@ -254,6 +255,13 @@ function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentNam
 			`Cannot spawn ${blockedAgent} agent from within itself (recursion prevention). Use a different agent type.`,
 		);
 	}
+	// A caller-supplied definition owns its own spawnability (see
+	// `StructuredSubagentRequest.agentDefinition`): the Fusion sidekick is
+	// dispatched by the `sidekick` tool, never through `task`, so a subagent
+	// lead's `spawns` allow-list (or absent `spawns`, which disables `task`
+	// spawning) must not block it. The depth check above still applies: the
+	// sidekick occupies one recursion level under its lead like any child.
+	if (request.agentDefinition) return;
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
 	if (!spawnPolicy.enabled || (spawnPolicy.allowedAgents !== null && !spawnPolicy.allowedAgents.includes(agentName))) {
 		throw new StructuredSubagentError(

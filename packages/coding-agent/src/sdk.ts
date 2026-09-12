@@ -196,7 +196,7 @@ import { AgentOutputManager } from "./task/output-manager";
 import { wrapStreamFnWithProviderConcurrency } from "./task/provider-concurrency";
 import { sessionDelegationBias } from "./task/prompt-policy";
 import { isScoutSpawnable } from "./task/spawn-policy";
-import type { StructuredSubagentSchemaMode } from "./task/types";
+import type { AgentDefinition, StructuredSubagentSchemaMode } from "./task/types";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -582,9 +582,15 @@ export interface CreateAgentSessionOptions {
 	agentDisplayName?: string;
 	/**
 	 * Agent definition name used to evaluate rule `agents` scoping. Defaults to
-	 * "main" for a top-level session / "sub" for a subagent.
+	 * `agentDefinition.name`, else "main" for a top-level session / "sub" for a subagent.
 	 */
 	agentName?: string;
+	/**
+	 * The agent definition a subagent session runs under. Per-agent session
+	 * policy (e.g. Fusion's `sidekick: true`) reads from here; the top-level
+	 * session has none.
+	 */
+	agentDefinition?: AgentDefinition;
 	/** Optional shared agent registry for IRC routing. Default: AgentRegistry.global(). */
 	agentRegistry?: AgentRegistry;
 	/**
@@ -1662,7 +1668,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// which rules are bucketed into this session at all.
 	const isSubagentSession = (options.taskDepth ?? 0) > 0 || Boolean(options.parentTaskPrefix);
 	const agentKind: AgentKind = isSubagentSession ? SUB_AGENT_RULE_NAME : MAIN_AGENT_RULE_NAME;
-	const resolvedAgentName = (options.agentName ?? agentKind).trim().toLowerCase();
+	const resolvedAgentName = (options.agentName ?? options.agentDefinition?.name ?? agentKind).trim().toLowerCase();
 
 	// Discover rules and bucket them in one pass to avoid repeated scans over large rule sets.
 	const { ttsrManager, rulebookRules, alwaysApplyRules, allRules } = await logger.time(
@@ -1827,7 +1833,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			outputSchemaMode: options.outputSchemaMode,
 			requireYieldTool: options.requireYieldTool,
 			prewalkArmed: options.prewalk !== undefined,
-			taskDepth: options.taskDepth ?? 0,
+			taskDepth,
+			agentDefinition: options.agentDefinition,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			sessionManager,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
@@ -3768,7 +3775,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					}
 				: undefined,
 			memoryAgentDir: agentDir,
-			memoryTaskDepth: taskDepth,
 			createMemoryTools: restrictToolNames
 				? undefined
 				: async () => {
@@ -3828,6 +3834,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			obfuscator,
 			agentId: resolvedAgentId,
 			agentKind,
+			taskDepth,
+			agentDefinition: options.agentDefinition,
 			providerSessionId: options.providerSessionId,
 			providerPromptCacheKeySource,
 			parentEvalSessionId: options.parentEvalSessionId,

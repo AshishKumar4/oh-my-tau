@@ -17,7 +17,8 @@ import { AUTO_THINKING } from "../thinking";
 
 import type { AgentDefinition, AgentSource } from "./types";
 
-interface AgentFrontmatter {
+/** Frontmatter slots of the bundled agent template (`prompts/agents/frontmatter.md`). */
+export interface AgentFrontmatter {
 	name: string;
 	description: string;
 	tools?: string[];
@@ -27,6 +28,8 @@ interface AgentFrontmatter {
 	blocking?: boolean;
 	prewalk?: boolean | string;
 	advisor?: boolean | string;
+	autoloadSkills?: string[];
+	sidekick?: boolean;
 }
 
 interface EmbeddedAgentDef {
@@ -35,10 +38,15 @@ interface EmbeddedAgentDef {
 	template: string;
 }
 
+/** Render an agent markdown file (frontmatter block + body) the way the bundled agents are embedded. */
+export function renderAgentMarkdown(frontmatter: AgentFrontmatter, body: string): string {
+	return prompt.render(agentFrontmatterTemplate, { ...frontmatter, body });
+}
+
 function buildAgentContent(def: EmbeddedAgentDef): string {
 	const body = prompt.render(def.template);
 	if (!def.frontmatter) return body;
-	return prompt.render(agentFrontmatterTemplate, { ...def.frontmatter, body });
+	return renderAgentMarkdown(def.frontmatter, body);
 }
 
 const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [

@@ -36,6 +36,8 @@ function session(
 		planMode?: boolean;
 		outputSchema?: unknown;
 		maxDepth?: number;
+		taskDepth?: number;
+		spawns?: string;
 		isolationEnabled?: boolean;
 		isolationApply?: boolean;
 		modelRoles?: Record<string, string>;
@@ -54,8 +56,9 @@ function session(
 			...(options.isolationApply !== undefined ? { "task.isolation.apply": options.isolationApply } : {}),
 		}),
 		getSessionFile: () => null,
-		getSessionSpawns: () => "*",
+		getSessionSpawns: () => options.spawns ?? "*",
 		getPlanModeState: () => (options.planMode ? { enabled: true } : undefined),
+		taskDepth: options.taskDepth,
 	} as unknown as ToolSession;
 }
 
@@ -148,6 +151,25 @@ describe("structured subagent primitive", () => {
 			if (previous === undefined) delete Bun.env.PI_BLOCKED_AGENT;
 			else Bun.env.PI_BLOCKED_AGENT = previous;
 		}
+	});
+
+	it("lets a caller-supplied definition past the spawns allow-list but not past the recursion depth", async () => {
+		mockDiscovery();
+		// A subagent lead with no `spawns` (task spawning disabled) still dispatches its own sidekick.
+		const explicit = await resolveEffectiveSubagentPolicy(
+			request({ agent: undefined, agentDefinition: AGENT, session: session({ spawns: "", taskDepth: 1 }) }),
+		);
+		expect(explicit.effectiveAgent.name).toBe("worker");
+		// `task` spawning itself is not loosened by the same session policy.
+		await expect(resolveEffectiveSubagentPolicy(request({ session: session({ spawns: "" }) }))).rejects.toThrow(
+			"Cannot spawn 'worker'. Allowed: none (spawns disabled for this agent)",
+		);
+		// The explicit definition occupies a recursion level like any child.
+		await expect(
+			resolveEffectiveSubagentPolicy(
+				request({ agent: undefined, agentDefinition: AGENT, session: session({ maxDepth: 1, taskDepth: 1 }) }),
+			),
+		).rejects.toThrow("Cannot spawn another agent at task depth 1; maximum depth is 1.");
 	});
 
 	it("attenuates plan-mode agents and rejects mutable isolation controls before discovery", async () => {

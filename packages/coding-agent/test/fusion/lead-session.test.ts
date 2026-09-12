@@ -6,16 +6,25 @@ import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mo
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const REMINDER_TYPE = "fusion-direct-edit-reminder";
+
+const EXPERT: AgentDefinition = {
+	name: "expert",
+	description: "Expert lane",
+	systemPrompt: "Lead.",
+	source: "project",
+};
 
 function stubTool(name: string): AgentTool {
 	const schema = type({});
@@ -68,7 +77,11 @@ describe("fusion lead session", () => {
 		return model;
 	}
 
-	async function runLead(options: { fusion: boolean; agentKind?: "main" | "sub" }): Promise<number> {
+	async function runLead(options: {
+		fusion: boolean;
+		/** Subagent identity, as the executor passes it: depth 1 under the given agent definition. */
+		subagent?: AgentDefinition;
+	}): Promise<number> {
 		const tools = [stubTool("edit"), stubTool("read"), ...(options.fusion ? [stubTool("sidekick")] : [])];
 		// Turn 1 edits twice in one step (one reminder), turn 2 reads (none), turn 3 edits again (second reminder).
 		const mock = createMockModel({
@@ -98,7 +111,7 @@ describe("fusion lead session", () => {
 			settings: Settings.isolated({ "compaction.enabled": false, "fusion.enabled": options.fusion }),
 			modelRegistry,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
-			agentKind: options.agentKind,
+			...(options.subagent && { agentKind: "sub", taskDepth: 1, agentDefinition: options.subagent }),
 		});
 		await session.prompt("change things");
 		// Reminders are delivered next turn; a second prompt lands them.
@@ -108,10 +121,11 @@ describe("fusion lead session", () => {
 			.filter(entry => entry.type === "custom_message" && entry.customType === REMINDER_TYPE).length;
 	}
 
-	it("nudges the fusion lead once per turn after a direct edit, and never outside fusion or in a subagent", async () => {
+	it("nudges a fusion lead once per turn after a direct edit: the top-level session and an opted-in subagent, never a plain subagent or outside fusion", async () => {
 		expect(await runLead({ fusion: true })).toBe(2);
 		expect(await runLead({ fusion: false })).toBe(0);
-		expect(await runLead({ fusion: true, agentKind: "sub" })).toBe(0);
+		expect(await runLead({ fusion: true, subagent: { ...EXPERT, sidekick: true } })).toBe(2);
+		expect(await runLead({ fusion: true, subagent: EXPERT })).toBe(0);
 	});
 
 	it("/fusion toggles the setting and remounts through the session", async () => {
@@ -153,5 +167,33 @@ describe("fusion lead session", () => {
 		expect(output.at(-1)).toContain("Fusion: disabled");
 		expect(output.at(-1)).toContain("sidekick: anthropic/claude-sonnet-4-6 · thinking high");
 		expect(output.at(-1)).toContain("sidekick agent: not spawned");
+	});
+
+	it("/fusion status lists every live sidekick with its owning lead", async () => {
+		const settings = Settings.isolated();
+		const runtime = {
+			session: { settings, modelRegistry, model: modelOrThrow("claude-sonnet-4-5"), getAgentId: () => "Main" },
+			settings,
+			output: (text: string) => {
+				output.push(text);
+			},
+		} as unknown as SlashCommandRuntime;
+		const output: string[] = [];
+		const registry = AgentRegistry.global();
+		const refs = [
+			{ id: "Sidekick", parentId: "Main", status: "idle" as const },
+			{ id: "Expert:Sidekick", parentId: "Expert", status: "running" as const },
+			{ id: "Sidekick-old", parentId: "Main", status: "aborted" as const },
+		];
+		for (const ref of refs) registry.register({ ...ref, displayName: "sidekick", kind: "sub", session: null });
+		try {
+			await executeAcpBuiltinSlashCommand("/fusion status", runtime);
+		} finally {
+			for (const ref of refs) registry.unregister(ref.id);
+		}
+		expect(output.at(-1)).toContain(
+			"sidekick agents: Sidekick (top-level, idle, usage unavailable), Expert:Sidekick (Expert, running, usage unavailable)",
+		);
+		expect(output.at(-1)).not.toContain("Sidekick-old");
 	});
 });
