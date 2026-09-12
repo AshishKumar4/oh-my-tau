@@ -15,16 +15,18 @@ const DEVIN_OS = process.platform === "darwin" ? "darwin" : process.platform ===
 const DEVIN_LOCALE = "en";
 
 /**
- * Released Devin CLI request identity. The backend gates behavior on this
- * tuple: `ideType: "chisel"` is what unlocks router assignment (`AssignModel`)
- * and the CLI model surface, which the older Windsurf identity does not reach.
+ * Released Devin CLI request identity, as the CLI's own `GetChatMessage`
+ * carries it (captured from devin 3000.10.21): `ideName` and `extensionName`
+ * are both `chisel`, and no `ideType` is sent. The CLI also sends a
+ * per-request `Metadata.f` blob the schema cannot derive; the backend serves
+ * requests without it.
  */
+const DEVIN_CLI_VERSION = "3000.10.21";
 const DEVIN_CLI_METADATA = {
-	ideName: "devin-cli",
-	ideType: "chisel",
-	ideVersion: "3000.6.2",
+	ideName: "chisel",
+	ideVersion: DEVIN_CLI_VERSION,
 	extensionName: "chisel",
-	extensionVersion: "3000.6.2",
+	extensionVersion: DEVIN_CLI_VERSION,
 	locale: DEVIN_LOCALE,
 	os: DEVIN_OS,
 } as const;

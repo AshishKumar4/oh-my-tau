@@ -185,11 +185,11 @@ describe("Devin account usage", () => {
 		expect(capture.headers?.get("content-type")).toBe("application/proto");
 		expect(capture.headers?.get("connect-protocol-version")).toBe("1");
 		expect(capture.metadata?.apiKey).toBe("devin-session-token$raw-token");
-		expect(capture.metadata?.ideName).toBe("devin-cli");
-		expect(capture.metadata?.ideType).toBe("chisel");
+		expect(capture.metadata?.ideName).toBe("chisel");
+		expect(capture.metadata?.ideType).toBe("");
 		expect(capture.metadata?.extensionName).toBe("chisel");
-		expect(capture.metadata?.ideVersion).toBe("3000.6.2");
-		expect(capture.metadata?.extensionVersion).toBe("3000.6.2");
+		expect(capture.metadata?.ideVersion).toBe("3000.10.21");
+		expect(capture.metadata?.extensionVersion).toBe("3000.10.21");
 		expect(capture.metadata?.locale).toBe("en");
 		expect(capture.metadata?.os).toBe(EXPECTED_OS);
 

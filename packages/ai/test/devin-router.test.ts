@@ -152,10 +152,9 @@ describe("streamDevin router assignment", () => {
 			prompt: "route me",
 		});
 		expect(recorded.assignment?.metadata).toMatchObject({
-			ideName: "devin-cli",
-			ideType: "chisel",
+			ideName: "chisel",
 			extensionName: "chisel",
-			extensionVersion: "3000.6.2",
+			extensionVersion: "3000.10.21",
 			apiKey: "devin-session-token$token",
 			userJwt: "",
 		});
@@ -163,48 +162,109 @@ describe("streamDevin router assignment", () => {
 		expect(recorded.chat?.chatModelUid).toBe("claude-sonnet-4-5");
 		expect(recorded.chat?.modelAssignmentJwt).toBe("assign-jwt");
 		expect(recorded.chat?.cascadeId).toBe("cascade-42");
-		expect(recorded.chat?.metadata).toMatchObject({ ideType: "chisel", userJwt: "user-jwt" });
+		expect(recorded.chat?.metadata).toMatchObject({ ideName: "chisel", userJwt: "" });
 		expect(result.upstreamModel).toBe("claude-sonnet-4-5");
 		expect(result.stopReason).toBe("stop");
 	});
 
-	it("sends only the sampling fields the Devin CLI sets, so the server applies the model's own defaults", async () => {
+	it("builds the chat request field for field as the Devin CLI does", async () => {
+		// Captured from devin 3000.10.21's own GetChatMessage for SWE-2 standalone,
+		// the Fusion lead and the Fusion sidekick: one configuration for every
+		// model, no tool choice, cache options, execution id or user JWT, and a
+		// per-session trajectory reference whose first step is the user's input.
+		// `numCompletions` is required: the backend answers `invalid_argument`
+		// without it.
 		const { fetch: fetchImpl, recorded } = fakeDevin({
-			assignment: { assignmentJwt: "assign-jwt", modelUid: "swe-2" },
+			assignment: { assignmentJwt: "assign-jwt", modelUid: "swe-2-high" },
 		});
+		const firstTurn: Context = { ...context, messages: [{ role: "user", content: "route me", timestamp: 1 }] };
 
-		await streamDevin(devinModel({ modelRouter: true }), context, {
+		await streamDevin(devinModel({ modelRouter: true, supportsParallelToolCalls: true }), firstTurn, {
 			apiKey: "token",
 			fetch: fetchImpl,
 			conversationId: "cascade-42",
 		}).result();
 
-		const configuration = recorded.chat?.configuration;
-		expect(configuration?.maxTokens).toBeGreaterThan(0n);
-		// Absent on the wire: proto3 scalars read back as their zero value.
-		expect(configuration).toMatchObject({
-			numCompletions: 0n,
-			maxNewlines: 0n,
-			temperature: 0,
-			firstTemperature: 0,
-			topK: 0n,
-			topP: 0,
-			stopPatterns: [],
-			fimEotProbThreshold: 0,
+		const chat = recorded.chat;
+		expect(chat?.configuration).toEqual(
+			expect.objectContaining({
+				numCompletions: 1n,
+				maxTokens: 128000n,
+				maxNewlines: 400n,
+				temperature: 1,
+				topK: 40n,
+				topP: 0.95,
+				firstTemperature: 0,
+				fimEotProbThreshold: 0,
+				stopPatterns: [],
+			}),
+		);
+		expect(chat?.metadata).toMatchObject({
+			ideName: "chisel",
+			extensionName: "chisel",
+			ideVersion: "3000.10.21",
+			extensionVersion: "3000.10.21",
+			ideType: "",
+			userJwt: "",
 		});
-		expect(recorded.chat?.plannerMode).toBe(0);
+		expect(chat?.toolChoice).toBeUndefined();
+		expect(chat?.systemPromptCacheOptions).toBeUndefined();
+		expect(chat?.executionId).toBe("");
+		expect(chat?.disableParallelToolCalls).toBe(false);
+		expect(chat?.trajectoryReference).toMatchObject({ trajectoryType: 4, stepType: 14, stepIndex: 0 });
+		expect(chat?.trajectoryReference?.trajectoryId).toMatch(/^[0-9a-f-]{36}$/);
+		expect(chat?.trajectoryReference?.trajectoryId).not.toBe("cascade-42");
 
-		const explicit = fakeDevin({ assignment: { assignmentJwt: "assign-jwt", modelUid: "swe-2" } });
+		// A second turn on the same cascade references the same trajectory at step 1.
+		const second = fakeDevin({ assignment: { assignmentJwt: "assign-jwt", modelUid: "swe-2-high" } });
+		await streamDevin(
+			devinModel({ modelRouter: true }),
+			{
+				...firstTurn,
+				messages: [
+					...firstTurn.messages,
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "done" }],
+						timestamp: 1,
+						api: "devin-agent",
+						provider: "devin",
+						model: "swe-2",
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+					},
+					{ role: "user", content: [{ type: "text", text: "again" }], timestamp: 2 },
+				],
+			},
+			{ apiKey: "token", fetch: second.fetch, conversationId: "cascade-42" },
+		).result();
+		expect(second.recorded.chat?.trajectoryReference).toMatchObject({
+			trajectoryId: chat?.trajectoryReference?.trajectoryId,
+			stepIndex: 1,
+			stepType: 0,
+		});
+
+		// A caller's explicit sampling still wins over the CLI defaults.
+		const explicit = fakeDevin({ assignment: { assignmentJwt: "assign-jwt", modelUid: "swe-2-high" } });
 		await streamDevin(devinModel({ modelRouter: true }), context, {
 			apiKey: "token",
 			fetch: explicit.fetch,
 			conversationId: "cascade-43",
 			temperature: 0.2,
+			maxTokens: 4096,
 			stopSequences: ["<stop>"],
 		}).result();
 		expect(explicit.recorded.chat?.configuration).toMatchObject({
 			temperature: 0.2,
-			firstTemperature: 0,
+			maxTokens: 4096n,
+			topK: 40n,
 			stopPatterns: ["<stop>"],
 		});
 	});
