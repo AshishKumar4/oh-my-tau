@@ -2237,6 +2237,8 @@ function mapOptionsForApi<TApi extends Api>(
 				serviceTier: options?.serviceTier,
 				preferWebsockets: options?.preferWebsockets,
 				codexCompaction: options?.codexCompaction,
+				codexFork: options?.codexFork,
+				onCodexRequestSnapshot: options?.onCodexRequestSnapshot,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
 				textVerbosity: options?.textVerbosity,
 				forceReasoningOff: options?.forceReasoningOff,

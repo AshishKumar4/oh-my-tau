@@ -1,8 +1,7 @@
 /**
- * Fork request lineage: journal-derived snapshots respect reset boundaries,
- * compaction/branch rewrites, and message-order fingerprints — so a forked
- * child only replays a provider-native prefix while the journal still
- * certifies it.
+ * Fork request lineage: journal-derived origins respect reset boundaries and
+ * compaction/branch rewrites, read from the ACTIVE branch only — so a forked
+ * child replays a provider-native prefix only while the journal certifies it.
  */
 import { describe, expect, it } from "bun:test";
 import type { AssistantMessage, CodexRequestSnapshot, UserMessage } from "@oh-my-pi/pi-ai";
@@ -10,6 +9,7 @@ import {
 	createForkJournalStateReader,
 	fingerprintForkMessage,
 	FORK_REQUEST_CONTEXT_TYPE,
+	forkAnchorIsCurrent,
 	forkPrefixMessageCount,
 	readForkJournalState,
 	recordForkRequestSnapshot,
@@ -71,8 +71,15 @@ function managerWith(messages: JournalMessage[]): SessionManager {
 	return manager;
 }
 
+function seedOrigin(manager: SessionManager, sessionId = "sess-parent"): void {
+	recordForkRequestSnapshot(manager, {
+		request: request({ sessionId }),
+		messageFingerprints: fingerprintHistory(manager),
+	});
+}
+
 describe("fork request journal state", () => {
-	it("round-trips a recorded snapshot and reports its fingerprint prefix", () => {
+	it("round-trips a recorded origin marker on the active branch", () => {
 		const manager = managerWith([user("one"), assistantText("two")]);
 		recordForkRequestSnapshot(manager, {
 			request: request(),
@@ -83,54 +90,121 @@ describe("fork request journal state", () => {
 		const state = readForkJournalState(manager);
 		expect(state.snapshot?.request.sessionId).toBe("sess-parent");
 		expect(state.snapshot?.credentialId).toBe(7);
-		expect(state.snapshot?.recordedAt).toBeGreaterThan(0);
-		expect(state.boundaryMs).toBeUndefined();
-		expect(state.lastRewriteMs).toBeUndefined();
+		expect(state.replayable).toBe(true);
+		expect(state.hasBoundary).toBe(false);
 	});
 
-	it("a reset boundary retires markers older than it but not newer ones", () => {
+	it("a reset boundary newer than the marker kills the origin", () => {
 		const manager = managerWith([user("one")]);
-		recordForkRequestSnapshot(manager, { request: request({ sessionId: "dead" }), messageFingerprints: [] });
+		seedOrigin(manager);
 		manager.appendResetBoundary();
-		expect(readForkJournalState(manager).snapshot).toBeUndefined();
+		const state = readForkJournalState(manager);
+		expect(state.snapshot).toBeUndefined();
+		expect(state.hasBoundary).toBe(true);
+	});
 
-		recordForkRequestSnapshot(manager, { request: request({ sessionId: "alive" }), messageFingerprints: [] });
+	it("a marker newer than the boundary survives and still reports the boundary", () => {
+		const manager = managerWith([user("one")]);
+		manager.appendResetBoundary();
+		seedOrigin(manager, "alive");
 		const state = readForkJournalState(manager);
 		expect(state.snapshot?.request.sessionId).toBe("alive");
-		expect(state.boundaryMs).toBeDefined();
+		expect(state.hasBoundary).toBe(true);
 	});
 
-	it("reports the newest compaction/branch rewrite after the marker", () => {
+	it("the newest marker wins regardless of entry timestamps", () => {
+		const manager = managerWith([user("one")]);
+		seedOrigin(manager, "older");
+		seedOrigin(manager, "newest");
+		expect(readForkJournalState(manager).snapshot?.request.sessionId).toBe("newest");
+	});
+
+	it("a compaction newer than the marker keeps lineage but withholds replay", () => {
 		const manager = managerWith([user("one"), assistantText("two")]);
-		recordForkRequestSnapshot(manager, { request: request(), messageFingerprints: [] });
-		manager.appendCompaction("summary", undefined, manager.getEntries()[0]!.id, 100);
+		seedOrigin(manager);
+		const firstEntry = manager.getEntries().at(0);
+		manager.appendCompaction("summary", undefined, firstEntry?.id ?? "root", 100);
 		const state = readForkJournalState(manager);
 		expect(state.snapshot).toBeDefined();
-		expect(state.lastRewriteMs).toBeDefined();
-		// The marker predates the rewrite: raw-prefix replay must be withheld.
-		expect(state.snapshot!.recordedAt <= state.lastRewriteMs!).toBe(true);
+		expect(state.replayable).toBe(false);
 	});
 
-	it("a branch_summary after the marker is also a rewrite", () => {
+	it("a branch rewrite newer than the marker keeps lineage but withholds replay", async () => {
 		const manager = managerWith([user("one")]);
-		recordForkRequestSnapshot(manager, { request: request(), messageFingerprints: [] });
-		manager.branchWithSummary(null, "abandoned path");
-		expect(readForkJournalState(manager).lastRewriteMs).toBeDefined();
+		seedOrigin(manager);
+		const extraId = manager.appendMessage(user("to be discarded"));
+		await manager.discardEntryDurably(extraId);
+		const state = readForkJournalState(manager);
+		expect(state.snapshot).toBeDefined();
+		expect(state.replayable).toBe(false);
 	});
 
-	it("skips a malformed marker and keeps the previous valid one", () => {
+	it("a malformed newest marker warns and yields no origin — never an older one", () => {
 		const manager = managerWith([user("one")]);
-		recordForkRequestSnapshot(manager, { request: request({ sessionId: "valid" }), messageFingerprints: [] });
+		seedOrigin(manager, "older-valid");
 		manager.appendCustomEntry(FORK_REQUEST_CONTEXT_TYPE, { request: { provider: 42 } });
-		expect(readForkJournalState(manager).snapshot?.request.sessionId).toBe("valid");
+		expect(readForkJournalState(manager).snapshot).toBeUndefined();
 	});
 
-	it("the cached reader re-scans only when the journal tail changes", () => {
+	it("a marker on an abandoned branch is not an origin", () => {
+		const manager = managerWith([user("one")]);
+		seedOrigin(manager, "abandoned");
+		// Rewind the leaf before the marker: it now lives on a dead branch.
+		const leafBefore = manager.getEntries().at(0)?.id ?? null;
+		manager.branchWithSummary(leafBefore, "switched away");
+		manager.appendMessage(user("new path"));
+		expect(readForkJournalState(manager).snapshot).toBeUndefined();
+	});
+
+	it("the cached reader re-scans only when the leaf or session changes", () => {
 		const manager = managerWith([user("one")]);
 		const read = createForkJournalStateReader(manager);
 		expect(read().snapshot).toBeUndefined();
-		recordForkRequestSnapshot(manager, { request: request(), messageFingerprints: [] });
+		// Same leaf: cached, still no origin.
+		expect(read().snapshot).toBeUndefined();
+		seedOrigin(manager);
+		// Leaf moved: re-scan sees the marker.
 		expect(read().snapshot?.request.sessionId).toBe("sess-parent");
+	});
+});
+
+describe("forkAnchorIsCurrent", () => {
+	it("keeps an anchor reachable across messages, compactions, and discard summaries", async () => {
+		const manager = managerWith([user("one")]);
+		const anchor = manager.getLeafId();
+		manager.appendMessage(assistantText("two"));
+		expect(forkAnchorIsCurrent(manager, anchor)).toBe(true);
+		// Compaction and discard-entry branch summaries are not killers: the
+		// produced request is still what the provider last saw.
+		const firstEntry = manager.getEntries().at(0);
+		manager.appendCompaction("summary", undefined, firstEntry?.id ?? "root", 100);
+		expect(forkAnchorIsCurrent(manager, anchor)).toBe(true);
+		const extraId = manager.appendMessage(user("to be discarded"));
+		await manager.discardEntryDurably(extraId);
+		expect(forkAnchorIsCurrent(manager, anchor)).toBe(true);
+	});
+
+	it("retires the anchor once a reset boundary lands", () => {
+		const manager = managerWith([user("one")]);
+		const anchor = manager.getLeafId();
+		manager.appendResetBoundary();
+		expect(forkAnchorIsCurrent(manager, anchor)).toBe(false);
+	});
+
+	it("a null anchor survives ordinary entries but not a boundary", () => {
+		const manager = SessionManager.inMemory();
+		expect(forkAnchorIsCurrent(manager, null)).toBe(true);
+		manager.appendMessage(user("one"));
+		expect(forkAnchorIsCurrent(manager, null)).toBe(true);
+		manager.appendResetBoundary();
+		expect(forkAnchorIsCurrent(manager, null)).toBe(false);
+	});
+
+	it("an anchor stranded off the active branch is dead", () => {
+		const manager = managerWith([user("one"), assistantText("two")]);
+		const anchor = manager.getLeafId();
+		manager.branchWithSummary(manager.getEntries().at(0)?.id ?? null, "switched away");
+		expect(forkAnchorIsCurrent(manager, anchor)).toBe(false);
 	});
 });
 
@@ -181,7 +255,10 @@ describe("forkPrefixMessageCount", () => {
 		const messages = [user("one"), assistantText("two")];
 		const inherited = {
 			request: request(),
-			messageFingerprints: [fingerprintForkMessage(messages[0]!), fingerprintForkMessage(assistantText("changed"))],
+			messageFingerprints: [
+				...messages.slice(0, 1).map(fingerprintForkMessage),
+				fingerprintForkMessage(assistantText("changed")),
+			],
 		};
 		expect(forkPrefixMessageCount(inherited, messages)).toBeUndefined();
 	});
@@ -190,7 +267,7 @@ describe("forkPrefixMessageCount", () => {
 		const messages = [user("one")];
 		const inherited = {
 			request: request(),
-			messageFingerprints: [fingerprintForkMessage(messages[0]!), fingerprintForkMessage(user("gone"))],
+			messageFingerprints: [...messages.map(fingerprintForkMessage), fingerprintForkMessage(user("gone"))],
 		};
 		expect(forkPrefixMessageCount(inherited, messages)).toBeUndefined();
 	});

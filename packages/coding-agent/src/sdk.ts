@@ -166,10 +166,11 @@ import { recoverInlineSloppyEdit } from "./session/inline-edit-recovery";
 import {
 	createForkJournalStateReader,
 	type ForkRequestSnapshot,
+	forkAnchorIsCurrent,
 	forkPrefixMessageCount,
 	fingerprintForkMessages,
+	recordForkRequestSnapshot,
 	resolveForkCredentialId,
-	type SessionForkRequest,
 } from "./session/fork-context";
 import {
 	type CustomMessage,
@@ -1473,53 +1474,36 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		await sessionManager.setAdditionalDirectories(merged);
 	}
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
-	// The request a forked child replays as its native prefix. The journal is
-	// the authority after initial seeding: `options.forkRequest` applies only
-	// while the journal shows neither a live marker nor a reset_boundary — a
-	// `/clear` can never be re-armed by a stale caller option. Re-scanned per
-	// turn via the cached reader so mid-session resets/compactions take effect.
+	// Two distinct concepts, kept strictly separate:
+	//
+	// 1. inherited origin — the journal-certified fork marker this session was
+	//    created on. `forkJournal` re-reads the active branch so a mid-session
+	//    reset_boundary kills the origin and a newer compaction/branch rewrite
+	//    withholds raw-prefix replay. `options.forkRequest` seeds the marker
+	//    exactly once at construction when the journal shows neither origin nor
+	//    boundary — afterwards the journal is the only origin authority, so a
+	//    `/clear` can never be re-armed by a stale caller option.
+	// 2. produced request — this session's last completed provider request,
+	//    owner-bound at dispatch (agent object, agent.sessionId, journal session
+	//    id, branch-leaf anchor). Served ONLY to future `fork: "all"` spawns via
+	//    getForkRequestSnapshot; it never becomes this session's own codexFork,
+	//    so a root session can never self-fork.
 	const forkJournal = createForkJournalStateReader(sessionManager);
-	const initialForkJournal = forkJournal();
-	const inheritedForkRequest: SessionForkRequest | undefined =
-		initialForkJournal.snapshot ??
-		(initialForkJournal.boundaryMs === undefined && options.forkRequest !== undefined
-			? // Explicitly unbound: a caller-supplied snapshot must not inherit a
-				// foreign owner id (the extra property is invisible at the type level).
-				{ ...options.forkRequest, ownerId: undefined, recordedAt: Date.now() }
-			: undefined);
-	// Latest live request snapshot — journal-seeded or captured by this session's
-	// own streamFn; lazily bound to the runtime identity on first use so a `/new`
-	// or session switch can never lend a previous session's prefix.
-	let latestForkRequest: SessionForkRequest | undefined = inheritedForkRequest;
-	const forkOwnerId = () => `${sessionManager.getSessionId?.() ?? ""}~${providerSessionId}`;
-	/**
-	 * Refresh the live request from journal authority and return it only for the
-	 * current runtime identity: a reset_boundary newer than the snapshot kills
-	 * it, an unbound snapshot binds lazily, and a bound snapshot whose owner no
-	 * longer matches (post `/new`, session switch) is retired rather than lent.
-	 */
-	const currentForkRequest = (): SessionForkRequest | undefined => {
-		const forkState = forkJournal();
-		if (
-			latestForkRequest !== undefined &&
-			forkState.boundaryMs !== undefined &&
-			latestForkRequest.recordedAt <= forkState.boundaryMs
-		) {
-			latestForkRequest = undefined;
-		}
-		if (latestForkRequest === undefined && forkState.snapshot !== undefined) {
-			latestForkRequest = forkState.snapshot;
-		}
-		const current = latestForkRequest;
-		if (current === undefined) return undefined;
-		const ownerId = forkOwnerId();
-		if (current.ownerId !== undefined && current.ownerId !== ownerId) {
-			latestForkRequest = undefined;
-			return undefined;
-		}
-		current.ownerId = ownerId;
-		return current;
-	};
+	if (forkJournal().snapshot === undefined && !forkJournal().hasBoundary && options.forkRequest !== undefined) {
+		recordForkRequestSnapshot(sessionManager, options.forkRequest);
+	}
+	/** The origin this session was forked from — undefined for non-forked sessions, always. */
+	const inheritedForkOrigin: ForkRequestSnapshot | undefined = forkJournal().snapshot;
+	/** This session's latest completed provider request, for future children only. */
+	let producedForkRequest:
+		| {
+				snapshot: ForkRequestSnapshot;
+				agent: Agent;
+				agentSessionId: string | undefined;
+				journalSessionId: string;
+				anchorId: string | null;
+		  }
+		| undefined;
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
 		options.modelPattern !== undefined ||
@@ -1910,21 +1894,23 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
-			// Newest live request snapshot for a `fork: "all"` spawn to inherit —
-			// owner-checked against the current runtime identity so a prior
-			// session's prefix can never be lent across `/new` or a session switch.
+			// Newest request this session produced — the snapshot a future
+			// `fork: "all"` spawn inherits. Owner-verified per call: the agent
+			// object and both session ids must still match dispatch, and no
+			// reset_boundary may sit between the dispatch anchor and the branch
+			// leaf. Cloned so a queued spawn never observes later mutation.
 			getForkRequestSnapshot: () => {
-				const live = currentForkRequest();
-				if (live === undefined) return undefined;
-				// Strip runtime-only fields (ownerId/recordedAt): the snapshot the
-				// child inherits must arrive unbound or the child's owner check
-				// would reject its own lineage.
-				const snapshot: ForkRequestSnapshot = {
-					request: live.request,
-					messageFingerprints: live.messageFingerprints,
-					...(live.credentialId !== undefined ? { credentialId: live.credentialId } : {}),
-				};
-				return structuredClone(snapshot);
+				const produced = producedForkRequest;
+				if (
+					produced === undefined ||
+					produced.agent !== agent ||
+					produced.agentSessionId !== agent.sessionId ||
+					produced.journalSessionId !== sessionManager.getSessionId() ||
+					!forkAnchorIsCurrent(sessionManager, produced.anchorId)
+				) {
+					return undefined;
+				}
+				return structuredClone(produced.snapshot);
 			},
 			getToolByName: name => session?.getToolByName(name),
 			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
@@ -3591,9 +3577,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// One-shot launch-latency marker: fired the first time the loop dispatches
 		// a chat request to the provider transport. See onFirstChatDispatch.
 		let notifyFirstChatDispatch = options.onFirstChatDispatch;
-		// The pin flag is per owner identity: a session switch that somehow kept
-		// lineage re-pins under the new session id.
-		let forkPinOwner: string | undefined;
 		// Shared, settings-aware stream wrapper used by the main agent, advisor,
 		// and side-channel requests (`/btw`, `/omfg`, IRC auto-replies, handoff).
 		// Keeps OpenRouter sticky-routing variants, antigravity endpoint routing,
@@ -3668,53 +3651,32 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						});
 					}
 				}
-				// A forked child inherits its parent's provider-native request as a
-				// prefix-reuse source: same provider, same resolved Codex URL, same
-				// OAuth account. The journal is re-checked per call so a mid-session
-				// reset_boundary kills the lineage and a newer compaction/branch
-				// rewrite disables raw-prefix replay (messageCount omitted) even when
-				// a surviving leading run still hashes the same — fingerprint equality
-				// alone is not proof the full captured wire prefix applies.
+				// Owner identity for the produced-snapshot contract: captured at
+				// dispatch (agent object, live agent.sessionId, journal id, branch
+				// leaf, context fingerprints) so a callback from a superseded session
+				// or a mutated context can never be relabeled as current.
+				const dispatchAgent = agent;
+				const dispatchAgentSessionId = agent.sessionId;
+				const dispatchJournalId = sessionManager.getSessionId();
+				const dispatchAnchorId = sessionManager.getLeafId();
+				const dispatchFingerprints = fingerprintForkMessages(context.messages ?? []);
+				// The inherited origin comes ONLY from the journal marker: a plain
+				// session never sets codexFork, and a forked child keeps using the
+				// journal origin even after its own produced request exists — the
+				// produced snapshot is reserved for future children.
 				const forkState = forkJournal();
-				const inheritedFork = currentForkRequest();
-				const currentOwnerId = inheritedFork?.ownerId;
-				const prefixEligible =
-					inheritedFork !== undefined &&
-					(forkState.lastRewriteMs === undefined || inheritedFork.recordedAt > forkState.lastRewriteMs);
-				const forkPrefixCount =
-					prefixEligible && inheritedFork !== undefined && context.messages !== undefined
-						? forkPrefixMessageCount(inheritedFork, context.messages)
+				const origin = forkState.snapshot;
+				const prefixCount =
+					origin !== undefined && forkState.replayable && context.messages !== undefined
+						? forkPrefixMessageCount(origin, context.messages)
 						: undefined;
 				const codexFork =
-					inheritedFork !== undefined
+					origin !== undefined
 						? {
-								source: inheritedFork.request,
-								...(forkPrefixCount !== undefined ? { messageCount: forkPrefixCount } : {}),
+								source: origin.request,
+								...(prefixCount !== undefined ? { messageCount: prefixCount } : {}),
 							}
 						: undefined;
-				if (inheritedFork !== undefined && currentOwnerId !== undefined && forkPinOwner !== currentOwnerId) {
-					// Best-effort OAuth affinity on the first turn: reuse the parent's
-					// account so the provider's source-account check actually passes.
-					// A held or missing account declines silently; the request still
-					// falls back to whichever key the session resolves.
-					forkPinOwner = currentOwnerId;
-					try {
-						const credentialId =
-							inheritedFork.credentialId ??
-							resolveForkCredentialId(authStorage, inheritedFork.request, providerSessionId);
-						if (credentialId !== undefined) {
-							authStorage.pinSessionOAuthAccount(
-								inheritedFork.request.provider,
-								providerSessionId,
-								credentialId,
-							);
-						}
-					} catch (err) {
-						logger.warn("fork credential pinning failed", {
-							error: err instanceof Error ? err.message : String(err),
-						});
-					}
-				}
 				const externalThinking =
 					settings.get("externalThinking") &&
 					agent.state.tools.some(tool => tool.name === "think") &&
@@ -3729,15 +3691,27 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					...(codexFork !== undefined ? { codexFork } : {}),
 					onCodexRequestSnapshot: snapshot => {
 						streamOptions?.onCodexRequestSnapshot?.(snapshot);
+						// A late response from a previous session/agent must not be
+						// relabeled as the current session's produced request.
+						if (
+							dispatchAgent !== agent ||
+							dispatchAgentSessionId !== agent.sessionId ||
+							dispatchJournalId !== sessionManager.getSessionId()
+						) {
+							return;
+						}
 						const credentialId =
-							resolveForkCredentialId(authStorage, snapshot, providerSessionId) ??
-							latestForkRequest?.credentialId;
-						latestForkRequest = {
-							request: snapshot,
-							messageFingerprints: fingerprintForkMessages(context.messages ?? []),
-							...(credentialId !== undefined ? { credentialId } : {}),
-							recordedAt: Date.now(),
-							ownerId: forkOwnerId(),
+							resolveForkCredentialId(authStorage, snapshot, dispatchAgentSessionId) ?? undefined;
+						producedForkRequest = {
+							snapshot: {
+								request: snapshot,
+								messageFingerprints: dispatchFingerprints,
+								...(credentialId !== undefined ? { credentialId } : {}),
+							},
+							agent: dispatchAgent,
+							agentSessionId: dispatchAgentSessionId,
+							journalSessionId: dispatchJournalId,
+							anchorId: dispatchAnchorId,
 						};
 					},
 				});
@@ -3798,6 +3772,37 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				sessionManager.appendServiceTierChange(
 					Object.keys(initialServiceTierByFamily).length > 0 ? initialServiceTierByFamily : null,
 				);
+			}
+		}
+
+		// Fresh-fork credential affinity: a child created via options.forkRequest
+		// may reuse the parent's account so the provider's source-account check
+		// passes on the first request. Construction-time only — a resumed session
+		// keeps its existing credential pin untouched, and a child on a different
+		// provider than the origin never pins an unrelated account. A held or
+		// unidentifiable account just declines; the request falls back to
+		// whatever key the session resolves.
+		if (
+			options.forkRequest !== undefined &&
+			inheritedForkOrigin !== undefined &&
+			model !== undefined &&
+			model.provider === inheritedForkOrigin.request.provider
+		) {
+			try {
+				const credentialId =
+					inheritedForkOrigin.credentialId ??
+					resolveForkCredentialId(authStorage, inheritedForkOrigin.request, providerSessionId);
+				if (credentialId !== undefined) {
+					authStorage.pinSessionOAuthAccount(
+						inheritedForkOrigin.request.provider,
+						providerSessionId,
+						credentialId,
+					);
+				}
+			} catch (err) {
+				logger.warn("fork credential pinning failed", {
+					error: err instanceof Error ? err.message : String(err),
+				});
 			}
 		}
 

@@ -1,23 +1,31 @@
 /**
- * Durable fork-request state: the provider-native request a forked child may
- * inherit for prompt-cache prefix reuse, plus the wire-level fingerprints that
- * certify the child's inherited prefix still matches it. The journal marker is
- * a `custom` entry (never model-visible), so restarts and nested forks keep
- * their lineage without a live parent runtime.
+ * Durable fork-request lineage for conversation forks.
  *
- * The journal is the authority after initial seeding: a `reset_boundary` newer
- * than the marker retires it, and a `compaction`/`branch_summary` newer than
- * the marker (or newer than a live captured request) keeps lineage but forbids
- * raw-prefix replay — a surviving leading run of messages is not proof the
- * full captured wire prefix still applies.
+ * Two distinct concepts share this file — never substitute one for the other:
+ *
+ * 1. **Inherited origin** — the provider-native request this child was forked
+ *    from, persisted once as a `subagent_fork_request` custom journal entry.
+ *    Only the journal certifies it: `readForkJournalState` walks the ACTIVE
+ *    branch (never raw getEntries, which leaks other branches) newest→oldest
+ *    and stops at the first boundary or marker, so a `reset_boundary` newer
+ *    than the origin kills it and a compaction/branch rewrite newer than the
+ *    origin withholds raw-prefix replay while lineage survives. Wall-clock
+ *    timestamps are never compared — journal order is the ordering.
+ *
+ * 2. **Latest produced request** — this session's last completed provider
+ *    request, what a FUTURE `fork: "all"` child would inherit. It is runtime
+ *    state only (never journaled) and owner-bound: the getter validates the
+ *    session/agent identity and the dispatch anchor's position on the active
+ *    branch before returning it, so `/new`, a session switch, or a late
+ *    response from a previous session can never lend a stale prefix.
  */
 import { type } from "@oh-my-pi/omptype";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { CodexRequestSnapshot } from "@oh-my-pi/pi-ai";
-import { logger, stableStringifyJson } from "@oh-my-pi/pi-utils";
+import type { CodexRequestSnapshot, OpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai";
+import { isRecord, logger, stableStringifyJson } from "@oh-my-pi/pi-utils";
 import type { SessionManager } from "./session-manager";
 
-/** Journal custom-type under which a forked child's inherited request is stored. */
+/** Journal custom-type under which a forked child's inherited origin is stored. */
 export const FORK_REQUEST_CONTEXT_TYPE = "subagent_fork_request";
 
 export interface ForkRequestSnapshot {
@@ -32,17 +40,11 @@ export interface ForkRequestSnapshot {
 	credentialId?: number;
 }
 
-/**
- * A live request snapshot bound to the session that captured (or seeded) it:
- * `recordedAt` orders it against journal rewrite/boundary markers, `ownerId`
- * ties it to one runtime session identity so `/new` or a session switch can
- * never lend a previous session's prefix.
- */
-export interface SessionForkRequest extends ForkRequestSnapshot {
-	/** ms since epoch: capture time, journal-marker time, or seed time. */
-	recordedAt: number;
-	/** `${sessionManagerId}~${agentSessionId}` bound lazily at first use. */
-	ownerId?: string;
+/** One provider-native wire item: the opaque serialized request elements. */
+type WireItem = OpenAIResponsesHistoryPayload["items"][number];
+
+function isWireItem(value: unknown): value is WireItem {
+	return isRecord(value);
 }
 
 const codexRequestSnapshotSchema = type({
@@ -63,15 +65,27 @@ const forkRequestSnapshotSchema = type({
 });
 
 /**
- * Validate a journal-persisted fork request. `input` items are provider-native
- * wire payloads: the schema certifies the envelope (which is all the journal
- * boundary can know) while the array itself stays opaque to the provider.
+ * Validate a journal-persisted fork request. The schema certifies the
+ * envelope; every `input` element must additionally be a record — a scalar
+ * wire item can never certify history, so the whole marker is rejected rather
+ * than silently narrowed.
  */
 function parseForkRequestSnapshot(data: unknown): ForkRequestSnapshot | undefined {
 	const parsed = forkRequestSnapshotSchema(data);
 	if (parsed instanceof type.errors) return undefined;
+	const items = parsed.request.input;
+	if (!items.every(isWireItem)) return undefined;
 	return {
-		request: parsed.request as CodexRequestSnapshot,
+		request: {
+			provider: parsed.request.provider,
+			model: parsed.request.model,
+			baseUrl: parsed.request.baseUrl,
+			accountId: parsed.request.accountId,
+			sessionId: parsed.request.sessionId,
+			threadId: parsed.request.threadId,
+			...(parsed.request.promptCacheKey !== undefined ? { promptCacheKey: parsed.request.promptCacheKey } : {}),
+			input: items,
+		},
 		messageFingerprints: parsed.messageFingerprints,
 		...(parsed.credentialId !== undefined ? { credentialId: parsed.credentialId } : {}),
 	};
@@ -146,8 +160,8 @@ export function forkPrefixMessageCount(
 
 /** Persist the inherited request once, alongside the seeded journal messages. */
 export function recordForkRequestSnapshot(sessionManager: SessionManager, snapshot: ForkRequestSnapshot): void {
-	// Only the durable shape crosses the journal boundary; runtime fields
-	// (ownerId/recordedAt) on a live SessionForkRequest never persist.
+	// Only the durable shape crosses the journal boundary; runtime fields on a
+	// live snapshot never persist.
 	sessionManager.appendCustomEntry(FORK_REQUEST_CONTEXT_TYPE, {
 		request: snapshot.request,
 		messageFingerprints: snapshot.messageFingerprints,
@@ -156,46 +170,60 @@ export function recordForkRequestSnapshot(sessionManager: SessionManager, snapsh
 }
 
 /**
- * Journal-derived lineage state, derived only from existing entry markers —
- * never persisted shadow flags.
+ * Journal-derived inherited origin, computed per read from existing entry
+ * markers — no persisted shadow flags.
  */
 export interface ForkJournalState {
-	/** The newest live fork marker's request; undefined when none survives the boundary. */
-	snapshot?: SessionForkRequest;
-	/** Timestamp (ms) of the newest `reset_boundary` seen; older lineage is dead. */
-	boundaryMs?: number;
-	/** Timestamp (ms) of the newest compaction/branch rewrite newer than the boundary. */
-	lastRewriteMs?: number;
+	/** The branch's newest live fork marker; undefined when none survives the boundary. */
+	snapshot?: ForkRequestSnapshot;
+	/**
+	 * False when a compaction/branch_summary sits newer than the marker on the
+	 * active branch: lineage is retained but raw-prefix replay is withheld —
+	 * fingerprint equality alone is not proof the full captured prefix applies.
+	 */
+	replayable: boolean;
+	/** True when the active branch's live head is truncated by a reset_boundary. */
+	hasBoundary: boolean;
 }
 
 /**
- * Scan the journal newest→oldest: the first `reset_boundary` kills everything
- * older (including fork markers); compaction/branch summaries above it set the
- * rewrite floor; the newest fork marker above it supplies the snapshot (its
- * entry timestamp doubles as `recordedAt`). Malformed markers are skipped.
+ * Walk the ACTIVE branch newest→oldest. The first `reset_boundary` seen kills
+ * everything older (including fork markers); compaction/branch summaries seen
+ * before the first marker mark it non-replayable; the FIRST fork marker found
+ * is the origin (never overwritten by an older one). A malformed newest marker
+ * warns and yields no origin — it never falls back to an older valid marker.
  */
-export function readForkJournalState(sessionManager: Pick<SessionManager, "getEntries">): ForkJournalState {
-	const state: ForkJournalState = {};
-	const entries = sessionManager.getEntries();
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const entry = entries[i];
+export function readForkJournalState(sessionManager: Pick<SessionManager, "getBranch">): ForkJournalState {
+	const state: ForkJournalState = { replayable: true, hasBoundary: false };
+	const branch = sessionManager.getBranch();
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
 		if (entry === undefined) continue;
 		if (entry.type === "reset_boundary") {
-			state.boundaryMs = Date.parse(entry.timestamp);
+			state.hasBoundary = true;
 			break;
 		}
 		if (entry.type === "compaction" || entry.type === "branch_summary") {
-			const at = Date.parse(entry.timestamp);
-			if (state.lastRewriteMs === undefined || at > state.lastRewriteMs) state.lastRewriteMs = at;
+			state.replayable = false;
 			continue;
 		}
 		if (entry.type === "custom" && entry.customType === FORK_REQUEST_CONTEXT_TYPE) {
 			const snapshot = parseForkRequestSnapshot(entry.data);
 			if (snapshot !== undefined) {
-				state.snapshot = { ...snapshot, recordedAt: Date.parse(entry.timestamp) };
+				state.snapshot = snapshot;
 			} else {
 				logger.warn("Ignoring malformed fork request snapshot in session journal", { entryId: entry.id });
 			}
+			// First marker wins: newer and older entries below are not origins.
+			// Keep walking only for a truncating reset_boundary.
+			while (--i >= 0) {
+				const rest = branch[i];
+				if (rest !== undefined && rest.type === "reset_boundary") {
+					state.hasBoundary = true;
+					break;
+				}
+			}
+			break;
 		}
 	}
 	return state;
@@ -203,26 +231,46 @@ export function readForkJournalState(sessionManager: Pick<SessionManager, "getEn
 
 /**
  * Cached {@link readForkJournalState} for per-turn calls: re-scans only when
- * the journal tail changes (appends and durable discards both shift the
- * length/last-id key).
+ * the active-leaf or session identity changes.
  */
 export function createForkJournalStateReader(
-	sessionManager: Pick<SessionManager, "getEntries" | "getSessionId">,
+	sessionManager: Pick<SessionManager, "getBranch" | "getLeafId" | "getSessionId">,
 ): () => ForkJournalState {
 	let cachedKey: string | undefined;
-	let cached: ForkJournalState = {};
+	let cached: ForkJournalState = { replayable: true, hasBoundary: false };
 	return () => {
-		const entries = sessionManager.getEntries();
-		const last = entries[entries.length - 1];
-		// The session id covers a journal swap under the same manager (`/new`):
-		// a fresh journal's tail alone could collide with the old key.
-		const key = `${sessionManager.getSessionId?.() ?? ""}:${entries.length}:${last?.id ?? ""}`;
+		const key = `${sessionManager.getSessionId()}\u0000${sessionManager.getLeafId() ?? ""}`;
 		if (key !== cachedKey) {
 			cached = readForkJournalState(sessionManager);
 			cachedKey = key;
 		}
 		return cached;
 	};
+}
+
+/**
+ * Is a produced-request anchor still reachable without crossing a
+ * `reset_boundary`? The anchor is the branch leaf at request dispatch; a
+ * reset boundary appended after dispatch retires the produced request as an
+ * inheritance source. Compaction and branch summaries are NOT killers here:
+ * the produced request is still what the provider last saw, and a later
+ * child that can no longer fingerprint-match its input simply inherits the
+ * lineage without raw-prefix replay (messageCount omitted).
+ */
+export function forkAnchorIsCurrent(
+	sessionManager: Pick<SessionManager, "getBranch">,
+	anchorId: string | null,
+): boolean {
+	const branch = sessionManager.getBranch();
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i];
+		if (entry === undefined) continue;
+		if (anchorId !== null && entry.id === anchorId) return true;
+		if (entry.type === "reset_boundary") return false;
+	}
+	// A null anchor means dispatch happened on an empty journal; the request
+	// stays a valid origin until any reset_boundary appears on the branch.
+	return anchorId === null;
 }
 
 /** Resolve the durable credential row behind a snapshot's account, for pinning. */
