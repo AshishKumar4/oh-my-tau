@@ -66,11 +66,7 @@ function projectTools(target: SwitchTarget): Tool[] {
 	return baseTools(model).map(tool => {
 		const binding = target.profile ? harnessToolBinding(target.profile, tool.name) : undefined;
 		if (!binding) return { ...tool };
-		return {
-			...tool,
-			...(binding.wireName ? { customWireName: binding.wireName } : {}),
-			...(binding.namespace ? { namespace: { name: binding.namespace } } : {}),
-		};
+		return { ...tool, ...(binding.wireName ? { customWireName: binding.wireName } : {}) };
 	});
 }
 

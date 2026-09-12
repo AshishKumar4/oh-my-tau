@@ -43,11 +43,6 @@ Run JavaScript code to orchestrate/compose tool calls
 - `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
 - `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
 - `yield_control()`: yields the accumulated output to the model immediately while the script keeps running.
-{{#each groups}}
-{{#if namespace}}
-
-## {{namespace}}
-{{/if}}
 {{#each tools}}
 
 ### `{{identifier}}`{{#if alias}} (`{{alias}}`){{/if}}
@@ -59,7 +54,6 @@ exec tool declaration:
 ```ts
 declare const tools: { {{declaration}} };
 ```
-{{/each}}
 {{/each}}
 {{#if preludeDeclarations}}
 

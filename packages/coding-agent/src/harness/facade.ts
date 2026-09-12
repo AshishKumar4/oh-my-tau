@@ -30,12 +30,10 @@ class PresentedTool implements AgentTool {
 	declare readonly parameters: TSchema;
 	declare readonly execute: AgentTool["execute"];
 	declare readonly customWireName?: string;
-	declare readonly namespace?: ToolNamespace;
 	declare readonly examples?: AgentTool["examples"];
 
 	constructor(tool: AgentTool, binding: HarnessToolBinding | undefined, vendor: VendorSurface) {
 		if (binding?.wireName !== undefined) this.customWireName = binding.wireName;
-		if (binding?.namespace !== undefined) this.namespace = { name: binding.namespace };
 		// Tools are presented when they mount, before the capture has loaded, so
 		// the vendor's declaration is read at request time rather than pinned
 		// here. Its schema validates the call too: the bridge behind `execute`

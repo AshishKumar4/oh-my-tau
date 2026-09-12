@@ -85,7 +85,9 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 		parameters: claudeCodeAgentSchema,
 		intent: (args: Partial<typeof claudeCodeAgentSchema.infer>) => args.description,
 		toParams: (args: typeof claudeCodeAgentSchema.infer, host) => {
-			if (args.model !== undefined) unsupported("Agent.model", "the agent definition owns its model");
+			// `model` is a documented optional override in both vendors' schemas; omp's
+			// agent definition owns the model, so the field is accepted and ignored
+			// rather than costing the model a rejected delegation.
 			if (args.subagent_type === "fork")
 				unsupported('Agent.subagent_type "fork"', "subagents start with no inherited context");
 			if (args.isolation === "remote") unsupported('Agent.isolation "remote"', "omp has no remote execution");
@@ -223,7 +225,6 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 		parameters: codexSpawnAgentSchema,
 		intent: (args: Partial<typeof codexSpawnAgentSchema.infer>) => args.task_name,
 		toParams: (args: typeof codexSpawnAgentSchema.infer, host) => {
-			if (args.model !== undefined) unsupported("spawn_agent.model", "the agent definition owns its model");
 			if (args.fork_turns !== undefined && args.fork_turns !== "none") {
 				unsupported(`spawn_agent.fork_turns "${args.fork_turns}"`, "subagents start with no inherited context");
 			}

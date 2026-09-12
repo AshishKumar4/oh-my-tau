@@ -10,8 +10,6 @@
  * call fails inside the isolate as an undefined function, with nothing on the
  * wire to show for it. `test/harness-identifier-parity.test.ts` fences that.
  */
-import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
-import { harnessToolBinding } from "./manifest";
 
 const IDENTIFIER_START = /[A-Za-z]/;
 const IDENTIFIER_PART = /[A-Za-z0-9]/;
@@ -28,7 +26,6 @@ export function normalizeCodeModeIdentifier(toolKey: string): string {
 	return identifier.length === 0 ? "_" : identifier;
 }
 
-export function codeModeIdentifier(profile: HarnessProfile, toolName: string): string {
-	const namespace = harnessToolBinding(profile, toolName)?.namespace;
-	return normalizeCodeModeIdentifier(namespace === undefined ? toolName : `${namespace}__${toolName}`);
+export function codeModeIdentifier(toolName: string): string {
+	return normalizeCodeModeIdentifier(toolName);
 }

@@ -596,7 +596,7 @@ describe("codex collaboration facades on the wire", () => {
 		);
 		expect(
 			collaboration?.type === "namespace" ? collaboration.tools.map(entry => "name" in entry && entry.name) : [],
-		).toEqual(["hub", "spawn_agent", "send_message", "followup_task", "list_agents", "wait_agent"]);
+		).toEqual(["spawn_agent", "send_message", "followup_task", "list_agents", "wait_agent"]);
 		expect(tools.map(tool => tool.name)).not.toContain("task");
 
 		const evalTool = new EvalTool({
@@ -609,10 +609,13 @@ describe("codex collaboration facades on the wire", () => {
 			getEvalBridgeToolNames: () => session.getEvalBridgeToolNames(),
 			getCodeModeDirectToolNames: () => session.getCodeModeDirectToolNames(),
 		} as unknown as ToolSession);
-		expect(session.getCodeModeDirectToolNames()).toEqual(["eval", "task", "hub"]);
+		// Only the facades are direct (they mount after the Code Mode partition);
+		// omp's own `task` and `hub` stay reachable inside exec under their names.
+		expect(session.getCodeModeDirectToolNames()).toEqual(["eval"]);
 		expect(evalTool.description).toContain("### `read`");
+		expect(evalTool.description).toContain("### `hub`");
 		expect(evalTool.description).not.toContain("spawn_agent");
-		expect(evalTool.description).not.toContain("### `task`");
+		expect(evalTool.description).not.toContain("## collaboration");
 	});
 });
 
@@ -658,8 +661,15 @@ describe("codex spawn_agent facade", () => {
 		});
 		expect(spawned).toEqual([{ name: "a", task: "b", effort: "hi" }]);
 
+		// A model override is accepted and ignored: the agent definition owns the model.
+		spawned.length = 0;
+		await runFacadeCall(CODEX_MODEL, [withEffort], {
+			name: "spawn_agent",
+			arguments: { task_name: "a", message: "b", model: "gpt-5.5" },
+		});
+		expect(spawned).toEqual([{ name: "a", task: "b" }]);
+
 		for (const [field, args] of [
-			["spawn_agent.model", { task_name: "a", message: "b", model: "gpt-5.5" }],
 			['spawn_agent.fork_turns "all"', { task_name: "a", message: "b", fork_turns: "all" }],
 			['spawn_agent.reasoning_effort "extreme"', { task_name: "a", message: "b", reasoning_effort: "extreme" }],
 		] as const) {

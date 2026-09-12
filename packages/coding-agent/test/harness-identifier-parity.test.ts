@@ -51,12 +51,11 @@ describe("codex code-mode identifier normalization", () => {
 		expect(OMP_TOOL_NAMES).toContain("new_context");
 	});
 
-	it("flattens a manifest namespace into the identifier the vendor would mint", () => {
-		expect(codeModeIdentifier("codex", "task")).toBe("collaboration__task");
-		expect(codeModeIdentifier("codex", "hub")).toBe("collaboration__hub");
-		expect(vendorNormalizeIdentifier("collaboration__task")).toBe("collaboration__task");
-		expect(codeModeIdentifier("codex", "read")).toBe("read");
-		expect(codeModeIdentifier("claude-code", "task")).toBe("task");
+	it("keeps native tool names as their exec identifiers; the collaboration namespace is the facades' alone", () => {
+		expect(codeModeIdentifier("task")).toBe("task");
+		expect(codeModeIdentifier("hub")).toBe("hub");
+		expect(codeModeIdentifier("read")).toBe("read");
+		expect(vendorNormalizeIdentifier("hub")).toBe("hub");
 	});
 
 	it("mints MCP tool names that survive normalization, however hostile the server name", () => {

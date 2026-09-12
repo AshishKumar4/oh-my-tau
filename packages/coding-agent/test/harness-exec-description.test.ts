@@ -99,31 +99,28 @@ describe("codex-profile exec description", () => {
 });
 
 describe("codex exec description assembly", () => {
-	test("groups a namespaced tool under its header and flattens its identifier", () => {
+	test("lists bridged tools flat and sorted under their own names", () => {
 		const description = buildCodexExecDescription({
-			profile: "codex",
 			tools: [
 				{ name: "task", summary: "Delegate work.", parameters: type({ prompt: "string" }) },
 				{ name: "read", parameters: type({ path: "string" }) },
 			],
 		});
 
-		expect(description.indexOf("### `read`")).toBeLessThan(description.indexOf("## collaboration"));
-		expect(description).toContain(
-			["## collaboration", "", "### `collaboration__task` (`task`)", "Delegate work."].join("\n"),
-		);
-		expect(description).toContain("declare const tools: { collaboration__task(args: {");
+		expect(description.indexOf("### `read`")).toBeLessThan(description.indexOf("### `task`"));
+		expect(description).toContain(["### `task`", "Delegate work."].join("\n"));
+		expect(description).toContain("declare const tools: { task(args: {");
 		expect(description).toContain("### `read`\n\nexec tool declaration:");
+		expect(description).not.toContain("## collaboration");
 	});
 
 	test("renders the prelude globals it is given and omits the block when there are none", () => {
 		const tools = [{ name: "read", parameters: type({ path: "string" }) }] as const;
 		const withPrelude = buildCodexExecDescription({
-			profile: "codex",
 			tools,
 			preludeDeclarations: "declare const browser: unknown;",
 		});
-		const without = buildCodexExecDescription({ profile: "codex", tools });
+		const without = buildCodexExecDescription({ tools });
 
 		expect(withPrelude).toContain("Additional globals:\n```ts\ndeclare const browser: unknown;\n```");
 		expect(without).not.toContain("Additional globals:");

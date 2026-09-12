@@ -948,7 +948,6 @@ export class SessionTools {
 			extraDirectTools: this.#host.settings.get("providers.openai-codex.codeModeDirectTools"),
 			enabledToolNames: toolNames,
 			evalTransportAvailable: this.#hasCodeModeEvalTransport(),
-			...(activeModel && { harnessProfile: profile }),
 		});
 		let builtInWriteAvailable = this.#builtInToolNames.has("write");
 		const fullWriteSelected =

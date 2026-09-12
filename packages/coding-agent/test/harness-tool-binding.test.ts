@@ -115,11 +115,11 @@ describe("harness tool binding through the session surface", () => {
 		expect(presented(session, "bash").namespace).toBeUndefined();
 	});
 
-	test("a codex model groups delegation into collaboration and renames only its own bridge", () => {
+	test("a codex model keeps natives out of the reserved collaboration namespace and renames only its own bridge", () => {
 		const session = createSession(CODEX_MODEL);
 
 		expect(presented(session, "spawn_agent")).toMatchObject({ namespace: "collaboration", persistAs: "task" });
-		expect(presented(session, "hub").namespace).toBe("collaboration");
+		expect(presented(session, "hub").namespace).toBeUndefined();
 		expect(presented(session, "read").namespace).toBeUndefined();
 		expect(presented(session, "eval").wireName).toBe("exec");
 		expect(presented(session, "bash").wireName).toBeUndefined();

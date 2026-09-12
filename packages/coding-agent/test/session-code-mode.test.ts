@@ -13,7 +13,6 @@ import { EVAL_AGENT_BRIDGE_NAME } from "../src/eval/agent-bridge";
 import { EVAL_BUDGET_BRIDGE_NAME } from "../src/eval/budget-bridge";
 import { EVAL_COMPLETION_BRIDGE_NAME } from "../src/eval/completion-bridge";
 import { EVAL_CANCEL_BRIDGE_NAME, EVAL_STATUS_BRIDGE_NAME, EVAL_WAIT_BRIDGE_NAME } from "../src/eval/handle-bridge";
-import { harnessToolBinding } from "../src/harness/manifest";
 import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import type { ToolNamespacesInfo } from "../src/session/code-mode";
@@ -162,28 +161,13 @@ describe("resolveCodeMode", () => {
 		});
 		expect([...r.directToolNames]).toEqual(["eval", ...reserved]);
 	});
-	test("the codex profile keeps exactly the tools its manifest groups under a namespace", () => {
-		const enabled = ["eval", "read", "bash", "task", "hub", "web_search"];
-		const grouped = enabled.filter(name => harnessToolBinding("codex", name)?.namespace !== undefined);
+	test("a harness profile adds nothing to the direct set: natives bridge, facades mount direct on their own", () => {
 		const r = resolveCodeMode({
 			provider: "openai-codex",
 			toolMode: "code_mode_only",
 			setting: "auto",
-			enabledToolNames: enabled,
+			enabledToolNames: ["eval", "read", "bash", "task", "hub", "web_search"],
 			evalTransportAvailable: true,
-			harnessProfile: "codex",
-		});
-		expect(grouped.length).toBeGreaterThan(0);
-		expect([...r.directToolNames]).toEqual(["eval", ...grouped]);
-	});
-	test("a profile that groups nothing leaves delegation bridged", () => {
-		const r = resolveCodeMode({
-			provider: "openai-codex",
-			toolMode: "code_mode_only",
-			setting: "auto",
-			enabledToolNames: ["eval", "task", "hub"],
-			evalTransportAvailable: true,
-			harnessProfile: "claude-code",
 		});
 		expect([...r.directToolNames]).toEqual(["eval"]);
 	});

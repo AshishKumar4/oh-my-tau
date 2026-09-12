@@ -4,9 +4,7 @@
  * bridge, mirroring codex-rs ToolMode::CodeModeOnly.
  */
 
-import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { logger } from "@oh-my-pi/pi-utils";
-import { harnessDirectTools } from "../harness/manifest";
 
 /**
  * Tool names that always stay directly model-visible under code mode. The
@@ -51,7 +49,6 @@ export function resolveCodeMode(args: {
 	extraDirectTools?: readonly string[];
 	enabledToolNames: readonly string[];
 	evalTransportAvailable: boolean;
-	harnessProfile?: HarnessProfile;
 }): CodeModeResolution {
 	const active =
 		args.provider === "openai-codex" &&
@@ -62,12 +59,6 @@ export function resolveCodeMode(args: {
 	const direct = new Set<string>();
 	for (const name of args.enabledToolNames) {
 		if (CODE_MODE_KEEP_TOOLS[name] === true) direct.add(name);
-	}
-	if (args.harnessProfile) {
-		const harnessDirect = harnessDirectTools(args.harnessProfile);
-		for (const name of args.enabledToolNames) {
-			if (harnessDirect[name] === true) direct.add(name);
-		}
 	}
 	for (const name of args.extraDirectTools ?? []) {
 		if (args.enabledToolNames.includes(name)) direct.add(name);

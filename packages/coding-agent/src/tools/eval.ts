@@ -340,7 +340,6 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 		const profile = this.#harnessProfile();
 		if (profile === "codex") {
 			return buildCodexExecDescription({
-				profile,
 				tools: bridged.map(entry => {
 					const summary = session.toolRegistry?.get(entry.name)?.summary;
 					return typeof summary === "string" ? { ...entry, summary } : entry;

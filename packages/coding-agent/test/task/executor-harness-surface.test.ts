@@ -104,10 +104,9 @@ describe("subagent harness surface", () => {
 			setting: "auto",
 			enabledToolNames: enabled,
 			evalTransportAvailable: true,
-			harnessProfile: resolveHarnessProfile(ASTRA),
 		});
 
 		expect(direct.active).toBe(true);
-		expect([...direct.directToolNames].sort()).toEqual(["eval", "hub", "task", ...ORCHESTRATION_BRIDGE_TOOLS].sort());
+		expect([...direct.directToolNames].sort()).toEqual(["eval", ...ORCHESTRATION_BRIDGE_TOOLS].sort());
 	});
 });
