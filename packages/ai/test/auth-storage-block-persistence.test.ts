@@ -221,6 +221,51 @@ describe("AuthStorage credential block persistence", () => {
 		}
 	});
 
+	it("never selects a held account, even as the last resort or by direct id, until it is released", async () => {
+		const setup = await SqliteAuthCredentialStore.open(dbPath);
+		setup.saveOAuth(PROVIDER, oauthCredential("held"));
+		setup.saveOAuth(PROVIDER, oauthCredential("other"));
+		const [heldRow, otherRow] = setup.listAuthCredentials(PROVIDER);
+		// Every account is exhausted for the Fable tier, so selection reaches its
+		// last-resort pass, which normally tries blocked accounts anyway.
+		for (const row of [heldRow, otherRow]) {
+			setup.upsertCredentialBlock({
+				credentialId: row!.id,
+				providerKey: PROVIDER_KEY,
+				blockScope: "tier:fable",
+				blockedUntilMs: FUTURE_BLOCK_MS,
+			});
+		}
+		setup.close();
+
+		const store = await SqliteAuthCredentialStore.open(dbPath);
+		const storage = new AuthStorage(store);
+		await storage.reload();
+		try {
+			storage.holdCredential(PROVIDER, heldRow!.id);
+			// The held account is the session's sticky preference, which the
+			// last-resort pass would otherwise take first.
+			expect(storage.pinSessionOAuthAccount(PROVIDER, "session-sticky", heldRow!.id)).toBe(true);
+
+			expect(await storage.getApiKey(PROVIDER, "session-sticky", { modelId: "claude-fable-5-1" })).toBe(
+				"access-other",
+			);
+			const direct = await storage.getOAuthAccessByCredentialId(PROVIDER, heldRow!.id);
+			expect(direct?.ok).toBe(false);
+			expect(
+				readCredentialBlockRows(dbPath).some(
+					row => row.credential_id === heldRow!.id && row.block_scope === "hold",
+				),
+			).toBe(true);
+
+			storage.releaseCredential(PROVIDER, heldRow!.id);
+			expect(readCredentialBlockRows(dbPath).some(row => row.block_scope === "hold")).toBe(false);
+			expect((await storage.getOAuthAccessByCredentialId(PROVIDER, heldRow!.id))?.ok).toBe(true);
+		} finally {
+			storage.close();
+		}
+	});
+
 	it("sets an org-wide OAuth denial aside for hours while a content denial only rotates", async () => {
 		const store = await SqliteAuthCredentialStore.open(dbPath);
 		store.saveOAuth(PROVIDER, oauthCredential("org"));

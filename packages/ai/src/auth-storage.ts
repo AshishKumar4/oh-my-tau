@@ -169,6 +169,15 @@ export interface StoredAuthCredential {
 }
 
 /** One persisted rate-limit block: credential row id + provider-type key + optional scope. */
+/**
+ * Block scope of a manual hold: an account the user has set aside. Unlike
+ * usage backoffs, a hold is never tried as a last resort and never expires on
+ * its own; it ends only through {@link AuthStorage.releaseCredential}.
+ */
+export const CREDENTIAL_HOLD_SCOPE = "hold";
+/** Deadline stored for a hold: far enough out that the store's expiry pruning never removes it. */
+const CREDENTIAL_HOLD_UNTIL_MS = Date.UTC(2200, 0, 1);
+
 export interface StoredCredentialBlock {
 	/** SQLite row id of the credential (auth_credentials.id). */
 	credentialId: number;
@@ -1941,6 +1950,27 @@ export class AuthStorage {
 			}
 		}
 		return blockedUntil;
+	}
+
+	/** True while the user has set this credential aside; consulted before any selection pass. */
+	#isCredentialHeld(credentialId: number | undefined, providerKey: string): boolean {
+		if (credentialId === undefined) return false;
+		return this.#readPersistedCredentialBlock(credentialId, providerKey, CREDENTIAL_HOLD_SCOPE) !== undefined;
+	}
+
+	/** Set a stored OAuth account aside: it stays saved and logged in, but no session selects it until released. */
+	holdCredential(provider: string, credentialId: number): void {
+		this.upsertCredentialBlock({
+			credentialId,
+			providerKey: this.#getProviderTypeKey(provider, "oauth"),
+			blockScope: CREDENTIAL_HOLD_SCOPE,
+			blockedUntilMs: CREDENTIAL_HOLD_UNTIL_MS,
+		});
+	}
+
+	/** Lift a hold placed by {@link AuthStorage.holdCredential}. */
+	releaseCredential(provider: string, credentialId: number): void {
+		this.deleteCredentialBlock(credentialId, this.#getProviderTypeKey(provider, "oauth"), CREDENTIAL_HOLD_SCOPE);
 	}
 
 	/** Checks if a credential is temporarily blocked due to usage limits. */
@@ -5715,6 +5745,9 @@ export class AuthStorage {
 			blockScopes,
 			allowFallback = true,
 		} = usageOptions;
+		if (this.#isCredentialHeld(this.#getStoredCredentials(provider)[selection.index]?.id, providerKey)) {
+			return undefined;
+		}
 		if (
 			!allowBlocked &&
 			this.#isCredentialBlocked(provider, providerKey, selection.index, blockScopes ?? blockScope)
