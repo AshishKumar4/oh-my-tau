@@ -151,10 +151,13 @@ export interface TaskItem {
 	isolated?: boolean;
 }
 
+const forkRule = '"all" | number' as const;
+
 export const taskSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	"fork?": forkRule,
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
@@ -165,6 +168,7 @@ const taskSchemaNoIsolation = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
+	"fork?": forkRule,
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
@@ -249,6 +253,7 @@ function createTaskSchema(options: {
 			agent,
 			task: "string",
 			...effortField,
+			"fork?": forkRule,
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			...toolsField,
@@ -261,6 +266,7 @@ function createTaskSchema(options: {
 		agent,
 		task: "string",
 		...effortField,
+		"fork?": forkRule,
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		...toolsField,
@@ -307,6 +313,12 @@ export interface TaskParams {
 	task?: string;
 	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
 	effort?: TaskEffort;
+	/**
+	 * Fork the parent's conversation into the child (flat form): `"all"`
+	 * inherits the whole resolved history, a positive integer the last N
+	 * user-message turns. The spawn call and its result never carry over.
+	 */
+	fork?: "all" | number;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */

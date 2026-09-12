@@ -89,15 +89,17 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 			// `model` is a documented optional override in both vendors' schemas; omp's
 			// agent definition owns the model, so the field is accepted and ignored
 			// rather than costing the model a rejected delegation.
-			if (args.subagent_type === "fork")
-				unsupported('Agent.subagent_type "fork"', "subagents start with no inherited context");
 			if (args.isolation === "remote") unsupported('Agent.isolation "remote"', "omp has no remote execution");
 			if (args.isolation === "worktree" && !host.settings.get("task.isolation.enabled")) {
 				unsupported('Agent.isolation "worktree"', "task.isolation.enabled is off in this session");
 			}
+			// `subagent_type: "fork"` forks the conversation, not an agent type:
+			// the default task agent runs with the parent's history inherited.
+			const isFork = args.subagent_type === "fork";
 			return {
 				task: args.prompt,
-				...(args.subagent_type !== undefined ? { agent: args.subagent_type } : {}),
+				...(args.subagent_type !== undefined && !isFork ? { agent: args.subagent_type } : {}),
+				...(isFork ? { fork: "all" as const } : {}),
 				...(args.isolation === "worktree" ? { isolated: true } : {}),
 			};
 		},
@@ -178,7 +180,9 @@ const codexSpawnAgentSchema = type({
 	message: type("string").describe("Initial plain-text task for the new agent."),
 	"model?": type("string").describe("Not available; the agent definition owns its model"),
 	"reasoning_effort?": type("string").describe("Reasoning effort override for the new agent. Omit to inherit."),
-	"fork_turns?": type("string").describe("Only `none` is available: the new agent starts with no inherited context"),
+	"fork_turns?": type("string").describe(
+		"Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns.",
+	),
 });
 
 const codexTargetMessageSchema = type({
@@ -230,8 +234,15 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 		parameters: codexSpawnAgentSchema,
 		intent: (args: Partial<typeof codexSpawnAgentSchema.infer>) => args.task_name,
 		toParams: (args: typeof codexSpawnAgentSchema.infer, host) => {
-			if (args.fork_turns !== undefined && args.fork_turns !== "none") {
-				unsupported(`spawn_agent.fork_turns "${args.fork_turns}"`, "subagents start with no inherited context");
+			let fork: "all" | number | undefined;
+			if (args.fork_turns === "none") {
+				fork = undefined;
+			} else if (args.fork_turns === undefined || args.fork_turns === "" || args.fork_turns === "all") {
+				fork = "all";
+			} else if (/^\d+$/.test(args.fork_turns) && Number.parseInt(args.fork_turns, 10) > 0) {
+				fork = Number.parseInt(args.fork_turns, 10);
+			} else {
+				throw new ToolError("fork_turns must be `none`, `all`, or a positive integer string");
 			}
 			let effort: TaskEffort | undefined;
 			if (args.reasoning_effort !== undefined) {
@@ -246,7 +257,12 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 					unsupported("spawn_agent.reasoning_effort", "task.enableEffort is off in this session");
 				}
 			}
-			return { name: args.task_name, task: args.message, ...(effort !== undefined ? { effort } : {}) };
+			return {
+				name: args.task_name,
+				task: args.message,
+				...(fork !== undefined ? { fork } : {}),
+				...(effort !== undefined ? { effort } : {}),
+			};
 		},
 	},
 	{

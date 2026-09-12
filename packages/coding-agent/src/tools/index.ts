@@ -272,7 +272,11 @@ export interface ToolSession {
 	sessionManager?: Pick<
 		SessionManager,
 		"appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"
-	> & { getSessionId?: SessionManager["getSessionId"] };
+	> & {
+		getSessionId?: SessionManager["getSessionId"];
+		/** Resolved LLM context — present on full SDK managers, absent on advisor-local journals. */
+		buildSessionContext?: SessionManager["buildSessionContext"];
+	};
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
 	getEvalKernelOwnerId?: () => string | null;
 	/** Current enabled eval prelude definitions. */

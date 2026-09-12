@@ -603,12 +603,15 @@ describe("claude-code Agent facade", () => {
 		sessionManager.appendMessage(run.result);
 		expect(sessionManager.getUsageStatistics().input).toBe(7);
 
+		spawned.length = 0;
 		const forked = await runFacadeCall(CLAUDE_CODE_MODEL, [facade], {
 			name: "Agent",
 			arguments: { description: "Fork", prompt: "continue", subagent_type: "fork" },
 		});
-		expect(forked.result.isError).toBe(true);
-		expect(forked.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("subagent_type") });
+		// "fork" inherits the conversation through the default agent — it is not
+		// itself an agent type, so it never reaches the spawn as `agent`.
+		expect(forked.result.isError).not.toBe(true);
+		expect(spawned).toEqual([{ task: "continue", fork: "all" }]);
 	});
 });
 
@@ -670,6 +673,22 @@ describe("codex spawn_agent facade", () => {
 		expect(run.assistant.content[0]).toMatchObject({ name: "task", wireName: "spawn_agent" });
 		expect((plain.intent as (args: unknown) => string | undefined)({ task_name: "scan_repo" })).toBe("scan_repo");
 
+		// The vendor default: an absent fork_turns forks the whole conversation.
+		spawned.length = 0;
+		await runFacadeCall(CODEX_MODEL, [plain], {
+			name: "spawn_agent",
+			arguments: { task_name: "inherit_all", message: "continue" },
+		});
+		expect(spawned).toEqual([{ name: "inherit_all", task: "continue", fork: "all" }]);
+
+		// A positive integer string forks only that many trailing turns.
+		spawned.length = 0;
+		await runFacadeCall(CODEX_MODEL, [plain], {
+			name: "spawn_agent",
+			arguments: { task_name: "tail_two", message: "continue", fork_turns: "2" },
+		});
+		expect(spawned).toEqual([{ name: "tail_two", task: "continue", fork: 2 }]);
+
 		const effortOff = await runFacadeCall(CODEX_MODEL, [plain], {
 			name: "spawn_agent",
 			arguments: { task_name: "a", message: "b", reasoning_effort: "xhigh" },
@@ -686,7 +705,7 @@ describe("codex spawn_agent facade", () => {
 			name: "spawn_agent",
 			arguments: { task_name: "a", message: "b", reasoning_effort: "xhigh" },
 		});
-		expect(spawned).toEqual([{ name: "a", task: "b", effort: "hi" }]);
+		expect(spawned).toEqual([{ name: "a", task: "b", fork: "all", effort: "hi" }]);
 
 		// A model override is accepted and ignored: the agent definition owns the model.
 		spawned.length = 0;
@@ -694,19 +713,30 @@ describe("codex spawn_agent facade", () => {
 			name: "spawn_agent",
 			arguments: { task_name: "a", message: "b", model: "gpt-5.5" },
 		});
-		expect(spawned).toEqual([{ name: "a", task: "b" }]);
+		expect(spawned).toEqual([{ name: "a", task: "b", fork: "all" }]);
 
-		for (const [field, args] of [
-			['spawn_agent.fork_turns "all"', { task_name: "a", message: "b", fork_turns: "all" }],
-			['spawn_agent.reasoning_effort "extreme"', { task_name: "a", message: "b", reasoning_effort: "extreme" }],
+		// fork_turns accepts the vendor's vocabulary only; anything else carries
+		// the vendor's own error text back to the model.
+		for (const args of [
+			{ task_name: "a", message: "b", fork_turns: "zero" },
+			{ task_name: "a", message: "b", fork_turns: "0" },
+			{ task_name: "a", message: "b", reasoning_effort: "extreme" },
 		] as const) {
 			const rejected = await runFacadeCall(CODEX_MODEL, [withEffort], {
 				name: "spawn_agent",
 				arguments: { ...args },
 			});
 			expect(rejected.result.isError).toBe(true);
-			expect(rejected.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining(field) });
 		}
+
+		const zero = await runFacadeCall(CODEX_MODEL, [withEffort], {
+			name: "spawn_agent",
+			arguments: { task_name: "a", message: "b", fork_turns: "0" },
+		});
+		expect(zero.result.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining("fork_turns must be `none`, `all`, or a positive integer string"),
+		});
 	});
 });
 

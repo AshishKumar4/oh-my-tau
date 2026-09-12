@@ -53,6 +53,7 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 {{/if}}
 - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
 - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
+- `fork`: Inherit your conversation into the child: `"all"` (every turn) or a positive integer (the last N turns). Omit for a blank start.
 {{#if isolationEnabled}}
 {{#if applyIsolatedChanges}}
 - `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
@@ -63,7 +64,7 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 {{/if}}
 
 # Communication
-Subagents start blank — no conversation history.{{#if ircEnabled}} Parent-to-subagent IRC delivered immediately as steering.{{/if}}
+Subagents start blank — no conversation history — unless `fork` inherits yours.{{#if ircEnabled}} Parent-to-subagent IRC delivered immediately as steering.{{/if}}
 Pass large payloads via `local://<path>` URIs, NEVER inline text.
 
 # Format Contracts

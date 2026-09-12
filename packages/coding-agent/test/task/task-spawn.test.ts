@@ -13,7 +13,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
-import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -882,5 +882,92 @@ describe("task spawn routing", () => {
 
 		gates.get("Fifth")!.resolve();
 		await Promise.all(jobs.map(job => job.promise));
+	});
+
+	it("forks the parent's journal into a flat spawn, cut at the spawn call", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+		const seen: Array<{ id: string | undefined; messages: unknown[] | undefined }> = [];
+		const gates = new Map<string, Deferred>();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			const gate = deferred();
+			gates.set(options.id ?? "?", gate);
+			seen.push({ id: options.id, messages: options.fork?.messages });
+			await gate.promise;
+			return makeResult(options.id ?? "?");
+		});
+
+		const parentHistory = [
+			{ role: "user", content: "first turn", timestamp: 1 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "first answer" }],
+				api: "openai-responses",
+				provider: "openai",
+				model: "mock",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 2,
+			},
+			{ role: "user", content: "second turn", timestamp: 3 },
+			// The in-flight spawn call that produced this run; the child must not
+			// inherit it or its toolResult.
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "tc-fork", name: "task", arguments: { task: "Do the thing." } }],
+				api: "openai-responses",
+				provider: "openai",
+				model: "mock",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: 4,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "tc-fork",
+				toolName: "task",
+				content: [{ type: "text", text: "" }],
+				isError: false,
+				timestamp: 5,
+			},
+		] satisfies AgentMessage[];
+		const parentSession = {
+			cwd: "/tmp",
+			hasUI: false,
+			settings: Settings.isolated({}),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			sessionManager: { buildSessionContext: () => ({ messages: parentHistory }) },
+		} as unknown as ToolSession;
+
+		const manager = createManager();
+		parentSession.asyncJobManager = manager;
+		const tool = await TaskTool.create(parentSession);
+
+		const result = await tool.execute("tc-fork", {
+			agent: "task",
+			name: "Forked",
+			task: "Do the thing.",
+			fork: 1,
+		} as TaskParams);
+		const jobId = result.details?.async?.jobId;
+		// Sync or async: the spawn options must carry the forked slice either way.
+		await pollUntil(() => seen.length === 1, 2000);
+		expect(seen[0]!.messages).toEqual([{ role: "user", content: "second turn", timestamp: 3 }]);
+		for (const gate of gates.values()) gate.resolve();
+		if (jobId) await manager.getJob(jobId)?.promise;
 	});
 });

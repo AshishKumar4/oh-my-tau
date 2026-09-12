@@ -47,6 +47,7 @@ import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
+import { forkMessages } from "./fork";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
@@ -255,6 +256,13 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			? "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`."
 			: "Missing `task`. Provide complete, self-contained instructions for the agent.";
 	}
+	if (
+		params.fork !== undefined &&
+		params.fork !== "all" &&
+		(typeof params.fork !== "number" || !Number.isInteger(params.fork) || params.fork <= 0)
+	) {
+		return 'The call has an invalid `fork` value. Use "all" or a positive integer of turns.';
+	}
 	return validateEffort(params.effort, "The call");
 }
 
@@ -295,6 +303,8 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
 	if ("tools" in item) spawn.tools = item.tools;
 	if ("effort" in item) spawn.effort = item.effort;
+	// Forking is a flat-form feature: batch items never inherit parent history.
+	if (params.tasks === undefined && params.fork !== undefined) spawn.fork = params.fork;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -1485,6 +1495,17 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				context,
 				agent: params.agent,
 				...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
+				...(params.fork !== undefined
+					? {
+							fork: {
+								messages: forkMessages(
+									this.session,
+									params.fork === "all" ? "all" : { lastTurns: params.fork },
+									toolCallId,
+								),
+							},
+						}
+					: {}),
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 				...(params.effort !== undefined ? { effort: params.effort } : {}),
 				...(params.tools?.length

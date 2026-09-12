@@ -2,12 +2,18 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
+import type { Message } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import {
 	artifactsDirsFromRegistry,
 	resetRegisteredArtifactDirsForTests,
 } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { createEvalCustomTools } from "@oh-my-pi/pi-coding-agent/task/eval-tools";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -21,6 +27,9 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition, SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { createSessionDefaults } from "../helpers/session-defaults";
 
 const AGENT: AgentDefinition = {
 	name: "worker",
@@ -787,5 +796,123 @@ describe("structured subagent primitive", () => {
 		expect(artifactsDirsFromRegistry()).toContain(settled.artifactsDir);
 		expect(await fs.stat(artifactsDir ?? "")).toBeDefined();
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
+
+	it("seeds a forked child's journal with the inherited history before the brief", async () => {
+		mockDiscovery({ ...AGENT, output: undefined });
+		using tempDir = TempDir.createSync("@omp-forked-subagent-");
+		const parentFile = path.join(tempDir.path(), "parent.jsonl");
+
+		const inherited: Message[] = [
+			{ role: "user", content: "remember BLUE-HERON-42", timestamp: 1 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "Noted." }],
+				api: "openai-responses",
+				provider: "openai",
+				model: "mock",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 2,
+			},
+		];
+
+		// The session is mocked at the boundary, but its journal is real: the
+		// executor hands createAgentSession the same SessionManager it seeded,
+		// and a live session would replay exactly buildSessionContext().messages
+		// plus the appended brief into its first model request.
+		let childManager: SessionManager | undefined;
+		let contextAtCreate: unknown[] | undefined;
+		const contextsAtPrompt: unknown[][] = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			childManager = options?.sessionManager as SessionManager | undefined;
+			contextAtCreate = childManager?.buildSessionContext().messages;
+			const listeners: Array<(event: AgentSessionEvent) => void> = [];
+			const emit = (event: AgentSessionEvent) => {
+				for (const listener of listeners) listener(event);
+			};
+			const mock = {
+				...createSessionDefaults(),
+				state: { messages: [] as unknown[] },
+				agent: { state: { systemPrompt: ["test"] } },
+				model: undefined,
+				extensionRunner: undefined,
+				sessionManager: childManager,
+				getActiveToolNames: () => ["read", "yield"],
+				getEnabledToolNames: () => ["read", "yield"],
+				subscribe: (listener: (event: AgentSessionEvent) => void) => {
+					listeners.push(listener);
+					return () => {
+						const index = listeners.indexOf(listener);
+						if (index >= 0) listeners.splice(index, 1);
+					};
+				},
+				prompt: async (text: string) => {
+					childManager!.appendMessage({ role: "user", content: text, timestamp: Date.now() });
+					contextsAtPrompt.push(childManager!.buildSessionContext().messages);
+					emit({
+						type: "tool_execution_end",
+						toolCallId: "yield-1",
+						toolName: "yield",
+						result: {
+							content: [{ type: "text", text: "Result submitted." }],
+							details: { status: "success", data: { ok: true } },
+						},
+						isError: false,
+					} as AgentSessionEvent);
+				},
+			};
+			return {
+				session: mock as unknown as AgentSession,
+				extensionsResult: {} as LoadExtensionsResult,
+				setToolUIContext: () => {},
+				eventBus: new EventBus(),
+			} satisfies CreateAgentSessionResult;
+		});
+
+		const forkedSession = {
+			...session(),
+			getSessionFile: () => parentFile,
+		} as ToolSession;
+		const settled = await runStructuredSubagent(
+			request({
+				session: forkedSession,
+				assignment: "Reply with the phrase only.",
+				fork: { messages: inherited },
+			}),
+		);
+
+		expect(settled.result.exitCode).toBe(0);
+		// The session was built on top of the inherited history…
+		expect(contextAtCreate).toEqual(inherited);
+		// …and the first model turn sees that history ahead of the brief.
+		expect(contextsAtPrompt).toHaveLength(1);
+		expect(contextsAtPrompt[0]).toEqual([
+			...inherited,
+			expect.objectContaining({
+				role: "user",
+				content: expect.stringContaining("Reply with the phrase only."),
+			}),
+		]);
+
+		// The child journal is its own file under the parent's artifacts dir,
+		// with the inherited turns persisted ahead of the brief.
+		const journalFile = path.join(tempDir.path(), "parent", `${settled.result.id}.jsonl`);
+		const journal = (await fs.readFile(journalFile, "utf8"))
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } });
+		const messageEntries = journal.filter(entry => entry.type === "message");
+		const roles = messageEntries.map(entry => entry.message?.role);
+		expect(roles.slice(0, 3)).toEqual(["user", "assistant", "user"]);
+		expect(messageEntries[0]?.message?.content).toBe("remember BLUE-HERON-42");
+		expect(String(messageEntries[2]?.message?.content)).toContain("Reply with the phrase only.");
 	});
 });

@@ -8,7 +8,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
+import type { Api, Message, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
@@ -419,6 +419,12 @@ export interface ExecutorOptions {
 	 * {@link SubagentLifecyclePayload.detached}.
 	 */
 	detached?: boolean;
+	/**
+	 * Forked conversation history seeded into the child's journal before its
+	 * session is created: resolved parent LLM messages (user/assistant/
+	 * toolResult) with the spawn call already cut, in order.
+	 */
+	fork?: { messages: AgentMessage[] };
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
@@ -3533,6 +3539,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const sessionManager = await awaitAbortable(sessionManagerPromise);
 			if (options.parentArtifactManager) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
+			}
+			// Forked children inherit the parent's resolved history into their
+			// own journal before the session is created, so the first prompt
+			// (the brief) lands after the inherited turns in both the transcript
+			// and the model context. Both the file and in-memory managers take
+			// the same append path.
+			for (const message of options.fork?.messages ?? []) {
+				sessionManager.appendMessage(message as Message);
 			}
 			sessionOpenedAt = performance.now();
 			if (ircEnabled) {

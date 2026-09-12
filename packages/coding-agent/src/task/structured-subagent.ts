@@ -4,6 +4,7 @@
  * The two public frontends deliberately retain their presentation concerns, but
  * every decision that affects what a child may run lives here.
  */
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
@@ -103,6 +104,12 @@ export interface StructuredSubagentRequest {
 	schemaMode?: StructuredSubagentSchemaMode;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
 	effort?: TaskEffort;
+	/**
+	 * Resolved parent history for a forked spawn, seeded into the child's
+	 * journal before its first prompt (Codex `fork_turns` / Claude Code
+	 * `subagent_type: "fork"`). Resolved by the caller via `forkMessages`.
+	 */
+	fork?: { messages: AgentMessage[] };
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -428,6 +435,7 @@ function buildExecutorOptions(
 		assignment: request.assignment.trim(),
 		context: request.context?.trim() || undefined,
 		planReference: undefined,
+		fork: request.fork,
 		// Task `name` is the spawn handle (id allocation). Eval `label` is a
 		// real UI description. Copy it only for eval so generateTaskLabel can run.
 		description: request.invocationKind === "eval" ? trimToUndefined(request.identity?.label) : undefined,
