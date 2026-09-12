@@ -45,12 +45,11 @@ describe("fusion lead prompt section", () => {
 		expect(text).toContain("You have a `sidekick` tool: a persistent subagent");
 		expect(text).toContain("wait for it with `hub` (`block: true`)");
 		expect(text).toContain("The user interacts with one assistant: you.");
-		expect(text).toContain("Because of sidekick delegation, you may be asked about low-level details");
-		expect(text).not.toContain("Complex interactive browser work");
+		expect(text).toContain("The sidekick is available for delegating mechanical work");
 
 		const off = await build({ toolNames: ["read", "hub"] });
 		expect(off).not.toContain("You have a `sidekick` tool");
-		expect(off).not.toContain("Because of sidekick delegation");
+		expect(off).not.toContain("delegating mechanical work");
 	});
 
 	it("renders in the custom (harness) template with the profile's wait facade and identity", async () => {
@@ -63,7 +62,6 @@ describe("fusion lead prompt section", () => {
 		expect(text).toContain("VENDOR PROMPT");
 		expect(text).toContain("wait for it with `TaskOutput` (`block: true`)");
 		expect(text).toContain("The user interacts with one Claude Code: you.");
-		expect(text).toContain("Complex interactive browser work");
 
 		const codex = await build({ toolNames: ["hub", "sidekick"], harnessProfile: "codex", customPrompt: "VENDOR" });
 		expect(codex).toContain("wait for it with `wait` (`block: true`)");

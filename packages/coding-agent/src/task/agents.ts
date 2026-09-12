@@ -84,9 +84,12 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 /**
  * The Fusion sidekick is deliberately NOT a discoverable bundled agent: the
  * `sidekick` tool owns its one-per-session lifecycle, so `task` must never be
- * able to spawn a second one.
+ * able to spawn a second one. Its body is the Devin CLI's sidekick prompt as
+ * captured, so it is parsed verbatim rather than rendered like the other
+ * bundled templates (whose render pass normalises whitespace); the two
+ * session-specific phrases are substituted at spawn.
  */
-const SIDEKICK_AGENT_DEF: EmbeddedAgentDef = { fileName: "sidekick.md", template: sidekickMd };
+const SIDEKICK_AGENT_FILE = "sidekick.md";
 
 // Computed lazily on first loadBundledAgents() call to avoid eager prompt.render at module load.
 
@@ -175,13 +178,9 @@ export function getBundledAgentsMap(): Map<string, AgentDefinition> {
 
 let sidekickAgentCache: AgentDefinition | null = null;
 
-/** The Fusion sidekick definition, parsed once. Not part of {@link loadBundledAgents}. */
+/** The Fusion sidekick definition, parsed once and unrendered. Not part of {@link loadBundledAgents}. */
 export function getSidekickAgent(): AgentDefinition {
-	sidekickAgentCache ??= parseAgent(
-		`embedded:${SIDEKICK_AGENT_DEF.fileName}`,
-		buildAgentContent(SIDEKICK_AGENT_DEF),
-		"bundled",
-	);
+	sidekickAgentCache ??= parseAgent(`embedded:${SIDEKICK_AGENT_FILE}`, sidekickMd, "bundled");
 	return sidekickAgentCache;
 }
 

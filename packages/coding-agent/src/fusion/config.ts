@@ -48,6 +48,27 @@ export function buildFusionPromptData(options: {
 	};
 }
 
+/**
+ * The two phrases in the captured sidekick prompt that belong to the recording
+ * session rather than the harness: the Devin CLI names its `todo_write` tool,
+ * and closes with the model and effort it ran on. Each must be present exactly
+ * once, so a re-capture that rewords them fails loudly here instead of
+ * shipping the recording's values.
+ */
+const SIDEKICK_TODO_PHRASE = "use the todo_write tool";
+const SIDEKICK_POWERED_BY_PHRASE = "Model: selected worker.";
+
+/** The captured sidekick prompt with omp's `todo` and the pairing's own model and effort substituted. */
+export function renderSidekickPrompt(captured: string, model: Model<Api>, thinkingLevel: string | undefined): string {
+	for (const phrase of [SIDEKICK_TODO_PHRASE, SIDEKICK_POWERED_BY_PHRASE]) {
+		if (captured.split(phrase).length !== 2) throw new Error(`sidekick prompt: expected exactly one "${phrase}"`);
+	}
+	const effort = thinkingLevel ? ` ${thinkingLevel.charAt(0).toUpperCase()}${thinkingLevel.slice(1)}` : "";
+	return captured
+		.replace(SIDEKICK_TODO_PHRASE, "use the todo tool")
+		.replace(SIDEKICK_POWERED_BY_PHRASE, `You are powered by ${model.name}${effort}.`);
+}
+
 export interface FusionSessionLike {
 	settings: Settings;
 	taskDepth?: number;

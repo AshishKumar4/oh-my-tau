@@ -19,6 +19,7 @@ import {
 	buildFusionPromptData,
 	findSidekickRef,
 	isFusionLead,
+	renderSidekickPrompt,
 	resolveSidekickModel,
 	SIDEKICK_AGENT_NAME,
 	SIDEKICK_LABEL,
@@ -247,12 +248,18 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			const ref = findSidekickRef(this.#leadId());
 			if (ref) registered.resolve(ref);
 		};
+		const sidekick = getSidekickAgent();
+		const thinkingLevel = settings.get("fusion.sidekickThinking");
 		try {
 			const execution = await runStructuredSubagent({
 				session: this.session,
 				invocationKind: "task",
 				assignment: message,
-				agentDefinition: { ...getSidekickAgent(), thinkingLevel: settings.get("fusion.sidekickThinking") },
+				agentDefinition: {
+					...sidekick,
+					thinkingLevel,
+					systemPrompt: renderSidekickPrompt(sidekick.systemPrompt, model.model, thinkingLevel),
+				},
 				model: `${model.model.provider}/${model.model.id}`,
 				identity: { label: SIDEKICK_LABEL },
 				keepAlive: true,
