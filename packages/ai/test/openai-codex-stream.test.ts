@@ -14,6 +14,7 @@ import {
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type {
 	CodexCompactionRequestContext,
+	CodexRequestSnapshot,
 	Context,
 	FetchImpl,
 	Model,
@@ -3794,6 +3795,92 @@ describe("openai-codex streaming", () => {
 		expect(stats?.lastInputItems).toBe(1);
 		expect(stats?.lastDeltaInputItems).toBe(1);
 		expect(stats?.lastPreviousResponseId).toBe("resp_2");
+	});
+
+	it("snapshots the full websocket request input, not the sent delta", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+
+		class SnapshotWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				const responseIndex = sentRequests.length;
+				this.emitCodexResponse({
+					messageId: `msg_${responseIndex}`,
+					responseId: `resp_${responseIndex}`,
+					text: `Answer ${responseIndex}`,
+					terminalType: "response.completed",
+					includeCreated: true,
+				});
+			}
+		}
+
+		global.WebSocket = SnapshotWebSocket as unknown as typeof WebSocket;
+		const model: Model<"openai-codex-responses"> = buildModel({
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			preferWebsockets: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272000,
+			maxTokens: 128000,
+		});
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const snapshots: CodexRequestSnapshot[] = [];
+		const baseOptions = {
+			fetch: fetchMock as FetchImpl,
+			apiKey: createCodexTestToken(),
+			sessionId: "ws-snapshot-session",
+			providerSessionState,
+			onCodexRequestSnapshot: (snapshot: CodexRequestSnapshot) => snapshots.push(snapshot),
+		};
+		const startedAt = Date.now();
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: startedAt }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, baseOptions).result();
+		const secondContext: Context = {
+			systemPrompt: firstContext.systemPrompt,
+			messages: [
+				...firstContext.messages,
+				firstResponse,
+				{ role: "user", content: "Second question", timestamp: startedAt + 1 },
+			],
+		};
+		await streamOpenAICodexResponses(model, secondContext, baseOptions).result();
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests).toHaveLength(2);
+		expect(snapshots).toHaveLength(2);
+
+		// The wire's second frame is an append delta chained on resp_1; the
+		// snapshot must carry the whole request body so a fork can replay it.
+		expect(sentRequests[1]?.previous_response_id).toBe("resp_1");
+		expect(JSON.stringify(sentRequests[1]?.input)).toContain("Second question");
+		expect(JSON.stringify(sentRequests[1]?.input)).not.toContain("First question");
+		const secondSnapshotInput = JSON.stringify(snapshots[1]?.input);
+		expect(secondSnapshotInput).toContain("First question");
+		expect(secondSnapshotInput).toContain("Answer 1");
+		expect(secondSnapshotInput).toContain("Second question");
+		// The first turn has no append baseline, so its snapshot equals the frame.
+		expect(JSON.stringify(snapshots[0]?.input)).toBe(JSON.stringify(sentRequests[0]?.input));
+		expect(snapshots[0]?.sessionId).toBe("ws-snapshot-session");
+		expect(snapshots[1]?.sessionId).toBe("ws-snapshot-session");
+		expect(snapshots[1]?.model).toBe("gpt-6-astra");
 	});
 
 	it("records websocket delta request and usage diagnostics", async () => {

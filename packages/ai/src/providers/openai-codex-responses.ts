@@ -1607,12 +1607,15 @@ export async function buildTransformedCodexRequestBody(
 	const forkSource = getCodexForkSource(model, options);
 	const forkMessageCount = options?.codexFork?.messageCount;
 	// Byte-for-byte prefix reuse additionally requires the same producing model
-	// on the codex harness profile and a caller-certified shared-prefix length.
+	// on the codex harness profile, a non-empty source input, and a
+	// caller-certified shared-prefix length. An empty source replaying nothing
+	// must never slice away converted history.
 	const useForkPrefix =
 		forkSource !== undefined &&
 		forkSource.model === model.id &&
 		resolveHarnessProfile(model) === "codex" &&
 		!options?.codexCompaction &&
+		forkSource.input.length > 0 &&
 		forkMessageCount !== undefined &&
 		Number.isSafeInteger(forkMessageCount) &&
 		forkMessageCount >= 0 &&
@@ -1682,11 +1685,11 @@ export async function buildTransformedCodexRequestBody(
 	const body = await transformRequestBody(params, model, codexOptions, { developerMessages });
 	if (codexHarness) relocateCodexHarnessToolSurface(body);
 	applyCodexStableEffort(model, body, options);
-	if (useForkPrefix && forkSource.input.length > 0) {
+	if (useForkPrefix) {
 		// Replay the source's serialized input verbatim ahead of the child's own
 		// tool surface, instructions, and new tail — measured cache hits require
 		// the leading bytes to match the parent's request exactly.
-		const sourceInput = structuredCloneJSON(forkSource.input) as InputItem[];
+		const sourceInput = structuredCloneJSON(forkSource.input);
 		body.input = body.input?.length ? [...sourceInput, ...body.input] : sourceInput;
 	}
 	return body;
@@ -2718,9 +2721,11 @@ class CodexStreamProcessor {
 		const onSnapshot = this.options?.onCodexRequestSnapshot;
 		if (!onSnapshot || this.options?.codexCompaction || resolveHarnessProfile(this.model) !== "codex") return;
 		if (status === "failed" || status === "cancelled") return;
-		const hasResponseError =
-			response !== null && typeof response === "object" && "error" in response && response.error != null;
-		if (status === "incomplete" && hasResponseError) return;
+		// Any error object on the terminal response — regardless of status —
+		// means the turn did not succeed, so it cannot seed a fork lineage.
+		if (response !== null && typeof response === "object" && "error" in response && response.error != null) {
+			return;
+		}
 		const requestMetadata = this.requestContext.requestMetadata;
 		if (!requestMetadata) return;
 		const body = this.runtime.requestBodyForState;
