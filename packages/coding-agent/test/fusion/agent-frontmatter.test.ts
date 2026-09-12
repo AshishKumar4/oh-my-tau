@@ -20,4 +20,18 @@ describe("fusion agent frontmatter", () => {
 		// A sidekick never leads a sidekick of its own.
 		expect(getSidekickAgent().sidekick).toBeUndefined();
 	});
+
+	it("round-trips pinModel: true, and the bundled sidekick pins its pairing", () => {
+		const pinned = parseAgent(
+			"pinned.md",
+			renderAgentMarkdown({ name: "pinned", description: "Pinned", pinModel: true }, "Stay put."),
+			"project",
+		);
+		expect(pinned.pinModel).toBe(true);
+		expect(
+			parseAgent("worker.md", renderAgentMarkdown({ name: "worker", description: "Worker" }, "Work."), "project")
+				.pinModel,
+		).toBeUndefined();
+		expect(getSidekickAgent().pinModel).toBe(true);
+	});
 });

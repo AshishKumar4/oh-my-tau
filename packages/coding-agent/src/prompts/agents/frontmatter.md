@@ -10,5 +10,6 @@ description: {{jsonStringify description}}
 {{/if}}{{#if advisor}}advisor: {{jsonStringify advisor}}
 {{/if}}{{#if autoloadSkills}}autoloadSkills: {{jsonStringify autoloadSkills}}
 {{/if}}{{#if sidekick}}sidekick: true
+{{/if}}{{#if pinModel}}pinModel: true
 {{/if}}---
 {{body}}

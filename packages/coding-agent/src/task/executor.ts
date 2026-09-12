@@ -3072,6 +3072,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		settings,
 		{
 			...(agent.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
+			// A pinned model gets an explicitly empty default chain, which
+			// resolveSubagentInheritedRetryFallbackChain reads as "no fallbacks".
+			...(agent.pinModel === true ? { "retry.fallbackChains": { default: [] } } : undefined),
 			// Isolated runs must not expose roots outside the worktree.
 			...(worktree !== undefined ? { "workspace.additionalDirectories": [] } : undefined),
 			...(advisorSelection ? { "advisor.enabled": true } : undefined),

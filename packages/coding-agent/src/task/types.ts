@@ -392,6 +392,12 @@ export interface AgentDefinition {
 	advisor?: boolean | string;
 	/** Under Fusion, sessions of this agent lead a sidekick of their own (see `isFusionLead`). Default: only the top-level session leads. */
 	sidekick?: boolean;
+	/**
+	 * The agent's model is a hard pairing: sessions run with no retry fallback
+	 * chain, so a transient provider error is retried on the same model rather
+	 * than walking the parent's chain onto another one. Default: inherit.
+	 */
+	pinModel?: boolean;
 	source: AgentSource;
 	filePath?: string;
 }

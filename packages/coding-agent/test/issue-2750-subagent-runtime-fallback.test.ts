@@ -302,6 +302,46 @@ describe("subagent runtime model resolution", () => {
 		expect(childFallbackChains?.["existing-local-role"]).toEqual(["other-provider/other-model"]);
 	});
 
+	it("installs no fallback chain for an agent that pins its model, even with a configured default chain", async () => {
+		const primary = model("devin", "swe-2");
+		const fallback = model("openai-codex", "gpt-6-astra");
+		let childFallbackChains: Record<string, string[]> | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("Expected createAgentSession options");
+			childFallbackChains = options.settings?.get("retry.fallbackChains") as Record<string, string[]> | undefined;
+			return { session: createYieldingSession(), extensionsResult: {}, setToolUIContext: () => {} } as never;
+		});
+
+		const agent: AgentDefinition = {
+			name: "sidekick",
+			description: "test",
+			systemPrompt: "test",
+			source: "bundled",
+			pinModel: true,
+		};
+		await runSubprocess({
+			cwd: "/tmp",
+			agent,
+			task: "work",
+			index: 0,
+			id: "pinned-model",
+			modelOverride: "devin/swe-2",
+			settings: Settings.isolated({ "retry.fallbackChains": { default: ["openai-codex/gpt-6-astra"] } }),
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [primary, fallback],
+				getApiKey: async () => "test-key",
+			} as never,
+			enableLsp: false,
+		});
+
+		// The parent's default chain is replaced by an explicitly empty one and
+		// no per-subagent role chain is installed, so a provider error retries
+		// on the pinned model instead of walking onto another.
+		expect(childFallbackChains?.default).toEqual([]);
+		expect(Object.keys(childFallbackChains ?? {}).some(key => key.startsWith("subagent:"))).toBe(false);
+	});
+
 	it("inherits the aliased role's chain, not the default chain, for a role-alias subagent model", async () => {
 		const fast = model("fast", "hy3");
 		const slow = model("slow", "opus");

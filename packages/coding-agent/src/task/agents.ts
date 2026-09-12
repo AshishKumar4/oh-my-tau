@@ -30,6 +30,7 @@ export interface AgentFrontmatter {
 	advisor?: boolean | string;
 	autoloadSkills?: string[];
 	sidekick?: boolean;
+	pinModel?: boolean;
 }
 
 interface EmbeddedAgentDef {
