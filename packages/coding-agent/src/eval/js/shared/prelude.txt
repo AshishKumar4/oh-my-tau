@@ -499,4 +499,130 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 	globalThis.read = read;
 	globalThis.write = write;
 	globalThis.env = env;
+
+	// --- Codex exec surface -------------------------------------------------
+	// Installed per run (not per realm) by the worker when the session's model
+	// resolves to the codex harness profile, so a runtime reused across profile
+	// switches gains and sheds these globals with the session. The native
+	// isolate keeps its own globals: install/uninstall are inert until called.
+
+	const codexCatalog = () => {
+		const catalog = globalThis.__omp_tool_catalog__;
+		return Array.isArray(catalog) ? catalog : [];
+	};
+	const codexCatalogNames = () => codexCatalog().map(entry => entry.name);
+	const codexCatalogHas = key => typeof key === "string" && codexCatalog().some(entry => entry.name === key);
+
+	const codexStringify = value => {
+		if (typeof value === "string") return value;
+		try {
+			const text = JSON.stringify(value);
+			if (text !== undefined) return text;
+		} catch {}
+		return String(value);
+	};
+
+	// `image(...)`/`audio(...)`/`generatedImage(...)` take a URL string or a
+	// structured item; pull whichever carrier field is present.
+	const codexMediaUrl = item => {
+		if (item === undefined || item === null) return "";
+		if (typeof item === "string") return item;
+		if (typeof item === "object") {
+			for (const key of ["image_url", "audio_url", "url", "data"]) {
+				const value = item[key];
+				if (typeof value === "string") return value;
+			}
+		}
+		return String(item);
+	};
+
+	// Display a media URL; data URLs render as real image content through the
+	// same `images` surfacing the read bridge uses.
+	const codexDisplayMedia = (item, detail) => {
+		const url = codexMediaUrl(item);
+		const match = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+		if (match) {
+			display({ images: [{ mimeType: match[1], data: match[2] }] });
+			return;
+		}
+		display(detail === undefined ? url : { url, detail });
+	};
+
+	const CODEX_EXIT_KEY = Symbol.for("omp.codexExec.exit");
+
+	// `tools` with the vendor surface: enumerable catalog entries, a callable
+	// member per name, and string coercion that doesn't throw.
+	const codexToolDescriptor = key => ({
+		get: () => tool[key],
+		enumerable: true,
+		configurable: true,
+	});
+	const codexTools = new Proxy(tool, {
+		get: (target, key) => {
+			if (key === Symbol.toPrimitive) return () => "[object tools]";
+			if (key === Symbol.toStringTag) return "tools";
+			if (key === "then") return undefined;
+			return target[key];
+		},
+		has: (target, key) => codexCatalogHas(key) || Reflect.has(target, key),
+		ownKeys: target => {
+			const keys = Reflect.ownKeys(target);
+			for (const name of codexCatalogNames()) {
+				if (!keys.includes(name)) keys.push(name);
+			}
+			return keys;
+		},
+		getOwnPropertyDescriptor: (target, key) =>
+			codexCatalogHas(key) ? codexToolDescriptor(key) : Reflect.getOwnPropertyDescriptor(target, key),
+		apply: () => {
+			throw new TypeError("tools is not a function");
+		},
+	});
+
+	globalThis.__omp_install_codex_exec__ = catalog => {
+		globalThis.__omp_tool_catalog__ = catalog;
+		if (!(globalThis.__omp_codex_store__ instanceof Map)) {
+			globalThis.__omp_codex_store__ = new Map();
+		}
+		globalThis.text = value => display(codexStringify(value));
+		globalThis.notify = globalThis.text;
+		globalThis.exit = () => {
+			const error = new Error("exit");
+			error[CODEX_EXIT_KEY] = true;
+			throw error;
+		};
+		globalThis.image = codexDisplayMedia;
+		globalThis.audio = codexDisplayMedia;
+		globalThis.generatedImage = codexDisplayMedia;
+		globalThis.store = (key, value) => {
+			globalThis.__omp_codex_store__.set(key, value);
+		};
+		globalThis.load = key => globalThis.__omp_codex_store__.get(key);
+		globalThis.yield_control = async () => {};
+		// A plain data property (not a getter) so the runtime's global-owner
+		// stack can save/restore it like every other prelude global.
+		globalThis.ALL_TOOLS = codexCatalog().map(({ name, description }) => ({ name, description }));
+		globalThis.tools = codexTools;
+	};
+
+	globalThis.__omp_uninstall_codex_exec__ = () => {
+		for (const key of [
+			"__omp_tool_catalog__",
+			"text",
+			"notify",
+			"exit",
+			"image",
+			"audio",
+			"generatedImage",
+			"store",
+			"load",
+			"yield_control",
+			"ALL_TOOLS",
+		]) {
+			delete globalThis[key];
+		}
+		// `__omp_codex_store__` survives: the vendor kernel is persistent, so
+		// stored values outlive a mid-session profile switch.
+		globalThis.tools = tool;
+	};
 }

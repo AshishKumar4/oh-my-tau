@@ -2,6 +2,7 @@ import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { toolWireSchema, validateToolArguments } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { type CodexNestedValue, codexNestedAliasForModel, codexNestedTargetEnabled } from "../../harness/codex-nested";
 import type { ToolSession } from "../../tools";
 import { ToolError } from "../../tools/tool-errors";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
@@ -44,7 +45,8 @@ type ToolValue =
 			details?: unknown;
 			images?: Array<{ mimeType: string; data: string }>;
 			hasError?: boolean;
-	  };
+	  }
+	| CodexNestedValue;
 function toolResultHasError(result: AgentToolResult): boolean {
 	if (isRecord(result) && result.isError === true) return true;
 	return isRecord(result.details) && result.details.isError === true;
@@ -202,6 +204,23 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		// The session recognizes checkpoint/rewind only as direct toolResult
 		// messages; a bridged call would report success without taking effect.
 		throw new ToolError(`\`${name}\` cannot run through the eval bridge; call the direct \`${name}\` tool.`);
+	}
+	const codexAlias = codexNestedAliasForModel(name, options.session.getActiveModel?.());
+	if (codexAlias) {
+		if (!codexNestedTargetEnabled(options.session, codexAlias)) {
+			throw new ToolError(`Unknown tool from js runtime: ${name}`);
+		}
+		const startedAt = Date.now();
+		const invoke = async (toolName: string, params: Record<string, unknown>): Promise<ToolValue> =>
+			callSessionTool(toolName, params, options);
+		const ctx = { session: options.session, invoke, elapsedSeconds: () => (Date.now() - startedAt) / 1000 };
+		const argsRecord = isRecord(args) ? args : typeof args === "string" ? { input: args } : {};
+		if (codexAlias.call) {
+			return await codexAlias.call(argsRecord, ctx);
+		}
+		const mapped = codexAlias.toParams ? codexAlias.toParams(argsRecord) : argsRecord;
+		const inner = await invoke(codexAlias.target, mapped);
+		return codexAlias.fromResult ? codexAlias.fromResult(inner, ctx.elapsedSeconds()) : inner;
 	}
 	const tool = getTool(options.session, name);
 	const toolCallId = `js-${name}-${crypto.randomUUID()}`;

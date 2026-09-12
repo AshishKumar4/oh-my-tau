@@ -1570,9 +1570,15 @@ export async function buildTransformedCodexRequestBody(
 	// (#3117 — codex-rs sends none of these either.)
 	applyOpenAIServiceTier(params, options?.serviceTier, model);
 	const codexHarness = resolveHarnessProfile(model) === "codex";
+	if (codexHarness) {
+		// codex-rs always sends tool_choice: "auto" (an explicit caller choice
+		// still wins below) and parallel_tool_calls: false on profiled turns.
+		params.tool_choice ??= "auto";
+		params.parallel_tool_calls = false;
+	}
 	if (context.tools && context.tools.length > 0) {
 		params.tools = codexHarness
-			? buildCodexNamespaceTools(context.tools, model)
+			? buildCodexNamespaceTools(context.tools, model, { strictFalse: true })
 			: convertOpenAICodexResponsesTools(context.tools, model);
 		if (options?.toolChoice) {
 			const toolChoice = normalizeCodexToolChoice(options.toolChoice, context.tools, model);
@@ -4762,6 +4768,8 @@ function convertCodexToolPayload(
 	model: Model<"openai-codex-responses">,
 	allowFreeform: boolean,
 	toolNames: HarnessToolNames | undefined,
+	/** Codex harness turns emit `strict: false` verbatim (the vendor sends it on every function). */
+	strictFalse = false,
 ): CodexToolPayload {
 	if (tool.native?.type === "computer" && model.supportsComputerUse === true) {
 		return { type: "computer" };
@@ -4786,7 +4794,13 @@ function convertCodexToolPayload(
 		name: tool.customFormat ? tool.name : (toolNames?.toWire.get(tool.name) ?? tool.name),
 		description: tool.description || "",
 		parameters,
-		...(effectiveStrict ? { strict: true } : !NO_STRICT && tool.strict === false ? { strict: false } : {}),
+		...(strictFalse
+			? { strict: false }
+			: effectiveStrict
+				? { strict: true }
+				: !NO_STRICT && tool.strict === false
+					? { strict: false }
+					: {}),
 	};
 }
 
@@ -4804,12 +4818,16 @@ type CodexAdditionalTool = NamespaceTool | CodexToolPayload;
 
 const CODEX_DEFAULT_TOOL_NAMESPACE = "functions";
 
-export function buildCodexNamespaceTools(tools: Tool[], model: Model<"openai-codex-responses">): CodexAdditionalTool[] {
+export function buildCodexNamespaceTools(
+	tools: Tool[],
+	model: Model<"openai-codex-responses">,
+	options?: { strictFalse?: boolean },
+): CodexAdditionalTool[] {
 	const groups = new Map<string, NamespaceTool>();
 	const surface: CodexAdditionalTool[] = [];
 	const toolNames = buildHarnessToolNames(model, "codex", tools);
 	for (const tool of tools) {
-		const payload = convertCodexToolPayload(tool, model, true, toolNames);
+		const payload = convertCodexToolPayload(tool, model, true, toolNames, options?.strictFalse === true);
 		if (payload.type === "computer") {
 			surface.push(payload);
 			continue;

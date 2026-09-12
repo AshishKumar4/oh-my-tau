@@ -534,6 +534,33 @@ describe("claude-code TaskStop facade", () => {
 	});
 });
 
+describe("codex interrupt_agent facade", () => {
+	it("cancels the job through hub cancel under the vendor name", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		managers.push(manager);
+		const hub = new HubTool(toolSession({ manager })) as unknown as AgentTool;
+		const facade = facadeFor("codex", "interrupt_agent", hub);
+		const jobId = manager.register(
+			"bash",
+			"facade job",
+			({ signal }) =>
+				new Promise<string>(resolve => {
+					signal.addEventListener("abort", () => resolve(""), { once: true });
+				}),
+			{ ownerId: SENDER },
+		);
+
+		const stopped = await runFacadeCall(CODEX_MODEL, [hub, facade], {
+			name: "interrupt_agent",
+			arguments: { target: jobId },
+		});
+		expect(stopped.result.toolName).toBe("hub");
+		expect(stopped.result.isError).toBeFalsy();
+		await manager.getJob(jobId)?.promise;
+		expect(manager.getJob(jobId)?.status).toBe("cancelled");
+	});
+});
+
 describe("claude-code Agent facade", () => {
 	it("spawns through task, persists as task, and feeds the task usage accounting", async () => {
 		const usage = {
@@ -596,7 +623,7 @@ describe("codex collaboration facades on the wire", () => {
 		);
 		expect(
 			collaboration?.type === "namespace" ? collaboration.tools.map(entry => "name" in entry && entry.name) : [],
-		).toEqual(["spawn_agent", "send_message", "followup_task", "list_agents", "wait_agent"]);
+		).toEqual(["spawn_agent", "send_message", "followup_task", "list_agents", "interrupt_agent", "wait_agent"]);
 		expect(tools.map(tool => tool.name)).not.toContain("task");
 
 		const evalTool = new EvalTool({

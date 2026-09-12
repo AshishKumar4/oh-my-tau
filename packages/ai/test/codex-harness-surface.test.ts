@@ -93,6 +93,9 @@ const LIST_DECLARATION = {
 	parameters: { type: "object", properties: {}, additionalProperties: false },
 };
 
+/** Codex-profile requests carry the vendor's explicit `strict: false` on every function declaration. */
+const strictFalse = <T extends Record<string, unknown>>(decl: T): T => ({ ...decl, strict: false });
+
 function createTestContext(tools: Tool[] = createHarnessTools()): Context {
 	return {
 		systemPrompt: ["You are Codex, an agent based on GPT-6.", "## Memory\n\nSecond developer block."],
@@ -220,12 +223,17 @@ describe("codex harness wire surface", () => {
 			type: "additional_tools",
 			role: "developer",
 			tools: [
-				{ type: "namespace", name: "functions", description: "", tools: [EXEC_DECLARATION, WAIT_DECLARATION] },
+				{
+					type: "namespace",
+					name: "functions",
+					description: "",
+					tools: [EXEC_DECLARATION, strictFalse(WAIT_DECLARATION)],
+				},
 				{
 					type: "namespace",
 					name: "collaboration",
 					description: COLLABORATION_BLURB,
-					tools: [SPAWN_DECLARATION, LIST_DECLARATION],
+					tools: [strictFalse(SPAWN_DECLARATION), strictFalse(LIST_DECLARATION)],
 				},
 			],
 		});
@@ -272,7 +280,7 @@ describe("codex harness wire surface", () => {
 				type: "namespace",
 				name: "collaboration",
 				description: COLLABORATION_BLURB,
-				tools: [SPAWN_DECLARATION],
+				tools: [strictFalse(SPAWN_DECLARATION)],
 			},
 		]);
 	});
@@ -283,7 +291,7 @@ describe("codex harness wire surface", () => {
 		expect(body.tools).toBeUndefined();
 		expect(body.tool_choice).toBe("required");
 		expect(inputItems(body)[0]?.tools).toEqual([
-			{ type: "namespace", name: "functions", description: "", tools: [WAIT_DECLARATION] },
+			{ type: "namespace", name: "functions", description: "", tools: [strictFalse(WAIT_DECLARATION)] },
 		]);
 	});
 
@@ -328,7 +336,7 @@ describe("codex harness wire surface", () => {
 					type: "namespace",
 					name: "functions",
 					description: "",
-					tools: [{ ...declaration, name: "request_user_input" }],
+					tools: [{ ...strictFalse(declaration), name: "request_user_input" }],
 				},
 			],
 		});
@@ -344,6 +352,23 @@ describe("codex harness wire surface", () => {
 		const toolCall = result.content.find(block => block.type === "toolCall");
 		expect(toolCall?.name).toBe("spawn_agent");
 		expect(toolCall?.arguments).toEqual({ prompt: "go" });
+	});
+
+	it("pins the vendor envelope on codex-profile requests: auto tool choice, serial calls, strict false, all_turns", async () => {
+		const profiled = await captureRequest("gpt-6-astra", { reasoning: "medium" });
+		expect(profiled.body.tool_choice).toBe("auto");
+		expect(profiled.body.parallel_tool_calls).toBe(false);
+		const reasoning = profiled.body.reasoning as Record<string, unknown> | undefined;
+		expect(reasoning?.context).toBe("all_turns");
+		// Deliberate delta: omp keeps the summary so thinking stays visible.
+		expect(reasoning?.summary).toBe("auto");
+		expect(reasoning?.effort).toBe("medium");
+
+		const unprofiled = await captureRequest("gpt-5.1-codex", { reasoning: "medium" });
+		expect(unprofiled.body.tool_choice).toBeUndefined();
+		expect(unprofiled.body.parallel_tool_calls).toBeUndefined();
+		const unprofiledReasoning = unprofiled.body.reasoning as Record<string, unknown> | undefined;
+		expect(unprofiledReasoning?.context).toBeUndefined();
 	});
 
 	it("leaves an unannotated double-underscore tool name intact", async () => {

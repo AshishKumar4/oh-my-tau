@@ -145,6 +145,7 @@ export async function executeInVmContext(options: {
 	code: string;
 	filename: string;
 	timeoutMs?: number;
+	codex?: SessionSnapshot["codex"];
 	runState: VmRunState;
 }): Promise<{ value: unknown }> {
 	const sessionKey = resolveOwnerScopedSessionKey({
@@ -381,6 +382,7 @@ async function runOnce(
 		session: ToolSession;
 		localRoots?: Record<string, string>;
 		code: string;
+		codex?: SessionSnapshot["codex"];
 		filename: string;
 		runState: VmRunState;
 	},
@@ -437,6 +439,7 @@ async function runOnce(
 				cwd: options.cwd,
 				sessionId: options.sessionId,
 				localRoots: options.localRoots,
+				codex: options.codex,
 				preludes: javascriptPreludeSources(options.session),
 			},
 		});

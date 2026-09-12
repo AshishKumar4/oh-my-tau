@@ -1,4 +1,7 @@
 import { afterAll, describe, expect, it } from "bun:test";
+import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { codexExecToolCatalog } from "@oh-my-pi/pi-coding-agent/harness/codex-nested";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
 import { executeJs } from "@oh-my-pi/pi-coding-agent/eval/js/executor";
@@ -99,6 +102,61 @@ describe("eval prelude runtime", () => {
 		const missing = await executeJs("await __omp_prelude__('missing', {})", options);
 		expect(missing.exitCode).toBe(1);
 		expect(missing.output).toContain('Eval prelude "missing" is not enabled');
+	});
+
+	it("installs the codex exec surface per run under the codex profile", async () => {
+		const codex = getBundledModel("openai-codex", "gpt-6-astra");
+		const enabled = new Set(["read", "bash", "edit", "hub", "goal"]);
+		const fakeTool = (name: string): AgentTool => ({
+			name,
+			label: name,
+			description: name,
+			parameters: {},
+			execute: async () => ({ content: [{ type: "text", text: name }] }),
+		});
+		const toolSession: ToolSession = {
+			cwd: process.cwd(),
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => null,
+			settings: Settings.isolated(),
+			getEvalPreludes: () => [],
+			getActiveModel: () => codex,
+			getEvalBridgeToolNames: () => [...enabled],
+			getToolForEvalBridge: (name: string) => (enabled.has(name) ? fakeTool(name) : undefined),
+			toolRegistry: new Map(),
+		};
+		expect(codexExecToolCatalog(toolSession).map(entry => entry.name)).toContain("exec_command");
+		const options = { sessionId: "codex-exec-runtime-js", session: toolSession, cwd: process.cwd() };
+
+		const first = await executeJs(
+			[
+				"text('alpha')",
+				"store('k', 41)",
+				"const keys = Object.keys(tools)",
+				"display({",
+				"  allTools: ALL_TOOLS.length,",
+				"  keys: keys.filter(k => ['exec_command', 'apply_patch'].includes(k)).sort(),",
+				"  str: String(tools),",
+				"})",
+				"exit()",
+				"text('unreachable')",
+			].join("\n"),
+			options,
+		);
+		expect(first.exitCode).toBe(0);
+		expect(first.output).toContain("alpha");
+		expect(first.output).not.toContain("unreachable");
+		const jsonOut = first.displayOutputs.find(o => o.type === "json");
+		expect(jsonOut?.type === "json" ? jsonOut.data : undefined).toMatchObject({
+			allTools: codexExecToolCatalog(toolSession).length,
+			keys: ["apply_patch", "exec_command"],
+			str: "[object tools]",
+		});
+
+		// store/load survive across cells; codex globals vanish without the profile.
+		const second = await executeJs("load('k') + 1", options);
+		expect(second.output.trim()).toBe("42");
 	});
 
 	it("synchronizes Python definitions, preserves cell state, and gates captured handles", async () => {

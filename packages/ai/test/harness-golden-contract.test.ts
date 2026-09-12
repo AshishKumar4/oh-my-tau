@@ -90,7 +90,7 @@ const CLAUDE_BOUND_WIRE_NAMES: ReadonlySet<string> = new Set([
 	"WebSearch",
 ]);
 
-const CODEX_COLLABORATION = { name: "collaboration" };
+const CODEX_COLLABORATION = { name: "collaboration", description: "Tools for spawning and managing sub-agents." };
 const CODEX_TOOLS: Tool[] = [
 	harnessTool(
 		"eval",

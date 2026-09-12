@@ -111,6 +111,9 @@ const TASK_ABORT_CLEANUP_GRACE_MS = 10_000;
 export const SOFT_REQUEST_BUDGET: Record<string, number> = {
 	scout: 100,
 	sonic: 100,
+	// The Fusion sidekick is one run for the whole session, across every
+	// handoff; a per-run cap would force-stop it mid-pairing.
+	sidekick: 0,
 	default: 200,
 };
 

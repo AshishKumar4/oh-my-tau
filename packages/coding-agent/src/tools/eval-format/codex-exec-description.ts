@@ -36,9 +36,16 @@ function renderTool(tool: CodexExecBridgedTool): RenderedTool {
 export function buildCodexExecDescription(args: {
 	tools: readonly CodexExecBridgedTool[];
 	preludeDeclarations?: string;
+	/**
+	 * The vendor capture's nested `### \`name\`` sections (everything from the
+	 * first `### ` to the end of the captured exec description), spliced
+	 * verbatim between the fixed head and omp's own bridged tools.
+	 */
+	nestedDeclarations?: string;
 }): string {
 	return prompt.render(codexExecTemplate, {
 		tools: [...args.tools].sort(compareTools).map(renderTool),
 		...(args.preludeDeclarations ? { preludeDeclarations: args.preludeDeclarations } : {}),
+		...(args.nestedDeclarations ? { nestedDeclarations: args.nestedDeclarations } : {}),
 	});
 }

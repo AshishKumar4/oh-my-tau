@@ -10,13 +10,16 @@
 	assembles the sections below it the same way.
 
 	Known gaps against omp's isolate, left in the vendor text rather than
-	paraphrased away: the `// @exec:` pragma is inert (omp's eval owns its own
-	timeout and output budget), and of the listed global helpers only
-	`setTimeout`/`clearTimeout` and the `tools` object exist —
-	`exit`/`text`/`image`/`audio`/`generatedImage`/`store`/`load`/`notify`/
-	`ALL_TOOLS`/`yield_control` are Codex-side and unimplemented. `tools` is
-	omp's `tool` proxy under Codex's spelling (`eval/js/shared/prelude.txt`),
-	so the one line here a model acts on first is true.
+	paraphrased away: `max_output_tokens` in the `// @exec:` pragma is inert
+	(`yield_time_ms` is honored as the cell timeout), `image`/`audio`/
+	`generatedImage` render URLs rather than fetching remote media, and
+	`store`/`load` live in a per-session Map. The rest of the vendor surface —
+	`exit`, `text`, `notify`, `ALL_TOOLS`, `yield_control`, and an enumerable
+	`tools` proxy — is installed per run by the worker when the profile is
+	codex (`eval/js/worker-core.ts` → `__omp_install_codex_exec__`).
+	`{{nestedDeclarations}}` splices the vendor's own nested `###` sections
+	verbatim between this head and omp's bridged tools when a capture is
+	served; absent a capture the slot renders empty.
 --}}
 Run JavaScript code to orchestrate/compose tool calls
 - Evaluates the provided JavaScript code in a fresh V8 isolate as an async module.
@@ -42,7 +45,7 @@ Run JavaScript code to orchestrate/compose tool calls
 - `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise if you need to wait for one.
 - `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
 - `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description }` entries.
-- `yield_control()`: yields the accumulated output to the model immediately while the script keeps running.
+- `yield_control()`: yields the accumulated output to the model immediately while the script keeps running.{{nestedDeclarations}}
 {{#each tools}}
 
 ### `{{identifier}}`{{#if alias}} (`{{alias}}`){{/if}}

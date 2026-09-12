@@ -1,5 +1,7 @@
+import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { DEFAULT_MAX_BYTES, OutputSink } from "../../session/streaming-output";
 import type { ToolSession } from "../../tools";
+import { codexExecToolCatalog } from "../../harness/codex-nested";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
 import { isEvalTimeoutControlEvent } from "../bridge-timeout";
 import { executeInVmContext, type JsDisplayOutput } from "./context-manager";
@@ -110,6 +112,12 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			code,
 			filename: `js-cell-${crypto.randomUUID()}.js`,
 			timeoutMs: acquireBudgetMs,
+			codex: (() => {
+				const model = options.session.getActiveModel?.();
+				return model && resolveHarnessProfile(model) === "codex"
+					? { tools: codexExecToolCatalog(options.session) }
+					: undefined;
+			})(),
 			runState: {
 				signal,
 				onText: chunk => outputSink.push(chunk),

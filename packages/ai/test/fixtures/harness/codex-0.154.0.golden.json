@@ -1,25 +1,17 @@
 {
 	"harness": "codex",
 	"clientVersion": "0.154.0",
-	"models": [
-		"gpt-6-astra",
-		"gpt-5.6-sol"
-	],
+	"models": ["gpt-6-astra", "gpt-5.6-sol"],
 	"source": {
 		"client": "Codex CLI 0.154.0 (codex_cli_rs), Apache-2.0 \u2014 fixtures derived from its own request bytes",
-		"captures": [
-			"cx-gpt-6-astra.json",
-			"cx-gpt-5.6-sol.json"
-		],
+		"captures": ["cx-gpt-6-astra.json", "cx-gpt-5.6-sol.json"],
 		"recorded": "POST /responses request body, interactive turn, sandbox_mode danger-full-access",
 		"derivation": "codexFraming(body) and harnessInventoryShape(codexDeclarations(body), <every declared name>) from test/helpers/harness-golden.ts. Passing the vendor's own names as `boundNames` makes `boundNaming` the harness's naming convention \u2014 the half omp's renamed tools must match \u2014 and leaves `unboundNaming` empty. Only the projections are vendored: the ~21k-char harness prompt and the vendor tool descriptions take part in no assertion here.",
 		"regenerate": "point OMP_HARNESS_CAPTURE_DIR at the capture directory and run the local-only block in harness-golden-contract.test.ts; it re-projects the captures and asserts they still match vendorFraming/vendorInventory."
 	},
 	"vendorFraming": {
 		"family": "codex-responses",
-		"systemLayout": [
-			"message:developer:input_text"
-		],
+		"systemLayout": ["message:developer:input_text"],
 		"cachedSystemSlots": [],
 		"inventoryCarrier": "input[0].additional_tools:developer",
 		"namespaceStructure": {
@@ -43,75 +35,48 @@
 		"prefixedToolNames": []
 	},
 	"vendorInventory": {
-		"declarationForms": [
-			"custom|description,format,name",
-			"function|description,name,parameters,strict"
-		],
-		"boundNaming": [
-			"lowercase",
-			"snake_case"
-		],
+		"declarationForms": ["custom|description,format,name", "function|description,name,parameters,strict"],
+		"boundNaming": ["lowercase", "snake_case"],
 		"unboundNaming": [],
-		"schemaForms": [
-			"object|additionalProperties,properties",
-			"object|additionalProperties,properties,required"
-		],
+		"schemaForms": ["object|additionalProperties,properties", "object|additionalProperties,properties,required"],
 		"argumentDocStyle": "inline-property-descriptions"
 	},
 	"ompFraming": {
 		"family": "codex-responses",
-		"systemLayout": [
-			"message:developer:input_text"
-		],
+		"systemLayout": ["message:developer:input_text"],
 		"cachedSystemSlots": [],
 		"inventoryCarrier": "input[0].additional_tools:developer",
 		"namespaceStructure": {
 			"defaultGroup": "functions",
 			"defaultGroupDescribed": false,
-			"extraGroupsAllDescribed": false,
+			"extraGroupsAllDescribed": true,
 			"allGroupsNonEmpty": true,
 			"duplicateGroups": [],
 			"ungroupedPayloadTypes": []
 		},
 		"envelope": {
 			"include": "[\"reasoning.encrypted_content\"]",
-			"reasoning": "object{effort,summary}",
+			"reasoning": "object{context,effort,summary}",
 			"text": "object{verbosity}",
 			"store": "false",
 			"stream": "true",
-			"tool_choice": "absent",
-			"parallel_tool_calls": "absent"
+			"tool_choice": "\"auto\"",
+			"parallel_tool_calls": "false"
 		},
 		"presentForbiddenKeys": [],
 		"prefixedToolNames": []
 	},
 	"ompInventory": {
-		"declarationForms": [
-			"custom|description,format,name",
-			"function|description,name,parameters"
-		],
-		"boundNaming": [
-			"lowercase",
-			"snake_case"
-		],
-		"unboundNaming": [
-			"lowercase",
-			"snake_case"
-		],
-		"schemaForms": [
-			"object|additionalProperties,properties",
-			"object|additionalProperties,properties,required"
-		],
+		"declarationForms": ["custom|description,format,name", "function|description,name,parameters,strict"],
+		"boundNaming": ["lowercase", "snake_case"],
+		"unboundNaming": ["lowercase", "snake_case"],
+		"schemaForms": ["object|additionalProperties,properties", "object|additionalProperties,properties,required"],
 		"argumentDocStyle": "inline-property-descriptions"
 	},
 	"documentedFramingDeltas": {
-		"envelope.reasoning": "omp sends `reasoning.summary` and no `reasoning.context`; real Codex sends `{context: \"all_turns\", effort}` and never a summary. A model post-trained on the client sees a reasoning envelope it was never trained under, and `context: all_turns` is what carries prior-turn reasoning. Owner: packages/ai/src/providers/openai-codex-responses.ts (reasoning assembly in transformRequestBody).",
-		"envelope.tool_choice": "real Codex always pins `tool_choice: \"auto\"`; omp omits the key unless a caller forces a tool. Same effective behaviour, different bytes on every turn.",
-		"envelope.parallel_tool_calls": "real Codex always pins `parallel_tool_calls: false`; omp omits the key, so the backend default decides. Under Code Mode the isolate serialises calls anyway, which is why this has not surfaced as a behaviour difference.",
-		"namespaceStructure.extraGroupsAllDescribed": "real Codex describes every group it declares beyond `functions`; omp's manifest carries names only (`harness/manifest.ts` vendors no vendor prose) and the SessionTools accessor returns `{name}`, so `collaboration` ships with an empty description. Owner: packages/coding-agent/src/harness/manifest.ts \u2014 carrying a blurb on the binding is what would close this."
+		"envelope.reasoning": "omp keeps `reasoning.summary` (visible thinking); `reasoning.context` now matches the vendor (`all_turns`)."
 	},
 	"documentedInventoryDeltas": {
-		"declarationForms": "real Codex sets `strict: false` on every `function` declaration; omp omits the key and takes the backend default. Same effective behaviour, different bytes on every declaration.",
 		"unboundNaming": "by design: omp keeps `grep`, `glob`, `todo`, `learn`, `recall` and the state-machine tools that the harness has no counterpart for, so their names stay in omp's own convention. The vendor projection passes every captured name as bound, so its unbound set is empty. Membership is the free half of the two-tier contract."
 	}
 }

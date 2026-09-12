@@ -1,5 +1,6 @@
 import { ToolError } from "../../tools/tool-errors";
 import { JsRuntime, type RuntimeHooks } from "./shared/runtime";
+import { CODEX_EXEC_GLOBAL_KEYS, isCodexExecExit } from "./shared/types";
 import type {
 	RunErrorPayload,
 	SessionSnapshot,
@@ -310,11 +311,15 @@ export class WorkerCore {
 			const runtime = this.#ensureRuntime(snapshot, runId);
 			runtime.setCwd(snapshot.cwd);
 			runtime.syncPreludes(snapshot.preludes ?? []);
+			this.#syncCodexSurface(runtime, snapshot);
 			const value = await runtime.run(code, filename, hooks, { runId, cwd: snapshot.cwd });
 			runtime.displayValue(value, hooks);
 			result = { type: "result", runId, ok: true };
 		} catch (error) {
-			result = { type: "result", runId, ok: false, error: errorPayload(error) };
+			// `exit()` under the codex surface is a successful early end, not a failure.
+			result = isCodexExecExit(error)
+				? { type: "result", runId, ok: true }
+				: { type: "result", runId, ok: false, error: errorPayload(error) };
 		}
 		try {
 			// One event-loop turn so rejections the cell already floated surface
@@ -327,6 +332,28 @@ export class WorkerCore {
 			this.#rememberCellFile(filename);
 			this.#transport.send(result);
 		}
+	}
+
+	/**
+	 * Apply the codex exec surface for this run: install the vendor globals
+	 * (`text`, `exit`, `ALL_TOOLS`, the enumerable `tools` proxy) when the
+	 * snapshot carries a codex catalog, uninstall them when it does not. Runs
+	 * per cell so a kernel reused across a mid-session profile switch follows
+	 * the session; the prelude no-ops both hooks on native profiles.
+	 */
+	#syncCodexSurface(runtime: JsRuntime, snapshot: SessionSnapshot): void {
+		const hook = snapshot.codex ? "__omp_install_codex_exec__" : "__omp_uninstall_codex_exec__";
+		const fn = runtime.getGlobal(hook);
+		if (typeof fn !== "function") return;
+		if (snapshot.codex) {
+			(fn as (catalog: unknown) => void)(snapshot.codex.tools);
+		} else {
+			(fn as () => void)();
+		}
+		// The hooks write globalThis directly; record the values so this
+		// runtime's owner stack restores them (not pre-install snapshots) when
+		// another same-realm runtime yields control back.
+		runtime.recordGlobals(CODEX_EXEC_GLOBAL_KEYS);
 	}
 
 	async #invokeTool(msg: Extract<WorkerInbound, { type: "tool" }>): Promise<void> {

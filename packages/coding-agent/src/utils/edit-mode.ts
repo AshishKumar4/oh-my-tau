@@ -45,7 +45,12 @@ export function resolveEditMode(session: EditModeSessionLike): EditMode {
 	const mode = settingsMode ?? DEFAULT_EDIT_MODE;
 	if (mode === "hashline" && !$flag("PI_STRICT_EDIT_MODE")) {
 		const model = session.getActiveModel?.();
-		if (model && resolveHarnessProfile(model) === "claude-code") return "replace";
+		const profile = model && resolveHarnessProfile(model);
+		if (profile === "claude-code") return "replace";
+		// Codex's editing primitive is the freeform V4A apply_patch; the codex
+		// profile serves `tools.apply_patch` inside exec, which bridges to this
+		// tool — it must speak V4A, not hashlines.
+		if (profile === "codex") return "apply_patch";
 		if (activeModel) {
 			const identity = classifyModel("", activeModel, { lenient: true });
 			if (

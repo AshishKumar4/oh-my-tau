@@ -10,6 +10,7 @@ import claudeCodeTaskStop from "../prompts/tools/harness/claude-code-task-stop.m
 import claudeCodeSkill from "../prompts/tools/harness/claude-code-skill.md" with { type: "text" };
 import codexCollaborationNamespace from "../prompts/tools/harness/codex-collaboration-namespace.md" with { type: "text" };
 import codexFollowupTask from "../prompts/tools/harness/codex-followup-task.md" with { type: "text" };
+import codexInterruptAgent from "../prompts/tools/harness/codex-interrupt-agent.md" with { type: "text" };
 import codexListAgents from "../prompts/tools/harness/codex-list-agents.md" with { type: "text" };
 import codexSendMessage from "../prompts/tools/harness/codex-send-message.md" with { type: "text" };
 import codexSpawnAgent from "../prompts/tools/harness/codex-spawn-agent.md" with { type: "text" };
@@ -189,6 +190,10 @@ const codexListAgentsSchema = type({
 	"path_prefix?": type("string").describe("Not available; agents have flat ids, not task paths"),
 });
 
+const codexInterruptAgentSchema = type({
+	target: type("string").describe("Agent id to interrupt (from spawn_agent or list_agents)."),
+});
+
 const codexWaitAgentSchema = type({
 	"timeout_ms?": type("number").describe(
 		`Timeout in milliseconds. Defaults to ${CODEX_WAIT_AGENT_DEFAULT_TIMEOUT_MS}.`,
@@ -280,6 +285,14 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 			}
 			return { op: "list" };
 		},
+	},
+	{
+		target: "hub",
+		wireName: "interrupt_agent",
+		namespace: CODEX_COLLABORATION,
+		description: codexInterruptAgent,
+		parameters: codexInterruptAgentSchema,
+		toParams: (args: typeof codexInterruptAgentSchema.infer) => ({ op: "cancel", ids: [args.target] }),
 	},
 	{
 		target: "hub",

@@ -1,3 +1,4 @@
+import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { $env } from "@oh-my-pi/pi-utils";
@@ -485,6 +486,9 @@ export async function transformRequestBody(
 			} else {
 				body.reasoning.context = options.reasoningContext;
 			}
+		} else if (resolveHarnessProfile(model) === "codex" && model.compat.supportsAllTurnsReasoningContext) {
+			// codex-rs sends reasoning.context: "all_turns" on profiled turns.
+			body.reasoning.context = "all_turns";
 		}
 	} else {
 		delete body.reasoning;

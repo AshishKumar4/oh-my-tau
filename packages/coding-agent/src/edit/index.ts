@@ -11,6 +11,7 @@ import type {
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
 import type { Model, ToolExample } from "@oh-my-pi/pi-ai";
+import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import {
 	EditSession,
 	editDescription,
@@ -24,6 +25,7 @@ import {
 } from "@oh-my-pi/pi-natives";
 import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
+import { codexExecNestedSummary } from "../harness/codex-nested";
 import { resolveLocalRoot } from "../internal-urls";
 import { cachedVaultRoots, isVaultEnabled } from "../internal-urls/vault-protocol";
 import {
@@ -449,7 +451,16 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	get description(): string {
-		return resolveEditToolDescription(this.mode, this.session.getActiveModel?.());
+		const mode = this.mode;
+		const model = this.session.getActiveModel?.();
+		const rendered = resolveEditToolDescription(mode, model);
+		// Codex trains on the freeform apply_patch shape; when the capture is
+		// served, lead with the vendor's own nested summary for that tool.
+		if (mode === "apply_patch" && model && resolveHarnessProfile(model) === "codex") {
+			const vendor = codexExecNestedSummary(model, "apply_patch");
+			if (vendor) return `${vendor}\n\n${rendered}`;
+		}
+		return rendered;
 	}
 
 	get parameters(): TInput {

@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { type EditMode, type EditModeSessionLike, resolveEditMode } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
+import { type Model } from "@oh-my-pi/pi-ai/types";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { resolveEditMode, type EditMode, type EditModeSessionLike } from "../src/utils/edit-mode";
 
 const originalEditVariant = Bun.env.PI_EDIT_VARIANT;
 const originalStrictEditMode = Bun.env.PI_STRICT_EDIT_MODE;
@@ -19,11 +21,13 @@ function restoreEnv(): void {
 
 function createSession(args: {
 	activeModel?: string;
+	activeModelObject?: Model;
 	modelVariant?: EditMode | null;
 	settingsMode?: EditMode;
 }): EditModeSessionLike {
 	return {
 		getActiveModelString: () => args.activeModel,
+		getActiveModel: () => args.activeModelObject,
 		settings: {
 			get: () => args.settingsMode ?? "hashline",
 			getEditVariantForModel: () => args.modelVariant ?? null,
@@ -110,5 +114,22 @@ describe("resolveEditMode", () => {
 		expect(resolveEditMode(createSession({ activeModel: "openrouter/moonshotai/Kimi-K2-Instruct" }))).toBe(
 			"hashline",
 		);
+	});
+
+	test("defaults to apply_patch under the codex harness profile", () => {
+		delete Bun.env.PI_EDIT_VARIANT;
+		const codex = getBundledModel("openai-codex", "gpt-6-astra");
+
+		expect(
+			resolveEditMode(createSession({ activeModel: "openai-codex/gpt-6-astra", activeModelObject: codex })),
+		).toBe("apply_patch");
+		// An explicit user setting still wins over the profile default.
+		expect(
+			resolveEditMode(
+				createSession({ activeModel: "openai-codex/gpt-6-astra", activeModelObject: codex, settingsMode: "patch" }),
+			),
+		).toBe("patch");
+		// Unprofiled codex models keep the hashline default.
+		expect(resolveEditMode(createSession({ activeModel: "openai-codex/gpt-5.1-codex" }))).toBe("hashline");
 	});
 });

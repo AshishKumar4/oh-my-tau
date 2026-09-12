@@ -17,6 +17,7 @@ import { getEnabledEvalPreludes } from "../eval/preludes";
 import type { BackendProbeOptions } from "../eval/probe";
 import { defaultEvalSessionId } from "../eval/session-id";
 import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
+import { codexExecNestedDeclarations } from "../harness/codex-nested";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import evalCodeModeDescription from "../prompts/tools/eval-code-mode.md" with { type: "text" };
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
@@ -345,6 +346,7 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 					return typeof summary === "string" ? { ...entry, summary } : entry;
 				}),
 				preludeDeclarations,
+				nestedDeclarations: codexExecNestedDeclarations(this.session?.getActiveModel?.()),
 			});
 		}
 		return prompt.render(evalCodeModeDescription, {
@@ -430,6 +432,30 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 		return this.#harnessProfile() === "codex" && this.supportsCodeModeTransport();
 	}
 
+	/**
+	 * The vendor's first-line `// @exec: {"yield_time_ms": N, ...}` pragma under
+	 * the codex profile: strip the line and apply `yield_time_ms` as the cell
+	 * timeout (seconds). `max_output_tokens` stays inert — omp's eval owns its
+	 * output budget. The lark grammar already guarantees the pragma shape.
+	 */
+	#stripCodexExecPragma(params: EvalToolParams): EvalToolParams {
+		const match = /^[ \t]*\/\/ @exec:([^\r\n]*)(\r?\n|$)/.exec(params.code);
+		if (!match) return params;
+		const code = params.code.slice(match[0].length);
+		let yieldMs: number | undefined;
+		try {
+			const pragma: unknown = JSON.parse(match[1].trim());
+			if (pragma !== null && typeof pragma === "object" && !Array.isArray(pragma)) {
+				const value = (pragma as Record<string, unknown>).yield_time_ms;
+				if (typeof value === "number" && Number.isFinite(value) && value > 0) yieldMs = value;
+			}
+		} catch {
+			// Malformed pragma JSON: strip the line and keep the caller's timeout.
+		}
+		const timeout = yieldMs === undefined ? params.timeout : Math.max(1, Math.ceil(yieldMs / 1000));
+		return { ...params, code, timeout };
+	}
+
 	constructor(
 		private readonly session: ToolSession | null,
 		options?: EvalToolOptions,
@@ -444,7 +470,10 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 		onUpdate?: AgentToolUpdateCallback,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<EvalToolDetails | undefined>> {
-		const params = evalCellOf(input);
+		let params = evalCellOf(input);
+		if (this.#presentsCodexExec()) {
+			params = this.#stripCodexExecPragma(params);
+		}
 		if (this.#proxyExecutor) {
 			return this.#proxyExecutor(params, signal);
 		}

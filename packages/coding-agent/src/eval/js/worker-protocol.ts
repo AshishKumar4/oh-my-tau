@@ -19,6 +19,14 @@ export interface SessionSnapshot {
 	localRoots?: Record<string, string>;
 	/** Enabled host-capability snippets projected for this JavaScript cell. */
 	preludes?: EvalPreludeSource[];
+	/**
+	 * Codex exec surface, present when the session's model resolves to the
+	 * codex harness profile: the worker installs the vendor globals (`text`,
+	 * `exit`, `store`/`load`, `ALL_TOOLS`, an enumerable `tools` proxy) before
+	 * each run. `tools` is the `{name, description}` catalog the bridge
+	 * resolves — omp tools plus the nested vendor aliases.
+	 */
+	codex?: { tools: { name: string; description: string }[] };
 }
 
 export interface RunErrorPayload {
