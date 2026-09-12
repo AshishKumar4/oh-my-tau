@@ -13,7 +13,6 @@ import {
 	ChatToolChoiceSchema,
 	ChatToolDefinitionSchema,
 	CompletionConfigurationSchema,
-	ConversationalPlannerMode,
 	GetChatMessageRequestSchema,
 	GetChatMessageResponseSchema,
 	GetUserJwtRequestSchema,
@@ -68,7 +67,6 @@ export interface DevinOptions extends StreamOptions {
 const CHAT_MESSAGE_PATH = "/exa.api_server_pb.ApiServerService/GetChatMessage";
 const DEVIN_ASSIGN_MODEL_PATH = "/exa.api_server_pb.ApiServerService/AssignModel";
 const DEVIN_AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt";
-const DEVIN_DEFAULT_STOP_PATTERNS = ["<|user|>", "<|bot|>", "<|context_request|>", "<|endoftext|>", "<|end_of_turn|>"];
 
 /** Connect streaming framing: flag byte bit 0x01 = gzip payload, 0x02 = end-of-stream JSON trailers. */
 const CONNECT_COMPRESSED_FLAG = 0x01;
@@ -594,10 +592,17 @@ function buildDevinChatRequest(
 	turn: DevinTurn,
 	assignment: ModelAssignment | undefined,
 ) {
-	const stopPatterns =
-		options?.stopSequences && options.stopSequences.length > 0
-			? [...DEVIN_DEFAULT_STOP_PATTERNS, ...options.stopSequences]
-			: DEVIN_DEFAULT_STOP_PATTERNS;
+	// The Devin CLI's own request declares no sampling fields: its protobuf
+	// descriptor carries none of `num_completions`, `max_newlines`,
+	// `first_temperature`, `stop_patterns`, `fim_eot_prob_threshold` or
+	// `planner_mode`, so the server applies each model's own defaults. Only what
+	// the client sets is sent; a caller's explicit temperature or stop sequences
+	// still go through.
+	const sampling = {
+		...(options?.temperature !== undefined ? { temperature: options.temperature } : {}),
+		...(options?.topP !== undefined ? { topP: options.topP } : {}),
+		...(options?.stopSequences && options.stopSequences.length > 0 ? { stopPatterns: options.stopSequences } : {}),
+	};
 	return create(GetChatMessageRequestSchema, {
 		metadata: create(MetadataSchema, devinCliMetadata(turn.apiKey, turn.userJwt)),
 		prompt: normalizeSystemPrompts(context.systemPrompt).join("\n\n"),
@@ -605,22 +610,14 @@ function buildDevinChatRequest(
 		chatModelUid: assignment?.modelUid ?? options?.chatModelUid ?? model.requestModelId ?? model.id,
 		...(assignment ? { modelAssignmentJwt: assignment.assignmentJwt } : undefined),
 		requestType: ChatMessageRequestType.CASCADE,
-		plannerMode: ConversationalPlannerMode.DEFAULT,
 		toolChoice: create(ChatToolChoiceSchema, { choice: { case: "optionName", value: "auto" } }),
 		systemPromptCacheOptions: create(PromptCacheOptionsSchema, { type: CacheControlType.EPHEMERAL }),
 		disableParallelToolCalls: !model.compat.supportsParallelToolCalls,
 		cascadeId: turn.cascadeId,
 		executionId: crypto.randomUUID(),
 		configuration: create(CompletionConfigurationSchema, {
-			numCompletions: 1n,
 			maxTokens: BigInt(options?.maxTokens ?? model.maxTokens ?? 64000),
-			maxNewlines: 200n,
-			temperature: options?.temperature ?? 0.4,
-			firstTemperature: options?.temperature ?? 0.4,
-			topK: 50n,
-			topP: options?.topP ?? 1,
-			stopPatterns,
-			fimEotProbThreshold: 1,
+			...sampling,
 		}),
 		tools: (context.tools ?? []).map((tool: Tool) =>
 			create(ChatToolDefinitionSchema, {

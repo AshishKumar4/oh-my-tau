@@ -168,6 +168,47 @@ describe("streamDevin router assignment", () => {
 		expect(result.stopReason).toBe("stop");
 	});
 
+	it("sends only the sampling fields the Devin CLI sets, so the server applies the model's own defaults", async () => {
+		const { fetch: fetchImpl, recorded } = fakeDevin({
+			assignment: { assignmentJwt: "assign-jwt", modelUid: "swe-2" },
+		});
+
+		await streamDevin(devinModel({ modelRouter: true }), context, {
+			apiKey: "token",
+			fetch: fetchImpl,
+			conversationId: "cascade-42",
+		}).result();
+
+		const configuration = recorded.chat?.configuration;
+		expect(configuration?.maxTokens).toBeGreaterThan(0n);
+		// Absent on the wire: proto3 scalars read back as their zero value.
+		expect(configuration).toMatchObject({
+			numCompletions: 0n,
+			maxNewlines: 0n,
+			temperature: 0,
+			firstTemperature: 0,
+			topK: 0n,
+			topP: 0,
+			stopPatterns: [],
+			fimEotProbThreshold: 0,
+		});
+		expect(recorded.chat?.plannerMode).toBe(0);
+
+		const explicit = fakeDevin({ assignment: { assignmentJwt: "assign-jwt", modelUid: "swe-2" } });
+		await streamDevin(devinModel({ modelRouter: true }), context, {
+			apiKey: "token",
+			fetch: explicit.fetch,
+			conversationId: "cascade-43",
+			temperature: 0.2,
+			stopSequences: ["<stop>"],
+		}).result();
+		expect(explicit.recorded.chat?.configuration).toMatchObject({
+			temperature: 0.2,
+			firstTemperature: 0,
+			stopPatterns: ["<stop>"],
+		});
+	});
+
 	it("prefers the model the response actually ran on", async () => {
 		const { fetch: fetchImpl } = fakeDevin({
 			assignment: { assignmentJwt: "assign-jwt", modelUid: "claude-sonnet-4-5" },
