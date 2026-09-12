@@ -5,14 +5,21 @@ import {
 	type OpenAICodexResponsesOptions,
 	streamOpenAICodexResponses,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
-import type { AssistantMessage, Context, FetchImpl, Tool } from "@oh-my-pi/pi-ai/types";
+import type {
+	AssistantMessage,
+	CodexRequestSnapshot,
+	Context,
+	FetchImpl,
+	ProviderSessionState,
+	Tool,
+} from "@oh-my-pi/pi-ai/types";
 import { jsonSchemaToTypeScript } from "@oh-my-pi/pi-ai/utils/schema/typescript";
 import { createCodexModel } from "./helpers";
 import { loadEvalToolCodexExecFormat } from "./helpers/harness-golden";
 
-function createCodexTestToken(): string {
+function createCodexTestToken(accountId = "acc_test"): string {
 	const payload = Buffer.from(
-		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: accountId } }),
 		"utf8",
 	).toBase64();
 	return `aaa.${payload}.bbb`;
@@ -208,6 +215,310 @@ function runCustomToolCall(call: Record<string, unknown>): Promise<AssistantMess
 		fetch: (async () => dataSse(events)) as unknown as FetchImpl,
 	}).result();
 }
+
+interface CapturedForkRequest {
+	body: Record<string, unknown>;
+	headers: Headers;
+	turnMetadata: Record<string, unknown>;
+	clientMetadata: Record<string, unknown>;
+	snapshots: CodexRequestSnapshot[];
+}
+
+/**
+ * One SSE round trip that also records request headers, the canonical
+ * client_metadata envelope, and every emitted request snapshot.
+ */
+async function captureForkRequest(
+	modelId: string,
+	options: Partial<OpenAICodexResponsesOptions> = {},
+	context: Context = createTestContext(),
+	events: Array<Record<string, unknown>> = COMPLETED_EVENTS,
+): Promise<CapturedForkRequest> {
+	let captured: { body: Record<string, unknown>; headers: Headers } | undefined;
+	const snapshots: CodexRequestSnapshot[] = [];
+	const fetchMock = (async (input: string | URL, init?: RequestInit) => {
+		const url = typeof input === "string" ? input : input.toString();
+		if (url.endsWith("/responses")) {
+			captured = {
+				body: JSON.parse(decodeCodexRequestBody(init?.body)) as Record<string, unknown>,
+				headers: new Headers(init?.headers),
+			};
+		}
+		return dataSse(events);
+	}) as unknown as FetchImpl;
+
+	await streamOpenAICodexResponses(createCodexModel(modelId), context, {
+		apiKey: createCodexTestToken(),
+		fetch: fetchMock,
+		onCodexRequestSnapshot: snapshot => snapshots.push(snapshot),
+		...options,
+	}).result();
+
+	if (!captured) throw new Error("no /responses request was captured");
+	const clientMetadata = (captured.body.client_metadata ?? {}) as Record<string, unknown>;
+	const encoded = clientMetadata["x-codex-turn-metadata"];
+	return {
+		body: captured.body,
+		headers: captured.headers,
+		clientMetadata,
+		turnMetadata: typeof encoded === "string" ? (JSON.parse(encoded) as Record<string, unknown>) : {},
+		snapshots,
+	};
+}
+
+/** A completed parent request as the snapshot observer would record it. */
+function createForkSource(overrides: Partial<CodexRequestSnapshot> = {}): CodexRequestSnapshot {
+	return {
+		provider: "openai-codex",
+		model: "gpt-6-astra",
+		baseUrl: "https://api.openai.com/v1",
+		accountId: "acc_test",
+		sessionId: "root-session",
+		threadId: "root-thread-1",
+		promptCacheKey: "root-cache-key",
+		input: [
+			{ type: "additional_tools", role: "developer", tools: [{ type: "namespace", name: "functions" }] },
+			{
+				type: "message",
+				role: "developer",
+				content: [{ type: "input_text", text: "You are Codex, an agent based on GPT-6." }],
+			},
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "Say hello" }] },
+		],
+		...overrides,
+	};
+}
+
+function createForkContext(messages: Context["messages"]): Context {
+	return {
+		systemPrompt: ["You are Codex, an agent based on GPT-6.", "## Memory\n\nSecond developer block."],
+		messages,
+		tools: createHarnessTools(),
+	};
+}
+
+describe("codex fork lineage", () => {
+	it("emits the full sent input and effective identity through onCodexRequestSnapshot", async () => {
+		const { body, snapshots } = await captureForkRequest("gpt-6-astra", { sessionId: "child-session" });
+
+		expect(snapshots).toHaveLength(1);
+		const snapshot = snapshots[0];
+		expect(snapshot.provider).toBe("openai-codex");
+		expect(snapshot.model).toBe("gpt-6-astra");
+		expect(snapshot.baseUrl).toBe("https://api.openai.com/v1");
+		expect(snapshot.accountId).toBe("acc_test");
+		expect(snapshot.sessionId).toBe("child-session");
+		expect(snapshot.threadId).toBeDefined();
+		expect(snapshot.promptCacheKey).toBe(body.prompt_cache_key as string | undefined);
+		// The snapshot carries the full wire input — tool surface, developer
+		// blocks, and user message — not just the converted messages.
+		expect(snapshot.input).toEqual(inputItems(body));
+		expect(snapshot.input[0]?.type).toBe("additional_tools");
+	});
+
+	it("replays the source input byte-for-byte ahead of the child's own surface", async () => {
+		const source = createForkSource();
+		const context = createForkContext([
+			{ role: "user", content: "Say hello", timestamp: 1 },
+			{ role: "user", content: "Summarize it for the parent", timestamp: 2 },
+		]);
+		const { body, headers, turnMetadata, clientMetadata, snapshots } = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
+			context,
+		);
+
+		const input = inputItems(body);
+		// Byte-for-byte: the source's serialized items open the request.
+		expect(JSON.stringify(input.slice(0, source.input.length))).toBe(JSON.stringify(source.input));
+		// Then the child's own tool surface, developer blocks, and only the new
+		// tail message — the inherited user message is not re-encoded.
+		const tail = input.slice(source.input.length);
+		expect(tail[0]?.type).toBe("additional_tools");
+		const userItems = tail.filter(item => item.role === "user");
+		expect(userItems).toHaveLength(1);
+		expect(userItems[0]?.content).toEqual([{ type: "input_text", text: "Summarize it for the parent" }]);
+
+		// Root lineage everywhere the backend groups sessions; child thread stays distinct.
+		expect(headers.get("session_id")).toBe("root-session");
+		expect(headers.get("session-id")).toBe("root-session");
+		expect(headers.get("x-codex-parent-thread-id")).toBe("root-thread-1");
+		expect(clientMetadata.session_id).toBe("root-session");
+		expect(clientMetadata["x-codex-parent-thread-id"]).toBe("root-thread-1");
+		expect(turnMetadata.session_id).toBe("root-session");
+		expect(turnMetadata.parent_thread_id).toBe("root-thread-1");
+		expect(turnMetadata.forked_from_thread_id).toBe("root-thread-1");
+		expect(turnMetadata.thread_id).not.toBe("root-thread-1");
+
+		// Transport identity stays child-local; the source's cache key is inherited.
+		expect(headers.get("conversation_id")).toBe("child-session");
+		expect(body.prompt_cache_key).toBe("root-cache-key");
+		expect(body.previous_response_id).toBeUndefined();
+
+		// The child's own snapshot records the root projection plus the full
+		// inherited+new input, ready to seed a grandchild fork.
+		expect(snapshots[0]?.sessionId).toBe("root-session");
+		expect(snapshots[0]?.threadId).toBe(turnMetadata.thread_id as string);
+		expect(snapshots[0]?.input).toEqual(input);
+	});
+
+	it("keeps shared root lineage without prefix replay on a different model", async () => {
+		const source = createForkSource();
+		const context = createForkContext([
+			{ role: "user", content: "Say hello", timestamp: 1 },
+			{ role: "user", content: "Summarize it for the parent", timestamp: 2 },
+		]);
+		const { body, turnMetadata, snapshots } = await captureForkRequest(
+			"gpt-5.1-codex",
+			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
+			context,
+		);
+
+		const input = inputItems(body);
+		expect(JSON.stringify(input.slice(0, source.input.length))).not.toBe(JSON.stringify(source.input));
+		// Every context message is converted portably; unprofiled turns keep
+		// top-level tools and never see the source items.
+		expect(body.tools).toBeDefined();
+		expect(input.filter(item => item.role === "user")).toHaveLength(2);
+		expect(input.some(item => item.type === "additional_tools")).toBe(false);
+		expect(turnMetadata.session_id).toBe("root-session");
+		expect(turnMetadata.forked_from_thread_id).toBe("root-thread-1");
+		expect(body.prompt_cache_key).toBe("root-cache-key");
+		expect(snapshots).toHaveLength(0);
+	});
+
+	it("ignores the source under a different account and under undefined accounts", async () => {
+		const source = createForkSource();
+		const context = createForkContext([{ role: "user", content: "Say hello", timestamp: 1 }]);
+
+		const otherAccount = await captureForkRequest(
+			"gpt-6-astra",
+			{
+				apiKey: createCodexTestToken("acc_other"),
+				sessionId: "child-session",
+				codexFork: { source, messageCount: 0 },
+			},
+			context,
+		);
+		expect(otherAccount.turnMetadata.session_id).toBe("child-session");
+		expect(otherAccount.turnMetadata.parent_thread_id).toBeUndefined();
+		expect(otherAccount.headers.get("session_id")).toBe("child-session");
+		expect(otherAccount.body.prompt_cache_key).toBe("child-session");
+		expect(JSON.stringify(inputItems(otherAccount.body).slice(0, source.input.length))).not.toBe(
+			JSON.stringify(source.input),
+		);
+
+		// undefined === undefined is not proof of a shared auth scope.
+		const anonymous = await captureForkRequest(
+			"gpt-6-astra",
+			{
+				apiKey: "plain-token",
+				sessionId: "child-session",
+				codexFork: { source: createForkSource({ accountId: undefined }), messageCount: 0 },
+			},
+			context,
+		);
+		expect(anonymous.turnMetadata.session_id).toBe("child-session");
+		expect(anonymous.turnMetadata.parent_thread_id).toBeUndefined();
+	});
+
+	it("gives sibling forks independent identity with no previous_response_id sharing", async () => {
+		const source = createForkSource();
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const context = () => createForkContext([{ role: "user", content: "Say hello", timestamp: 1 }]);
+
+		const first = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-a", providerSessionState, codexFork: { source, messageCount: 0 } },
+			context(),
+		);
+		const second = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-b", providerSessionState, codexFork: { source, messageCount: 0 } },
+			context(),
+		);
+
+		// Both project the shared root session but own distinct threads and ids.
+		expect(first.turnMetadata.session_id).toBe("root-session");
+		expect(second.turnMetadata.session_id).toBe("root-session");
+		expect(first.turnMetadata.thread_id).not.toBe(second.turnMetadata.thread_id);
+		expect(first.turnMetadata.turn_id).not.toBe(second.turnMetadata.turn_id);
+		expect(first.snapshots[0]?.threadId).not.toBe(second.snapshots[0]?.threadId);
+		expect(first.body.previous_response_id).toBeUndefined();
+		expect(second.body.previous_response_id).toBeUndefined();
+		expect(first.body.prompt_cache_key).toBe("root-cache-key");
+		expect(second.body.prompt_cache_key).toBe("root-cache-key");
+		// With messageCount 0 every context message is still converted after the prefix.
+		const firstTail = inputItems(first.body).slice(source.input.length);
+		expect(firstTail.filter(item => item.role === "user")).toHaveLength(1);
+	});
+
+	it("lets explicit cache options win over the source's cache key", async () => {
+		const source = createForkSource();
+		const context = createForkContext([{ role: "user", content: "Say hello", timestamp: 1 }]);
+
+		const explicit = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", promptCacheKey: "explicit-key", codexFork: { source, messageCount: 1 } },
+			context,
+		);
+		expect(explicit.body.prompt_cache_key).toBe("explicit-key");
+
+		const disabled = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", cacheRetention: "none", codexFork: { source, messageCount: 1 } },
+			context,
+		);
+		expect(disabled.body.prompt_cache_key).toBeUndefined();
+		// Lineage metadata still applies even when caching is off.
+		expect(disabled.turnMetadata.session_id).toBe("root-session");
+	});
+
+	it("withholds the snapshot for compaction and failed turns", async () => {
+		const source = createForkSource();
+		const context = createForkContext([{ role: "user", content: "Say hello", timestamp: 1 }]);
+
+		const compacted = await captureForkRequest(
+			"gpt-6-astra",
+			{
+				sessionId: "child-session",
+				codexFork: { source, messageCount: 1 },
+				codexCompaction: {
+					operationId: "op-1",
+					trigger: "manual",
+					reason: "user_requested",
+					implementation: "responses",
+					phase: "standalone_turn",
+					strategy: "memento",
+				},
+			},
+			context,
+		);
+		expect(compacted.snapshots).toHaveLength(0);
+		// Compaction also disqualifies prefix replay even though ids line up.
+		expect(JSON.stringify(inputItems(compacted.body).slice(0, source.input.length))).not.toBe(
+			JSON.stringify(source.input),
+		);
+
+		// A terminal event reporting a backend error is not a lineage source.
+		const failed = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
+			context,
+			[
+				{
+					type: "response.incomplete",
+					response: {
+						status: "incomplete",
+						error: { code: "server_error", message: "upstream exploded" },
+						incomplete_details: { reason: "content_filter" },
+					},
+				},
+			],
+		);
+		expect(failed.snapshots).toHaveLength(0);
+	});
+});
 
 function inputItems(body: Record<string, unknown>): Array<Record<string, unknown>> {
 	return (body.input ?? []) as Array<Record<string, unknown>>;

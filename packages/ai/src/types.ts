@@ -376,6 +376,39 @@ export interface CodexCompactionRequestContext extends CodexCompactionMetadata {
 	operationId: string;
 }
 
+/**
+ * Point-in-time identity and serialized input of one completed Codex
+ * Responses request, captured via {@link StreamOptions.onCodexRequestSnapshot}.
+ * Consumers persist this as the {@link CodexForkContext.source} for a later
+ * same-provider fork so the child can inherit the parent's wire prefix and
+ * share its root lineage. Auth-free by contract: never carries keys, tokens,
+ * or headers.
+ */
+export interface CodexRequestSnapshot {
+	provider: Provider;
+	model: string;
+	baseUrl: string;
+	accountId: string | undefined;
+	sessionId: string;
+	threadId: string;
+	promptCacheKey?: string;
+	input: OpenAIResponsesHistoryPayload["items"];
+}
+
+/**
+ * Fork linkage supplied by a caller that owns conversation lineage (e.g.
+ * subagent spawn). `source` is the parent request's {@link CodexRequestSnapshot};
+ * `messageCount` marks how many leading context messages are byte-identical to
+ * the tail of `source.input`. The provider replays `source.input` verbatim and
+ * converts only the trailing messages, so the child request shares the parent's
+ * prompt-cache prefix. Omit `messageCount` when compaction or pruning changed
+ * the inherited prefix — lineage metadata still applies without prefix reuse.
+ */
+export interface CodexForkContext {
+	source: CodexRequestSnapshot;
+	messageCount?: number;
+}
+
 /** Anthropic `compact_20260112` context-management edit (`compact-2026-01-12` beta). */
 export interface AnthropicCompactionRequest {
 	/**
@@ -534,6 +567,16 @@ export interface StreamOptions {
 	providerSessionState?: Map<string, ProviderSessionState>;
 	/** Canonical Codex compaction classification; ignored by other providers. */
 	codexCompaction?: CodexCompactionRequestContext;
+	/** Codex fork lineage for cache-sharing child requests; ignored by other providers. */
+	codexFork?: CodexForkContext;
+	/**
+	 * Codex request snapshot observer, invoked once after a turn's successful
+	 * terminal response event with the effective request identity and the full
+	 * serialized `input` array that was actually sent. Consumers store the
+	 * result as a later {@link CodexForkContext.source}. Ignored by other
+	 * providers; not invoked for compaction requests or failed turns.
+	 */
+	onCodexRequestSnapshot?: (snapshot: CodexRequestSnapshot) => void;
 	/** Codex Code Mode tool exposure snapshot emitted as `tool_namespaces_info` turn metadata; ignored by other providers. */
 	toolNamespacesInfo?: unknown;
 	/**

@@ -30,6 +30,7 @@ import type {
 	AssistantMessage,
 	CodexCompactionContext,
 	CodexCompactionRequestContext,
+	CodexRequestSnapshot,
 	Context,
 	FetchImpl,
 	Model,
@@ -512,9 +513,12 @@ interface CodexMetadataSessionState {
 
 interface CodexCompatibilityIdentity {
 	installationId: string;
+	/** Effective lineage session id — the child's own, or the shared root on forks. */
 	sessionId: string;
 	threadId: string;
 	windowId: string;
+	/** Fork source thread id; projects `x-codex-parent-thread-id`/`forked_from_thread_id`. */
+	parentThreadId?: string;
 	/** Header projection: identity fields only, never the Code Mode snapshot. */
 	turnMetadataHeaderJson?: string;
 }
@@ -651,6 +655,12 @@ function createCodexRequestMetadata(
 		parentTurnId?: string;
 		compaction?: CodexCompactionRequestContext;
 		toolNamespacesInfo?: unknown;
+		/**
+		 * Resolved fork source identity. When present the request projects the
+		 * source's root session id and records the source thread as its parent;
+		 * the child keeps its own thread/window/turn cells.
+		 */
+		forkSource?: CodexRequestSnapshot;
 	},
 ): CodexRequestMetadata {
 	if (options.startNewTurn || !session.turnId) {
@@ -661,6 +671,10 @@ function createCodexRequestMetadata(
 	// codex-rs `set_parent_turn_id` ignores blank values; keep the original
 	// spelling when non-blank.
 	const parentTurnId = options.parentTurnId?.trim() ? options.parentTurnId : undefined;
+	// Forked children project the source root's session id onto every
+	// session-identity surface while keeping their own thread lineage.
+	const effectiveSessionId = options.forkSource?.sessionId ?? identity.sessionId;
+	const parentThreadId = options.forkSource?.threadId;
 	const extra: Record<string, string> = {};
 	const callerMetadata = options.clientMetadata;
 	if (callerMetadata) {
@@ -670,12 +684,16 @@ function createCodexRequestMetadata(
 	}
 	const turnMetadata: Record<string, unknown> = {
 		installation_id: identity.installationId,
-		session_id: identity.sessionId,
+		session_id: effectiveSessionId,
 		thread_id: identity.threadId,
 		turn_id: session.turnId,
 		window_id: identity.windowId,
 		request_kind: requestKind,
 	};
+	if (parentThreadId) {
+		turnMetadata.parent_thread_id = parentThreadId;
+		turnMetadata.forked_from_thread_id = parentThreadId;
+	}
 	if (parentTurnId) turnMetadata.parent_turn_id = parentTurnId;
 	if (options.compaction) {
 		turnMetadata.compaction = {
@@ -703,17 +721,20 @@ function createCodexRequestMetadata(
 	}
 	const clientMetadata: Record<string, string> = {
 		[OPENAI_HEADERS.INSTALLATION_ID]: identity.installationId,
-		session_id: identity.sessionId,
+		session_id: effectiveSessionId,
 		thread_id: identity.threadId,
 		[OPENAI_HEADERS.WINDOW_ID]: identity.windowId,
 		turn_id: session.turnId,
 	};
+	if (parentThreadId) clientMetadata[OPENAI_HEADERS.PARENT_THREAD_ID] = parentThreadId;
 	// Both projections, mirroring codex-rs `CodexResponsesMetadata::to_client_metadata`:
 	// the flat key above/below AND the field inside the turn-metadata JSON.
 	if (parentTurnId) clientMetadata.parent_turn_id = parentTurnId;
 	clientMetadata[OPENAI_HEADERS.TURN_METADATA] = turnMetadataJson;
 	return {
 		...identity,
+		sessionId: effectiveSessionId,
+		parentThreadId,
 		turnId: session.turnId,
 		turnMetadataJson,
 		turnMetadataHeaderJson,
@@ -725,6 +746,11 @@ function applyCodexCompatibilityHeaders(headers: Headers, metadata: CodexCompati
 	headers.set(OPENAI_HEADERS.SCOPED_SESSION_ID, metadata.sessionId);
 	headers.set(OPENAI_HEADERS.THREAD_ID, metadata.threadId);
 	headers.set(OPENAI_HEADERS.WINDOW_ID, metadata.windowId);
+	if (metadata.parentThreadId) {
+		headers.set(OPENAI_HEADERS.PARENT_THREAD_ID, metadata.parentThreadId);
+	} else {
+		headers.delete(OPENAI_HEADERS.PARENT_THREAD_ID);
+	}
 	if (metadata.turnMetadataHeaderJson) {
 		headers.set(OPENAI_HEADERS.TURN_METADATA, metadata.turnMetadataHeaderJson);
 	} else {
@@ -1399,6 +1425,27 @@ function resetOutputState(output: AssistantMessage): void {
 	output.stopDetails = undefined;
 }
 
+/**
+ * Resolve the fork source this request may claim lineage from. A source only
+ * applies when it was produced by the same provider against the same backend
+ * endpoint under a known shared account: two `undefined` account ids prove
+ * nothing about a common auth scope, so they never match. Model equality is
+ * intentionally not required — a child may run a different model and still
+ * project the source's root identity; prefix reuse is gated separately in
+ * {@link buildTransformedCodexRequestBody}.
+ */
+function getCodexForkSource(
+	model: Model<"openai-codex-responses">,
+	options: OpenAICodexResponsesOptions | undefined,
+): CodexRequestSnapshot | undefined {
+	const source = options?.codexFork?.source;
+	if (!source || source.provider !== model.provider) return undefined;
+	if (resolveCodexResponsesUrl(source.baseUrl) !== resolveCodexResponsesUrl(model.baseUrl)) return undefined;
+	const accountId = getCodexAccountId(options?.apiKey || getEnvApiKey(model.provider) || "");
+	if (!accountId || source.accountId !== accountId) return undefined;
+	return source;
+}
+
 function createRequestSetup(options: OpenAICodexResponsesOptions | undefined): CodexRequestSetup {
 	const requestAbortController = new AbortController();
 	const requestSignal = options?.signal
@@ -1509,6 +1556,7 @@ function createCodexRequestContext(
 		parentTurnId: options?.parentTurnId,
 		compaction,
 		toolNamespacesInfo: resolveHarnessProfile(model) === "codex" ? undefined : options?.toolNamespacesInfo,
+		forkSource: getCodexForkSource(model, options),
 	});
 	transformedBody.client_metadata = requestMetadata.clientMetadata;
 	return {
@@ -1535,7 +1583,11 @@ async function buildCodexRequestContext(
 	context: Context,
 	options: OpenAICodexResponsesOptions | undefined,
 ): Promise<CodexRequestContext> {
-	const promptCacheKey = getOpenAIPromptCacheKey(options);
+	const forkSource = getCodexForkSource(model, options);
+	const promptCacheKey = getOpenAIPromptCacheKey({
+		...options,
+		promptCacheKey: options?.promptCacheKey ?? forkSource?.promptCacheKey,
+	});
 	const transformedBody = await buildTransformedCodexRequestBody(model, context, options, promptCacheKey);
 	return createCodexRequestContext(model, transformedBody, options, {
 		isolateCompactionTransport: true,
@@ -1549,15 +1601,36 @@ export async function buildTransformedCodexRequestBody(
 	model: Model<"openai-codex-responses">,
 	context: Context,
 	options: OpenAICodexResponsesOptions | undefined,
-	promptCacheKey = getOpenAIPromptCacheKey(options),
+	promptCacheKey?: string,
 	inputPrefix?: InputItem[],
 ): Promise<RequestBody> {
-	const input = convertMessages(model, context);
+	const forkSource = getCodexForkSource(model, options);
+	const forkMessageCount = options?.codexFork?.messageCount;
+	// Byte-for-byte prefix reuse additionally requires the same producing model
+	// on the codex harness profile and a caller-certified shared-prefix length.
+	const useForkPrefix =
+		forkSource !== undefined &&
+		forkSource.model === model.id &&
+		resolveHarnessProfile(model) === "codex" &&
+		!options?.codexCompaction &&
+		forkMessageCount !== undefined &&
+		Number.isSafeInteger(forkMessageCount) &&
+		forkMessageCount >= 0 &&
+		forkMessageCount <= context.messages.length;
+	const input = useForkPrefix
+		? convertMessages(model, { ...context, messages: context.messages.slice(forkMessageCount) })
+		: convertMessages(model, context);
+	const effectivePromptCacheKey =
+		promptCacheKey ??
+		getOpenAIPromptCacheKey({
+			...options,
+			promptCacheKey: options?.promptCacheKey ?? forkSource?.promptCacheKey,
+		});
 	const params: RequestBody = {
 		model: model.requestModelId ?? model.id,
 		input: inputPrefix?.length ? [...inputPrefix, ...input] : input,
 		stream: true,
-		prompt_cache_key: promptCacheKey,
+		prompt_cache_key: effectivePromptCacheKey,
 	};
 
 	// `maxTokens` is intentionally not forwarded: transformRequestBody strips
@@ -1609,6 +1682,13 @@ export async function buildTransformedCodexRequestBody(
 	const body = await transformRequestBody(params, model, codexOptions, { developerMessages });
 	if (codexHarness) relocateCodexHarnessToolSurface(body);
 	applyCodexStableEffort(model, body, options);
+	if (useForkPrefix && forkSource.input.length > 0) {
+		// Replay the source's serialized input verbatim ahead of the child's own
+		// tool surface, instructions, and new tail — measured cache hits require
+		// the leading bytes to match the parent's request exactly.
+		const sourceInput = structuredCloneJSON(forkSource.input) as InputItem[];
+		body.input = body.input?.length ? [...sourceInput, ...body.input] : sourceInput;
+	}
 	return body;
 }
 
@@ -2624,6 +2704,42 @@ class CodexStreamProcessor {
 			endTurn === true ? true : endTurn === false ? false : undefined,
 			shouldPromoteIncompleteToolUse,
 		);
+		this.#emitCodexRequestSnapshot(status, response);
+	}
+
+	/**
+	 * Deliver the fork-lineage snapshot after a successful terminal event on a
+	 * normal Codex-profile turn. The input comes from `requestBodyForState` —
+	 * the full request actually sent (WebSocket append deltas never reach it) —
+	 * so a later fork can replay the same leading bytes. Only request-identity
+	 * and input metadata cross the boundary; credentials never do.
+	 */
+	#emitCodexRequestSnapshot(status: ResponseStatus | undefined, response: unknown): void {
+		const onSnapshot = this.options?.onCodexRequestSnapshot;
+		if (!onSnapshot || this.options?.codexCompaction || resolveHarnessProfile(this.model) !== "codex") return;
+		if (status === "failed" || status === "cancelled") return;
+		const hasResponseError =
+			response !== null && typeof response === "object" && "error" in response && response.error != null;
+		if (status === "incomplete" && hasResponseError) return;
+		const requestMetadata = this.requestContext.requestMetadata;
+		if (!requestMetadata) return;
+		const body = this.runtime.requestBodyForState;
+		// Spread each item into a fresh record so the payload type and consumers
+		// see plain serialized input items, not the internal wire interface.
+		const input = structuredCloneJSON((body.input ?? []).map(item => ({ ...item })));
+		const snapshot: CodexRequestSnapshot = {
+			provider: this.model.provider,
+			model: this.model.id,
+			baseUrl: this.requestContext.baseUrl,
+			accountId: this.requestContext.accountId,
+			sessionId: requestMetadata.sessionId,
+			threadId: requestMetadata.threadId,
+			input,
+		};
+		if (typeof body.prompt_cache_key === "string") {
+			snapshot.promptCacheKey = body.prompt_cache_key;
+		}
+		onSnapshot(snapshot);
 	}
 
 	async #recoverStreamError(error: unknown): Promise<boolean> {
@@ -4490,13 +4606,22 @@ function createCodexHeaders(
 	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
 	headers.set(OPENAI_HEADERS.VERSION, codexClientVersion);
 	headers.set("User-Agent", USER_AGENT);
+	// The legacy `session_id` header projects the effective lineage session:
+	// the request metadata value on forks (the shared root id), the caller's
+	// own transport session otherwise — identical to before for non-forks.
+	// `conversation_id`/`x-client-request-id` stay transport-scoped per child.
+	const forkedSessionId = requestMetadata?.parentThreadId !== undefined ? requestMetadata.sessionId : undefined;
 	if (sessionId) {
 		headers.set(OPENAI_HEADERS.CONVERSATION_ID, sessionId);
-		headers.set(OPENAI_HEADERS.SESSION_ID, sessionId);
+		headers.set(OPENAI_HEADERS.SESSION_ID, forkedSessionId ?? sessionId);
 		headers.set("x-client-request-id", sessionId);
 	} else {
 		headers.delete(OPENAI_HEADERS.CONVERSATION_ID);
-		headers.delete(OPENAI_HEADERS.SESSION_ID);
+		if (forkedSessionId) {
+			headers.set(OPENAI_HEADERS.SESSION_ID, forkedSessionId);
+		} else {
+			headers.delete(OPENAI_HEADERS.SESSION_ID);
+		}
 		headers.delete("x-client-request-id");
 	}
 	headers.delete(OPENAI_HEADERS.INSTALLATION_ID);
