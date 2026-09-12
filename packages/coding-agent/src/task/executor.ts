@@ -8,7 +8,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import type { Api, Message, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
+import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
@@ -68,6 +68,7 @@ import { trackLateCleanup } from "../utils/late-cleanup";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { attributeSubagentError } from "./error-attribution";
+import type { ForkSnapshot } from "./fork";
 import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
@@ -422,9 +423,10 @@ export interface ExecutorOptions {
 	/**
 	 * Forked conversation history seeded into the child's journal before its
 	 * session is created: resolved parent LLM messages (user/assistant/
-	 * toolResult) with the spawn call already cut, in order.
+	 * toolResult) with the spawn call already cut, in order. Applied only to a
+	 * fresh journal — a reopened child already carries the prefix.
 	 */
-	fork?: { messages: AgentMessage[] };
+	fork?: ForkSnapshot;
 	modelOverride?: string | string[];
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
@@ -3543,10 +3545,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// Forked children inherit the parent's resolved history into their
 			// own journal before the session is created, so the first prompt
 			// (the brief) lands after the inherited turns in both the transcript
-			// and the model context. Both the file and in-memory managers take
-			// the same append path.
-			for (const message of options.fork?.messages ?? []) {
-				sessionManager.appendMessage(message as Message);
+			// and the model context. Only a fresh journal is seeded: a reopened
+			// child file already carries the prefix.
+			if (options.fork && sessionManager.getEntries().length === 0) {
+				for (const message of options.fork.messages) sessionManager.appendMessage(message);
 			}
 			sessionOpenedAt = performance.now();
 			if (ircEnabled) {

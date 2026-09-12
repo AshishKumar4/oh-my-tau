@@ -3,76 +3,79 @@
  * history into the message list a forked child inherits. Mirrors Codex's
  * `spawn_agent` `fork_turns` and Claude Code's `Agent` `subagent_type: "fork"`.
  */
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { Message } from "@oh-my-pi/pi-ai";
+import {
+	convertToLlm,
+	isUserTurnInitiator,
+	sanitizeRehydratedOpenAIResponsesAssistantMessage,
+} from "../session/messages";
+import { ToolError } from "../tools/tool-errors";
 import type { ToolSession } from "../tools";
 
 /** Fork extent: `"all"` inherits the whole resolved history; `{ lastTurns: N }` keeps the last N user-message-delimited turns. */
 export type ForkMode = "all" | { lastTurns: number };
 
+/** The resolved history a forked child starts with, captured at spawn-call time. */
+export interface ForkSnapshot {
+	messages: Message[];
+}
+
 /**
  * The messages a forked child starts with: the parent's resolved LLM context
- * (post-compaction, post-pruning — what the parent would send next), cut at
- * the spawn call so the child never sees its own birth. Only
- * user/assistant/toolResult messages carry over; thinking blocks and
- * toolResults orphaned by a dropped call do not.
+ * converted by the same path the agent loop uses (`convertToLlm`, so
+ * compaction/branch summaries, file mentions, skill prompts and steering keep
+ * their provider-facing shape). The history is cut before the assistant
+ * message carrying this spawn call, so the child never sees its own birth;
+ * a surviving toolResult for that call is dropped as orphaned below.
+ *
+ * Provider replay state (encrypted reasoning, native response items,
+ * `providerPayload`) is self-contained for OpenAI-family providers and must
+ * survive so the child can reuse it; only the canonical Copilot-bound
+ * sanitizer runs on assistant messages. The snapshot is a deep clone — the
+ * child may prune or rewrite its copy without mutating the parent's journal.
  */
-export function forkMessages(
-	session: ToolSession,
-	mode: ForkMode,
-	spawnToolCallId: string | undefined,
-): AgentMessage[] {
-	let messages: AgentMessage[] = (session.sessionManager?.buildSessionContext?.().messages ?? []).filter(
-		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
-	);
-
-	// Cut the turn that spawned the fork: the assistant message carrying this
-	// spawn call and its toolResult (defensive — the in-flight call has none
-	// yet, but a late-arriving one must not replay either).
-	if (spawnToolCallId !== undefined) {
-		messages = messages.filter(
-			message =>
-				!(
-					(message.role === "assistant" &&
-						message.content.some(block => block.type === "toolCall" && block.id === spawnToolCallId)) ||
-					(message.role === "toolResult" && message.toolCallId === spawnToolCallId)
-				),
-		);
+export function forkMessages(session: ToolSession, mode: ForkMode, spawnToolCallId: string | undefined): Message[] {
+	const manager = session.sessionManager;
+	if (!manager?.buildSessionContext) {
+		throw new ToolError("Conversation forking requires a session journal.");
 	}
+	const history = manager.buildSessionContext().messages;
 
+	const spawnIndex =
+		spawnToolCallId === undefined
+			? -1
+			: history.findIndex(
+					message =>
+						message.role === "assistant" &&
+						message.content.some(block => block.type === "toolCall" && block.id === spawnToolCallId),
+				);
+	const prefix = spawnIndex < 0 ? history : history.slice(0, spawnIndex);
+
+	// A "turn" starts at a user message (or a custom message that initiates a
+	// user-attributed turn, e.g. a directly invoked /skill prompt); walk back N
+	// such boundaries.
+	let start = 0;
 	if (typeof mode === "object") {
-		// A "turn" is one user message plus everything the assistant did up to
-		// the next user message; walk back N user-message boundaries.
-		let cutIndex = 0;
-		let seen = 0;
-		for (let i = messages.length - 1; i >= 0; i--) {
-			if (messages[i]!.role !== "user") continue;
-			seen += 1;
-			if (seen === mode.lastTurns) {
-				cutIndex = i;
+		let turns = 0;
+		for (let i = prefix.length - 1; i >= 0; i--) {
+			const message = prefix[i];
+			if (!message || !(message.role === "user" || (message.role === "custom" && isUserTurnInitiator(message))))
+				continue;
+			turns += 1;
+			if (turns === mode.lastTurns) {
+				start = i;
 				break;
 			}
 		}
-		messages = messages.slice(cutIndex);
 	}
 
-	// Provider replay state cannot cross into another session: strip thinking
-	// and other provider-owned blocks plus the providerPayload that would
-	// resurrect them. Assistant messages left empty are dropped entirely.
-	const kept: AgentMessage[] = [];
-	for (const message of messages) {
-		if (message.role !== "assistant") {
-			kept.push(message);
-			continue;
-		}
-		const content = message.content.filter(
-			block => block.type === "text" || block.type === "image" || block.type === "toolCall",
-		);
-		if (content.length === 0) continue;
-		kept.push({ ...message, content, providerPayload: undefined });
-	}
+	const messages = structuredClone(convertToLlm(prefix.slice(start)));
+	const kept = messages.map(message =>
+		message.role === "assistant" ? sanitizeRehydratedOpenAIResponsesAssistantMessage(message) : message,
+	);
 
-	// A toolResult whose call was dropped (spawn omission, a content filter, or
-	// a lastTurns cut that landed mid-turn) has nothing to pair with.
+	// A toolResult whose call was dropped (spawn omission, or a lastTurns cut
+	// that landed mid-turn) has nothing to pair with.
 	const keptToolCallIds = new Set<string>();
 	for (const message of kept) {
 		if (message.role !== "assistant") continue;

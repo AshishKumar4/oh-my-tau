@@ -234,13 +234,19 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 		parameters: codexSpawnAgentSchema,
 		intent: (args: Partial<typeof codexSpawnAgentSchema.infer>) => args.task_name,
 		toParams: (args: typeof codexSpawnAgentSchema.infer, host) => {
+			// Vendor parity (codex-rs spawn.rs fork_mode): absent or
+			// whitespace-only defaults to `all`; `none`/`all` are
+			// case-insensitive; anything else must parse as a positive integer.
+			const raw = args.fork_turns?.trim();
 			let fork: "all" | number | undefined;
-			if (args.fork_turns === "none") {
-				fork = undefined;
-			} else if (args.fork_turns === undefined || args.fork_turns === "" || args.fork_turns === "all") {
+			if (raw === undefined || raw === "" || raw.toLowerCase() === "all") {
 				fork = "all";
-			} else if (/^\d+$/.test(args.fork_turns) && Number.parseInt(args.fork_turns, 10) > 0) {
-				fork = Number.parseInt(args.fork_turns, 10);
+			} else if (raw.toLowerCase() === "none") {
+				fork = undefined;
+			} else if (/^\+?\d+$/.test(raw)) {
+				const n = Number(raw);
+				if (Number.isSafeInteger(n) && n > 0) fork = n;
+				else throw new ToolError("fork_turns must be `none`, `all`, or a positive integer string");
 			} else {
 				throw new ToolError("fork_turns must be `none`, `all`, or a positive integer string");
 			}

@@ -4,7 +4,6 @@
  * The two public frontends deliberately retain their presentation concerns, but
  * every decision that affects what a child may run lives here.
  */
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
@@ -26,6 +25,7 @@ import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess } from "./executor";
+import type { ForkSnapshot } from "./fork";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -107,9 +107,10 @@ export interface StructuredSubagentRequest {
 	/**
 	 * Resolved parent history for a forked spawn, seeded into the child's
 	 * journal before its first prompt (Codex `fork_turns` / Claude Code
-	 * `subagent_type: "fork"`). Resolved by the caller via `forkMessages`.
+	 * `subagent_type: "fork"`). Captured by the caller via `forkMessages` at
+	 * spawn-call time.
 	 */
-	fork?: { messages: AgentMessage[] };
+	fork?: ForkSnapshot;
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;

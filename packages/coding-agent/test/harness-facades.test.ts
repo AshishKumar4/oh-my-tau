@@ -689,6 +689,29 @@ describe("codex spawn_agent facade", () => {
 		});
 		expect(spawned).toEqual([{ name: "tail_two", task: "continue", fork: 2 }]);
 
+		// Vendor parsing is case-insensitive and trims: "NONE" inherits
+		// nothing, "All" and " 3 " map onto the same task params.
+		spawned.length = 0;
+		await runFacadeCall(CODEX_MODEL, [plain], {
+			name: "spawn_agent",
+			arguments: { task_name: "no_ctx", message: "fresh", fork_turns: "NONE" },
+		});
+		expect(spawned).toEqual([{ name: "no_ctx", task: "fresh" }]);
+
+		spawned.length = 0;
+		await runFacadeCall(CODEX_MODEL, [plain], {
+			name: "spawn_agent",
+			arguments: { task_name: "all_caps", message: "everything", fork_turns: "All" },
+		});
+		expect(spawned).toEqual([{ name: "all_caps", task: "everything", fork: "all" }]);
+
+		spawned.length = 0;
+		await runFacadeCall(CODEX_MODEL, [plain], {
+			name: "spawn_agent",
+			arguments: { task_name: "tail_three", message: "continue", fork_turns: " 3 " },
+		});
+		expect(spawned).toEqual([{ name: "tail_three", task: "continue", fork: 3 }]);
+
 		const effortOff = await runFacadeCall(CODEX_MODEL, [plain], {
 			name: "spawn_agent",
 			arguments: { task_name: "a", message: "b", reasoning_effort: "xhigh" },
@@ -720,6 +743,8 @@ describe("codex spawn_agent facade", () => {
 		for (const args of [
 			{ task_name: "a", message: "b", fork_turns: "zero" },
 			{ task_name: "a", message: "b", fork_turns: "0" },
+			{ task_name: "a", message: "b", fork_turns: "1e3" },
+			{ task_name: "a", message: "b", fork_turns: "-1" },
 			{ task_name: "a", message: "b", reasoning_effort: "extreme" },
 		] as const) {
 			const rejected = await runFacadeCall(CODEX_MODEL, [withEffort], {

@@ -2,21 +2,20 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import type { Message } from "@oh-my-pi/pi-ai";
+import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import {
 	artifactsDirsFromRegistry,
 	resetRegisteredArtifactDirsForTests,
 } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
-import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { createEvalCustomTools } from "@oh-my-pi/pi-coding-agent/task/eval-tools";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import { forkMessages } from "@oh-my-pi/pi-coding-agent/task/fork";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import {
 	buildStructuredSubagentRecoveryHint,
@@ -29,7 +28,7 @@ import type { AgentDefinition, SingleResult } from "@oh-my-pi/pi-coding-agent/ta
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createSessionDefaults } from "../helpers/session-defaults";
+import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const AGENT: AgentDefinition = {
 	name: "worker",
@@ -803,87 +802,89 @@ describe("structured subagent primitive", () => {
 		using tempDir = TempDir.createSync("@omp-forked-subagent-");
 		const parentFile = path.join(tempDir.path(), "parent.jsonl");
 
-		const inherited: Message[] = [
-			{ role: "user", content: "remember BLUE-HERON-42", timestamp: 1 },
-			{
-				role: "assistant",
-				content: [{ type: "text", text: "Noted." }],
-				api: "openai-responses",
-				provider: "openai",
-				model: "mock",
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-				stopReason: "stop",
-				timestamp: 2,
-			},
-		];
-
-		// The session is mocked at the boundary, but its journal is real: the
-		// executor hands createAgentSession the same SessionManager it seeded,
-		// and a live session would replay exactly buildSessionContext().messages
-		// plus the appended brief into its first model request.
-		let childManager: SessionManager | undefined;
-		let contextAtCreate: unknown[] | undefined;
-		const contextsAtPrompt: unknown[][] = [];
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			childManager = options?.sessionManager as SessionManager | undefined;
-			contextAtCreate = childManager?.buildSessionContext().messages;
-			const listeners: Array<(event: AgentSessionEvent) => void> = [];
-			const emit = (event: AgentSessionEvent) => {
-				for (const listener of listeners) listener(event);
-			};
-			const mock = {
-				...createSessionDefaults(),
-				state: { messages: [] as unknown[] },
-				agent: { state: { systemPrompt: ["test"] } },
-				model: undefined,
-				extensionRunner: undefined,
-				sessionManager: childManager,
-				getActiveToolNames: () => ["read", "yield"],
-				getEnabledToolNames: () => ["read", "yield"],
-				subscribe: (listener: (event: AgentSessionEvent) => void) => {
-					listeners.push(listener);
-					return () => {
-						const index = listeners.indexOf(listener);
-						if (index >= 0) listeners.splice(index, 1);
-					};
-				},
-				prompt: async (text: string) => {
-					childManager!.appendMessage({ role: "user", content: text, timestamp: Date.now() });
-					contextsAtPrompt.push(childManager!.buildSessionContext().messages);
-					emit({
-						type: "tool_execution_end",
-						toolCallId: "yield-1",
-						toolName: "yield",
-						result: {
-							content: [{ type: "text", text: "Result submitted." }],
-							details: { status: "success", data: { ok: true } },
+		// A real createAgentSession with a mock model: the child session is built
+		// on the executor's seeded journal and its first provider request carries
+		// the inherited history ahead of the brief.
+		registerMockApi();
+		const mockModel = createMockModel({
+			provider: "mock",
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "call_yield_1",
+							name: "yield",
+							arguments: { data: { phrase: "BLUE-HERON-42" } },
 						},
-						isError: false,
-					} as AgentSessionEvent);
+					],
+					stopReason: "toolUse",
 				},
-			};
-			return {
-				session: mock as unknown as AgentSession,
-				extensionsResult: {} as LoadExtensionsResult,
-				setToolUIContext: () => {},
-				eventBus: new EventBus(),
-			} satisfies CreateAgentSessionResult;
+			],
+			handler: () => ({ content: ["done"], stopReason: "stop" }),
 		});
+		const authStorage = createInMemoryAuthStorage();
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		authStorage.setRuntimeApiKey("mock", "test-key");
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([mockModel]);
+		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+		vi.spyOn(modelRegistry, "hasConfiguredAuth").mockReturnValue(true);
+
+		const parentManager = SessionManager.inMemory();
+		parentManager.appendMessage({ role: "user", content: "remember BLUE-HERON-42", timestamp: 1 } as never);
+		parentManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "Noted." }],
+			api: "openai-responses",
+			provider: "openai",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 2,
+		} as never);
 
 		const forkedSession = {
 			...session(),
+			cwd: tempDir.path(),
+			authStorage,
+			modelRegistry,
+			sessionManager: parentManager,
+			eventBus: new EventBus(),
 			getSessionFile: () => parentFile,
-		} as ToolSession;
+			enableMCP: false,
+			enableLsp: false,
+			extensionPaths: [] as string[],
+			preparedExtensions: [],
+			customToolPaths: [],
+			effectiveExtensionRoots: () => ({
+				explicit: [] as string[],
+				mode: "explicit-only" as const,
+				configured: [] as string[],
+				configuredLevel: "project" as const,
+			}),
+		} as unknown as ToolSession;
+		const inherited = forkMessages(forkedSession, "all", undefined);
+
+		let childManager: SessionManager | undefined;
+		let contextAtCreate: unknown[] | undefined;
+		const realCreateAgentSession = sdkModule.createAgentSession;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			childManager = options?.sessionManager as SessionManager | undefined;
+			contextAtCreate = childManager?.buildSessionContext().messages;
+			return realCreateAgentSession(options);
+		});
+
 		const settled = await runStructuredSubagent(
 			request({
 				session: forkedSession,
+				model: "mock/mock-model",
 				assignment: "Reply with the phrase only.",
 				fork: { messages: inherited },
 			}),
@@ -892,16 +893,13 @@ describe("structured subagent primitive", () => {
 		expect(settled.result.exitCode).toBe(0);
 		// The session was built on top of the inherited history…
 		expect(contextAtCreate).toEqual(inherited);
-		// …and the first model turn sees that history ahead of the brief.
-		expect(contextsAtPrompt).toHaveLength(1);
-		expect(contextsAtPrompt[0]).toEqual([
-			...inherited,
-			expect.objectContaining({
-				role: "user",
-				content: expect.stringContaining("Reply with the phrase only."),
-			}),
-		]);
-
+		// …and the first provider request saw that history ahead of the brief.
+		expect(mockModel.calls).toHaveLength(1);
+		const firstContext = mockModel.calls[0]!.context.messages;
+		expect(JSON.stringify(firstContext[0])).toContain("remember BLUE-HERON-42");
+		expect(firstContext[1]?.role).toBe("assistant");
+		expect(JSON.stringify(firstContext[1])).toContain("Noted.");
+		expect(JSON.stringify(firstContext[inherited.length])).toContain("Reply with the phrase only.");
 		// The child journal is its own file under the parent's artifacts dir,
 		// with the inherited turns persisted ahead of the brief.
 		const journalFile = path.join(tempDir.path(), "parent", `${settled.result.id}.jsonl`);
@@ -913,6 +911,6 @@ describe("structured subagent primitive", () => {
 		const roles = messageEntries.map(entry => entry.message?.role);
 		expect(roles.slice(0, 3)).toEqual(["user", "assistant", "user"]);
 		expect(messageEntries[0]?.message?.content).toBe("remember BLUE-HERON-42");
-		expect(String(messageEntries[2]?.message?.content)).toContain("Reply with the phrase only.");
+		expect(JSON.stringify(messageEntries[2]?.message?.content)).toContain("Reply with the phrase only.");
 	});
 });

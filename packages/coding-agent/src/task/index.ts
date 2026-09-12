@@ -47,8 +47,8 @@ import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
-import { forkMessages } from "./fork";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
+import { forkMessages, type ForkSnapshot } from "./fork";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
@@ -220,6 +220,11 @@ function validateEffort(effort: TaskEffort | undefined, label: string): string |
 function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string | undefined {
 	const hasTask = typeof params.task === "string" && params.task.trim() !== "";
 	const tasks = params.tasks;
+	// Forking is a flat-form feature: an explicit `fork` beside `tasks[]` is a
+	// rejected combination, never silently ignored.
+	if (tasks !== undefined && params.fork !== undefined) {
+		return "`fork` inherits this conversation and only applies to a single spawn. Remove `tasks[]` or drop `fork`.";
+	}
 	if (batchEnabled && tasks !== undefined) {
 		if (!Array.isArray(tasks) || tasks.length === 0) {
 			return "Missing `tasks`. Provide at least one task item ({ name?, agent?, task }).";
@@ -259,7 +264,7 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 	if (
 		params.fork !== undefined &&
 		params.fork !== "all" &&
-		(typeof params.fork !== "number" || !Number.isInteger(params.fork) || params.fork <= 0)
+		(typeof params.fork !== "number" || !Number.isSafeInteger(params.fork) || params.fork <= 0)
 	) {
 		return 'The call has an invalid `fork` value. Use "all" or a positive integer of turns.';
 	}
@@ -702,6 +707,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (validationError) {
 			return createTaskModeError(validationError);
 		}
+		// The fork snapshot freezes the parent's resolved context at call time —
+		// before any await (eval-tool description, preflight) or queued
+		// semaphore — so a spawn that starts later cannot absorb parent turns
+		// newer than the call that created it.
+		const fork =
+			params.tasks === undefined && params.fork !== undefined
+				? {
+						messages: forkMessages(
+							this.session,
+							params.fork === "all" ? "all" : { lastTurns: params.fork },
+							toolCallId,
+						),
+					}
+				: undefined;
 
 		const spawnItems = resolveSpawnItems(params);
 		const evalToolNames = spawnItems.flatMap(item => item.tools ?? []);
@@ -789,6 +808,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				defaultAgent,
 				signal,
 				onUpdate,
+				fork,
 			);
 			if (!advisory) return result;
 			let appended = false;
@@ -844,6 +864,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					defaultAgent,
 					signal,
 					onUpdate,
+					fork,
 				),
 			);
 		}
@@ -942,6 +963,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						settledCount += 1;
 						if (failed) failedCount += 1;
 					},
+					fork,
 				});
 				if (started.length === 0) primaryJobId = jobId;
 				started.push({ agentId: spawn.agentId, jobId });
@@ -1098,9 +1120,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		buildDetails: () => TaskToolDetails;
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
 		onSettled?: (failed: boolean) => void;
+		fork?: ForkSnapshot;
 	}): string {
-		const { manager, toolCallId, spawnParams, agentId, progress, ircEnabled, buildDetails, onUpdate, onSettled } =
-			options;
+		const {
+			manager,
+			toolCallId,
+			spawnParams,
+			agentId,
+			progress,
+			ircEnabled,
+			buildDetails,
+			onUpdate,
+			onSettled,
+			fork,
+		} = options;
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
 			// Isolated runs are parked without a reviver once the run ends
 			// (`finalizeSubagentLifecycle`), so "message it" would point the
@@ -1213,6 +1246,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							if (job) job.retainedArtifactsCleanup = cleanup;
 							else void cleanup();
 						},
+						fork,
 					);
 					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 					const singleResult = result.details?.results[0];
@@ -1303,6 +1337,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		defaultAgent: string,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+		fork?: ForkSnapshot,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		if (spawns.length === 1) {
 			const spawn = spawns[0]!;
@@ -1320,6 +1355,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					spawn.index,
 					false,
 					{ invokedAt, acquiredAt },
+					undefined,
+					fork,
 				);
 			} finally {
 				this.#releaseSpawnSemaphore();
@@ -1457,6 +1494,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
 		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
+		fork?: ForkSnapshot,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		return this.#runSpawn(
 			toolCallId,
@@ -1468,6 +1506,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			detached,
 			launchTiming,
 			onArtifactsRetained,
+			fork,
 		);
 	}
 
@@ -1482,6 +1521,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
 		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
+		fork?: ForkSnapshot,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const assignment = (params.task ?? "").trim();
@@ -1495,17 +1535,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				context,
 				agent: params.agent,
 				...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
-				...(params.fork !== undefined
-					? {
-							fork: {
-								messages: forkMessages(
-									this.session,
-									params.fork === "all" ? "all" : { lastTurns: params.fork },
-									toolCallId,
-								),
-							},
-						}
-					: {}),
+				fork,
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 				...(params.effort !== undefined ? { effort: params.effort } : {}),
 				...(params.tools?.length
