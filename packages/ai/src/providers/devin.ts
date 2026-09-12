@@ -580,9 +580,8 @@ function buildRouterPrompt(messages: Message[]): ChatMessagePrompt | undefined {
 
 /**
  * The completion configuration the Devin CLI (3000.10.21) sends on every
- * `GetChatMessage`, captured from its own requests for SWE-2 standalone, the
- * Fusion lead (Fable) and the Fusion sidekick (SWE-2): one config for every
- * model. A caller's explicit temperature, top-p or stop sequences still win.
+ * `GetChatMessage`, the same for every model, standalone or in a Fusion pair.
+ * A caller's explicit temperature, top-p or stop sequences still win.
  * `numCompletions` is required; the backend answers `invalid_argument` when
  * it is absent.
  */
@@ -603,7 +602,7 @@ const DEVIN_CLI_COMPLETION_CONFIGURATION = {
  * supplies both the resolved uid and its JWT. The CLI sends no tool choice,
  * cache options or execution id, and no user JWT on this call; the backend
  * applies its defaults for each. Parallel tool calls follow the model features
- * the server declares, which is unset (enabled) for every captured model.
+ * the server declares, which is unset (enabled) for the Devin models omp pairs.
  */
 function buildDevinChatRequest(
 	model: Model<"devin-agent">,

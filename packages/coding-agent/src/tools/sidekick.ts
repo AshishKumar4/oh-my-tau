@@ -36,20 +36,17 @@ import type { ToolSession } from "./index";
 import { ToolError } from "./tool-errors";
 
 /**
- * Longest a blocking handoff waits inside one tool call, and the default when
- * `timeout` is omitted. A handoff that outlasts it keeps running; its report
- * then self-delivers like any background job.
+ * Longest a blocking handoff waits inside one tool call, as in the Devin CLI
+ * (2700 s). A handoff that outlasts it keeps running; its report then
+ * self-delivers like any background job.
  */
-export const SIDEKICK_MAX_BLOCK_SECONDS = 1800;
+export const SIDEKICK_MAX_BLOCK_SECONDS = 2700;
 
+// The Devin CLI's `sidekick` declaration: `message` and `block` only.
 const sidekickSchema = type({
-	// `message` is inferred from the vendor prompt ("call the tool again with a new `message`"); the wire name was not captured.
-	message: type("string > 0").describe(
-		"The brief: goal, plan, constraints, and how to verify. While the sidekick is running, this is injected into the running handoff as an interrupt.",
-	),
-	"block?": type("boolean").describe("Wait for the handoff to finish and return its report (default true)."),
-	"timeout?": type("number > 0").describe(
-		`Seconds to wait when blocking; default and maximum ${SIDEKICK_MAX_BLOCK_SECONDS}.`,
+	message: type("string > 0").describe("The message to send the sidekick."),
+	"block?": type("boolean").describe(
+		"Wait for the worker to report. Interrupted waits leave the handoff running.",
 	),
 });
 
@@ -201,7 +198,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			});
 		}
 		try {
-			return await this.#awaitJob(manager, jobId, params.timeout, signal, mode);
+			return await this.#awaitJob(manager, jobId, signal, mode);
 		} finally {
 			waiting = false;
 		}
@@ -306,22 +303,20 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 	}
 
 	/**
-	 * Block on the handoff job up to the timeout (or the caller's abort, e.g. a
-	 * user steer the lead must act on first). A settled job is consumed here so
-	 * the async path does not deliver the same report twice.
+	 * Block on the handoff job up to the fixed wait (or the caller's abort, e.g.
+	 * a user steer the lead must act on first). A settled job is consumed here
+	 * so the async path does not deliver the same report twice.
 	 */
 	async #awaitJob(
 		manager: AsyncJobManager,
 		jobId: string,
-		timeoutSeconds: number | undefined,
 		signal: AbortSignal | undefined,
 		mode: SidekickHandoffMode,
 	): Promise<AgentToolResult<SidekickToolDetails>> {
 		const job = manager.getJob(jobId);
 		if (!job) throw new ToolError(`Sidekick handoff job ${jobId} vanished before it could be awaited.`);
-		const timeoutMs = Math.min(timeoutSeconds ?? SIDEKICK_MAX_BLOCK_SECONDS, SIDEKICK_MAX_BLOCK_SECONDS) * 1000;
 		const timeout = Promise.withResolvers<"timeout">();
-		const timer = setTimeout(() => timeout.resolve("timeout"), timeoutMs);
+		const timer = setTimeout(() => timeout.resolve("timeout"), SIDEKICK_MAX_BLOCK_SECONDS * 1000);
 		const aborted = Promise.withResolvers<"aborted">();
 		const onAbort = (): void => aborted.resolve("aborted");
 		signal?.addEventListener("abort", onAbort, { once: true });
@@ -343,7 +338,9 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			return textResult(job.resultText ?? "", { agentId: job.agentId, jobId, mode, pending: false });
 		}
 		const reason =
-			outcome === "aborted" ? "The wait was interrupted" : `No report within ${formatDuration(timeoutMs)}`;
+			outcome === "aborted"
+				? "The wait was interrupted"
+				: `No report within ${formatDuration(SIDEKICK_MAX_BLOCK_SECONDS * 1000)}`;
 		return textResult(`${reason}; the sidekick is still working on handoff job \`${jobId}\`. ${waitHint(jobId)}`, {
 			agentId: job.agentId,
 			jobId,

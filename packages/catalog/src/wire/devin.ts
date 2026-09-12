@@ -15,11 +15,10 @@ const DEVIN_OS = process.platform === "darwin" ? "darwin" : process.platform ===
 const DEVIN_LOCALE = "en";
 
 /**
- * Released Devin CLI request identity, as the CLI's own `GetChatMessage`
- * carries it (captured from devin 3000.10.21): `ideName` and `extensionName`
- * are both `chisel`, and no `ideType` is sent. The CLI also sends a
- * per-request `Metadata.f` blob the schema cannot derive; the backend serves
- * requests without it.
+ * Released Devin CLI (3000.10.21) request identity: `ideName` and
+ * `extensionName` are both `chisel`, and no `ideType` is sent. The CLI also
+ * sends a per-request `Metadata.f` value the schema cannot derive; the backend
+ * serves requests without it.
  */
 const DEVIN_CLI_VERSION = "3000.10.21";
 const DEVIN_CLI_METADATA = {

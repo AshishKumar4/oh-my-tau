@@ -48,9 +48,12 @@ session: it talks to you, plans, writes briefs and reviews the result. One persi
 work: it explores, implements, runs the tests and reports back. The two exchange briefs and reports, never their
 conversations, so each keeps its own warm prompt cache.
 
-The lead prompt and the sidekick prompt are the ones the Devin CLI ships. The lead gets one extra tool, `sidekick`,
-with the same contract: blocking by default, re-briefable while it runs, exactly one sidekick per session. Nothing
-else changes for the lead; it keeps the profile above and omp's full tool layer.
+The lead prompt, the sidekick prompt and the `sidekick` tool are the Devin CLI's own, and the sidekick runs with the
+same request settings the CLI uses. The lead gets one extra tool, `sidekick`, with the same contract: blocking by
+default, re-briefable while it runs, exactly one sidekick per lead. A second `sidekick` call while one is running is
+an update to that handoff, not a second sidekick; parallel work goes to subagent lanes, each of which can lead a
+sidekick of its own. Nothing else changes for the lead; it keeps the profile above and omp's full tool layer. GPT
+leads (the Codex profile) get the two extra delegation bullets Devin gives them.
 
 A subagent can lead too: an agent definition that sets `sidekick: true` in its frontmatter gets its own sidekick
 tool and sidekick when Fusion is on, so an expert lane briefs and reviews without doing the edits itself.
@@ -65,10 +68,6 @@ tool and sidekick when Fusion is on, so an expert lane briefs and reviews withou
 The default sidekick is `devin/swe-2`, which needs a Devin login (`omp` reads the same credentials the Devin CLI
 uses). The settings panel has a **Fusion** tab, and the status line shows the pair as `fable-5-1 ⚡ swe-2` while it
 is on. The lead prompt costs about 5,000 tokens of cached prefix per request.
-
-On one SWE-bench Verified instance rated 1 to 4 hours (`django__django-15957`), an Opus lead with an SWE-2 sidekick
-passed all 4 hidden tests and kept all 75 regression tests green. The lead spent 28 turns investigating and wrote
-one 8,800-character brief; the sidekick made the 3 edits and ran the tests. More runs are in progress.
 
 ## Install
 
@@ -88,10 +87,10 @@ Codex capture if `codex` is.
 Split the phases with `--build-only` or `--record-only`. Re-run it after upgrading Claude Code or Codex: captures are
 keyed by client version, and an older one keeps serving until you refresh it.
 
-## Why the prompts are recorded and not shipped
+## Why the harness prompts are recorded and not shipped
 
-The vendor system prompts are proprietary text. Committing them would redistribute someone else's copyrighted work,
-so this repository contains none of it. The test fixtures store structure only, never prose.
+The Claude Code and Codex system prompts belong to their vendors. This repository contains none of that text; the test
+fixtures store structure only, never prose.
 
 Instead the script records the prompt locally from the client you already license. It starts a loopback recording
 gateway, points a real `claude` or `codex` session at it once, and stores what that client sent under
@@ -118,10 +117,10 @@ follow the profile; the vendor prompt needs a capture.
 
 ## Known gaps
 
-- **The sidekick prompt variant is fixed to the strong one.** Devin tunes its lead prompt by sidekick strength; this
-  port uses the SWE-2 (strong) variant. Pointing `/fusion` at a weaker sidekick does not switch to the weak variant.
-- **Devin's server-side harness bundles are not captured.** The CLI applies per-role "harness UIDs" it fetches at
-  runtime. Everything embedded in the client, the whole lead and sidekick prompts, is here; those bundles are not.
+- **The Fusion prompts are tuned for SWE-2.** Pointing `/fusion` at another sidekick model keeps the same lead and
+  sidekick text; Devin's per-pair tuning for other sidekicks is not reproduced.
+- **The lead's "You are powered by Fusion (…)" line is not served.** The lead prompt is built before the pair's model
+  names are known. Everything else in the lead and sidekick prompts is.
 - **`hub` and `eval` stay visible** under a profile, though no vendor ships them. That is the design: the agent keeps
   omp's full capability rather than a reduced impersonation.
 - **The Codex profile has no live inference turn yet.** Its prompt, tool surface and wire shape are verified against
@@ -136,5 +135,6 @@ releases do not reach a from-source install, so re-run the install script to pic
 ## Credits and licence
 
 All of the agent is upstream work by [@can1357](https://github.com/can1357) and, before that,
-[@mariozechner](https://github.com/mariozechner). The fork adds two features on top. The Fusion prompts are Cognition's, recorded from the Devin CLI you license. Licence is unchanged from
+[@mariozechner](https://github.com/mariozechner). The fork adds two features on top. The Fusion prompts and tool
+contract are Cognition's, from the Devin CLI, and using them requires a Devin login. Licence is unchanged from
 upstream; see [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).

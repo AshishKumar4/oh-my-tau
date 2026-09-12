@@ -32,6 +32,8 @@ export interface FusionPromptData extends Record<string, unknown> {
 	/** The tool the lead waits for a background handoff with: the profile's job-wait facade, else `hub`. */
 	readTool: string;
 	leadIdentity: string;
+	/** GPT leads (the Codex profile) get two extra delegation bullets that Claude leads do not. */
+	gptLead: boolean;
 }
 
 export function buildFusionPromptData(options: {
@@ -45,26 +47,27 @@ export function buildFusionPromptData(options: {
 		sidekickTool: toolRefs[SIDEKICK_TOOL_NAME] ?? SIDEKICK_TOOL_NAME,
 		readTool: profile === undefined ? hubRef : HARNESS_JOB_WAIT_FACADE[profile].wireName,
 		leadIdentity: profile === undefined ? "assistant" : LEAD_IDENTITY_BY_PROFILE[profile],
+		gptLead: profile === "codex",
 	};
 }
 
 /**
- * The two phrases in the captured sidekick prompt that belong to the recording
- * session rather than the harness: the Devin CLI names its `todo_write` tool,
- * and closes with the model and effort it ran on. Each must be present exactly
- * once, so a re-capture that rewords them fails loudly here instead of
- * shipping the recording's values.
+ * The two phrases in the Devin sidekick prompt that belong to a particular
+ * session rather than the harness: the CLI names its `todo_write` tool, and
+ * closes with the model and effort it runs on. Each must be present exactly
+ * once, so a prompt update that rewords them fails loudly here instead of
+ * shipping stale values.
  */
 const SIDEKICK_TODO_PHRASE = "use the todo_write tool";
 const SIDEKICK_POWERED_BY_PHRASE = "Model: selected worker.";
 
-/** The captured sidekick prompt with omp's `todo` and the pairing's own model and effort substituted. */
-export function renderSidekickPrompt(captured: string, model: Model<Api>, thinkingLevel: string | undefined): string {
+/** The Devin sidekick prompt with omp's `todo` and the pairing's own model and effort substituted. */
+export function renderSidekickPrompt(prompt: string, model: Model<Api>, thinkingLevel: string | undefined): string {
 	for (const phrase of [SIDEKICK_TODO_PHRASE, SIDEKICK_POWERED_BY_PHRASE]) {
-		if (captured.split(phrase).length !== 2) throw new Error(`sidekick prompt: expected exactly one "${phrase}"`);
+		if (prompt.split(phrase).length !== 2) throw new Error(`sidekick prompt: expected exactly one "${phrase}"`);
 	}
 	const effort = thinkingLevel ? ` ${thinkingLevel.charAt(0).toUpperCase()}${thinkingLevel.slice(1)}` : "";
-	return captured
+	return prompt
 		.replace(SIDEKICK_TODO_PHRASE, "use the todo tool")
 		.replace(SIDEKICK_POWERED_BY_PHRASE, `You are powered by ${model.name}${effort}.`);
 }
