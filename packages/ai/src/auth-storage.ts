@@ -3085,8 +3085,17 @@ export class AuthStorage {
 		// #tryOAuthCredential), not the OAuth-only subset, so dereferencing it into the
 		// filtered array would be off-by-N when any non-OAuth credential precedes the
 		// OAuth ones (e.g. [api_key, oauth_A, oauth_B] stored order).
+		// A held account is never the active one, even when a restored pin names
+		// it: the next request resolves around it and re-records the sticky.
+		const providerKey = this.#getProviderTypeKey(provider, "oauth");
+		const usable = (credential: AuthCredential | undefined): credential is OAuthCredential =>
+			credential?.type === "oauth" &&
+			!this.#isCredentialHeld(
+				this.#getStoredCredentials(provider).find(entry => entry.credential === credential)?.id,
+				providerKey,
+			);
 		const stickyCredential = sessionPref?.type === "oauth" ? allCredentials[sessionPref.index] : undefined;
-		return stickyCredential?.type === "oauth" ? stickyCredential : oauthCredentials[0];
+		return usable(stickyCredential) ? stickyCredential : oauthCredentials.find(usable);
 	}
 
 	/**
@@ -6215,6 +6224,7 @@ export class AuthStorage {
 		const index = stored.findIndex(entry => entry.id === credentialId);
 		const target = stored[index];
 		if (target?.credential.type !== "oauth") return false;
+		if (this.#isCredentialHeld(credentialId, this.#getProviderTypeKey(provider, "oauth"))) return false;
 		this.#recordSessionCredential(provider, sessionId, "oauth", index, options?.lastUsedAtMs);
 		return true;
 	}

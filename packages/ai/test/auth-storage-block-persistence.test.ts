@@ -242,10 +242,13 @@ describe("AuthStorage credential block persistence", () => {
 		const storage = new AuthStorage(store);
 		await storage.reload();
 		try {
-			storage.holdCredential(PROVIDER, heldRow!.id);
 			// The held account is the session's sticky preference, which the
 			// last-resort pass would otherwise take first.
 			expect(storage.pinSessionOAuthAccount(PROVIDER, "session-sticky", heldRow!.id)).toBe(true);
+			storage.holdCredential(PROVIDER, heldRow!.id);
+			// Neither the active-account view nor a pin restored from a session file names a held account.
+			expect(storage.getOAuthAccountIdentity(PROVIDER, "session-sticky")?.email).toBe("other@example.com");
+			expect(storage.pinSessionOAuthAccount(PROVIDER, "session-restored", heldRow!.id)).toBe(false);
 
 			expect(await storage.getApiKey(PROVIDER, "session-sticky", { modelId: "claude-fable-5-1" })).toBe(
 				"access-other",
