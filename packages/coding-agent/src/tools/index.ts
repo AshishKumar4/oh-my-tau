@@ -27,6 +27,7 @@ import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
+import type { ForkRequestSnapshot } from "../session/fork-context";
 import type { CustomMessage } from "../session/messages";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
@@ -277,6 +278,8 @@ export interface ToolSession {
 		/** Resolved LLM context — present on full SDK managers, absent on advisor-local journals. */
 		buildSessionContext?: SessionManager["buildSessionContext"];
 	};
+	/** Latest Codex request snapshot captured by this session's main loop; a cloned copy so a queued fork never observes later mutation. */
+	getForkRequestSnapshot?: () => ForkRequestSnapshot | undefined;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
 	getEvalKernelOwnerId?: () => string | null;
 	/** Current enabled eval prelude definitions. */

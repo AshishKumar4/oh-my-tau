@@ -5,8 +5,8 @@
  * last N user-message turns when asked.
  */
 import { describe, expect, it } from "bun:test";
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ThinkingContent, ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { forkMessages } from "@oh-my-pi/pi-coding-agent/task/fork";
@@ -67,22 +67,26 @@ function custom(customType: string): CustomMessage {
 	};
 }
 
+/** Messages the session journal accepts — the resolved-history subset of AgentMessage. */
+type JournalMessage = Parameters<SessionManager["appendMessage"]>[0];
+
 const SPAWN_CALL = "spawn-call-1";
 
-function sessionWith(messages: AgentMessage[]): ToolSession {
+function sessionWith(messages: JournalMessage[]): ToolSession {
 	const sessionManager = SessionManager.inMemory();
-	for (const message of messages) sessionManager.appendMessage(message as never);
+	for (const message of messages) sessionManager.appendMessage(message);
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
+		settings: Settings.isolated(),
 		sessionManager,
-	} as unknown as ToolSession;
+	};
 }
 
 /** Full transcript up to the in-flight spawn: two complete turns plus the assistant's spawn call. */
-function history(): AgentMessage[] {
+function history(): JournalMessage[] {
 	return [
 		user("remember the secret BLUE-HERON-42"),
 		assistant([

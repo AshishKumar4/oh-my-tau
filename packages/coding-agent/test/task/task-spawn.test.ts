@@ -18,10 +18,12 @@ import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { ForkRequestSnapshot } from "@oh-my-pi/pi-coding-agent/session/fork-context";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import type { AgentDefinition, AgentProgress, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -970,6 +972,63 @@ describe("task spawn routing", () => {
 		expect(seen[0]!.messages).toEqual([{ role: "user", content: "second turn", attribution: "user", timestamp: 3 }]);
 		for (const gate of gates.values()) gate.resolve();
 		if (jobId) await manager.getJob(jobId)?.promise;
+	});
+
+	it("carries the parent's request snapshot on fork:all, never on an N-turn fork", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+		const seen: Array<{ id: string | undefined; fork: ExecutorOptions["fork"] }> = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			seen.push({ id: options.id, fork: options.fork });
+			return makeResult(options.id ?? "?");
+		});
+
+		const parentRequest: ForkRequestSnapshot = {
+			request: {
+				provider: "openai-codex-responses",
+				model: "gpt-5",
+				baseUrl: "https://api.openai.com/v1",
+				accountId: "acct-parent",
+				sessionId: "sess-parent",
+				threadId: "thread-parent",
+				input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "seed" }] }],
+			},
+			messageFingerprints: [],
+		};
+		const parentSession = {
+			cwd: "/tmp",
+			hasUI: false,
+			settings: Settings.isolated({}),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getForkRequestSnapshot: () => parentRequest,
+			sessionManager: {
+				buildSessionContext: () => ({
+					messages: [{ role: "user", content: "first turn", timestamp: 1 }] satisfies AgentMessage[],
+				}),
+			},
+		} as unknown as ToolSession;
+
+		const manager = createManager();
+		parentSession.asyncJobManager = manager;
+		const tool = await TaskTool.create(parentSession);
+
+		await tool.execute("tc-fork-all", {
+			agent: "task",
+			name: "AllFork",
+			task: "Inherit everything.",
+			fork: "all",
+		} as TaskParams);
+		await pollUntil(() => seen.length === 1, 2000);
+		expect(seen[0]!.fork?.request?.request.sessionId).toBe("sess-parent");
+
+		await tool.execute("tc-fork-one", {
+			agent: "task",
+			name: "TurnFork",
+			task: "Inherit the last turn only.",
+			fork: 1,
+		} as TaskParams);
+		await pollUntil(() => seen.length === 2, 2000);
+		expect(seen[1]!.fork?.request).toBeUndefined();
 	});
 
 	it("rejects invalid fork values and fork+batch before any spawn work", async () => {

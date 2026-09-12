@@ -11,6 +11,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import { fingerprintForkMessage, FORK_REQUEST_CONTEXT_TYPE } from "@oh-my-pi/pi-coding-agent/session/fork-context";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { createEvalCustomTools } from "@oh-my-pi/pi-coding-agent/task/eval-tools";
@@ -886,7 +887,21 @@ describe("structured subagent primitive", () => {
 				session: forkedSession,
 				model: "mock/mock-model",
 				assignment: "Reply with the phrase only.",
-				fork: { messages: inherited },
+				fork: {
+					messages: inherited,
+					request: {
+						request: {
+							provider: "openai-codex-responses",
+							model: "gpt-5",
+							baseUrl: "https://api.openai.com/v1",
+							accountId: "acct-parent",
+							sessionId: "sess-parent",
+							threadId: "thread-parent",
+							input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "seed" }] }],
+						},
+						messageFingerprints: inherited.map(fingerprintForkMessage),
+					},
+				},
 			}),
 		);
 
@@ -906,11 +921,25 @@ describe("structured subagent primitive", () => {
 		const journal = (await fs.readFile(journalFile, "utf8"))
 			.trim()
 			.split("\n")
-			.map(line => JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } });
+			.map(
+				line =>
+					JSON.parse(line) as {
+						type?: string;
+						customType?: string;
+						data?: { request?: { sessionId?: string } };
+						message?: { role?: string; content?: unknown };
+					},
+			);
 		const messageEntries = journal.filter(entry => entry.type === "message");
 		const roles = messageEntries.map(entry => entry.message?.role);
 		expect(roles.slice(0, 3)).toEqual(["user", "assistant", "user"]);
 		expect(messageEntries[0]?.message?.content).toBe("remember BLUE-HERON-42");
 		expect(JSON.stringify(messageEntries[2]?.message?.content)).toContain("Reply with the phrase only.");
+		// The inherited provider-native request is persisted as a custom marker
+		// so restarts and nested forks keep the shared prompt-cache lineage.
+		const forkMarker = journal.find(
+			entry => entry.type === "custom" && entry.customType === FORK_REQUEST_CONTEXT_TYPE,
+		);
+		expect(forkMarker?.data?.request?.sessionId).toBe("sess-parent");
 	});
 });

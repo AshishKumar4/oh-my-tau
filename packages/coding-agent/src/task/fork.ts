@@ -4,6 +4,7 @@
  * `spawn_agent` `fork_turns` and Claude Code's `Agent` `subagent_type: "fork"`.
  */
 import type { Message } from "@oh-my-pi/pi-ai";
+import type { ForkRequestSnapshot } from "../session/fork-context";
 import {
 	convertToLlm,
 	isUserTurnInitiator,
@@ -14,10 +15,15 @@ import type { ToolSession } from "../tools";
 
 /** Fork extent: `"all"` inherits the whole resolved history; `{ lastTurns: N }` keeps the last N user-message-delimited turns. */
 export type ForkMode = "all" | { lastTurns: number };
-
 /** The resolved history a forked child starts with, captured at spawn-call time. */
 export interface ForkSnapshot {
 	messages: Message[];
+	/**
+	 * The parent's provider-native request snapshot, attached only for a
+	 * whole-history (`"all"`) fork: a partial slice can never be a byte-exact
+	 * wire prefix, so N-turn forks deliberately do not claim prefix reuse.
+	 */
+	request?: ForkRequestSnapshot;
 }
 
 /**

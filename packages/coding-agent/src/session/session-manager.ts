@@ -2298,8 +2298,14 @@ export class SessionManager {
 			| BashExecutionMessage
 			| PythonExecutionMessage
 			| FileMentionMessage,
+		options?: { inherited?: boolean },
 	): string {
-		const entry: SessionMessageEntry = { type: "message", ...this.#freshEntryFields(), message };
+		// Inherited turns (conversation forks) record the message clone with
+		// billing zeroed: the child must not pay for the parent's spend while
+		// token counts stay intact for context accounting.
+		const stored = options?.inherited === true ? structuredClone(message) : message;
+		const entry: SessionMessageEntry = { type: "message", ...this.#freshEntryFields(), message: stored };
+		if (options?.inherited === true) resetUsageCost(entryUsage(entry));
 		this.#recordEntry(entry);
 		return entry.id;
 	}

@@ -164,6 +164,14 @@ import { DateCwdReminderInjector } from "./session/date-cwd-reminder";
 import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import { recoverInlineSloppyEdit } from "./session/inline-edit-recovery";
 import {
+	createForkJournalStateReader,
+	type ForkRequestSnapshot,
+	forkPrefixMessageCount,
+	fingerprintForkMessages,
+	resolveForkCredentialId,
+	type SessionForkRequest,
+} from "./session/fork-context";
+import {
 	type CustomMessage,
 	convertToLlm,
 	LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE,
@@ -615,6 +623,13 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
+
+	/**
+	 * Provider-native request a forked child inherits for prompt-cache prefix
+	 * reuse. When absent, a `subagent_fork_request` journal marker seeded by the
+	 * executor supplies the same state for restarts and nested forks.
+	 */
+	forkRequest?: ForkRequestSnapshot;
 
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
@@ -1458,6 +1473,53 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		await sessionManager.setAdditionalDirectories(merged);
 	}
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
+	// The request a forked child replays as its native prefix. The journal is
+	// the authority after initial seeding: `options.forkRequest` applies only
+	// while the journal shows neither a live marker nor a reset_boundary — a
+	// `/clear` can never be re-armed by a stale caller option. Re-scanned per
+	// turn via the cached reader so mid-session resets/compactions take effect.
+	const forkJournal = createForkJournalStateReader(sessionManager);
+	const initialForkJournal = forkJournal();
+	const inheritedForkRequest: SessionForkRequest | undefined =
+		initialForkJournal.snapshot ??
+		(initialForkJournal.boundaryMs === undefined && options.forkRequest !== undefined
+			? // Explicitly unbound: a caller-supplied snapshot must not inherit a
+				// foreign owner id (the extra property is invisible at the type level).
+				{ ...options.forkRequest, ownerId: undefined, recordedAt: Date.now() }
+			: undefined);
+	// Latest live request snapshot — journal-seeded or captured by this session's
+	// own streamFn; lazily bound to the runtime identity on first use so a `/new`
+	// or session switch can never lend a previous session's prefix.
+	let latestForkRequest: SessionForkRequest | undefined = inheritedForkRequest;
+	const forkOwnerId = () => `${sessionManager.getSessionId?.() ?? ""}~${providerSessionId}`;
+	/**
+	 * Refresh the live request from journal authority and return it only for the
+	 * current runtime identity: a reset_boundary newer than the snapshot kills
+	 * it, an unbound snapshot binds lazily, and a bound snapshot whose owner no
+	 * longer matches (post `/new`, session switch) is retired rather than lent.
+	 */
+	const currentForkRequest = (): SessionForkRequest | undefined => {
+		const forkState = forkJournal();
+		if (
+			latestForkRequest !== undefined &&
+			forkState.boundaryMs !== undefined &&
+			latestForkRequest.recordedAt <= forkState.boundaryMs
+		) {
+			latestForkRequest = undefined;
+		}
+		if (latestForkRequest === undefined && forkState.snapshot !== undefined) {
+			latestForkRequest = forkState.snapshot;
+		}
+		const current = latestForkRequest;
+		if (current === undefined) return undefined;
+		const ownerId = forkOwnerId();
+		if (current.ownerId !== undefined && current.ownerId !== ownerId) {
+			latestForkRequest = undefined;
+			return undefined;
+		}
+		current.ownerId = ownerId;
+		return current;
+	};
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
 		options.modelPattern !== undefined ||
@@ -1848,6 +1910,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
+			// Newest live request snapshot for a `fork: "all"` spawn to inherit —
+			// owner-checked against the current runtime identity so a prior
+			// session's prefix can never be lent across `/new` or a session switch.
+			getForkRequestSnapshot: () => {
+				const live = currentForkRequest();
+				if (live === undefined) return undefined;
+				// Strip runtime-only fields (ownerId/recordedAt): the snapshot the
+				// child inherits must arrive unbound or the child's owner check
+				// would reject its own lineage.
+				const snapshot: ForkRequestSnapshot = {
+					request: live.request,
+					messageFingerprints: live.messageFingerprints,
+					...(live.credentialId !== undefined ? { credentialId: live.credentialId } : {}),
+				};
+				return structuredClone(snapshot);
+			},
 			getToolByName: name => session?.getToolByName(name),
 			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
 			getEvalBridgeToolNames: () => session?.getEvalBridgeToolNames() ?? [],
@@ -3513,6 +3591,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// One-shot launch-latency marker: fired the first time the loop dispatches
 		// a chat request to the provider transport. See onFirstChatDispatch.
 		let notifyFirstChatDispatch = options.onFirstChatDispatch;
+		// The pin flag is per owner identity: a session switch that somehow kept
+		// lineage re-pins under the new session id.
+		let forkPinOwner: string | undefined;
 		// Shared, settings-aware stream wrapper used by the main agent, advisor,
 		// and side-channel requests (`/btw`, `/omfg`, IRC auto-replies, handoff).
 		// Keeps OpenRouter sticky-routing variants, antigravity endpoint routing,
@@ -3587,6 +3668,53 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						});
 					}
 				}
+				// A forked child inherits its parent's provider-native request as a
+				// prefix-reuse source: same provider, same resolved Codex URL, same
+				// OAuth account. The journal is re-checked per call so a mid-session
+				// reset_boundary kills the lineage and a newer compaction/branch
+				// rewrite disables raw-prefix replay (messageCount omitted) even when
+				// a surviving leading run still hashes the same — fingerprint equality
+				// alone is not proof the full captured wire prefix applies.
+				const forkState = forkJournal();
+				const inheritedFork = currentForkRequest();
+				const currentOwnerId = inheritedFork?.ownerId;
+				const prefixEligible =
+					inheritedFork !== undefined &&
+					(forkState.lastRewriteMs === undefined || inheritedFork.recordedAt > forkState.lastRewriteMs);
+				const forkPrefixCount =
+					prefixEligible && inheritedFork !== undefined && context.messages !== undefined
+						? forkPrefixMessageCount(inheritedFork, context.messages)
+						: undefined;
+				const codexFork =
+					inheritedFork !== undefined
+						? {
+								source: inheritedFork.request,
+								...(forkPrefixCount !== undefined ? { messageCount: forkPrefixCount } : {}),
+							}
+						: undefined;
+				if (inheritedFork !== undefined && currentOwnerId !== undefined && forkPinOwner !== currentOwnerId) {
+					// Best-effort OAuth affinity on the first turn: reuse the parent's
+					// account so the provider's source-account check actually passes.
+					// A held or missing account declines silently; the request still
+					// falls back to whichever key the session resolves.
+					forkPinOwner = currentOwnerId;
+					try {
+						const credentialId =
+							inheritedFork.credentialId ??
+							resolveForkCredentialId(authStorage, inheritedFork.request, providerSessionId);
+						if (credentialId !== undefined) {
+							authStorage.pinSessionOAuthAccount(
+								inheritedFork.request.provider,
+								providerSessionId,
+								credentialId,
+							);
+						}
+					} catch (err) {
+						logger.warn("fork credential pinning failed", {
+							error: err instanceof Error ? err.message : String(err),
+						});
+					}
+				}
 				const externalThinking =
 					settings.get("externalThinking") &&
 					agent.state.tools.some(tool => tool.name === "think") &&
@@ -3598,6 +3726,20 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					...(codeModeState.namespacesInfo === undefined
 						? {}
 						: { toolNamespacesInfo: codeModeState.namespacesInfo }),
+					...(codexFork !== undefined ? { codexFork } : {}),
+					onCodexRequestSnapshot: snapshot => {
+						streamOptions?.onCodexRequestSnapshot?.(snapshot);
+						const credentialId =
+							resolveForkCredentialId(authStorage, snapshot, providerSessionId) ??
+							latestForkRequest?.credentialId;
+						latestForkRequest = {
+							request: snapshot,
+							messageFingerprints: fingerprintForkMessages(context.messages ?? []),
+							...(credentialId !== undefined ? { credentialId } : {}),
+							recordedAt: Date.now(),
+							ownerId: forkOwnerId(),
+						};
+					},
 				});
 			},
 			cursorExecHandlers,

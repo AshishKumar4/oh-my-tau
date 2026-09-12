@@ -719,6 +719,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							params.fork === "all" ? "all" : { lastTurns: params.fork },
 							toolCallId,
 						),
+						// Prefix reuse is whole-history only: an N-turn slice can never be
+						// a byte-exact wire prefix of the parent's captured request.
+						...(params.fork === "all" ? { request: this.session.getForkRequestSnapshot?.() } : {}),
 					}
 				: undefined;
 

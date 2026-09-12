@@ -51,6 +51,7 @@ import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-
 import { type ArtifactManager, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
+import { recordForkRequestSnapshot } from "../session/fork-context";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
@@ -3461,6 +3462,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					model || modelOverride === undefined ? undefined : `${SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX}${id}`,
 				modelPatternDefaultFallbackChain:
 					model || modelOverride === undefined ? undefined : inheritedRetryFallbackChain,
+				forkRequest: options.fork?.request,
 				thinkingLevel: effectiveThinkingLevel,
 				thinkingLevelCeiling: spawnEffortCeiling,
 				toolNames,
@@ -3546,9 +3548,15 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// own journal before the session is created, so the first prompt
 			// (the brief) lands after the inherited turns in both the transcript
 			// and the model context. Only a fresh journal is seeded: a reopened
-			// child file already carries the prefix.
+			// child file already carries the prefix. `inherited` zeroes billing
+			// attribution so the parent's spend never charges to the child.
 			if (options.fork && sessionManager.getEntries().length === 0) {
-				for (const message of options.fork.messages) sessionManager.appendMessage(message);
+				for (const message of options.fork.messages) {
+					sessionManager.appendMessage(message, { inherited: true });
+				}
+				if (options.fork.request !== undefined) {
+					recordForkRequestSnapshot(sessionManager, options.fork.request);
+				}
 			}
 			sessionOpenedAt = performance.now();
 			if (ircEnabled) {
