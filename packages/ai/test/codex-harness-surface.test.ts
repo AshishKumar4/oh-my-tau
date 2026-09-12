@@ -537,7 +537,7 @@ describe("codex fork lineage", () => {
 			"gpt-6-astra",
 			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
 			context,
-			[{ type: "response.done", response: { status: "completed" } }],
+			[{ type: "response.done", response: {} }],
 		);
 		expect(legacyDone.snapshots).toHaveLength(1);
 	});
