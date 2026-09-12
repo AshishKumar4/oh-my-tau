@@ -196,7 +196,9 @@ export function renderSummary(
 			elidedLines += Math.max(0, unit.endLine - unit.startLine - 1);
 			continue;
 		}
-		modelParts.push(formatSingleLine(unit.line, unit.text, shouldAddHashLines, shouldAddLineNumbers));
+		modelParts.push(
+			formatSingleLine(unit.line, unit.text, shouldAddHashLines, shouldAddLineNumbers, displayMode.numbering),
+		);
 		displayParts.push(unit.text);
 	}
 

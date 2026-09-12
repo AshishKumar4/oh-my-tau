@@ -197,20 +197,17 @@ describe("approval parity under a harness rename", () => {
 				return result.content
 					.flatMap(block => (block.type === "text" ? block.text.split("\n") : []))
 					.filter(line => !line.startsWith("["))
-					.map(line => line.replace(/^\d+:/, ""));
+					.map(line => line.replace(/^(\d+:|\s*\d+\t)/, ""));
 			};
+			// The vendor's `Read` returns exactly the requested lines in `cat -n`
+			// shape; omp's native read pads a range with context, so compare
+			// against the native raw (unpadded) window.
 			const window = await text(tool, { file_path: target, offset: 3, limit: 2 });
-			expect(window).toContain("line3");
-			expect(window).not.toContain("line10");
-			expect(window).toEqual(await text(native, { path: `${target}:3+2` }));
-			expect(await text(tool, { file_path: target, offset: 9 })).toEqual(
-				await text(native, { path: `${target}:9-` }),
-			);
-			const head = await text(tool, { file_path: target, limit: 1 });
-			expect(head).toContain("line1");
-			expect(head).not.toContain("line10");
-			expect(head).toEqual(await text(native, { path: `${target}:1+1` }));
-			expect(await text(tool, { file_path: target })).toEqual(await text(native, { path: target }));
+			expect(window).toEqual(["line3", "line4"]);
+			expect(window).toEqual(await text(native, { path: `${target}:raw:3+2` }));
+			expect(await text(tool, { file_path: target, offset: 9 })).toEqual(["line9", "line10"]);
+			expect(await text(tool, { file_path: target, limit: 1 })).toEqual(["line1"]);
+			expect(await text(tool, { file_path: target })).toEqual(await text(native, { path: `${target}:raw` }));
 
 			await expect(tool.execute("c", { file_path: target, pages: "1-2" })).rejects.toThrow(/Read\.pages/);
 		} finally {

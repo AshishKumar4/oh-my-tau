@@ -1,3 +1,4 @@
+import type { LineNumbering } from "../utils/file-display-mode";
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { getEditStore } from "../edit/store";
@@ -26,9 +27,13 @@ import { formatBytes, shortenPath } from "./render-utils";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
-function prependLineNumbers(text: string, startNum: number): string {
+function numberedLine(line: number, text: string, numbering: LineNumbering): string {
+	return numbering === "cat" ? `${String(line).padStart(6)}\t${text}` : `${line}|${text}`;
+}
+
+function prependLineNumbers(text: string, startNum: number, numbering: LineNumbering): string {
 	const textLines = text.split("\n");
-	return textLines.map((line, i) => `${startNum + i}|${line}`).join("\n");
+	return textLines.map((line, i) => numberedLine(startNum + i, line, numbering)).join("\n");
 }
 
 export interface HashlineHeaderContext {
@@ -110,25 +115,34 @@ export function formatTextWithMode(
 	startNum: number,
 	shouldAddHashLines: boolean,
 	shouldAddLineNumbers: boolean,
+	numbering: LineNumbering = "pipe",
 ): string {
 	if (shouldAddHashLines) return formatNumberedLines(text, startNum);
-	if (shouldAddLineNumbers) return prependLineNumbers(text, startNum);
+	if (shouldAddLineNumbers) return prependLineNumbers(text, startNum, numbering);
 	return text;
 }
 
 export const BRACKET_CONTEXT_ELLIPSIS = "…";
 
-function formatLineEntryWithMode(entry: LineEntry, shouldAddHashLines: boolean, shouldAddLineNumbers: boolean): string {
+function formatLineEntryWithMode(
+	entry: LineEntry,
+	shouldAddHashLines: boolean,
+	shouldAddLineNumbers: boolean,
+	numbering: LineNumbering,
+): string {
 	if (entry.kind === "ellipsis") return BRACKET_CONTEXT_ELLIPSIS;
-	return formatSingleLine(entry.lineNumber, entry.text, shouldAddHashLines, shouldAddLineNumbers);
+	return formatSingleLine(entry.lineNumber, entry.text, shouldAddHashLines, shouldAddLineNumbers, numbering);
 }
 
 export function formatLineEntriesWithMode(
 	entries: readonly LineEntry[],
 	shouldAddHashLines: boolean,
 	shouldAddLineNumbers: boolean,
+	numbering: LineNumbering = "pipe",
 ): string {
-	return entries.map(entry => formatLineEntryWithMode(entry, shouldAddHashLines, shouldAddLineNumbers)).join("\n");
+	return entries
+		.map(entry => formatLineEntryWithMode(entry, shouldAddHashLines, shouldAddLineNumbers, numbering))
+		.join("\n");
 }
 
 const BRACE_PAIRS: Record<string, string> = { "{": "}", "(": ")", "[": "]" };
@@ -156,9 +170,10 @@ export function formatSingleLine(
 	text: string,
 	shouldAddHashLines: boolean,
 	shouldAddLineNumbers: boolean,
+	numbering: LineNumbering = "pipe",
 ): string {
 	if (shouldAddHashLines) return formatNumberedLine(line, text);
-	if (shouldAddLineNumbers) return `${line}|${text}`;
+	if (shouldAddLineNumbers) return numberedLine(line, text, numbering);
 	return text;
 }
 

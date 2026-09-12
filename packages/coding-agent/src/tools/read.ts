@@ -39,7 +39,7 @@ import {
 } from "../session/streaming-output";
 import { buildLineEntriesWithBlockContext, lineEntriesToPlainText } from "../utils/block-context";
 import { isCpuProfilePath, renderCpuProfile } from "../utils/cpuprofile";
-import { resolveFileDisplayMode } from "../utils/file-display-mode";
+import { type FileDisplayMode, resolveFileDisplayMode } from "../utils/file-display-mode";
 import {
 	ImageInputTooLargeError,
 	InvalidImageDataError,
@@ -1118,7 +1118,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 		fileSize: number,
 		buffered: BufferedFileText | undefined,
 		parsed: ParsedSelector,
-		displayMode: { hashLines: boolean; lineNumbers: boolean },
+		displayMode: FileDisplayMode,
 		suffixResolution: { from: string; to: string } | undefined,
 		signal: AbortSignal | undefined,
 		allowBridge = true,
@@ -1223,7 +1223,15 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 				}
 				if (!fullLines || rawSelector) {
 					const blockText = displayLines.join("\n");
-					blocks.push(formatTextWithMode(blockText, range.startLine, shouldAddHashLines, shouldAddLineNumbers));
+					blocks.push(
+						formatTextWithMode(
+							blockText,
+							range.startLine,
+							shouldAddHashLines,
+							shouldAddLineNumbers,
+							displayMode.numbering,
+						),
+					);
 				}
 			}
 		}
@@ -1253,7 +1261,12 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 				startLine: firstLine?.kind === "line" ? firstLine.lineNumber : (visibleSpans[0]?.startLine ?? 1),
 				lineNumbers: entries.map(entry => (entry.kind === "line" ? entry.lineNumber : null)),
 			};
-			outputText = formatLineEntriesWithMode(entries, shouldAddHashLines, shouldAddLineNumbers);
+			outputText = formatLineEntriesWithMode(
+				entries,
+				shouldAddHashLines,
+				shouldAddLineNumbers,
+				displayMode.numbering,
+			);
 		} else {
 			outputText = blocks.join("\n\n…\n\n");
 		}
@@ -1808,8 +1821,11 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 					// return line 31 and nothing else.
 					const rawSelector = isRawSelector(sel);
 					const requestedStart = offset ? Math.max(0, offset - 1) : 0;
-					const expandStart = !rawSelector && offset !== undefined && offset > 1;
-					const expandEnd = !rawSelector && limit !== undefined;
+					// Context padding is omp's convention; a vendor-numbered read
+					// returns exactly the window the vendor's `Read` would.
+					const padRange = !rawSelector && displayMode.numbering === "pipe";
+					const expandStart = padRange && offset !== undefined && offset > 1;
+					const expandEnd = padRange && limit !== undefined;
 					const leadingContext = expandStart ? Math.min(requestedStart, RANGE_LEADING_CONTEXT_LINES) : 0;
 					const trailingContext = expandEnd ? RANGE_TRAILING_CONTEXT_LINES : 0;
 					const startLine = requestedStart - leadingContext;
@@ -1964,7 +1980,13 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 							startLine: startNum,
 							lineNumbers: Array.from({ length: lineCount }, (_, i) => startNum + i),
 						};
-						const formatted = formatTextWithMode(text, startNum, shouldAddHashLines, shouldAddLineNumbers);
+						const formatted = formatTextWithMode(
+							text,
+							startNum,
+							shouldAddHashLines,
+							shouldAddLineNumbers,
+							displayMode.numbering,
+						);
 						if (!hashContext || emittedHashlineHeader) return formatted;
 						emittedHashlineHeader = true;
 						return prependHashlineHeader(formatted, hashContext);
@@ -1994,7 +2016,12 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 							startLine: firstLine?.kind === "line" ? firstLine.lineNumber : startLineDisplay,
 							lineNumbers: entries.map(entry => (entry.kind === "line" ? entry.lineNumber : null)),
 						};
-						const formatted = formatLineEntriesWithMode(entries, shouldAddHashLines, shouldAddLineNumbers);
+						const formatted = formatLineEntriesWithMode(
+							entries,
+							shouldAddHashLines,
+							shouldAddLineNumbers,
+							displayMode.numbering,
+						);
 						if (!hashContext || emittedHashlineHeader) return formatted;
 						emittedHashlineHeader = true;
 						return prependHashlineHeader(formatted, hashContext);
@@ -2171,7 +2198,13 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 		const hashContext = tag
 			? hashlineHeaderContext(formatPathRelativeToCwd(entry.absolutePath, this.session.cwd), tag)
 			: undefined;
-		const formattedBody = formatTextWithMode(rawText, region.startLine, shouldAddHashLines, shouldAddLineNumbers);
+		const formattedBody = formatTextWithMode(
+			rawText,
+			region.startLine,
+			shouldAddHashLines,
+			shouldAddLineNumbers,
+			displayMode.numbering,
+		);
 		const formattedText = prependHashlineHeader(formattedBody, hashContext);
 
 		const details: ReadToolDetails = {
@@ -2294,8 +2327,9 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 		const { offset, limit } = selToOffsetLimit(parsedSel);
 		const requestedStart = offset ? Math.max(0, offset - 1) : 0;
 		// Raw mode never adds context lines — see the plain-file range path.
-		const expandStart = !rawSelector && offset !== undefined && offset > 1;
-		const expandEnd = !rawSelector && limit !== undefined;
+		const padRange = !rawSelector && displayMode.numbering === "pipe";
+		const expandStart = padRange && offset !== undefined && offset > 1;
+		const expandEnd = padRange && limit !== undefined;
 		const leadingContext = expandStart ? Math.min(requestedStart, RANGE_LEADING_CONTEXT_LINES) : 0;
 		const trailingContext = expandEnd ? RANGE_TRAILING_CONTEXT_LINES : 0;
 		const startLine = requestedStart - leadingContext;
@@ -2372,7 +2406,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 				startLine: startNum,
 				lineNumbers: Array.from({ length: lineCount }, (_, i) => startNum + i),
 			};
-			return formatTextWithMode(text, startNum, false, shouldAddLineNumbers);
+			return formatTextWithMode(text, startNum, false, shouldAddLineNumbers, displayMode.numbering);
 		};
 
 		let outputText: string;
