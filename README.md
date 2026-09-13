@@ -1,12 +1,20 @@
 # oh-my-tau
 
-> An AI assistant writes and maintains this document. It is presented as-is.
+![oh-my-tau: familiar model interfaces and shared context](assets/tau-banner.svg)
 
-A fork of [Oh My Pi](https://github.com/can1357/oh-my-pi) with Claude Code and Codex profiles, conversation forks, and a Fusion mode inspired by Devin Fusion.
+oh-my-tau builds on [Oh My Pi](https://github.com/can1357/oh-my-pi) with model profiles, context-sharing subagents, and a Fusion mode inspired by Devin Fusion. It keeps OMP's tools and integrations while changing how supported models receive instructions and delegate work.
+
+## What is different, and why?
+
+- Claude Code and Codex profiles give supported models familiar tool names and locally loaded client instructions. The goal is to reduce friction from unfamiliar interfaces while retaining OMP tools that have no vendor counterpart.
+- Conversation forks let a subagent inherit the parent's resolved history, so the lead does not have to restate every detail. Each child has its own session; compatible same-model forks can reuse a cached prefix.
+- Fusion separates judgment from execution. A lead handles planning and review, while a persistent worker implements changes and runs checks. This aims to reserve expensive model time for decisions that need it, rather than routine execution.
+
+These are adaptations, not a guarantee of identical behavior or cost savings. Other OMP features remain available; provider subscriptions and usage limits still apply.
 
 ## Setup
 
-You need Bun, Rust/Cargo, Git, and Python 3. Install and sign in to Claude Code or Codex for the corresponding profile. Sign in to Devin CLI if you want to use the default SWE-2 sidekick. Your provider subscriptions and usage limits still apply.
+You need Bun, Rust/Cargo, Git, and Python 3. Install and sign in to Claude Code or Codex for the corresponding profile. Sign in to Devin CLI if you want to use the default SWE-2 sidekick.
 
 1. Install the fork:
 
