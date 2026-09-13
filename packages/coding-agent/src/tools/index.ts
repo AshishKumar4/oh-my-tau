@@ -256,6 +256,9 @@ export interface ToolSession {
 	/** Session starts with a prewalk hand-off armed. Keeps `todo` in yield-gated
 	 *  (subagent) registries: the prewalk plan nudge + todo gate need it. */
 	prewalkArmed?: boolean;
+	/** Session is a forked conversation worker: keeps independent planning
+	 *  tools (`todo`) even though `requireYieldTool` sessions normally omit them. */
+	conversationFork?: boolean;
 	/**
 	 * Constrain the active set to the caller's explicit built-in names (plus a
 	 * required yield tool). Suppresses automatic tool-set expansion.
@@ -675,7 +678,13 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "eval") return allowEval;
 		if (name === "debug") return session.settings.get("debug.enabled");
 		if (name === "todo")
-			return (!includeYield || session.prewalkArmed === true) && session.settings.get("todo.enabled");
+			return (
+				session.settings.get("todo.enabled") &&
+				(!includeYield ||
+					session.prewalkArmed === true ||
+					session.conversationFork === true ||
+					requestedTools?.includes("todo") === true)
+			);
 		if (name === "glob") return session.settings.get("glob.enabled");
 		if (name === "grep") return session.settings.get("grep.enabled");
 		if (name === "github") return session.settings.get("github.enabled");

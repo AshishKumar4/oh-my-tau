@@ -345,6 +345,24 @@ describe("runSubprocess per-agent prewalk", () => {
 		expect(session.getActiveToolNames()).not.toContain("todo");
 		expect(session.getActiveToolNames()).toContain("read");
 	});
+
+	it("keeps todo active for a forked subagent and marks the session as a conversation fork", async () => {
+		const session = yieldEmittingSession(["read", "todo", "yield"]);
+		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions("subagent-fork-todo-kept", Settings.isolated()),
+			agent: { ...baseAgent, model: [`${primary.provider}/${primary.id}`] },
+			fork: {
+				messages: [{ role: "user", content: "parent turn", timestamp: 1 }],
+			},
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(spy.mock.calls[0]?.[0]?.conversationFork).toBe(true);
+		expect(session.getActiveToolNames()).toContain("todo");
+		expect(session.getActiveToolNames()).toContain("read");
+	});
 });
 // Plan-mode spawns are read-only exploration: the task tool must strip a
 // prewalk-enabled agent definition before spawning so the hidden

@@ -3470,6 +3470,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				outputSchemaMode: options.outputSchemaMode,
 				restrictToolNames: options.restrictToolNames,
 				requireYieldTool: true,
+				conversationFork: options.fork !== undefined,
 				contextFiles: options.contextFiles,
 				skills: options.skills,
 				promptTemplates: options.promptTemplates,
@@ -3642,8 +3643,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			// Todos are parent-owned bookkeeping and stripped from subagents —
 			// except under prewalk, whose plan nudge + todo gate require the
-			// subagent to commit its own todo list before the hand-off.
-			const isParentOwnedTool = (name: string): boolean => !prewalk && name === "todo";
+			// subagent to commit its own todo list before the hand-off, and on
+			// conversation forks, where the child keeps its own independent
+			// planning tools.
+			const isParentOwnedTool = (name: string): boolean => !prewalk && options.fork === undefined && name === "todo";
 			const subagentToolNames = session.getEnabledToolNames();
 			const filteredSubagentTools = subagentToolNames.filter(name => !isParentOwnedTool(name));
 			if (filteredSubagentTools.length !== subagentToolNames.length) {

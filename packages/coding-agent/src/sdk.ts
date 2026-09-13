@@ -579,6 +579,8 @@ export interface CreateAgentSessionOptions {
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	/** Whether to include the yield tool by default */
 	requireYieldTool?: boolean;
+	/** Internal: a forked worker keeps independent planning tools (`todo`) despite the yield-tool session policy. */
+	conversationFork?: boolean;
 	/** Task recursion depth (for subagent sessions). Default: 0 */
 	taskDepth?: number;
 	/** Parent Hindsight state to alias for subagent memory tools. */
@@ -1880,6 +1882,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			outputSchema: options.outputSchema,
 			outputSchemaMode: options.outputSchemaMode,
 			requireYieldTool: options.requireYieldTool,
+			conversationFork: options.conversationFork,
 			prewalkArmed: options.prewalk !== undefined,
 			taskDepth,
 			agentDefinition: options.agentDefinition,

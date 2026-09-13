@@ -223,6 +223,42 @@ describe("createTools", () => {
 		expect(prewalkSubagent.map(t => t.name)).toContain("todo");
 	});
 
+	it("keeps todo for forked conversation workers without relaxing explicit lists", async () => {
+		// A forked child owns its own planning list: conversationFork retains
+		// todo beside yield, where an ordinary yield session drops it.
+		const forked = await createTools(createTestSession({ requireYieldTool: true, conversationFork: true }));
+		const forkedNames = forked.map(t => t.name);
+		expect(forkedNames).toContain("todo");
+		expect(forkedNames).toContain("yield");
+
+		// An explicit restricted list without todo never acquires it.
+		const restricted = await createTools(
+			createTestSession({ requireYieldTool: true, conversationFork: true, restrictToolNames: true }),
+			["read"],
+		);
+		const restrictedNames = restricted.map(t => t.name);
+		expect(restrictedNames).not.toContain("todo");
+		expect(restrictedNames).toContain("read");
+
+		// An explicit list naming todo is honored even on a plain yield session
+		// (cold revive replays session_init.tools as such a list).
+		const explicit = await createTools(createTestSession({ requireYieldTool: true, restrictToolNames: true }), [
+			"read",
+			"todo",
+		]);
+		expect(explicit.map(t => t.name)).toContain("todo");
+
+		// todo.enabled=false wins over the fork retention.
+		const disabled = await createTools(
+			createTestSession({
+				requireYieldTool: true,
+				conversationFork: true,
+				settings: createSettingsWithOverrides({ "todo.enabled": false }),
+			}),
+		);
+		expect(disabled.map(t => t.name)).not.toContain("todo");
+	});
+
 	it("excludes ask tool when hasUI is false", async () => {
 		const session = createTestSession({ hasUI: false });
 		const tools = await createTools(session);
