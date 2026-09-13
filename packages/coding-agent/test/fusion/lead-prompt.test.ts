@@ -64,12 +64,12 @@ describe("fusion lead prompt section", () => {
 		expect(text).toContain("wait for the report with `TaskOutput`");
 		expect(text).toContain("one Claude Code: you");
 		// The GPT-lead extra-detail block stays gated to the Codex profile.
-		expect(text).not.toContain("blocking handoff beats");
+		expect(text).not.toContain("Concrete implementation packets");
 
 		const codex = await build({ toolNames: ["hub", "sidekick"], harnessProfile: "codex", customPrompt: "VENDOR" });
 		expect(codex).toContain("wait for the report with `wait`");
 		expect(codex).toContain("one Codex: you");
-		expect(codex).toContain("blocking handoff beats");
+		expect(codex).toContain("Concrete implementation packets");
 
 		const customOff = await build({ toolNames: ["read", "hub"], customPrompt: "VENDOR PROMPT" });
 		expect(customOff).not.toContain("`sidekick` tool");

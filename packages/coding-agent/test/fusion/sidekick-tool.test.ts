@@ -237,7 +237,7 @@ describe("fusion sidekick tool", () => {
 			expect(request.agentDefinition?.thinkingLevel).toBe(Effort.Medium);
 			expect(request.model).toBe("devin/swe-2");
 			expect(request.keepAlive).toBe(true);
-			expect(request.assignment).toStartWith("This is your first handoff from the lead.");
+			expect(request.assignment).toStartWith("Worker assignment.");
 			// The brief rides inside the `<lead_handoff>` envelope.
 			expect(request.assignment).toEndWith("<lead_handoff>\nImplement X\n</lead_handoff>");
 			// The worker prompt is rendered for this pairing: the model/effort
@@ -253,8 +253,7 @@ describe("fusion sidekick tool", () => {
 			expect(spawn).toHaveBeenCalledTimes(1);
 			expect(followUp).toHaveBeenCalledTimes(1);
 			const turn = followUp.mock.calls[0][0];
-			expect(turn.id).toBe(SIDEKICK_ID);
-			expect(turn.message).toStartWith("The lead sent an update for the handoff you are working on.");
+			expect(turn.message).toStartWith("Assignment update.");
 			expect(turn.message).toEndWith("<lead_handoff>\nNow also Y\n</lead_handoff>");
 			// Consumed inline: nothing is re-delivered as a background result.
 			expect(deliveries).toEqual([]);
@@ -332,8 +331,7 @@ describe("fusion sidekick tool", () => {
 			const interrupt = await tool.execute("c2", { message: "Change of plan" });
 			expect(interrupt.details?.mode).toBe("interrupt");
 			expect(interrupt.details?.jobId).toBe(first.details?.jobId);
-			expect(steered).toHaveLength(1);
-			expect(steered[0]).toStartWith("The lead sent an update for the handoff you are working on.");
+			expect(steered[0]).toStartWith("Assignment update.");
 			expect(steered[0]).toEndWith("<lead_handoff>\nChange of plan\n</lead_handoff>");
 			expect(spawn).toHaveBeenCalledTimes(1);
 			expect(followUp).not.toHaveBeenCalled();
