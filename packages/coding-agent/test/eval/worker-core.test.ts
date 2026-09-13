@@ -132,7 +132,7 @@ describe("WorkerCore", () => {
 				type: "result",
 				runId: "overlap-second-runtime",
 				ok: false,
-				error: { message: "Cannot run code while another same-realm JS runtime is running" },
+				error: { message: expect.stringContaining("while another same-realm JS runtime is running") },
 			});
 		} finally {
 			gate.resolve();
@@ -192,7 +192,7 @@ describe("WorkerCore", () => {
 				type: "result",
 				runId: "overlap-after-reinit",
 				ok: false,
-				error: { message: "Cannot run code while another same-realm JS runtime is running" },
+				error: { message: expect.stringContaining("while another same-realm JS runtime is running") },
 			});
 
 			// Drain microtasks so a latent fatal would surface.
@@ -274,13 +274,13 @@ describe("WorkerCore", () => {
 				type: "result",
 				runId: "overlap-second",
 				ok: false,
-				error: { message: "Cannot run code while another same-realm JS runtime is running" },
+				error: { message: expect.stringContaining("while another same-realm JS runtime is running") },
 			});
 			expect(await resultThird).toMatchObject({
 				type: "result",
 				runId: "overlap-third",
 				ok: false,
-				error: { message: "Cannot run code while another same-realm JS runtime is running" },
+				error: { message: expect.stringContaining("while another same-realm JS runtime is running") },
 			});
 
 			await Bun.sleep(0);

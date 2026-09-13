@@ -11,7 +11,7 @@
  * - A reset_boundary (/clear) retires the origin: the next request projects
  *   the child's own session identity again.
  */
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -191,6 +191,9 @@ function expectDefined<T>(value: T | undefined, what: string): T {
 }
 
 describe("sdk fork request lineage", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
 	it("never self-forks a root session and keeps parent lineage in a forked child until /clear", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: [taskAgent],
