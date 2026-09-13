@@ -6,11 +6,11 @@ oh-my-tau builds on [Oh My Pi](https://github.com/can1357/oh-my-pi) with model p
 
 ## What is different, and why?
 
-- Claude Code and Codex profiles give supported models familiar tool names and locally loaded client instructions. The goal is to reduce friction from unfamiliar interfaces while retaining OMP tools that have no vendor counterpart.
-- Conversation forks let a subagent inherit the parent's resolved history, so the lead does not have to restate every detail. Each child has its own session; compatible same-model forks can reuse a cached prefix.
-- Fusion separates judgment from execution. A lead handles planning and review, while a persistent worker implements changes and runs checks. This aims to reserve expensive model time for decisions that need it, rather than routine execution.
+Frontier coding models such as Claude and GPT are often post-trained, including through reinforcement learning, to work in their providers' coding environments. That training can favor particular system prompts, tool interfaces, and interaction patterns. A model may perform best in the environment it was tuned for.
 
-These are adaptations, not a guarantee of identical behavior or cost savings. Other OMP features remain available; provider subscriptions and usage limits still apply.
+The idea behind this fork is to make supported models feel at home in OMP. Its Claude Code and Codex profiles load the native client prompts locally and present familiar tool names and schemas, adapted to OMP execution. This reduces avoidable differences from those environments while keeping OMP's tools and integrations, including tools with no native counterpart.
+
+The goal is to minimize mismatch risk. Conversation forks and Fusion mode extend how agents share context and divide work. These adaptations do not guarantee identical behavior or cost savings; provider subscriptions and usage limits still apply.
 
 ## Setup
 
