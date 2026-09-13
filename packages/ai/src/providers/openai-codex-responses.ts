@@ -3955,6 +3955,7 @@ class CodexWebSocketConnection {
 		// Initial connect sets #lastInboundAt; any later message or pong refreshes
 		// it. A zero value means the field was never initialized, which itself is
 		// a desync — treat as unhealthy.
+		if (this.#lastInboundAt === 0) return false;
 		return Date.now() - this.#lastInboundAt <= maxIdleMs;
 	}
 

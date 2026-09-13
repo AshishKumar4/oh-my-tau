@@ -5173,7 +5173,7 @@ describe("openai-codex streaming", () => {
 				for (let sequence = 1; sequence <= 300; sequence += 1) {
 					this.sendJson({
 						type: "response.function_call_arguments.delta",
-						delta: sequence % 2 === 0 ? " ".repeat(64) : "	",
+						delta: sequence % 2 === 0 ? " ".repeat(64) : "\t",
 						item_id: "fc_ws_whitespace",
 						output_index: 1,
 						sequence_number: sequence,
@@ -5245,7 +5245,7 @@ describe("openai-codex streaming", () => {
 					for (let sequence = 1; sequence <= 300; sequence += 1) {
 						this.sendJson({
 							type: "response.function_call_arguments.delta",
-							delta: sequence % 2 === 0 ? " ".repeat(64) : "	",
+							delta: sequence % 2 === 0 ? " ".repeat(64) : "\t",
 							item_id: "fc_ws",
 							output_index: 0,
 							sequence_number: sequence,
@@ -5361,7 +5361,7 @@ describe("openai-codex streaming", () => {
 				for (let sequence = 1; sequence <= 300; sequence += 1) {
 					this.sendJson({
 						type: "response.custom_tool_call_input.delta",
-						delta: sequence % 2 === 0 ? " ".repeat(64) : "	",
+						delta: sequence % 2 === 0 ? " ".repeat(64) : "\t",
 						item_id: "ctc_ws",
 						output_index: 0,
 						sequence_number: sequence,
