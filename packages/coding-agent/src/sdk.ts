@@ -3661,7 +3661,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const dispatchAgentSessionId = agent.sessionId;
 				const dispatchJournalId = sessionManager.getSessionId();
 				const dispatchAnchorId = sessionManager.getLeafId();
-				const dispatchFingerprints = fingerprintForkMessages(context.messages ?? []);
+				// Fingerprinting is Codex-only bookkeeping: every other provider
+				// skips the stable-JSON hashing over the whole context.
+				const dispatchFingerprints =
+					streamModel.api === "openai-codex-responses" ? fingerprintForkMessages(context.messages ?? []) : [];
 				// The inherited origin comes ONLY from the journal marker: a plain
 				// session never sets codexFork, and a forked child keeps using the
 				// journal origin even after its own produced request exists — the
