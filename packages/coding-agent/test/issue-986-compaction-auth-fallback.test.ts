@@ -406,6 +406,7 @@ describe("issue #986 compaction auth fallback", () => {
 		});
 
 		const result = await session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBe("same-provider manual summary");
 		expect(attemptedModels).toEqual([
@@ -461,6 +462,7 @@ describe("issue #986 compaction auth fallback", () => {
 		});
 
 		const result = await session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBe("fallback summary");
 		expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -530,6 +532,7 @@ describe("issue #986 compaction auth fallback", () => {
 		});
 
 		const result = await session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBe("fallback summary");
 		expect(compactSpy).toHaveBeenCalledTimes(3);

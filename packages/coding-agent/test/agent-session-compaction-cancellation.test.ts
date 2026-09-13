@@ -228,6 +228,7 @@ describe.each([false, true])("AgentSession compaction cancellation source (exper
 			});
 			session.settings.override("compaction.experimentalContextManagement", false);
 			const result = await session.compact();
+			if (!result) throw new Error("expected a compaction result");
 			expect(result.summary).toBe("compacted");
 			expect(JSON.stringify(session.agent.state.messages)).toContain("Preserve the rollback decision.");
 		});

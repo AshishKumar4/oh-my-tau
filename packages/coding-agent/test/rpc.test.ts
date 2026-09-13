@@ -126,6 +126,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("RPC mode", () => {
 
 		// Compact
 		const result = await client.compact();
+		if (!result) throw new Error("expected a compaction result");
 		expect(result.summary).toBeDefined();
 		expect(result.tokensBefore).toBeGreaterThan(0);
 

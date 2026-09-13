@@ -317,6 +317,7 @@ describe("AgentSession snapcompact frame-budget sizing", () => {
 		});
 
 		const result = await session.compact(undefined, { mode: "snapcompact" });
+		if (!result) throw new Error("expected a compaction result");
 		const response = JSON.parse(
 			encodeRpcFrame({ id: "c1", type: "response", command: "compact", success: true, data: result }),
 		) as { success: boolean; error?: string };

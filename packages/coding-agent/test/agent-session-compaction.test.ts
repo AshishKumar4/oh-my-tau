@@ -101,6 +101,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession compaction e2e", 
 
 		// Manually compact
 		const result = await session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBeDefined();
 		expect(result.summary.length).toBeGreaterThan(0);
@@ -155,6 +156,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession compaction e2e", 
 
 		// Compact should work even without file persistence
 		const result = await session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBeDefined();
 		expect(result.summary.length).toBeGreaterThan(0);

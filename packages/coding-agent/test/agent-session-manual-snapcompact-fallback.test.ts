@@ -111,6 +111,7 @@ describe("AgentSession manual snapcompact text-only fallback", () => {
 		}));
 
 		const result = await harness.session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBe("llm summary");
 		// The preference resolver skips snapcompact and tries the active model for soft compaction.
