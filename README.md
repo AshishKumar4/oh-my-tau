@@ -25,21 +25,27 @@ This fork lets them keep the house. Under a *harness profile*, omp presents the 
 | | Claude Code profile | Codex profile |
 |---|---|---|
 | Models | `claude-opus-5`, `claude-fable-5-1` | `gpt-6-astra`, `gpt-5.6-sol` |
-| Tools | `Read`, `Write`, `Edit`, `Bash`, `Agent`, `AskUserQuestion`, `WebSearch`, `WebFetch`, `Skill`, `SendMessage`, `ListAgents`, `TaskOutput`, `TaskStop` | `exec` with its grammar, namespaced `functions` / `collaboration` groups |
-| Tool descriptions and schemas | the vendor's own, verbatim from the capture | the vendor's own, verbatim from the capture |
+| Tools | `Read`, `Write`, `Edit`, `Bash`, `Agent`, `AskUserQuestion`, `WebSearch`, `WebFetch`, `Skill`, `SendMessage`, `ListAgents`, `TaskOutput`, `TaskStop` | `exec` with its grammar, namespaced `functions` / `agents` groups |
+| Tool descriptions and schemas | the vendor's own, verbatim from the capture | vendor names and schemas adapted to omp execution |
 | System prompt | the real Claude Code prompt, recorded per model | the real Codex prompt |
-| Prompt cache | identity and last system block at 1h, matching the client | unchanged |
+| Prompt cache | identity and last system block at 1h, matching the client | same-model fork reuse when account and tool contracts match |
 
 The capture is recorded once per model, because the vendor prompt names the model it runs on. A Fable session reads
 Fable's prompt and an Opus session reads Opus's.
 
-Tools with no vendor counterpart are **bridged, not hidden**. `SendMessage`, `ListAgents`, `TaskOutput` and `TaskStop`
-map onto omp's `hub`; `spawn_agent` and `wait_agent` map onto `task`. The call executes as the real omp tool and is
+Tools with no vendor counterpart are **bridged, not hidden**. `SendMessage`, `ListAgents`, `TaskOutput`, `TaskStop`
+and `wait_agent` map onto omp's `hub`; `spawn_agent` maps onto `task`. The call executes as the real omp tool and is
 recorded under the omp name, so approval policy, renderers, session state and subagent accounting all keep working.
 The agent still sees omp's full tool layer. Nothing is taken away to make the costume fit.
 
 Every other model is untouched. The profile is chosen by model lineage, so a Haiku or Gemini session behaves exactly
 as it does upstream.
+
+## Conversation forks
+
+Codex `spawn_agent` inherits the resolved parent conversation by default. `fork_turns: "none"` starts fresh; a positive integer string selects recent turns.
+
+Each child keeps its own session and tools. Full same-model forks can reuse the parent's cached prefix when the account and tool contracts match. A narrower tool set, a forced tool choice, or changed history uses normal replay. Other models receive the inherited conversation through their normal provider conversion.
 
 ## Fusion mode
 
@@ -123,8 +129,9 @@ follow the profile; the vendor prompt needs a capture.
   names are known. Everything else in the lead and sidekick prompts is.
 - **`hub` and `eval` stay visible** under a profile, though no vendor ships them. That is the design: the agent keeps
   omp's full capability rather than a reduced impersonation.
-- **The Codex profile has no live inference turn yet.** Its prompt, tool surface and wire shape are verified against
-  a real capture at unit and gateway level, but no completion has come back from a profiled Codex request.
+- Codex request defaults are not fully matched. Omp requests reasoning summaries by default and leaves text
+  verbosity unset unless configured. Its normal request path also leaves Responses Lite disabled, unlike Astra's
+  current Codex default.
 - Beta headers diverge from the captured client in both directions. Recorded in the golden fixtures, not fixed.
 
 ## Staying current
