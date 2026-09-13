@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import {
+	buildCodexNamespaceTools,
 	buildTransformedCodexRequestBody,
 	type OpenAICodexResponsesOptions,
 	streamOpenAICodexResponses,
@@ -268,9 +269,16 @@ async function captureForkRequest(
 		snapshots,
 	};
 }
-
-/** A completed parent request as the snapshot observer would record it. */
+/**
+ * A completed parent request as the snapshot observer would record it. The
+ * advertised tool surface is serialized with the real
+ * {@link buildCodexNamespaceTools} output so the fixture is a valid catalog
+ * the compatibility check can actually certify — never a skeleton record.
+ */
 function createForkSource(overrides: Partial<CodexRequestSnapshot> = {}): CodexRequestSnapshot {
+	const parentTools = buildCodexNamespaceTools(createHarnessTools(), createCodexModel("gpt-6-astra"), {
+		strictFalse: true,
+	});
 	return {
 		provider: "openai-codex",
 		model: "gpt-6-astra",
@@ -280,7 +288,7 @@ function createForkSource(overrides: Partial<CodexRequestSnapshot> = {}): CodexR
 		threadId: "root-thread-1",
 		promptCacheKey: "root-cache-key",
 		input: [
-			{ type: "additional_tools", role: "developer", tools: [{ type: "namespace", name: "functions" }] },
+			{ type: "additional_tools", role: "developer", tools: parentTools },
 			{
 				type: "message",
 				role: "developer",
@@ -292,11 +300,11 @@ function createForkSource(overrides: Partial<CodexRequestSnapshot> = {}): CodexR
 	};
 }
 
-function createForkContext(messages: Context["messages"]): Context {
+function createForkContext(messages: Context["messages"], tools: Tool[] = createHarnessTools()): Context {
 	return {
 		systemPrompt: ["You are Codex, an agent based on GPT-6.", "## Memory\n\nSecond developer block."],
 		messages,
-		tools: createHarnessTools(),
+		tools,
 	};
 }
 
@@ -559,6 +567,148 @@ describe("codex fork lineage", () => {
 		expect(inputItems(body).filter(item => item.role === "user")).toHaveLength(2);
 		expect(turnMetadata.session_id).toBe("root-session");
 		expect(turnMetadata.forked_from_thread_id).toBe("root-thread-1");
+	});
+
+	it("falls back to portable history when the child forces one tool", async () => {
+		const source = createForkSource();
+		const context = createForkContext([
+			{ role: "user", content: "Say hello", timestamp: 1 },
+			{ role: "user", content: "Summarize it for the parent", timestamp: 2 },
+		]);
+		const { body, turnMetadata } = await captureForkRequest(
+			"gpt-6-astra",
+			{
+				sessionId: "child-session",
+				codexFork: { source, messageCount: 1 },
+				toolChoice: { type: "tool", name: "wait" },
+			},
+			context,
+		);
+
+		// A forced choice narrows the request while the replayed prefix would
+		// re-advertise the parent's full surface (measured: the backend then
+		// emits the parent-only tool), so the source bytes stay out entirely.
+		expect(JSON.stringify(inputItems(body).slice(0, source.input.length))).not.toBe(JSON.stringify(source.input));
+		// The child's own forced selection is intact: required choice plus an
+		// isolated surface carrying only the selected tool.
+		expect(body.tool_choice).toBe("required");
+		const surface: unknown = inputItems(body)[0];
+		if (!isRecord(surface) || !Array.isArray(surface.tools)) {
+			throw new Error("expected a namespaced additional_tools surface");
+		}
+		expect(surface.tools).toHaveLength(1);
+		const group: unknown = surface.tools[0];
+		if (!isRecord(group) || !Array.isArray(group.tools)) throw new Error("expected one tool namespace");
+		const selectedNames: unknown[] = [];
+		for (const tool of group.tools) {
+			if (!isRecord(tool)) throw new Error("expected tool records in the namespace");
+			selectedNames.push(tool.name);
+		}
+		expect(selectedNames).toEqual(["wait"]);
+		expect(inputItems(body).filter(item => item.role === "user")).toHaveLength(2);
+		expect(turnMetadata.session_id).toBe("root-session");
+		expect(turnMetadata.forked_from_thread_id).toBe("root-thread-1");
+	});
+
+	it("falls back to portable history when the source tool is gone or changed", async () => {
+		const source = createForkSource();
+		const messages: Context["messages"] = [
+			{ role: "user", content: "Say hello", timestamp: 1 },
+			{ role: "user", content: "Summarize it for the parent", timestamp: 2 },
+		];
+
+		// The collaboration group (spawn_agent, list_agents) no longer exists
+		// in the child's catalog: replaying the prefix would let the model
+		// emit calls the child cannot execute.
+		const withoutAgents = createHarnessTools().filter(tool => tool.namespace?.name !== "collaboration");
+		const removed = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
+			createForkContext(messages, withoutAgents),
+		);
+		expect(JSON.stringify(inputItems(removed.body).slice(0, source.input.length))).not.toBe(
+			JSON.stringify(source.input),
+		);
+		expect(inputItems(removed.body).filter(item => item.role === "user")).toHaveLength(2);
+		expect(removed.turnMetadata.session_id).toBe("root-session");
+		expect(removed.turnMetadata.forked_from_thread_id).toBe("root-thread-1");
+
+		// Same tool name with a different parameter schema is a different
+		// contract and must not certify prefix reuse either.
+		const changedSchema = createHarnessTools().map(tool =>
+			tool.name === "wait" ? { ...tool, parameters: type({ cell_id: "string", extra: "string" }) } : tool,
+		);
+		const changed = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
+			createForkContext(messages, changedSchema),
+		);
+		expect(JSON.stringify(inputItems(changed.body).slice(0, source.input.length))).not.toBe(
+			JSON.stringify(source.input),
+		);
+		expect(inputItems(changed.body).filter(item => item.role === "user")).toHaveLength(2);
+	});
+
+	it("reuses the exact prefix when the child only adds tools", async () => {
+		const source = createForkSource();
+		const extraTool: Tool = {
+			name: "notes",
+			description: "Take notes.",
+			parameters: type({ text: "string" }),
+		};
+		const context = createForkContext(
+			[
+				{ role: "user", content: "Say hello", timestamp: 1 },
+				{ role: "user", content: "Summarize it for the parent", timestamp: 2 },
+			],
+			[...createHarnessTools(), extraTool],
+		);
+		const { body } = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
+			context,
+		);
+
+		// Every source contract is still present, so the parent bytes open the
+		// request even though the child's own surface carries one more tool.
+		expect(JSON.stringify(inputItems(body).slice(0, source.input.length))).toBe(JSON.stringify(source.input));
+		const tail = inputItems(body).slice(source.input.length);
+		expect(tail[0]?.type).toBe("additional_tools");
+		expect(JSON.stringify(tail[0])).toContain("notes");
+	});
+
+	it("ignores a source with blank lineage ids", async () => {
+		const context = createForkContext([{ role: "user", content: "Say hello", timestamp: 1 }]);
+		for (const overrides of [{ sessionId: "   " }, { threadId: "" }]) {
+			const blanked = await captureForkRequest(
+				"gpt-6-astra",
+				{
+					sessionId: "child-session",
+					codexFork: { source: createForkSource(overrides), messageCount: 0 },
+				},
+				context,
+			);
+			expect(blanked.turnMetadata.session_id).toBe("child-session");
+			expect(blanked.turnMetadata.parent_thread_id).toBeUndefined();
+			expect(blanked.turnMetadata.forked_from_thread_id).toBeUndefined();
+			expect(blanked.headers.get("x-codex-parent-thread-id")).toBeNull();
+			expect(blanked.body.prompt_cache_key).toBe("child-session");
+		}
+	});
+
+	it("keeps a successful turn when the snapshot observer throws", async () => {
+		const { body, snapshots } = await captureForkRequest("gpt-6-astra", {
+			sessionId: "child-session",
+			onCodexRequestSnapshot: () => {
+				throw new Error("observer boom");
+			},
+		});
+
+		// The observer failure is swallowed: the turn still succeeds and the
+		// request went out whole, just with no recorded snapshot.
+		expect(snapshots).toHaveLength(0);
+		expect(inputItems(body).filter(item => item.role === "user")).toHaveLength(1);
+		expect(body.prompt_cache_key).toBe("child-session");
 	});
 });
 
