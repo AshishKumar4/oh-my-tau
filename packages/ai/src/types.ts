@@ -381,8 +381,9 @@ export interface CodexCompactionRequestContext extends CodexCompactionMetadata {
  * Responses request, captured via {@link StreamOptions.onCodexRequestSnapshot}.
  * Consumers persist this as the {@link CodexForkContext.source} for a later
  * same-provider fork so the child can inherit the parent's wire prefix and
- * share its root lineage. Auth-free by contract: never carries keys, tokens,
- * or headers.
+ * share its root lineage. The provider adds no authentication material to the
+ * snapshot — no keys, tokens, or headers — though the replayed input itself
+ * can still contain user-provided text.
  */
 export interface CodexRequestSnapshot {
 	provider: Provider;
