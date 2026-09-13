@@ -609,12 +609,16 @@ function clearCodexTurnStatesForNewTurn(
 	if (startNewTurn && compaction?.phase !== "standalone_turn") session.turnStates.clear();
 }
 
-function createCodexCompatibilityIdentity(session: CodexMetadataSessionState): CodexCompatibilityIdentity {
+function createCodexCompatibilityIdentity(
+	session: CodexMetadataSessionState,
+	forkSource?: CodexRequestSnapshot,
+): CodexCompatibilityIdentity {
 	return {
 		installationId: getInstallId(),
-		sessionId: session.sessionId,
+		sessionId: forkSource?.sessionId ?? session.sessionId,
 		threadId: session.threadId,
 		windowId: session.windowId,
+		parentThreadId: forkSource?.threadId,
 	};
 }
 
@@ -669,14 +673,14 @@ function createCodexRequestMetadata(
 		session.turnId = crypto.randomUUID();
 		session.turnStartedAtUnixMs = options.turnStartedAtUnixMs;
 	}
-	const identity = createCodexCompatibilityIdentity(session);
+	const identity = createCodexCompatibilityIdentity(session, options.forkSource);
 	// codex-rs `set_parent_turn_id` ignores blank values; keep the original
 	// spelling when non-blank.
 	const parentTurnId = options.parentTurnId?.trim() ? options.parentTurnId : undefined;
 	// Forked children project the source root's session id onto every
 	// session-identity surface while keeping their own thread lineage.
-	const effectiveSessionId = options.forkSource?.sessionId ?? identity.sessionId;
-	const parentThreadId = options.forkSource?.threadId;
+	const effectiveSessionId = identity.sessionId;
+	const parentThreadId = identity.parentThreadId;
 	const extra: Record<string, string> = {};
 	const callerMetadata = options.clientMetadata;
 	if (callerMetadata) {
@@ -3347,7 +3351,14 @@ export async function prewarmOpenAICodexResponses(
 	model: Model<"openai-codex-responses">,
 	options?: Pick<
 		OpenAICodexResponsesOptions,
-		"apiKey" | "headers" | "sessionId" | "signal" | "preferWebsockets" | "providerSessionState" | "responsesLite"
+		| "apiKey"
+		| "headers"
+		| "sessionId"
+		| "signal"
+		| "preferWebsockets"
+		| "providerSessionState"
+		| "responsesLite"
+		| "codexFork"
 	>,
 ): Promise<void> {
 	const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
@@ -3373,7 +3384,10 @@ export async function prewarmOpenAICodexResponses(
 	);
 	const turnState = getOrCreateCodexTurnState(metadataSession, sessionKey);
 	const codexClientVersion = CODEX_CLIENT_VERSION;
-	const requestIdentity = createCodexCompatibilityIdentity(metadataSession);
+	// A forked child must warm a socket bound to the shared root lineage —
+	// headers are fixed at handshake, so the later real request can only reuse
+	// this connection when it projects the same session identity.
+	const requestIdentity = createCodexCompatibilityIdentity(metadataSession, getCodexForkSource(model, options));
 	const attestation = await getCodexAttestationHeader(accountId);
 	const headers = logger.time(
 		"prewarmCodex:createHeaders",
@@ -3941,12 +3955,17 @@ class CodexWebSocketConnection {
 		// Initial connect sets #lastInboundAt; any later message or pong refreshes
 		// it. A zero value means the field was never initialized, which itself is
 		// a desync — treat as unhealthy.
-		if (this.#lastInboundAt === 0) return false;
 		return Date.now() - this.#lastInboundAt <= maxIdleMs;
 	}
 
-	matchesAuth(headers: Record<string, string>): boolean {
-		return this.#headers.authorization === headers.authorization;
+	matchesConnectionIdentity(headers: Record<string, string>): boolean {
+		return (
+			this.#headers.authorization === headers.authorization &&
+			this.#headers[OPENAI_HEADERS.SESSION_ID] === headers[OPENAI_HEADERS.SESSION_ID] &&
+			this.#headers[OPENAI_HEADERS.SCOPED_SESSION_ID] === headers[OPENAI_HEADERS.SCOPED_SESSION_ID] &&
+			this.#headers[OPENAI_HEADERS.THREAD_ID] === headers[OPENAI_HEADERS.THREAD_ID] &&
+			this.#headers[OPENAI_HEADERS.PARENT_THREAD_ID] === headers[OPENAI_HEADERS.PARENT_THREAD_ID]
+		);
 	}
 
 	close(reason = "done"): void {
@@ -4498,7 +4517,7 @@ async function getOrCreateCodexWebSocketConnection(
 		}
 	}
 	if (state.connection?.isOpen()) {
-		if (!state.connection.matchesAuth(headerRecord)) {
+		if (!state.connection.matchesConnectionIdentity(headerRecord)) {
 			state.connection.close("token-refresh");
 			resetCodexWebSocketAppendState(state);
 		} else if (state.connection.isHealthyForReuse()) {

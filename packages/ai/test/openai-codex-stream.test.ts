@@ -5173,7 +5173,7 @@ describe("openai-codex streaming", () => {
 				for (let sequence = 1; sequence <= 300; sequence += 1) {
 					this.sendJson({
 						type: "response.function_call_arguments.delta",
-						delta: sequence % 2 === 0 ? " ".repeat(64) : "\t",
+						delta: sequence % 2 === 0 ? " ".repeat(64) : "	",
 						item_id: "fc_ws_whitespace",
 						output_index: 1,
 						sequence_number: sequence,
@@ -5245,7 +5245,7 @@ describe("openai-codex streaming", () => {
 					for (let sequence = 1; sequence <= 300; sequence += 1) {
 						this.sendJson({
 							type: "response.function_call_arguments.delta",
-							delta: sequence % 2 === 0 ? " ".repeat(64) : "\t",
+							delta: sequence % 2 === 0 ? " ".repeat(64) : "	",
 							item_id: "fc_ws",
 							output_index: 0,
 							sequence_number: sequence,
@@ -5361,7 +5361,7 @@ describe("openai-codex streaming", () => {
 				for (let sequence = 1; sequence <= 300; sequence += 1) {
 					this.sendJson({
 						type: "response.custom_tool_call_input.delta",
-						delta: sequence % 2 === 0 ? " ".repeat(64) : "\t",
+						delta: sequence % 2 === 0 ? " ".repeat(64) : "	",
 						item_id: "ctc_ws",
 						output_index: 0,
 						sequence_number: sequence,
@@ -6040,6 +6040,117 @@ describe("openai-codex streaming", () => {
 			websocketConnected: true,
 			canAppend: false,
 		});
+	});
+
+	it("binds a forked child's prewarmed socket to the root lineage and rebinds on clear", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+
+		const payload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+			"utf8",
+		).toBase64();
+		const token = `aaa.${payload}.bbb`;
+
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+
+		let constructorCount = 0;
+		let sendCount = 0;
+		const handshakeHeaders: Array<WsHeaders | undefined> = [];
+		class ForkedWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				constructorCount += 1;
+				handshakeHeaders.push(options?.headers);
+				this.scheduleOpen();
+			}
+
+			override send(_data: string): void {
+				sendCount += 1;
+				this.emitCodexResponse({
+					messageId: `msg_${sendCount}`,
+					responseId: `resp_${sendCount}`,
+					text: `Hello ${sendCount}`,
+				});
+			}
+		}
+
+		global.WebSocket = ForkedWebSocket as unknown as typeof WebSocket;
+
+		const model: Model<"openai-codex-responses"> = buildModel({
+			id: "gpt-5.3-codex-spark",
+			name: "GPT-5.3 Codex Spark",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			preferWebsockets: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128000,
+			maxTokens: 128000,
+		});
+
+		const forkSource = {
+			provider: "openai-codex",
+			model: model.id,
+			baseUrl: model.baseUrl,
+			accountId: "acc_test",
+			sessionId: "parent-root-session",
+			threadId: "parent-root-thread",
+			input: [],
+		};
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		// Prewarm with the fork source: the handshake must already project the
+		// shared root identity — socket headers are frozen at upgrade.
+		await prewarmOpenAICodexResponses(model, {
+			apiKey: token,
+			sessionId: "child-session",
+			providerSessionState,
+			codexFork: { source: forkSource },
+		});
+		const prewarmHeaders = handshakeHeaders[0];
+		expect(prewarmHeaders?.["session-id"]).toBe("parent-root-session");
+		expect(prewarmHeaders?.["session_id"]).toBe("parent-root-session");
+		expect(prewarmHeaders?.["x-codex-parent-thread-id"]).toBe("parent-root-thread");
+		expect(prewarmHeaders?.["conversation_id"]).toBe("child-session");
+		expect(prewarmHeaders?.["thread-id"]).toBeDefined();
+		expect(prewarmHeaders?.["thread-id"]).not.toBe("parent-root-thread");
+
+		// The first real request under the same fork reuses the warmed socket.
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "Child turn", timestamp: Date.now() }],
+		};
+		await streamOpenAICodexResponses(model, firstContext, {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "child-session",
+			providerSessionState,
+			codexFork: { source: forkSource },
+		}).result();
+		expect(constructorCount).toBe(1);
+		expect(sendCount).toBe(1);
+
+		// Clearing the fork (e.g. /clear retires the origin) changes the
+		// connection-scoped lineage, so the next request must handshake a fresh
+		// socket bound to the child's own root.
+		await streamOpenAICodexResponses(model, firstContext, {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "child-session",
+			providerSessionState,
+		}).result();
+		expect(constructorCount).toBe(2);
+		expect(sendCount).toBe(2);
+		const reboundHeaders = handshakeHeaders[1];
+		expect(reboundHeaders?.["session-id"]).toBe("child-session");
+		expect(reboundHeaders?.["session_id"]).toBe("child-session");
+		expect(reboundHeaders?.["x-codex-parent-thread-id"]).toBeUndefined();
+		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
 	it("does not throw when closing a stale socket", async () => {

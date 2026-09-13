@@ -4224,11 +4224,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 								await resolveApiKeyOnce(await options.getApiKey(codexModel))
 							: await modelRegistry.getApiKey(codexModel, providerSessionId);
 						if (!codexPrewarmApiKey) return;
+						// A forked child must warm the socket under the shared root
+						// lineage — WS headers are fixed at handshake, so an unwarmed-
+						// fork connection can never be reused by the real request.
+						const prewarmForkSource = forkJournal().snapshot?.request;
 						await logger.time("prewarmOpenAICodexResponses", prewarmOpenAICodexResponses, codexModel, {
 							apiKey: codexPrewarmApiKey,
 							sessionId: providerSessionId,
 							preferWebsockets: preferOpenAICodexWebsockets,
 							providerSessionState: session.providerSessionState,
+							...(prewarmForkSource !== undefined ? { codexFork: { source: prewarmForkSource } } : {}),
 						});
 					} catch (error) {
 						const errorMessage = error instanceof Error ? error.message : String(error);
