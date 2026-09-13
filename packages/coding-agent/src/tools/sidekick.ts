@@ -47,7 +47,9 @@ const sidekickSchema = type({
 	message: type("string > 0").describe(
 		"The brief: goal, plan, constraints, and how to verify. While the sidekick is running, this is injected into the running handoff as an interrupt.",
 	),
-	"block?": type("boolean").describe("Wait for the handoff to finish and return its report (default true)."),
+	"block?": type("boolean").describe(
+		"Wait for the worker report (default true). If interrupted or timed out, the worker continues and reports asynchronously.",
+	),
 });
 
 type SidekickParams = typeof sidekickSchema.infer;
