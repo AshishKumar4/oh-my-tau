@@ -11,8 +11,8 @@ You need Bun, Rust/Cargo, Git, and Python 3. Install and sign in to Claude Code 
 1. Install the fork:
 
    ```sh
-   git clone https://github.com/AshishKumar4/oh-my-pi.git
-   cd oh-my-pi
+   git clone https://github.com/AshishKumar4/oh-my-tau.git
+   cd oh-my-tau
    ./scripts/install-harness.sh
    ```
 
@@ -30,7 +30,7 @@ You need Bun, Rust/Cargo, Git, and Python 3. Install and sign in to Claude Code 
    omp --model anthropic/claude-opus-5
    ```
 
-The repository is still named `oh-my-pi`. The installer sets up profiles for the clients it finds on your PATH. Claude Code and Codex system prompts load from your local profile cache; they are not bundled in this repository.
+The installer sets up profiles for the clients it finds on your PATH. Claude Code and Codex system prompts load from your local profile cache; they are not bundled in this repository.
 
 ## Profiles and forks
 
