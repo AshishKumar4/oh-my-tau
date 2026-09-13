@@ -17,6 +17,7 @@ import {
 	asRecord,
 	fetchWithRetry,
 	getInstallId,
+	isRecord,
 	logger,
 	parseStreamingJson,
 	readSseJson,
@@ -1443,6 +1444,9 @@ function getCodexForkSource(
 	if (resolveCodexResponsesUrl(source.baseUrl) !== resolveCodexResponsesUrl(model.baseUrl)) return undefined;
 	const accountId = getCodexAccountId(options?.apiKey || getEnvApiKey(model.provider) || "");
 	if (!accountId || source.accountId !== accountId) return undefined;
+	// Every projection (turn metadata, client_metadata, headers, snapshot)
+	// derives from these two ids; a blank one cannot name a lineage root.
+	if (source.sessionId.trim().length === 0 || source.threadId.trim().length === 0) return undefined;
 	return source;
 }
 
@@ -1596,6 +1600,76 @@ async function buildCodexRequestContext(
 	});
 }
 
+/**
+ * Canonical JSON for a serialized tool contract, ignoring description text.
+ * Everything else — identity, parameters, grammar, strictness, and any future
+ * contract field the serializer emits — must match exactly for prefix reuse.
+ */
+function stableJsonForToolContract(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableJsonForToolContract).join(",")}]`;
+	if (isRecord(value)) {
+		const keys = Object.keys(value)
+			.filter(key => key !== "description")
+			.sort();
+		return `{${keys.map(key => `${JSON.stringify(key)}:${stableJsonForToolContract(value[key])}`).join(",")}}`;
+	}
+	return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * Whether every tool contract the source advertised in any `additional_tools`
+ * input item is still present with an identical contract in the child's
+ * current catalog. The backend treats `additional_tools` as additive: a fork
+ * that replays a parent-only tool (or a changed schema/grammar) would let the
+ * model emit calls the child cannot execute, so such forks fall back to
+ * portable history while keeping the shared root lineage. Extra child-only
+ * tools are fine — the child catalog is a superset. Malformed source records
+ * never certify compatibility.
+ */
+function isCodexForkCatalogCompatible(
+	sourceInput: Array<Record<string, unknown>>,
+	childCatalog: CodexAdditionalTool[] | undefined,
+): boolean {
+	const childContracts = new Map<string, string>();
+	for (const entry of childCatalog ?? []) {
+		if (entry.type === "namespace") {
+			for (const tool of entry.tools) {
+				childContracts.set(`${entry.name}\0${tool.type}\0${tool.name}`, stableJsonForToolContract({ ...tool }));
+			}
+			continue;
+		}
+		if (entry.type === "computer") {
+			childContracts.set("computer", stableJsonForToolContract({ ...entry }));
+			continue;
+		}
+		childContracts.set(`\0${entry.type}\0${entry.name}`, stableJsonForToolContract({ ...entry }));
+	}
+	const checkTool = (namespace: string, tool: Record<string, unknown>): boolean => {
+		if (tool.type === "computer") {
+			return childContracts.get("computer") === stableJsonForToolContract(tool);
+		}
+		if (typeof tool.type !== "string" || typeof tool.name !== "string") return false;
+		if (tool.type.length === 0 || tool.name.length === 0) return false;
+		return childContracts.get(`${namespace}\0${tool.type}\0${tool.name}`) === stableJsonForToolContract(tool);
+	};
+	for (const item of sourceInput) {
+		if (item.type !== "additional_tools") continue;
+		if (!Array.isArray(item.tools)) return false;
+		for (const entry of item.tools) {
+			if (!isRecord(entry)) return false;
+			if (entry.type === "namespace") {
+				if (typeof entry.name !== "string" || !Array.isArray(entry.tools)) return false;
+				for (const tool of entry.tools) {
+					if (!isRecord(tool) || !checkTool(entry.name, tool)) return false;
+				}
+				continue;
+			}
+			if (!checkTool("", entry)) return false;
+		}
+	}
+	return true;
+}
+
 /** Serialize normal Codex turns and V2 compaction with the same cacheable prefix. */
 export async function buildTransformedCodexRequestBody(
 	model: Model<"openai-codex-responses">,
@@ -1606,20 +1680,34 @@ export async function buildTransformedCodexRequestBody(
 ): Promise<RequestBody> {
 	const forkSource = getCodexForkSource(model, options);
 	const forkMessageCount = options?.codexFork?.messageCount;
+	const codexHarness = resolveHarnessProfile(model) === "codex";
+	// The child's own catalog, serialized once and reused for both the request
+	// params and the fork compatibility check below.
+	const childNamespaceTools =
+		codexHarness && context.tools && context.tools.length > 0
+			? buildCodexNamespaceTools(context.tools, model, { strictFalse: true })
+			: undefined;
 	// Byte-for-byte prefix reuse additionally requires the same producing model
 	// on the codex harness profile, a non-empty source input, and a
 	// caller-certified shared-prefix length. An empty source replaying nothing
-	// must never slice away converted history.
+	// must never slice away converted history. A forced tool choice narrows the
+	// request to one tool while the replayed prefix would re-advertise the
+	// parent's full surface (measured: the backend then emits the parent-only
+	// tool), so only auto/unspecified choices qualify — and only while every
+	// tool contract the source advertised anywhere in its input is still
+	// available unchanged in the child's catalog.
 	const useForkPrefix =
 		forkSource !== undefined &&
 		forkSource.model === model.id &&
-		resolveHarnessProfile(model) === "codex" &&
+		codexHarness &&
 		!options?.codexCompaction &&
 		forkSource.input.length > 0 &&
 		forkMessageCount !== undefined &&
 		Number.isSafeInteger(forkMessageCount) &&
 		forkMessageCount >= 0 &&
-		forkMessageCount <= context.messages.length;
+		forkMessageCount <= context.messages.length &&
+		(options?.toolChoice === undefined || options?.toolChoice === "auto") &&
+		isCodexForkCatalogCompatible(forkSource.input, childNamespaceTools);
 	const input = useForkPrefix
 		? convertMessages(model, { ...context, messages: context.messages.slice(forkMessageCount) })
 		: convertMessages(model, context);
@@ -1645,7 +1733,6 @@ export async function buildTransformedCodexRequestBody(
 	// everything from `StreamOptions` rather than forwarding any of them.
 	// (#3117 — codex-rs sends none of these either.)
 	applyOpenAIServiceTier(params, options?.serviceTier, model);
-	const codexHarness = resolveHarnessProfile(model) === "codex";
 	if (codexHarness) {
 		// codex-rs always sends tool_choice: "auto" (an explicit caller choice
 		// still wins below) and parallel_tool_calls: false on profiled turns.
@@ -1653,9 +1740,7 @@ export async function buildTransformedCodexRequestBody(
 		params.parallel_tool_calls = false;
 	}
 	if (context.tools && context.tools.length > 0) {
-		params.tools = codexHarness
-			? buildCodexNamespaceTools(context.tools, model, { strictFalse: true })
-			: convertOpenAICodexResponsesTools(context.tools, model);
+		params.tools = codexHarness ? childNamespaceTools : convertOpenAICodexResponsesTools(context.tools, model);
 		if (options?.toolChoice) {
 			const toolChoice = normalizeCodexToolChoice(options.toolChoice, context.tools, model);
 			if (toolChoice) {
@@ -2744,7 +2829,15 @@ class CodexStreamProcessor {
 		if (typeof body.prompt_cache_key === "string") {
 			snapshot.promptCacheKey = body.prompt_cache_key;
 		}
-		onSnapshot(snapshot);
+		try {
+			onSnapshot(snapshot);
+		} catch (error) {
+			// Diagnostic observer: a throwing callback must not turn a
+			// successful model response into a stream error.
+			logger.warn("onCodexRequestSnapshot observer threw", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	async #recoverStreamError(error: unknown): Promise<boolean> {
