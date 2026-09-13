@@ -77,8 +77,9 @@ export async function readHashlineHeaderContext(
 	session: ToolSession,
 	absolutePath: string,
 	cwd: string,
+	displayPath?: string,
 ): Promise<HashlineHeaderContext> {
-	return hashlineHeaderContextForText(session, absolutePath, cwd, await Bun.file(absolutePath).text());
+	return hashlineHeaderContextForText(session, absolutePath, cwd, await Bun.file(absolutePath).text(), displayPath);
 }
 
 /**
@@ -91,13 +92,9 @@ export function hashlineHeaderContextForText(
 	absolutePath: string,
 	cwd: string,
 	fullText: string,
+	displayPath: string = formatPathRelativeToCwd(absolutePath, cwd),
 ): HashlineHeaderContext {
-	const context = recordFullHashlineContext(
-		session,
-		absolutePath,
-		formatPathRelativeToCwd(absolutePath, cwd),
-		fullText,
-	);
+	const context = recordFullHashlineContext(session, absolutePath, displayPath, fullText);
 	if (!context) throw new ToolError(`Cannot record hashline snapshot for non-absolute path: ${absolutePath}`);
 	return context;
 }

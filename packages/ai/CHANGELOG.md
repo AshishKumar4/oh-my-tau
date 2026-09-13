@@ -5,6 +5,20 @@
 ### Changed
 
 - Models post-trained on a vendor harness are now served that vendor's own request surface: `claude-opus-5`, `claude-fable-5` and `claude-fable-5-1` on the Anthropic Messages API get the Claude Code shape, and `gpt-6-astra` and `gpt-5.6-sol` on the Codex route get the Codex CLI shape (tools as a namespaced `additional_tools` item, base prompt as a developer message with no top-level `instructions`, no `tool_namespaces_info` extension, namespace-qualified tool calls resolved back to the declared tool). Every other model keeps omp's native surface. The auth-gateway also accepts an opt-in harness recorder that is handed the inbound body of every `/v1/messages` and `/v1/responses` call before model resolution, so a real vendor client's surface can be captured through the gateway, and the pinned Codex client version is now `0.154.0`.
+## [18.1.19] - 2026-09-12
+
+### Added
+
+- Charm Hyper accounts now report their remaining prepaid credit balance in `/usage` ([#11656](https://github.com/can1357/oh-my-pi/pull/11656) by [@oldschoola](https://github.com/oldschoola)).
+
+### Fixed
+
+- Fixed Kimi Code's 7-day rate-limiting window being mislabeled as "Total quota" in `omp usage`, causing accounts whose monthly subscription pool is exhausted to appear 100% free while chat completions fail; parsed `totalQuota` add-on packs into the true "Total quota" row when present, and recognized Kimi's HTTP 403 `access_terminated_error` as a credential-rotatable usage limit. ([#11827](https://github.com/can1357/oh-my-pi/pull/11827) by [@revofusion](https://github.com/revofusion))
+- Fixed provider streams that die after emitting `toolcall_start` but before any argument content failing validation with empty `{}` arguments; the uncommitted attempt is now discarded and retried ([#11823](https://github.com/can1357/oh-my-pi/pull/11823) by [@justdoGIT](https://github.com/justdoGIT)).
+- Fixed Windows `zcode://` (Z.AI coding-plan) OAuth sign-in never completing after a successful browser authorization: the native callback handler is now registered with a path the Windows shell can launch, so the `zcode://zai-auth/callback` redirect reaches omp instead of being silently dropped by the browser ([#11907](https://github.com/can1357/oh-my-pi/pull/11907) by [@oldschoola](https://github.com/oldschoola)).
+- Codex OAuth login now accepts valid account tokens that expose an email but omit `chatgpt_account_id`, without fabricating a workspace header ([#11847](https://github.com/can1357/oh-my-pi/pull/11847) by [@nguyennguyenit](https://github.com/nguyennguyenit)).
+- Fixed Muse Code login failing when Meta returns no assigned subscription tier (`subs_tier_id`/`subs_tier_name` as null); sign-in now succeeds and usage is reported without a tier ([#11843](https://github.com/can1357/oh-my-pi/pull/11843) by [@John-Cusack](https://github.com/John-Cusack)).
+
 ## [18.1.18] - 2026-09-11
 
 ### Added
@@ -38,7 +52,9 @@
 
 ### Fixed
 
+- Anthropic `credits_required` responses now rotate to another account instead of retrying the same one: the entitlement wall is a quota outcome, so a session no longer repeats the request against an account that cannot serve the model ([#11333](https://github.com/can1357/oh-my-pi/pull/11333) by [@AshishKumar4](https://github.com/AshishKumar4)).
 - Codex SSE streams that end without a terminal completion event now retry when replay-safe and remain transient errors when partial output prevents replay ([#11349](https://github.com/can1357/oh-my-pi/issues/11349)).
+- Anthropic subscription usage now falls back to the canonical `api.anthropic.com` OAuth usage endpoint when a custom provider `baseUrl` does not serve it, instead of leaving the report to rate-limit headers — those carry the model-scoped weekly window only on responses for that model family, so `/usage` could report a scoped window far below its real utilization.
 
 ## [18.1.15] - 2026-09-08
 
