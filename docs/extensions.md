@@ -294,7 +294,7 @@ Cancelable pre-events:
 
 - `session_before_switch` → `{ cancel?: boolean }`
 - `session_before_branch` → `{ cancel?: boolean; skipConversationRestore?: boolean }`
-- `session_before_compact` → `{ cancel?: boolean; compaction?: CompactionResult }`
+- `session_before_compact` → `{ cancel?: boolean; compaction?: CompactionResult; rewrite?: SessionHistoryRewrite[] }`
 - `session_before_tree` → `{ cancel?: boolean; summary?: { summary: string; details?: unknown } }`
 
 ### Prompt and turn lifecycle

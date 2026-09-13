@@ -5511,8 +5511,12 @@ export class AgentSession {
 		return this.#maintenance.shake(mode, opts);
 	}
 
-	/** Compact the active session history. */
-	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+	/**
+	 * Compact the active session history. Resolves without a result when a
+	 * `session_before_compact` handler compacted history in place instead of
+	 * writing a boundary.
+	 */
+	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult | undefined> {
 		return this.#maintenance.compact(customInstructions, options);
 	}
 

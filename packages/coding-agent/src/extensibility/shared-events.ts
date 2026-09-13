@@ -220,17 +220,24 @@ export interface TurnEndEvent {
 // Auto-compaction / Auto-retry Events
 // ============================================================================
 
+/**
+ * What an automatic maintenance pass is doing. Start events name the selected
+ * method; an end event reports `rewrite` when a `session_before_compact`
+ * handler settled the pass with an in-place history rewrite instead.
+ */
+export type AutoCompactionAction = "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "rewrite";
+
 /** Fired when auto-compaction starts */
 export interface AutoCompactionStartEvent {
 	type: "auto_compaction_start";
 	reason: "threshold" | "overflow" | "idle" | "incomplete";
-	action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
+	action: AutoCompactionAction;
 }
 
 /** Fired when auto-compaction ends */
 export interface AutoCompactionEndEvent {
 	type: "auto_compaction_end";
-	action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
+	action: AutoCompactionAction;
 	result: CompactionResult | undefined;
 	aborted: boolean;
 	willRetry: boolean;
@@ -372,12 +379,35 @@ export interface SessionBeforeBranchResult {
 	skipConversationRestore?: boolean;
 }
 
+/**
+ * One kept entry rewritten in place by a `session_before_compact` handler.
+ * The entry keeps its id, role, and position; only the message body changes.
+ */
+export interface SessionHistoryRewrite {
+	entryId: string;
+	message: AgentMessage;
+}
+
 /** Return type for `session_before_compact` handlers */
 export interface SessionBeforeCompactResult {
 	/** If true, cancel the compaction */
 	cancel?: boolean;
 	/** Custom compaction result - SessionManager adds id/parentId */
 	compaction?: CompactionResult;
+	/**
+	 * Rewrite kept entries in place instead of, or before, replacing the prefix
+	 * with a summary. History keeps its shape: user messages stay user
+	 * messages, assistant and tool entries stay where they are with reduced
+	 * bodies. The host persists the rewrite first; when `compaction` is also
+	 * set, that boundary is committed on top of the rewritten branch.
+	 * Without `compaction`, a rewrite that changed at least one entry is the
+	 * whole answer: manual compaction finishes there with no boundary, and
+	 * automatic maintenance finishes when the freed headroom reaches the
+	 * recovery band, otherwise the configured method runs natively over the
+	 * rewritten branch without consulting the handler again. A rewrite that
+	 * matches no entry is ignored. Ignored entirely when `cancel` is set.
+	 */
+	rewrite?: SessionHistoryRewrite[];
 }
 
 /** Return type for `session.compacting` handlers */

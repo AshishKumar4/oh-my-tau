@@ -152,7 +152,7 @@ Important edge behavior from runtime:
 
 ### Compaction
 
-- `{ id?, type: "compact", customInstructions?: string }`
+- `{ id?, type: "compact", customInstructions?: string }` — the response carries the `CompactionResult` in `data`, or no `data` when an extension compacted history in place without writing a boundary
 - `{ id?, type: "set_auto_compaction", enabled: boolean }`
 
 ### Retry

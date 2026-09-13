@@ -757,9 +757,10 @@ export class RpcClient {
 	}
 
 	/**
-	 * Compact session context.
+	 * Compact session context. Resolves without a result when an extension
+	 * compacted history in place and no boundary was written.
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	async compact(customInstructions?: string): Promise<CompactionResult | undefined> {
 		const response = await this.#send({ type: "compact", customInstructions });
 		return this.#getData(response);
 	}

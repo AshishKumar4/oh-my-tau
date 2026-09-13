@@ -2109,6 +2109,7 @@ export class EventController {
 		const isHandoffAction = event.action === "handoff";
 		const isRemoteAction = event.action === "remote";
 		const isShakeAction = event.action === "shake";
+		const isRewriteAction = event.action === "rewrite";
 		const isSnapcompactAction = event.action === "snapcompact";
 		if (event.aborted) {
 			this.ctx.showStatus(
@@ -2118,15 +2119,18 @@ export class EventController {
 						? "Auto server compaction cancelled"
 						: isShakeAction
 							? "Auto-shake cancelled"
-							: isSnapcompactAction
-								? "Auto-snapcompact cancelled"
-								: "Auto context-full maintenance cancelled",
+							: isRewriteAction
+								? "Extension history rewrite cancelled"
+								: isSnapcompactAction
+									? "Auto-snapcompact cancelled"
+									: "Auto context-full maintenance cancelled",
 			);
-		} else if (isShakeAction) {
-			// Shake produces no CompactionResult; rebuild on success, suppress benign skips.
-			// The fallback path (`errorMessage` set, `skipped` false) means shake reclaimed
-			// some tokens before deciding the threshold still wasn't cleared — rebuild so
-			// the chat reflects the dropped regions even though a context-full pass follows.
+		} else if (isShakeAction || isRewriteAction) {
+			// Shake and extension rewrites produce no CompactionResult; rebuild on
+			// success, suppress benign skips. The fallback path (`errorMessage` set,
+			// `skipped` false) means the pass reclaimed some tokens before deciding
+			// the threshold still wasn't cleared — rebuild so the chat reflects the
+			// dropped regions even though another pass follows.
 			if (event.errorMessage) {
 				if (!event.skipped) {
 					this.ctx.rebuildChatFromMessages();
@@ -2139,7 +2143,7 @@ export class EventController {
 				this.ctx.rebuildChatFromMessages();
 				this.ctx.statusLine.invalidate();
 				this.ctx.ui.requestRender();
-				this.ctx.showStatus("Auto-shake completed");
+				this.ctx.showStatus(isShakeAction ? "Auto-shake completed" : "Extension history rewrite completed");
 			}
 		} else if (event.result) {
 			this.ctx.lastAssistantUsage = undefined;

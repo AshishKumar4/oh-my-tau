@@ -86,7 +86,7 @@ Hook events are strongly typed in `types.ts`.
 - `session_switch`
 - `session_before_branch` → can return `{ cancel?: boolean; skipConversationRestore?: boolean }`
 - `session_branch`
-- `session_before_compact` → can return `{ cancel?: boolean; compaction?: CompactionResult }`
+- `session_before_compact` → can return `{ cancel?: boolean; compaction?: CompactionResult; rewrite?: SessionHistoryRewrite[] }`
 - `session.compacting` → can return `{ context?: string[]; prompt?: string; preserveData?: Record<string, unknown> }`
 - `session_compact`
 - `session_before_tree` → can return `{ cancel?: boolean; summary?: { summary: string; details?: unknown } }`

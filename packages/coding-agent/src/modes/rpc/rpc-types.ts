@@ -291,7 +291,7 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "set_interrupt_mode"; success: true }
 
 	// Compaction
-	| { id?: string; type: "response"; command: "compact"; success: true; data: CompactionResult }
+	| { id?: string; type: "response"; command: "compact"; success: true; data?: CompactionResult }
 	| { id?: string; type: "response"; command: "set_auto_compaction"; success: true }
 
 	// Retry
