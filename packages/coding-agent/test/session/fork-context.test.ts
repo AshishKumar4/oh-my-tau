@@ -139,11 +139,17 @@ describe("fork request journal state", () => {
 		expect(state.replayable).toBe(false);
 	});
 
-	it("a malformed newest marker warns and yields no origin — never an older one", () => {
+	it("a malformed newest marker warns, still occupies the origin slot, and never falls back", () => {
 		const manager = managerWith([user("one")]);
 		seedOrigin(manager, "older-valid");
 		manager.appendCustomEntry(FORK_REQUEST_CONTEXT_TYPE, { request: { provider: 42 } });
-		expect(readForkJournalState(manager).snapshot).toBeUndefined();
+		const state = readForkJournalState(manager);
+		expect(state.snapshot).toBeUndefined();
+		// Marker presence is reported independently of parse success: the SDK
+		// seed decision reads hasMarker, so a stale caller-supplied forkRequest
+		// can never resurrect an origin over a malformed entry.
+		expect(state.hasMarker).toBe(true);
+		expect(state.hasBoundary).toBe(false);
 	});
 
 	it("a marker on an abandoned branch is not an origin", () => {

@@ -177,6 +177,13 @@ export interface ForkJournalState {
 	/** The branch's newest live fork marker; undefined when none survives the boundary. */
 	snapshot?: ForkRequestSnapshot;
 	/**
+	 * True when a fork marker entry sits on the active branch regardless of
+	 * parse success — a malformed marker still occupies the origin slot, so
+	 * callers must never re-seed from a caller-supplied snapshot once any
+	 * marker exists.
+	 */
+	hasMarker: boolean;
+	/**
 	 * False when a compaction/branch_summary sits newer than the marker on the
 	 * active branch: lineage is retained but raw-prefix replay is withheld —
 	 * fingerprint equality alone is not proof the full captured prefix applies.
@@ -191,10 +198,11 @@ export interface ForkJournalState {
  * everything older (including fork markers); compaction/branch summaries seen
  * before the first marker mark it non-replayable; the FIRST fork marker found
  * is the origin (never overwritten by an older one). A malformed newest marker
- * warns and yields no origin — it never falls back to an older valid marker.
+ * warns, reports hasMarker so no stale caller option resurrects an origin,
+ * and yields no snapshot — it never falls back to an older valid marker.
  */
 export function readForkJournalState(sessionManager: Pick<SessionManager, "getBranch">): ForkJournalState {
-	const state: ForkJournalState = { replayable: true, hasBoundary: false };
+	const state: ForkJournalState = { replayable: true, hasBoundary: false, hasMarker: false };
 	const branch = sessionManager.getBranch();
 	for (let i = branch.length - 1; i >= 0; i--) {
 		const entry = branch[i];
@@ -208,6 +216,7 @@ export function readForkJournalState(sessionManager: Pick<SessionManager, "getBr
 			continue;
 		}
 		if (entry.type === "custom" && entry.customType === FORK_REQUEST_CONTEXT_TYPE) {
+			state.hasMarker = true;
 			const snapshot = parseForkRequestSnapshot(entry.data);
 			if (snapshot !== undefined) {
 				state.snapshot = snapshot;
@@ -237,7 +246,7 @@ export function createForkJournalStateReader(
 	sessionManager: Pick<SessionManager, "getBranch" | "getLeafId" | "getSessionId">,
 ): () => ForkJournalState {
 	let cachedKey: string | undefined;
-	let cached: ForkJournalState = { replayable: true, hasBoundary: false };
+	let cached: ForkJournalState = { replayable: true, hasBoundary: false, hasMarker: false };
 	return () => {
 		const key = `${sessionManager.getSessionId()}\u0000${sessionManager.getLeafId() ?? ""}`;
 		if (key !== cachedKey) {

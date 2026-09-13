@@ -1480,16 +1480,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	//    created on. `forkJournal` re-reads the active branch so a mid-session
 	//    reset_boundary kills the origin and a newer compaction/branch rewrite
 	//    withholds raw-prefix replay. `options.forkRequest` seeds the marker
-	//    exactly once at construction when the journal shows neither origin nor
+	//    exactly once at construction, only when the journal shows neither a
+	//    marker (even malformed — a marker occupies the origin slot) nor a
 	//    boundary — afterwards the journal is the only origin authority, so a
-	//    `/clear` can never be re-armed by a stale caller option.
+	//    `/clear` or a stale caller option can never re-arm it.
 	// 2. produced request — this session's last completed provider request,
 	//    owner-bound at dispatch (agent object, agent.sessionId, journal session
 	//    id, branch-leaf anchor). Served ONLY to future `fork: "all"` spawns via
 	//    getForkRequestSnapshot; it never becomes this session's own codexFork,
 	//    so a root session can never self-fork.
 	const forkJournal = createForkJournalStateReader(sessionManager);
-	if (forkJournal().snapshot === undefined && !forkJournal().hasBoundary && options.forkRequest !== undefined) {
+	const initialForkState = forkJournal();
+	if (!initialForkState.hasMarker && !initialForkState.hasBoundary && options.forkRequest !== undefined) {
 		recordForkRequestSnapshot(sessionManager, options.forkRequest);
 	}
 	/** The origin this session was forked from — undefined for non-forked sessions, always. */
@@ -3690,7 +3692,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						: { toolNamespacesInfo: codeModeState.namespacesInfo }),
 					...(codexFork !== undefined ? { codexFork } : {}),
 					onCodexRequestSnapshot: snapshot => {
-						streamOptions?.onCodexRequestSnapshot?.(snapshot);
 						// A late response from a previous session/agent must not be
 						// relabeled as the current session's produced request.
 						if (
@@ -3700,11 +3701,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						) {
 							return;
 						}
+						// Store our own clone BEFORE the caller's callback runs — a
+						// mutating observer must not corrupt the produced request.
 						const credentialId =
 							resolveForkCredentialId(authStorage, snapshot, dispatchAgentSessionId) ?? undefined;
 						producedForkRequest = {
 							snapshot: {
-								request: snapshot,
+								request: structuredClone(snapshot),
 								messageFingerprints: dispatchFingerprints,
 								...(credentialId !== undefined ? { credentialId } : {}),
 							},
@@ -3713,6 +3716,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 							journalSessionId: dispatchJournalId,
 							anchorId: dispatchAnchorId,
 						};
+						streamOptions?.onCodexRequestSnapshot?.(snapshot);
 					},
 				});
 			},
@@ -3777,16 +3781,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		// Fresh-fork credential affinity: a child created via options.forkRequest
 		// may reuse the parent's account so the provider's source-account check
-		// passes on the first request. Construction-time only — a resumed session
-		// keeps its existing credential pin untouched, and a child on a different
-		// provider than the origin never pins an unrelated account. A held or
-		// unidentifiable account just declines; the request falls back to
-		// whatever key the session resolves.
+		// passes on the first request. Construction-time only, and only while
+		// the child has no credential choice of its own — a journal pin or an
+		// already-active session-sticky account (e.g. a revived child that was
+		// re-pinned before) must never be clobbered by the parent's credential.
+		// A held or unidentifiable account just declines; the request falls back
+		// to whatever key the session resolves.
+		const forkPinProvider = inheritedForkOrigin?.request.provider;
 		if (
 			options.forkRequest !== undefined &&
 			inheritedForkOrigin !== undefined &&
+			forkPinProvider !== undefined &&
 			model !== undefined &&
-			model.provider === inheritedForkOrigin.request.provider
+			model.provider === forkPinProvider &&
+			!sessionManager.getCredentialPins().has(forkPinProvider) &&
+			!authStorage.listOAuthAccounts(forkPinProvider, providerSessionId).some(account => account.active)
 		) {
 			try {
 				const credentialId =
