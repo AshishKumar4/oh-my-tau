@@ -224,6 +224,7 @@ interface CapturedForkRequest {
 	turnMetadata: Record<string, unknown>;
 	clientMetadata: Record<string, unknown>;
 	snapshots: CodexRequestSnapshot[];
+	result: AssistantMessage;
 }
 
 /**
@@ -247,8 +248,7 @@ async function captureForkRequest(
 		}
 		return dataSse(events);
 	};
-
-	await streamOpenAICodexResponses(createCodexModel(modelId), context, {
+	const result = await streamOpenAICodexResponses(createCodexModel(modelId), context, {
 		apiKey: createCodexTestToken(),
 		fetch: fetchMock,
 		onCodexRequestSnapshot: snapshot => snapshots.push(snapshot),
@@ -267,6 +267,7 @@ async function captureForkRequest(
 		clientMetadata: rawClientMetadata,
 		turnMetadata,
 		snapshots,
+		result,
 	};
 }
 /**
@@ -275,8 +276,11 @@ async function captureForkRequest(
  * {@link buildCodexNamespaceTools} output so the fixture is a valid catalog
  * the compatibility check can actually certify — never a skeleton record.
  */
-function createForkSource(overrides: Partial<CodexRequestSnapshot> = {}): CodexRequestSnapshot {
-	const parentTools = buildCodexNamespaceTools(createHarnessTools(), createCodexModel("gpt-6-astra"), {
+function createForkSource(
+	overrides: Partial<CodexRequestSnapshot> = {},
+	parentTools: Tool[] = createHarnessTools(),
+): CodexRequestSnapshot {
+	const surface = buildCodexNamespaceTools(parentTools, createCodexModel("gpt-6-astra"), {
 		strictFalse: true,
 	});
 	return {
@@ -288,7 +292,7 @@ function createForkSource(overrides: Partial<CodexRequestSnapshot> = {}): CodexR
 		threadId: "root-thread-1",
 		promptCacheKey: "root-cache-key",
 		input: [
-			{ type: "additional_tools", role: "developer", tools: parentTools },
+			{ type: "additional_tools", role: "developer", tools: surface },
 			{
 				type: "message",
 				role: "developer",
@@ -649,6 +653,34 @@ describe("codex fork lineage", () => {
 		expect(inputItems(changed.body).filter(item => item.role === "user")).toHaveLength(2);
 	});
 
+	it("treats a nested description schema field as contract data", async () => {
+		const parentTools = createHarnessTools().map(tool =>
+			tool.name === "wait" ? { ...tool, parameters: type({ cell_id: "string", description: "string" }) } : tool,
+		);
+		const source = createForkSource({}, parentTools);
+		const childTools = createHarnessTools().map(tool =>
+			tool.name === "wait" ? { ...tool, parameters: type({ cell_id: "string", description: "number" }) } : tool,
+		);
+		const context = createForkContext(
+			[
+				{ role: "user", content: "Say hello", timestamp: 1 },
+				{ role: "user", content: "Summarize it for the parent", timestamp: 2 },
+			],
+			childTools,
+		);
+		const { body } = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", codexFork: { source, messageCount: 1 } },
+			context,
+		);
+
+		// Only the tool-level description is doc text. A schema argument that
+		// happens to be named `description` changing string → number is a
+		// different contract and must fall back to portable history.
+		expect(JSON.stringify(inputItems(body).slice(0, source.input.length))).not.toBe(JSON.stringify(source.input));
+		expect(inputItems(body).filter(item => item.role === "user")).toHaveLength(2);
+	});
+
 	it("reuses the exact prefix when the child only adds tools", async () => {
 		const source = createForkSource();
 		const extraTool: Tool = {
@@ -697,15 +729,16 @@ describe("codex fork lineage", () => {
 	});
 
 	it("keeps a successful turn when the snapshot observer throws", async () => {
-		const { body, snapshots } = await captureForkRequest("gpt-6-astra", {
+		const { body, snapshots, result } = await captureForkRequest("gpt-6-astra", {
 			sessionId: "child-session",
 			onCodexRequestSnapshot: () => {
 				throw new Error("observer boom");
 			},
 		});
 
-		// The observer failure is swallowed: the turn still succeeds and the
-		// request went out whole, just with no recorded snapshot.
+		// The observer failure is swallowed: the returned message still reports
+		// success, the request went out whole, just with no recorded snapshot.
+		expect(result.stopReason).toBe("stop");
 		expect(snapshots).toHaveLength(0);
 		expect(inputItems(body).filter(item => item.role === "user")).toHaveLength(1);
 		expect(body.prompt_cache_key).toBe("child-session");

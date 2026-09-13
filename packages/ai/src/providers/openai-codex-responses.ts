@@ -21,6 +21,7 @@ import {
 	logger,
 	parseStreamingJson,
 	readSseJson,
+	stableStringifyJson,
 	structuredCloneJSON,
 	USER_AGENT,
 } from "@oh-my-pi/pi-utils";
@@ -1601,19 +1602,19 @@ async function buildCodexRequestContext(
 }
 
 /**
- * Canonical JSON for a serialized tool contract, ignoring description text.
- * Everything else — identity, parameters, grammar, strictness, and any future
- * contract field the serializer emits — must match exactly for prefix reuse.
+ * Fingerprint a serialized tool contract, omitting only its top-level
+ * `description`. Nested fields stay intact — even a schema argument literally
+ * named `description` under `parameters.properties` — because dropping nested
+ * keys could equate incompatible contracts, while a missed reuse on nested
+ * doc-only changes merely falls back to portable history.
  */
-function stableJsonForToolContract(value: unknown): string {
-	if (Array.isArray(value)) return `[${value.map(stableJsonForToolContract).join(",")}]`;
-	if (isRecord(value)) {
-		const keys = Object.keys(value)
-			.filter(key => key !== "description")
-			.sort();
-		return `{${keys.map(key => `${JSON.stringify(key)}:${stableJsonForToolContract(value[key])}`).join(",")}}`;
+function toolContractFingerprint(tool: Record<string, unknown>): string {
+	const contract: Record<string, unknown> = {};
+	for (const key of Object.keys(tool)) {
+		if (key === "description") continue;
+		contract[key] = tool[key];
 	}
-	return JSON.stringify(value) ?? "null";
+	return stableStringifyJson(contract);
 }
 
 /**
@@ -1634,23 +1635,23 @@ function isCodexForkCatalogCompatible(
 	for (const entry of childCatalog ?? []) {
 		if (entry.type === "namespace") {
 			for (const tool of entry.tools) {
-				childContracts.set(`${entry.name}\0${tool.type}\0${tool.name}`, stableJsonForToolContract({ ...tool }));
+				childContracts.set(`${entry.name}\0${tool.type}\0${tool.name}`, toolContractFingerprint({ ...tool }));
 			}
 			continue;
 		}
 		if (entry.type === "computer") {
-			childContracts.set("computer", stableJsonForToolContract({ ...entry }));
+			childContracts.set("computer", toolContractFingerprint({ ...entry }));
 			continue;
 		}
-		childContracts.set(`\0${entry.type}\0${entry.name}`, stableJsonForToolContract({ ...entry }));
+		childContracts.set(`\0${entry.type}\0${entry.name}`, toolContractFingerprint({ ...entry }));
 	}
 	const checkTool = (namespace: string, tool: Record<string, unknown>): boolean => {
 		if (tool.type === "computer") {
-			return childContracts.get("computer") === stableJsonForToolContract(tool);
+			return childContracts.get("computer") === toolContractFingerprint(tool);
 		}
 		if (typeof tool.type !== "string" || typeof tool.name !== "string") return false;
 		if (tool.type.length === 0 || tool.name.length === 0) return false;
-		return childContracts.get(`${namespace}\0${tool.type}\0${tool.name}`) === stableJsonForToolContract(tool);
+		return childContracts.get(`${namespace}\0${tool.type}\0${tool.name}`) === toolContractFingerprint(tool);
 	};
 	for (const item of sourceInput) {
 		if (item.type !== "additional_tools") continue;
