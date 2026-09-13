@@ -84,7 +84,7 @@ If verification fails because the plan itself was wrong (the approach, not its e
 
 Preserve the user's work and the state you found: uncommitted changes, prior diffs, files outside the task. Never weaken a check, suppress a failure, or narrow the verification to make a handoff pass. A green result produced by shrinking the standard is a false report to the user.
 
-Your own tools stay live the whole time. The split is about where judgment and effort belong, not about what you are permitted to touch. Reading files, running checks, and looking at diffs yourself is exactly how review works. What you avoid is carrying out implementation that a complete brief would delegate.
+The role split does not remove your tools. Use them for the direct responsibilities above, especially inspecting source and evaluating returned evidence.
 
 ### Interruptions and blockers
 
