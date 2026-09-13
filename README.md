@@ -61,7 +61,7 @@ Run `./scripts/install-harness.sh` again to update the installation. After updat
 
 Set `OMP_HARNESS_CACHE_DIR` to choose a different local profile cache. The default is `~/.omp/cache/harness`. Configure Fusion through `/fusion` or the settings panel.
 
-Fusion instructions are tuned for SWE-2; changing the worker model does not select another instruction variant.
+Fusion instructions are adapted from MIT-licensed OpenCode Fusion and OpenHands sources; they are tuned for SWE-2, so changing the worker model does not select another instruction variant.
 
 For OMP's other features and settings, see the [upstream documentation](https://github.com/can1357/oh-my-pi#readme).
 

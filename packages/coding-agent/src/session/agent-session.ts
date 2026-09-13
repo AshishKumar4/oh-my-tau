@@ -5455,7 +5455,7 @@ export class AgentSession {
 
 	/**
 	 * Fusion: a user message that lands while the sidekick is mid-handoff gets
-	 * the vendor's report-first guidance so the lead can re-brief for an
+	 * the report-first guidance so the lead can re-brief for an
 	 * immediate report instead of waiting out the handoff.
 	 */
 	#createFusionReportFirstNotice(): CustomMessage | undefined {

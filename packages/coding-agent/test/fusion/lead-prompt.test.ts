@@ -42,14 +42,15 @@ describe("fusion lead prompt section", () => {
 
 	it("renders only when the sidekick tool is mounted, resolving the wait tool and identity natively", async () => {
 		const text = await build({ toolNames: ["read", "hub", "sidekick"] });
-		expect(text).toContain("You have a `sidekick` tool: a persistent subagent");
-		expect(text).toContain("wait for it with `hub` (`block: true`)");
-		expect(text).toContain("The user interacts with one assistant: you.");
-		expect(text).toContain("The sidekick is available for delegating mechanical work");
+		expect(text).toContain("`sidekick` tool");
+		expect(text).toContain("persistent");
+		// The readTool slot resolves to the native job-wait tool.
+		expect(text).toContain("wait for the report with `hub`");
+		expect(text).not.toContain("{{");
 
 		const off = await build({ toolNames: ["read", "hub"] });
-		expect(off).not.toContain("You have a `sidekick` tool");
-		expect(off).not.toContain("delegating mechanical work");
+		expect(off).not.toContain("`sidekick` tool");
+		expect(off).not.toContain("persistent");
 	});
 
 	it("renders in the custom (harness) template with the profile's wait facade and identity", async () => {
@@ -60,14 +61,17 @@ describe("fusion lead prompt section", () => {
 			browserEnabled: true,
 		});
 		expect(text).toContain("VENDOR PROMPT");
-		expect(text).toContain("wait for it with `TaskOutput` (`block: true`)");
-		expect(text).toContain("The user interacts with one Claude Code: you.");
+		expect(text).toContain("wait for the report with `TaskOutput`");
+		expect(text).toContain("one Claude Code: you");
+		// The GPT-lead extra-detail block stays gated to the Codex profile.
+		expect(text).not.toContain("blocking handoff beats");
 
 		const codex = await build({ toolNames: ["hub", "sidekick"], harnessProfile: "codex", customPrompt: "VENDOR" });
-		expect(codex).toContain("wait for it with `wait` (`block: true`)");
-		expect(codex).toContain("The user interacts with one Codex: you.");
+		expect(codex).toContain("wait for the report with `wait`");
+		expect(codex).toContain("one Codex: you");
+		expect(codex).toContain("blocking handoff beats");
 
 		const customOff = await build({ toolNames: ["read", "hub"], customPrompt: "VENDOR PROMPT" });
-		expect(customOff).not.toContain("You have a `sidekick` tool");
+		expect(customOff).not.toContain("`sidekick` tool");
 	});
 });

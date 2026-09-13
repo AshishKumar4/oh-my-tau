@@ -6,6 +6,7 @@
  */
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, resolveCliModel } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -52,24 +53,12 @@ export function buildFusionPromptData(options: {
 }
 
 /**
- * The two phrases in the Devin sidekick prompt that belong to a particular
- * session rather than the harness: the CLI names its `todo_write` tool, and
- * closes with the model and effort it runs on. Each must be present exactly
- * once, so a prompt update that rewords them fails loudly here instead of
- * shipping stale values.
+ * Render the worker's prompt template for this pairing: `{{modelName}}` and
+ * `{{effort}}` slots carry the sidekick's own model and thinking level, so the
+ * model-facing footer always names the runtime that actually serves it.
  */
-const SIDEKICK_TODO_PHRASE = "use the todo_write tool";
-const SIDEKICK_POWERED_BY_PHRASE = "Model: selected worker.";
-
-/** The Devin sidekick prompt with omp's `todo` and the pairing's own model and effort substituted. */
-export function renderSidekickPrompt(prompt: string, model: Model<Api>, thinkingLevel: string | undefined): string {
-	for (const phrase of [SIDEKICK_TODO_PHRASE, SIDEKICK_POWERED_BY_PHRASE]) {
-		if (prompt.split(phrase).length !== 2) throw new Error(`sidekick prompt: expected exactly one "${phrase}"`);
-	}
-	const effort = thinkingLevel ? ` ${thinkingLevel.charAt(0).toUpperCase()}${thinkingLevel.slice(1)}` : "";
-	return prompt
-		.replace(SIDEKICK_TODO_PHRASE, "use the todo tool")
-		.replace(SIDEKICK_POWERED_BY_PHRASE, `You are powered by ${model.name}${effort}.`);
+export function renderSidekickPrompt(template: string, model: Model<Api>, thinkingLevel: string | undefined): string {
+	return prompt.render(template, { modelName: model.name, effort: thinkingLevel });
 }
 
 export interface FusionSessionLike {

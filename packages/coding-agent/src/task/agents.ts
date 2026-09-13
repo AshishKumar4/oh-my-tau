@@ -84,10 +84,11 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 /**
  * The Fusion sidekick is deliberately NOT a discoverable bundled agent: the
  * `sidekick` tool owns its one-per-session lifecycle, so `task` must never be
- * able to spawn a second one. Its body is the Devin CLI's sidekick prompt, so
- * it is parsed verbatim rather than rendered like the other bundled templates
- * (whose render pass normalises whitespace); the two session-specific phrases
- * are substituted at spawn.
+ * able to spawn a second one. Its body is the worker prompt template, parsed
+ * once and kept unrendered — `{{modelName}}`/`{{effort}}` slots are filled at
+ * spawn from the resolved pairing, so the parsed definition must not go
+ * through the render pass that other bundled templates use (it also
+ * normalises whitespace).
  */
 const SIDEKICK_AGENT_FILE = "sidekick.md";
 

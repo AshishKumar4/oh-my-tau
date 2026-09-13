@@ -36,18 +36,18 @@ import type { ToolSession } from "./index";
 import { ToolError } from "./tool-errors";
 
 /**
- * Longest a blocking handoff waits inside one tool call, as in the Devin CLI
- * (2700 s). A handoff that outlasts it keeps running; its report then
- * self-delivers like any background job.
+ * Longest a blocking handoff waits inside one tool call. A handoff that
+ * outlasts it keeps running; its report then self-delivers like any
+ * background job.
  */
 export const SIDEKICK_MAX_BLOCK_SECONDS = 2700;
 
-// The Devin CLI's `sidekick` declaration: `message` and `block` only.
+// The sidekick handoff contract: `message` and `block` only.
 const sidekickSchema = type({
-	message: type("string > 0").describe("The message to send the sidekick."),
-	"block?": type("boolean").describe(
-		"Wait for the worker to report. Interrupted waits leave the handoff running.",
+	message: type("string > 0").describe(
+		"The brief: goal, plan, constraints, and how to verify. While the sidekick is running, this is injected into the running handoff as an interrupt.",
 	),
+	"block?": type("boolean").describe("Wait for the handoff to finish and return its report (default true)."),
 });
 
 type SidekickParams = typeof sidekickSchema.infer;

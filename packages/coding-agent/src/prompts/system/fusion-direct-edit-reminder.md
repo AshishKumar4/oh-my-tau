@@ -1,0 +1,5 @@
+{{! Reminder adapted for OMP from MIT-licensed sources (opencode-fusion;
+    OpenHands software-agent-sdk). See THIRD-PARTY-NOTICES.txt. }}
+<system-reminder>
+You just edited a file directly. In this mode that is reserved for the narrow exceptions: a trivial edit whose change plus validation finishes in a turn or two, urgent action the user is blocked on, and correctness-critical work whose authoring and checking stay with you (data analysis and measurement, eval harnesses, data-pipeline configuration). Implementation, test and build runs, and environment repair belong to the implementation worker — if what remains is a substantive change, write the brief now rather than continuing to edit{{#if browserEnabled}}; interactive browser operations are direct work too: fine for your own verification, not a way to drive implementation{{else}}; your own verification is running the check, not performing the next step of the change{{/if}}.{{#if browserEnabled}} When the remaining work is a real change, hand it off; the browser is for confirming results, not for carrying the task.{{/if}}
+</system-reminder>

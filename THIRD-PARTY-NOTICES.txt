@@ -270,6 +270,76 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 -------------------------------------------------------------------------------
+opencode-fusion (https://github.com/mihneaptu/opencode-fusion), MIT
+
+Covers material adapted into
+`packages/coding-agent/src/prompts/system/fusion-lead.md`,
+`packages/coding-agent/src/prompts/system/fusion-direct-edit-reminder.md`,
+`packages/coding-agent/src/prompts/system/fusion-report-first.md`,
+`packages/coding-agent/src/prompts/tools/sidekick.md`,
+`packages/coding-agent/src/prompts/tools/sidekick-handoff.md`, and
+`packages/coding-agent/src/prompts/agents/sidekick.md`: the structure and
+wording of the Fusion lead-and-worker instructions and the handoff envelope,
+adapted for OMP from the `fusion-setup` build and sidekick agents at commit
+https://github.com/mihneaptu/opencode-fusion/tree/e48981ace39bb02aedb4fed234a4088220ef8b36.
+
+MIT License
+
+Copyright (c) 2026 mihneaptu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+OpenHands software-agent-sdk (https://github.com/OpenHands/software-agent-sdk), MIT
+
+Covers material adapted into
+`packages/coding-agent/src/prompts/system/fusion-lead.md` and
+`packages/coding-agent/src/prompts/agents/sidekick.md`: workflow,
+code-quality, security, and verification guidance in the Fusion lead and
+worker instructions, adapted for OMP from the agent system prompt snapshot
+`tests/sdk/context/prompts/snapshots/anthropic__browser-off__secana-off__cli-on.txt`
+at commit
+https://github.com/OpenHands/software-agent-sdk/tree/76e9e25078ed0ff7970f2c75e451274d3ed32bf2.
+
+MIT License
+
+Copyright (c) 2026 OpenHands contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
 crates/pi-shell/NOTICE
 
 This file documents third-party attribution for the shell-output minimizer in

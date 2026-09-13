@@ -238,14 +238,15 @@ describe("fusion sidekick tool", () => {
 			expect(request.model).toBe("devin/swe-2");
 			expect(request.keepAlive).toBe(true);
 			expect(request.assignment).toStartWith("This is your first handoff from the lead.");
-			// The brief rides inside the Devin CLI's `<lead_handoff>` envelope.
+			// The brief rides inside the `<lead_handoff>` envelope.
 			expect(request.assignment).toEndWith("<lead_handoff>\nImplement X\n</lead_handoff>");
-			// The captured Devin sidekick prompt, with the recording's tool name and
-			// model/effort tail replaced by this pairing's.
-			expect(request.agentDefinition?.systemPrompt).toStartWith("You are a Fusion implementation worker,");
-			expect(request.agentDefinition?.systemPrompt).toContain("use the todo tool");
-			expect(request.agentDefinition?.systemPrompt).not.toContain("todo_write");
-			expect(request.agentDefinition?.systemPrompt).toEndWith("You are powered by swe-2 Medium.");
+			// The worker prompt is rendered for this pairing: the model/effort
+			// footer names the sidekick's own runtime, and no template slots leak.
+			expect(request.agentDefinition?.systemPrompt).toStartWith(
+				"You are the implementation worker in a Fusion session.",
+			);
+			expect(request.agentDefinition?.systemPrompt).toEndWith("Model: swe-2; reasoning effort: medium.");
+			expect(request.agentDefinition?.systemPrompt).not.toContain("{{");
 
 			const second = await tool.execute("c2", { message: "Now also Y" });
 			expect(second.content[0]).toEqual({ type: "text", text: "second report" });
