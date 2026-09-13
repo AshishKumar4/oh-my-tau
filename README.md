@@ -19,10 +19,11 @@ You need Bun, Rust/Cargo, Git, and Python 3. Install and sign in to Claude Code 
 2. Start OMP in your project:
 
    ```sh
+   cd /path/to/your/project
    omp
    ```
 
-3. Select a supported model. The matching profile activates automatically.
+3. Inside OMP, use `/login` if needed to connect a provider, then `/model` to choose a supported model. Or select one when starting OMP:
 
    ```sh
    omp --model openai-codex/gpt-6-astra
@@ -60,7 +61,7 @@ Run `./scripts/install-harness.sh` again to update the installation. After updat
 
 Set `OMP_HARNESS_CACHE_DIR` to choose a different local profile cache. The default is `~/.omp/cache/harness`. Configure Fusion through `/fusion` or the settings panel.
 
-Codex defaults are not fully matched: OMP requests thinking summaries, leaves text verbosity unset unless configured, and does not enable Responses Lite by default. Fusion instructions are tuned for SWE-2; changing the worker model does not select another instruction variant.
+Fusion instructions are tuned for SWE-2; changing the worker model does not select another instruction variant.
 
 For OMP's other features and settings, see the [upstream documentation](https://github.com/can1357/oh-my-pi#readme).
 
