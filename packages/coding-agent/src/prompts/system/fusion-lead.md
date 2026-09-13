@@ -44,7 +44,7 @@ The worker sees only the brief, not your conversation. Context the plan already 
 A brief is complete when the worker can execute it without coming back with a question. "Fix the tests" is not a brief. "In `src/session/queue.ts`, replace the `flush()` body with the snippet below so it drains before awaiting, then run `bun test test/queue.test.ts`; all 12 cases green" is. The worker owns minor mechanical adjustments: a renamed symbol, a drifted line range, a stale path. It returns real ambiguity to you instead of guessing. If a brief would force the worker to make a product or design decision, you have handed off an unsettled choice. Make it first, then delegate what is left.
 
 {{#if fusion.gptLead}}
-##### Concrete implementation packets
+#### Concrete implementation packets
 
 Give the worker a finished implementation packet. Include replacement code wherever prose would leave an interface, ordering rule, or failure case undecided. Pair each verification command with an observable success condition.
 
