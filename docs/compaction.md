@@ -427,7 +427,7 @@ Can:
 
 - cancel compaction (`{ cancel: true }`)
 - provide full custom compaction payload (`{ compaction: CompactionResult }`)
-- rewrite kept entries in place (`{ rewrite: SessionHistoryRewrite[] }`); each item names an entry id on the branch and the message that replaces its body, with the same role
+- rewrite kept entries in place (`{ rewrite: SessionHistoryRewrite[] }`); each item names an entry id on the branch and the message that replaces its body, with the same role. The event carries `supportsRewrite: true` on the paths that honor it, so a handler can fall back to `compaction` elsewhere
 
 A rewrite lands before any `compaction` in the same answer, so a boundary is committed over the already-reduced tail. Without `compaction`, a rewrite that changed at least one entry is the whole answer: `/compact` finishes there with no compaction entry (the `compact` RPC response then carries no `data`), and automatic maintenance finishes when the freed headroom reaches the recovery band, ending the pass with `action: "rewrite"`. When it does not, the configured method runs natively over the rewritten branch without consulting the hook again. A rewrite that matches no entry, or that would change an entry's role, is ignored. The hook is never consulted twice in one maintenance round.
 

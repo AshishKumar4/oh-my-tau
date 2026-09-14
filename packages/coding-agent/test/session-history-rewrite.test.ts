@@ -64,7 +64,12 @@ describe("AgentSession extension history rewrite", () => {
 
 		const extensionRunner = {
 			hasHandlers: (type: string) => type === "session_before_compact",
-			emit: async (event: { type: string; preparation?: CompactionPreparation; branchEntries?: SessionEntry[] }) => {
+			emit: async (event: {
+				type: string;
+				preparation?: CompactionPreparation;
+				branchEntries?: SessionEntry[];
+				supportsRewrite?: boolean;
+			}) => {
 				if (event.type !== "session_before_compact" || !event.preparation || !event.branchEntries) return undefined;
 				// The seam mutates entry.message in place after the consult, so a bare
 				// reference would retroactively show the rewrite; snapshot per call.
@@ -74,6 +79,7 @@ describe("AgentSession extension history rewrite", () => {
 						entry.type === "message" ? { ...entry, message: structuredClone(entry.message) } : entry,
 					),
 				};
+				expect(event.supportsRewrite).toBe(true);
 				hookCalls.push(call);
 				contextTokensAtCall.push(session.getContextUsage()?.tokens);
 				return hookAnswer(call, hookCalls.length - 1);

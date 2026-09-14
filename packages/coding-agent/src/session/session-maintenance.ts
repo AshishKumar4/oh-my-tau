@@ -964,6 +964,7 @@ export class SessionMaintenance {
 			if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
 				const result = (await this.#host.extensionRunner.emit({
 					type: "session_before_compact",
+					supportsRewrite: true,
 					preparation,
 					branchEntries: pathEntries,
 					customInstructions,
@@ -1284,6 +1285,7 @@ export class SessionMaintenance {
 		if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
 			const hookResult = (await this.#host.extensionRunner.emit({
 				type: "session_before_compact",
+				supportsRewrite: false,
 				preparation,
 				branchEntries: entries,
 				customInstructions: undefined,
@@ -1409,6 +1411,7 @@ export class SessionMaintenance {
 			if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
 				const hookResult = (await this.#host.extensionRunner.emit({
 					type: "session_before_compact",
+					supportsRewrite: false,
 					preparation,
 					branchEntries: this.#host.sessionManager.getBranch(),
 					customInstructions: undefined,
@@ -3860,6 +3863,7 @@ export class SessionMaintenance {
 			if (options.rewriteAttempted !== true && this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
 				const hookResult = (await this.#host.extensionRunner.emit({
 					type: "session_before_compact",
+					supportsRewrite: true,
 					preparation,
 					branchEntries: pathEntriesForCompaction,
 					customInstructions: undefined,

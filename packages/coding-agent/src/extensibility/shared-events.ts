@@ -71,6 +71,11 @@ export interface SessionBeforeCompactEvent {
 	customInstructions?: string;
 	/** Abort signal - handlers should pass this to LLM calls and check it periodically */
 	signal: AbortSignal;
+	/**
+	 * Whether this compaction honors a `rewrite` answer. Hosts without the
+	 * in-place seam omit the field, so a handler can fall back to `compaction`.
+	 */
+	supportsRewrite: boolean;
 }
 
 /** Fired before compaction summarization to customize prompts/context */
