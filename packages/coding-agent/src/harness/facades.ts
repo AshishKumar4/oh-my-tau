@@ -195,17 +195,14 @@ const codexInterruptAgentSchema = type({
 });
 
 const codexWaitAgentSchema = type({
-	"timeout_ms?": type("number").describe(
-		`Accepted but not applied; the wait window adapts automatically.`,
-	),
+	"timeout_ms?": type("number").describe(`Accepted but not applied; the wait window adapts automatically.`),
 });
 
 const codexWaitSchema = type({
 	cell_id: type("string").describe("Identifier of the running exec cell."),
 	"max_tokens?": type("number").describe("Accepted but not applied; output is capped by the session."),
-	"yield_time_ms?": type("number").describe(
-		`Accepted but not applied; the wait window adapts automatically.`,
-	),
+	"terminate?": type("boolean").describe("True stops the running exec cell; false or omitted waits for output."),
+	"yield_time_ms?": type("number").describe(`Accepted but not applied; the wait window adapts automatically.`),
 });
 
 const CODEX_WAIT: HarnessFacadeSpec<typeof codexWaitSchema> = {
