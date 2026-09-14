@@ -450,6 +450,51 @@ describe("openai-completions wire-quirk compat detection", () => {
 		).toBe(false);
 	});
 
+	it("keeps image input for the natively multimodal DeepSeek V4.1 Flash lineage", () => {
+		// DeepSeek V4.1 Flash is image-text-to-text, but its id carries no
+		// `vision` token, so the class-wide strip rule dropped every attachment
+		// the model reads on hosts without their own carve-out.
+		expect(
+			resolveModelPolicy(completionsSpec({ provider: "vllm", id: "deepseek-v4.1-flash", input: ["text", "image"] }))
+				.compat.stripImageInput,
+		).toBe(false);
+		// Hosts that were carved out individually must keep working without them.
+		expect(
+			resolveModelPolicy(
+				completionsSpec({
+					provider: "openrouter",
+					id: "deepseek/deepseek-v4.1-flash",
+					baseUrl: "https://openrouter.ai/api/v1",
+					input: ["text", "image"],
+				}),
+			).compat.stripImageInput,
+		).toBe(false);
+		// Text-only DeepSeek SKUs keep the wire guard.
+		expect(
+			resolveModelPolicy(completionsSpec({ provider: "vllm", id: "deepseek-v4-flash", input: ["text", "image"] }))
+				.compat.stripImageInput,
+		).toBe(true);
+		// The lineage glob covers dated SKUs, not just the bare id.
+		expect(
+			resolveModelPolicy(
+				completionsSpec({ provider: "vllm", id: "deepseek-v4.1-flash-0731", input: ["text", "image"] }),
+			).compat.stripImageInput,
+		).toBe(false);
+		// A V4.1 id that also carries a `vision` token matches both exceptions at
+		// equal rank; the explicit priority keeps that resolvable instead of
+		// throwing AmbiguousOverlapError.
+		expect(
+			resolveModelPolicy(
+				completionsSpec({ provider: "vllm", id: "deepseek-v4.1-flash-vision-exp", input: ["text", "image"] }),
+			).compat.stripImageInput,
+		).toBe(false);
+		// Non-Flash V4.1 lineages are not established as multimodal and keep the guard.
+		expect(
+			resolveModelPolicy(completionsSpec({ provider: "vllm", id: "deepseek-v4.1-pro", input: ["text", "image"] }))
+				.compat.stripImageInput,
+		).toBe(true);
+	});
+
 	it("downgrades forced tool choice only for DeepSeek reasoning models on OpenCode gateways", () => {
 		const deepseekReasoning = {
 			id: "deepseek-v4-flash",
@@ -521,6 +566,37 @@ describe("openai-completions wire-quirk compat detection", () => {
 				responsesSpec({ id: "gpt-5", provider: "openai", name: "GPT-5", baseUrl: "https://api.openai.com/v1" }),
 			).compat.supportsForcedToolChoice,
 		).toBe(true);
+	});
+	it("disables encrypted reasoning replay for Muse Spark on OpenCode gateways (#11928)", () => {
+		// The Zen/Go gateways proxy Muse Spark's Responses lane to Meta but
+		// cannot round-trip encrypted reasoning: the upstream binds
+		// `encrypted_content` to the gateway's caller, so replaying it on a
+		// later tool-call step 400s with "reasoning `encrypted_content` was not
+		// issued to this caller". The deployment contract must stop requesting
+		// it and drop native reasoning items from replay.
+		for (const [provider, id, baseUrl] of [
+			["opencode-zen", "muse-spark-1.3-contributor-free", "https://opencode.ai/zen/v1"],
+			["opencode-go", "muse-spark-1.3-contributor", "https://opencode.ai/zen/go/v1"],
+		] as const) {
+			const compat = resolveModelPolicy(
+				responsesSpec({ id, provider, name: "Muse Spark", baseUrl, reasoning: true }),
+			).compat;
+			expect(compat.includeEncryptedReasoning).toBe(false);
+			expect(compat.filterReasoningHistory).toBe(true);
+		}
+		// A non-Muse reasoning model on the same gateway keeps the Responses
+		// default replay behavior, so the carve-out is scoped to the broken lane.
+		const other = resolveModelPolicy(
+			responsesSpec({
+				id: "big-pickle",
+				provider: "opencode-zen",
+				name: "Big Pickle",
+				baseUrl: "https://opencode.ai/zen/v1",
+				reasoning: true,
+			}),
+		).compat;
+		expect(other.includeEncryptedReasoning).toBe(true);
+		expect(other.filterReasoningHistory).toBe(false);
 	});
 
 	it("requires a synthetic assistant bridge after tool results only for Mistral hosts", () => {

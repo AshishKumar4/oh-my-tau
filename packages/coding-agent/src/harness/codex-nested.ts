@@ -137,7 +137,6 @@ async function writeStdinCall(
 		const result = await ctx.invoke("hub", {
 			op: "wait",
 			ids: [id],
-			timeoutMs: numberArg(args, "yield_time_ms") ?? 5000,
 		});
 		const output: Record<string, unknown> = {
 			output: resultText(result),

@@ -40,7 +40,7 @@ const claudeCodeListAgentsSchema = type({
 const claudeCodeTaskOutputSchema = type({
 	task_id: type("string").describe("The task ID to get output from"),
 	block: type("boolean").describe("Whether to wait for completion"),
-	timeout: type("number >= 0").describe("Max wait time in ms; 0 waits until the task settles"),
+	timeout: type("number >= 0").describe("Not applied; blocking polls the adaptive wait window"),
 });
 
 const claudeCodeTaskStopSchema = type({
@@ -74,7 +74,7 @@ const CLAUDE_CODE_TASK_OUTPUT: HarnessFacadeSpec<typeof claudeCodeTaskOutputSche
 	description: claudeCodeTaskOutput,
 	parameters: claudeCodeTaskOutputSchema,
 	toParams: (args: typeof claudeCodeTaskOutputSchema.infer) =>
-		args.block ? { op: "wait", ids: [args.task_id], timeoutMs: args.timeout } : { op: "jobs" },
+		args.block ? { op: "wait", ids: [args.task_id] } : { op: "jobs" },
 };
 
 const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
@@ -162,10 +162,6 @@ const CODEX_COLLABORATION: ToolNamespace = {
 	name: CODEX_COLLABORATION_NAMESPACE,
 	description: codexCollaborationNamespace.trim(),
 };
-
-const CODEX_WAIT_AGENT_DEFAULT_TIMEOUT_MS = 30_000;
-const CODEX_WAIT_DEFAULT_YIELD_MS = 10_000;
-
 const CODEX_REASONING_EFFORTS: Readonly<Record<string, TaskEffort>> = {
 	low: "lo",
 	medium: "med",
@@ -200,16 +196,15 @@ const codexInterruptAgentSchema = type({
 
 const codexWaitAgentSchema = type({
 	"timeout_ms?": type("number").describe(
-		`Timeout in milliseconds. Defaults to ${CODEX_WAIT_AGENT_DEFAULT_TIMEOUT_MS}.`,
+		`Accepted but not applied; the wait window adapts automatically.`,
 	),
 });
 
 const codexWaitSchema = type({
 	cell_id: type("string").describe("Identifier of the running exec cell."),
 	"max_tokens?": type("number").describe("Accepted but not applied; output is capped by the session."),
-	"terminate?": type("boolean").describe("True stops the running exec cell; false or omitted waits for output."),
 	"yield_time_ms?": type("number").describe(
-		`Wait before yielding more output. Defaults to ${CODEX_WAIT_DEFAULT_YIELD_MS} ms.`,
+		`Accepted but not applied; the wait window adapts automatically.`,
 	),
 });
 
@@ -219,9 +214,7 @@ const CODEX_WAIT: HarnessFacadeSpec<typeof codexWaitSchema> = {
 	description: codexWait,
 	parameters: codexWaitSchema,
 	toParams: (args: typeof codexWaitSchema.infer) =>
-		args.terminate
-			? { op: "cancel", ids: [args.cell_id] }
-			: { op: "wait", ids: [args.cell_id], timeoutMs: args.yield_time_ms ?? CODEX_WAIT_DEFAULT_YIELD_MS },
+		args.terminate ? { op: "cancel", ids: [args.cell_id] } : { op: "wait", ids: [args.cell_id] },
 };
 
 const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
@@ -322,9 +315,8 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 		namespace: CODEX_COLLABORATION,
 		description: codexWaitAgent,
 		parameters: codexWaitAgentSchema,
-		toParams: (args: typeof codexWaitAgentSchema.infer) => ({
+		toParams: () => ({
 			op: "wait",
-			timeoutMs: args.timeout_ms ?? CODEX_WAIT_AGENT_DEFAULT_TIMEOUT_MS,
 		}),
 	},
 	CODEX_WAIT,

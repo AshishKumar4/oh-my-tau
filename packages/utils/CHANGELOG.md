@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [18.1.22] - 2026-09-14
+
+### Fixed
+
+- Fixed `extractRetryHint` sleeping hours past the provider's stated wait when a timezone-naive `reset at` timestamp overshoots the relative retry hint: the skewed stamp is now ignored instead of winning longest-wins ([#12070](https://github.com/can1357/oh-my-pi/pull/12070) by [@H4vC](https://github.com/H4vC)).
+
+## [18.1.21] - 2026-09-14
+
+### Added
+
+- Added `getBrowserProfilesDir()` (`~/.omp/browser-profiles`; XDG: `$XDG_STATE_HOME/omp/browser-profiles`) for profiles of Chromium browsers spawned by the browser tool.
+
+### Fixed
+
+- Timed out stalled Chrome-for-Testing metadata requests after 30 seconds when looking up download metadata
+- Concurrent browser installations share one download without replacing a running browser, and stalled downloads time out with partial files cleaned up for retry.
+
 ## [18.1.19] - 2026-09-12
 
 ### Added
