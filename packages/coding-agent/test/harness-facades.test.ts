@@ -896,7 +896,7 @@ describe("codex list_agents facade", () => {
 });
 
 describe("codex wait_agent facade", () => {
-	it("returns a queued peer message, else the job snapshot once timeout_ms elapses", async () => {
+	it("returns a queued peer message, else the job snapshot once the wait window elapses", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({
 			id: SENDER,
@@ -933,6 +933,7 @@ describe("codex wait_agent facade", () => {
 				}),
 			{ ownerId: SENDER },
 		);
+		vi.spyOn(manager, "nextPollWaitMs").mockReturnValue(1);
 		const timedOut = await runFacadeCall(CODEX_MODEL, [hub, facade], {
 			name: "wait_agent",
 			arguments: { timeout_ms: 1 },

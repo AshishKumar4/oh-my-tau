@@ -94,7 +94,7 @@ describe("codex nested exec aliases", () => {
 		const s = session(CODEX, [hub]);
 
 		const out = await call(s, "write_stdin", { session_id: "bg_2", yield_time_ms: 2000 });
-		expect(hub.calls).toEqual([{ op: "wait", ids: ["bg_2"], timeoutMs: 2000 }]);
+		expect(hub.calls).toEqual([{ op: "wait", ids: ["bg_2"] }]);
 		expect(out).toMatchObject({ output: "…output…" });
 	});
 
