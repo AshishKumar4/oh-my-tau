@@ -21,7 +21,7 @@ import {
 import { buildLineEntriesWithBlockContext, type LineEntry, lineEntriesToPlainText } from "../utils/block-context";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { formatPathRelativeToCwd, type LineRange } from "./path-utils";
-import type { ReadToolDetails } from "./read";
+import type { ReadToolDetails, ReadTruncationStats } from "./read";
 import { isRawSelector, type ParsedSelector, resolveTailSelector, selToOffsetLimit } from "./read-selector";
 import { formatBytes, shortenPath } from "./render-utils";
 import { ToolError } from "./tool-errors";
@@ -32,8 +32,15 @@ function numberedLine(line: number, text: string, numbering: LineNumbering): str
 }
 
 function prependLineNumbers(text: string, startNum: number, numbering: LineNumbering): string {
-	const textLines = text.split("\n");
-	return textLines.map((line, i) => numberedLine(startNum + i, line, numbering)).join("\n");
+	return text
+		.split("\n")
+		.map((line, i) => numberedLine(startNum + i, line, numbering))
+		.join("\n");
+}
+
+export function toReadTruncationStats(result: TruncationResult): ReadTruncationStats {
+	const { content: _content, ...stats } = result;
+	return stats;
 }
 
 export interface HashlineHeaderContext {
@@ -471,7 +478,7 @@ export function buildInMemoryTextResult(
 			)}, exceeds ${formatBytes(DEFAULT_MAX_BYTES)} limit. Unable to display a valid UTF-8 snippet.]`;
 		}
 
-		details.truncation = truncation;
+		details.truncation = toReadTruncationStats(truncation);
 		truncationInfo = {
 			result: truncation,
 			options: { direction: "head", startLine: startLineDisplay, totalFileLines: totalLines },
@@ -485,7 +492,7 @@ export function buildInMemoryTextResult(
 		} else {
 			outputText = formatLineEntries(buildLineEntries(endLineDisplay), startLineDisplay);
 		}
-		details.truncation = truncation;
+		details.truncation = toReadTruncationStats(truncation);
 		truncationInfo = {
 			result: truncation,
 			options: { direction: "head", startLine: startLineDisplay, totalFileLines: totalLines },

@@ -91,7 +91,11 @@ export interface NonMessageTokenSource {
 		};
 	};
 	readonly skills?: readonly Skill[];
-	readonly settings?: { get(key: "skillful"): boolean };
+	readonly settings?: {
+		get(key: "skillful"): boolean;
+		/** Effective settings revision; invalidates settings-backed dynamic tool metadata. */
+		readonly revision?: number;
+	};
 }
 
 const EMPTY_STRING_PARTS: string[] = [];
@@ -124,23 +128,80 @@ export function estimateSkillsTokens(skills: readonly Skill[], tokenizer: Tokeni
 	return tokenizer.countTokens(fragments);
 }
 
-export function estimateToolSchemaTokens(
-	tools: ReadonlyArray<Pick<Tool, "name" | "description" | "parameters">>,
-	tokenizer: Tokenizer,
-): number {
+type ToolSchemaSource = ReadonlyArray<Pick<Tool, "name" | "description" | "parameters">>;
+
+interface ToolSchemaTokenCache {
+	revision: number;
+	byTokenizer: WeakMap<Tokenizer, { revision: number; sourceRevision: number; tokens: number }>;
+}
+
+/**
+ * Per-roster metadata revisions and token estimates. Tool arrays are
+ * caller-owned and may be frozen, so a WeakMap is the only safe place to keep
+ * cache state without changing their observable shape.
+ */
+const TOOL_SCHEMA_TOKEN_CACHE = new WeakMap<ToolSchemaSource, ToolSchemaTokenCache>();
+
+function toolSchemaTokenCache(tools: ToolSchemaSource): ToolSchemaTokenCache {
+	let cache = TOOL_SCHEMA_TOKEN_CACHE.get(tools);
+	if (!cache) {
+		cache = { revision: 0, byTokenizer: new WeakMap() };
+		TOOL_SCHEMA_TOKEN_CACHE.set(tools, cache);
+	}
+	return cache;
+}
+
+/**
+ * Current dynamic metadata revision for one tool roster.
+ *
+ * Consumers caching a larger context breakdown must key on both the tools
+ * array identity and this revision. Array replacement covers roster changes;
+ * {@link invalidateToolSchemaMetadata} covers live description/schema changes
+ * while the roster object remains stable.
+ */
+export function getToolSchemaMetadataRevision(tools: ToolSchemaSource): number {
+	return TOOL_SCHEMA_TOKEN_CACHE.get(tools)?.revision ?? 0;
+}
+
+/**
+ * Invalidate token estimates after a live tool description or parameter schema
+ * can change without replacing the tools array (settings, model, policy, or
+ * discovered-agent metadata changes).
+ */
+export function invalidateToolSchemaMetadata(tools: ToolSchemaSource): void {
+	toolSchemaTokenCache(tools).revision++;
+}
+
+/**
+ * Estimate provider-visible tool-schema tokens.
+ *
+ * Results are cached by roster-array identity, tokenizer identity, the
+ * caller-supplied settings/source revision, and the roster's explicit dynamic
+ * metadata revision. Callers whose descriptions or schemas are live getters
+ * must either advance `sourceRevision` or call
+ * {@link invalidateToolSchemaMetadata} when those inputs change.
+ */
+export function estimateToolSchemaTokens(tools: ToolSchemaSource, tokenizer: Tokenizer, sourceRevision = 0): number {
+	const cache = toolSchemaTokenCache(tools);
+	const cached = cache.byTokenizer.get(tokenizer);
+	if (cached?.revision === cache.revision && cached.sourceRevision === sourceRevision) return cached.tokens;
+
 	const fragments: string[] = [];
 	for (const tool of tools) {
 		// Extension-supplied tools may carry a non-string name/description or a
 		// parameters value whose wire schema stringifies to `undefined` (e.g. a
 		// callable schema that escaped normalization). A non-string fragment is
 		// fatal inside the native tokenizer, so only real strings are counted.
-		if (typeof tool.name === "string") fragments.push(tool.name);
-		if (typeof tool.description === "string") fragments.push(tool.description);
+		const name = tool.name;
+		const description = tool.description;
+		const parameters = tool.parameters;
+		if (typeof name === "string") fragments.push(name);
+		if (typeof description === "string") fragments.push(description);
 		try {
 			const wireTool: AiTool = {
-				name: tool.name,
-				description: tool.description,
-				parameters: tool.parameters as AiTool["parameters"],
+				name,
+				description,
+				parameters: parameters as AiTool["parameters"],
 			};
 			const wireJson = JSON.stringify(toolWireSchema(wireTool) ?? {});
 			if (typeof wireJson === "string") fragments.push(wireJson);
@@ -148,7 +209,9 @@ export function estimateToolSchemaTokens(
 			// Schema may contain functions or cycles; ignore.
 		}
 	}
-	return tokenizer.countTokens(fragments);
+	const tokens = tokenizer.countTokens(fragments);
+	cache.byTokenizer.set(tokenizer, { revision: cache.revision, sourceRevision, tokens });
+	return tokens;
 }
 
 /**
@@ -175,7 +238,9 @@ export function estimateToolSchemaTokens(
 // (setSystemPrompt/setTools replace the array reference rather than mutating it).
 interface NonMessageTokenCache {
 	systemPromptRef: readonly string[];
-	toolsRef: ReadonlyArray<Pick<Tool, "name" | "description" | "parameters">>;
+	toolsRef: ToolSchemaSource;
+	toolsRevision: number;
+	settingsRevision: number;
 	skillsRef: readonly Skill[];
 	// The Agent swaps its Tokenizer instance when the model's encoding changes,
 	// so instance identity doubles as the encoding key.
@@ -204,6 +269,8 @@ function nonMessageTokenCacheEntry(session: NonMessageTokenSource, tokenizer: To
 	const cachedSession: CachedNonMessageTokenSource = session;
 	const systemPromptRef = session.systemPrompt ?? EMPTY_STRING_PARTS;
 	const toolsRef = session.agent?.state?.tools ?? EMPTY_TOOLS;
+	const toolsRevision = getToolSchemaMetadataRevision(toolsRef);
+	const settingsRevision = session.settings?.revision ?? 0;
 	const skillsRef = session.skills ?? EMPTY_SKILLS;
 	const harnessRef = servedHarnessPrompt(session.model);
 	let entry = cachedSession[NON_MESSAGE_TOKEN_CACHE];
@@ -211,6 +278,8 @@ function nonMessageTokenCacheEntry(session: NonMessageTokenSource, tokenizer: To
 		entry &&
 		entry.systemPromptRef === systemPromptRef &&
 		entry.toolsRef === toolsRef &&
+		entry.toolsRevision === toolsRevision &&
+		entry.settingsRevision === settingsRevision &&
 		entry.skillsRef === skillsRef &&
 		entry.tokenizerRef === tokenizer &&
 		entry.harnessRef === harnessRef
@@ -220,6 +289,8 @@ function nonMessageTokenCacheEntry(session: NonMessageTokenSource, tokenizer: To
 	entry = {
 		systemPromptRef,
 		toolsRef,
+		toolsRevision,
+		settingsRevision,
 		skillsRef,
 		tokenizerRef: tokenizer,
 		harnessRef,
@@ -237,7 +308,7 @@ export function computeNonMessageTokens(session: NonMessageTokenSource, tokenize
 	const tools = session.agent?.state?.tools ?? EMPTY_TOOLS;
 	const tokens =
 		tokenizer.countTokens(Array.from(systemPromptParts, part => part ?? "")) +
-		estimateToolSchemaTokens(tools, tokenizer);
+		estimateToolSchemaTokens(tools, tokenizer, session.settings?.revision);
 	entry.tokens = tokens;
 	return tokens;
 }
@@ -264,7 +335,7 @@ export function computeNonMessageBreakdown(
 		session.settings?.get("skillful") === false
 			? 0
 			: estimateSkillsTokens(renderedSkills(session.skills ?? EMPTY_SKILLS, tools), tokenizer);
-	const toolsTokens = estimateToolSchemaTokens(tools, tokenizer);
+	const toolsTokens = estimateToolSchemaTokens(tools, tokenizer, session.settings?.revision);
 	const systemPromptParts = session.systemPrompt ?? EMPTY_STRING_PARTS;
 	const leadTokens = tokenizer.countTokens(systemPromptParts[0] ?? "");
 	const restTokens = tokenizer.countTokens(Array.from(systemPromptParts.slice(1), part => part ?? ""));

@@ -1,5 +1,6 @@
 import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
-import { DEFAULT_MAX_BYTES, OutputSink } from "../../session/streaming-output";
+import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "../../session/streaming-output";
+
 import type { ToolSession } from "../../tools";
 import { codexExecToolCatalog } from "../../harness/codex-nested";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
@@ -38,6 +39,7 @@ export interface JsResult {
 	cancelled: boolean;
 	truncated: boolean;
 	artifactId?: string;
+	artifactError?: OutputArtifactError;
 	totalLines: number;
 	totalBytes: number;
 	outputLines: number;
@@ -139,6 +141,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			cancelled: false,
 			truncated: summary.truncated,
 			artifactId: summary.artifactId,
+			artifactError: summary.artifactError,
 			totalLines: summary.totalLines,
 			totalBytes: summary.totalBytes,
 			outputLines: summary.outputLines,
@@ -158,6 +161,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 				cancelled: true,
 				truncated: summary.truncated,
 				artifactId: summary.artifactId,
+				artifactError: summary.artifactError,
 				totalLines: summary.totalLines,
 				totalBytes: summary.totalBytes,
 				outputLines: summary.outputLines,
@@ -174,6 +178,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			cancelled: false,
 			truncated: summary.truncated,
 			artifactId: summary.artifactId,
+			artifactError: summary.artifactError,
 			totalLines: summary.totalLines,
 			totalBytes: summary.totalBytes,
 			outputLines: summary.outputLines,

@@ -27,11 +27,15 @@ function oauthCredential(suffix: string): OAuthCredential {
 }
 
 function claudeLimit(id: string, usedFraction: number, scope: { shared?: boolean; tier?: string }): UsageLimit {
+	// Window ids mirror the real /usage payload shape (see
+	// auth-storage-claude-fable-fallback.test.ts): bare '5h'/'7d', so the
+	// shared-gate check in healableBlockScopes can match them.
+	const windowId = id.split(':').pop() ?? id;
 	return {
 		id,
 		label: id,
-		scope: { provider: PROVIDER, ...scope },
-		window: { id, label: id, resetsAt: Date.now() + 60_000 },
+		scope: { provider: PROVIDER, windowId, ...scope },
+		window: { id: windowId, label: windowId, resetsAt: Date.now() + 60_000 },
 		amount: { usedFraction, unit: "percent" },
 		status: usedFraction >= 1 ? "exhausted" : "ok",
 	};
@@ -180,6 +184,7 @@ describe("AuthStorage credential block persistence", () => {
 								provider: PROVIDER,
 								fetchedAt: Date.now(),
 								limits: [
+									claudeLimit("anthropic:5h", 0.6, { shared: true }),
 									claudeLimit("anthropic:7d", 0.6, { shared: true }),
 									// The account this test recovers reports an empty Fable
 									// week; the other stays exhausted.

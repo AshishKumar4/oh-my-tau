@@ -520,6 +520,8 @@ export interface SystemPromptToolMetadata {
 	parameters?: TSchema;
 	/** Illustrative examples rendered into the verbose inventory. */
 	examples?: readonly ToolExample[];
+	/** Whether this concrete tool can read `skill://` instruction content. */
+	readsSkillUris?: boolean;
 }
 
 export type SystemPromptToolMetadataProjection =
@@ -540,6 +542,19 @@ export function buildSystemPromptToolMetadata(
 	return projectSystemPromptToolMetadata(tools, { mode: "full", overrides });
 }
 
+/** Whether a tool can read `skill://` instruction content.
+ *
+ * Shared by initial prompt construction and mid-session skill notices so both
+ * consult declared capability instead of the tool name. Accepts live tools
+ * (`AgentTool` declares the `readsSkillUris` capability) and projected
+ * metadata (`SystemPromptToolMetadata`). Accepts `undefined`/`null` (missing
+ * registry/metadata entries) and returns `false` for them. */
+export function toolReadsSkillUris(
+	tool: Pick<AgentTool, "readsSkillUris"> | SystemPromptToolMetadata | undefined | null,
+): boolean {
+	return tool != null && tool.readsSkillUris === true;
+}
+
 /** Builds a mode-specific metadata snapshot for internal prompt assembly. */
 export function projectSystemPromptToolMetadata(
 	tools: Map<string, AgentTool>,
@@ -550,22 +565,21 @@ export function projectSystemPromptToolMetadata(
 		const override = projection.overrides?.[name];
 		const labelValue = override?.label ?? tool.label;
 		const wireNameValue = override?.wireName ?? tool.customWireName;
-		const label = typeof labelValue === "string" ? labelValue : "";
-		const wireName = typeof wireNameValue === "string" ? wireNameValue : undefined;
+		const metadataEntry: SystemPromptToolMetadata = {
+			label: typeof labelValue === "string" ? labelValue : "",
+			description: "",
+			wireName: typeof wireNameValue === "string" ? wireNameValue : undefined,
+		};
 
-		if (projection.mode === "compact") {
-			metadata.set(name, { label, description: "", wireName });
-			return;
+		if (projection.mode === "full") {
+			const descriptionValue = override?.description ?? tool.description;
+			metadataEntry.description = typeof descriptionValue === "string" ? descriptionValue : "";
+			metadataEntry.parameters = tool.parameters;
+			metadataEntry.examples = tool.examples;
 		}
+		if ((override?.readsSkillUris ?? toolReadsSkillUris(tool)) === true) metadataEntry.readsSkillUris = true;
 
-		const descriptionValue = override?.description ?? tool.description;
-		metadata.set(name, {
-			label,
-			description: typeof descriptionValue === "string" ? descriptionValue : "",
-			parameters: tool.parameters,
-			examples: tool.examples,
-			wireName,
-		});
+		metadata.set(name, metadataEntry);
 	};
 
 	if (projection.mode === "compact") {
@@ -693,6 +707,33 @@ export interface BuildSystemPromptResult {
 
 prompt.registerPartial("xdevDevices", xdevDevicesTemplate);
 prompt.registerPartial("fusionLead", fusionLeadTemplate);
+/**
+ * Heading that separates the user's append prompt (`APPEND_SYSTEM.md`,
+ * `--append-system-prompt`) from the generated blocks that precede it.
+ */
+export const USER_APPEND_HEADING =
+	"## User Instructions\n\nThe following instructions are user-authored (session configuration or CLI). They are authoritative and supersede conflicting guidance above.";
+
+/**
+ * Join generated append blocks (memory, auto-learn, `xd://` routes, MCP server
+ * instructions) with the user's append prompt.
+ *
+ * The generated blocks end with `## MCP Server Instructions`, whose text tells
+ * the model it is server-controlled and may not be verified. Concatenating the
+ * user's append text directly behind it, with no heading of its own, rendered
+ * user-authored instructions as a trailing paragraph of that section, so the
+ * user's text gets a boundary heading whenever generated blocks precede it.
+ */
+export function composeAppendPrompt(appendParts: readonly string[], appendSystemPrompt?: string): string | undefined {
+	const generated = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
+	if (!appendSystemPrompt || appendSystemPrompt.trim().length === 0) {
+		return generated;
+	}
+	if (!generated) {
+		return appendSystemPrompt;
+	}
+	return `${generated}\n\n${USER_APPEND_HEADING}\n\n${appendSystemPrompt}`;
+}
 
 /** Build the system prompt with tools, guidelines, and context */
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
@@ -988,10 +1029,17 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			);
 
 	// Filter skills for the rendered system prompt:
-	// - require the `read` tool so the model can actually fetch skill content;
+	// - require an active tool that declares `skill://` read capability (any tool
+	//   name, not just `read`, so custom resolvers count once projected; mounted
+	//   xd:// tools count too when their metadata is projected);
 	// - drop skills with frontmatter `hide: true` (still loadable via skill:// and /skill:<name>).
-	const hasRead = toolNames.includes("read");
-	const filteredSkills = hasRead ? skills.filter(skill => skill.hide !== true) : [];
+	const hasSkillReader =
+		tools === undefined
+			? toolNames.includes("read")
+			: toolNames.some(name => toolReadsSkillUris(tools.get(name))) ||
+				xdevTools.some(entry => toolReadsSkillUris(tools.get(entry.name)));
+	const hasSkillUriAccess = hasSkillReader && skills.length > 0;
+	const filteredSkills = hasSkillReader ? skills.filter(skill => skill.hide !== true) : [];
 
 	const harnessPromptText = harnessPrompt?.text;
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
@@ -1025,6 +1073,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles,
 		agentsMdSearch: { files: agentsMdFiles },
 		workspaceTree,
+		hasSkillUriAccess,
 		skills: filteredSkills,
 		rules: rules ?? [],
 		alwaysApplyRules: injectedAlwaysApplyRules,

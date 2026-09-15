@@ -22,6 +22,8 @@ import { HOUR_MS, parseIsoTimestamp, WEEK_MS } from "./shared";
 const DEFAULT_ENDPOINT = "https://api.anthropic.com/api/oauth";
 const MAX_ATTEMPTS = 3;
 const BASE_RETRY_DELAY_MS = 500;
+/** Shared windows that gate every Claude request, whatever the model. */
+const CLAUDE_SHARED_GATE_WINDOW_IDS = ["5h", "7d"] as const;
 
 const CLAUDE_HEADERS = {
 	accept: "application/json, text/plain, */*",
@@ -928,23 +930,36 @@ export const claudeRankingStrategy: CredentialRankingStrategy = {
 		const kind = getClaudeModelKind(context);
 		return isClaudeTierBlockScope(kind) ? `tier:${kind}` : undefined;
 	},
-	// A Fable/Mythos 429 carries a retry-after at the weekly reset, but the
-	// window rolls on its own schedule and Anthropic restores the tier earlier.
-	// Without this the block outlives the exhaustion: an account whose report
-	// now reads 0% stays skipped until the stored clock runs out, so a turn
-	// walks the model fallback chain while a healthy seat sits idle. One scope
-	// per tier the report names, judged by the shared windows plus that tier's
-	// own rows — the same limits `scopeClaudeLimitsForModelHardBlock` gates
-	// selection on.
+	/**
+	 * A reactive Fable/Mythos block carries the reset the 429 reported, but
+	 * Anthropic can restore the tier earlier (plan change, corrected counter),
+	 * and the block then idles a usable account for days. Judge each tier scope
+	 * against the limits that actually gate a request of that kind — its own
+	 * weekly row plus the shared umbrella windows — so a healthy report lifts
+	 * the block while a spent shared 5-hour wall keeps it.
+	 *
+	 * Only Fable/Mythos appear: {@link blockScope} scopes reactive blocks for
+	 * those tiers alone, so no other scope can exist to heal.
+	 */
 	healableBlockScopes(report) {
-		const shared = report.limits.filter(limit => limit.scope.shared === true);
-		const scopes = [{ blockScope: "", limits: shared }];
-		for (const tier of CLAUDE_TIER_BLOCK_SCOPES) {
-			const tierLimits = report.limits.filter(limit => limit.scope.tier === tier);
-			if (tierLimits.length === 0) continue;
-			scopes.push({ blockScope: `tier:${tier}`, limits: [...shared, ...tierLimits] });
+		const sharedLimits = report.limits.filter(limit => limit.scope.shared === true);
+		// The endpoint returns a report as soon as one window parses, and a tier
+		// 429 can be caused by a shared wall. A payload missing a shared gate
+		// leaves the block's cause unknown, so vouch for nothing rather than
+		// clear a block that still holds.
+		const everySharedGateReported = CLAUDE_SHARED_GATE_WINDOW_IDS.every(windowId =>
+			sharedLimits.some(limit => limit.scope.windowId === windowId || limit.window?.id === windowId),
+		);
+		if (!everySharedGateReported) return [];
+		const tiers = new Set<string>();
+		for (const limit of report.limits) {
+			const tier = limit.scope.tier;
+			if (tier === "fable" || tier === "mythos") tiers.add(tier);
 		}
-		return scopes;
+		return [...tiers].map(tier => ({
+			blockScope: `tier:${tier}`,
+			limits: [...sharedLimits, ...report.limits.filter(limit => limit.scope.tier === tier)],
+		}));
 	},
 	windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 7 * 24 * 60 * 60 * 1000 },
 };

@@ -47,8 +47,8 @@ export function resolveEditMode(session: EditModeSessionLike): EditMode {
 		const model = session.getActiveModel?.();
 		const profile = model && resolveHarnessProfile(model);
 		if (profile === "claude-code") return "replace";
-		// Codex's editing primitive is the freeform V4A apply_patch; the codex
-		// profile serves `tools.apply_patch` inside exec, which bridges to this
+		// Codex editing primitive is the freeform V4A apply_patch; the codex
+		// profile serves tools.apply_patch inside exec, which bridges to this
 		// tool — it must speak V4A, not hashlines.
 		if (profile === "codex") return "apply_patch";
 		if (activeModel) {
@@ -56,8 +56,11 @@ export function resolveEditMode(session: EditModeSessionLike): EditMode {
 			if (
 				identity.class === "kimi" ||
 				identity.class === "mimo" ||
+				identity.class === "minimax" ||
 				identity.class === "deepseek" ||
-				identity.class === "stepfun"
+				identity.class === "stepfun" ||
+				identity.family === "codex-spark" ||
+				(identity.class === "glm" && identity.family === "flash" && identity.revision === "5.3.0")
 			) {
 				return "replace";
 			}

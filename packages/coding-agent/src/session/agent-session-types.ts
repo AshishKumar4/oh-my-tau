@@ -38,6 +38,7 @@ import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { AgentDefinition } from "../task/types";
 import type { ConfiguredThinkingLevel } from "../thinking";
+import type { ToolSession } from "../tools";
 import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
 import type { HarnessCacheStats } from "./prompt-cache-stats";
@@ -180,6 +181,8 @@ export interface AgentSessionConfig {
 	extensionRunner?: ExtensionRunner;
 	/** Returns the current enabled eval prelude definitions. */
 	getEvalPreludes?: () => readonly EvalPreludeDefinition[];
+	/** Tool bridge context used by user-initiated Python cells to project enabled eval preludes. */
+	evalToolSession?: ToolSession;
 	/** Loaded skills already discovered by the SDK. */
 	skills?: Skill[];
 	/** Skill loading warnings already captured by the SDK. */
@@ -189,6 +192,8 @@ export interface AgentSessionConfig {
 	/** Custom TypeScript slash commands. */
 	customCommands?: LoadedCustomCommand[];
 	skillsSettings?: SkillsSettings;
+	/** Whether this session may start memory backends. Defaults to true. */
+	memoryEnabled?: boolean;
 	/** Agent directory used when changing memory backends in a live session. */
 	memoryAgentDir?: string;
 	/** Creates built-in memory tools for the current backend. */
@@ -301,8 +306,8 @@ export interface AgentSessionConfig {
 	 *
 	 * `ExtensionToolWrapper` reads `tools.approvalMode`, per-tool
 	 * `tools.approval.<tool>` policies and `autoApprove` only from this context;
-	 * with none it defaults to `yolo` with empty policies, so a bridge tool would
-	 * run a native frame the user configured `ask` or `deny` for.
+	 * with none it fails closed to `always-ask` with empty policies (no user
+	 * grant), so a bridge tool that needs a prompt cannot run unattended.
 	 */
 	advisorGetToolContext?: () => AgentToolContext | undefined;
 	/**
@@ -317,7 +322,7 @@ export interface AgentSessionConfig {
 	advisorWatchdogPrompt?: string;
 	/** Shared advisor instructions loaded from WATCHDOG.yml. */
 	advisorSharedInstructions?: string;
-	/** Shared advisor max notes per update loaded from WATCHDOG.yml. */
+	/** Shared non-blocker budget from top-level WATCHDOG.yml maxNotesPerUpdate. */
 	advisorSharedMaxNotesPerUpdate?: number;
 	/** Project context rendered for advisor sessions. */
 	advisorContextPrompt?: string;
@@ -373,6 +378,20 @@ export interface FollowUpOptions {
 	synthetic?: boolean;
 	/** Whether to expand file-based prompt templates (default: true). */
 	expandPromptTemplates?: boolean;
+	/** Explicit billing/initiator attribution. */
+	attribution?: MessageAttribution;
+}
+
+/** Options for AgentSession.steer(). */
+export interface SteerOptions {
+	/** Explicit billing/initiator attribution. */
+	attribution?: MessageAttribution;
+}
+
+/** Options for AgentSession.sendUserMessage(). */
+export interface SendUserMessageOptions {
+	/** Queue behavior; omitted starts a turn when idle and steers while streaming. */
+	deliverAs?: "steer" | "followUp" | "aside";
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
 }
