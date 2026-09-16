@@ -8,7 +8,7 @@
  */
 
 import type { Model } from "@oh-my-pi/pi-ai";
-import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import type { ToolSession } from "../tools";
 import { ToolError } from "../tools/tool-errors";
 import { servedHarnessPrompt } from "./capture";
@@ -259,9 +259,15 @@ export function codexNestedAliasNames(): readonly string[] {
 	return CODEX_NESTED_ALIASES.map(alias => alias.name);
 }
 
-/** Alias for `name` when the session's active model resolves to the codex profile. */
-export function codexNestedAliasForModel(name: string, model: Model | undefined): CodexNestedAlias | undefined {
-	if (!model || resolveHarnessProfile(model) !== "codex") return undefined;
+/** Alias for `name` when the session's effective profile is codex. */
+export function codexNestedAliasForModel(
+	name: string,
+	model: Model | undefined,
+	override?: HarnessProfile | null,
+): CodexNestedAlias | undefined {
+	if (!model) return undefined;
+	const effective = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
+	if (effective !== "codex") return undefined;
 	return ALIAS_BY_NAME.get(name);
 }
 
@@ -299,22 +305,23 @@ export function codexExecToolCatalog(session: ToolSession): { name: string; desc
  * trimmed so it splices cleanly between the fixed head and omp's own tool
  * sections. Undefined when no capture is loaded for the model.
  */
-export function codexExecNestedDeclarations(model: Model | undefined): string | undefined {
-	const exec = servedHarnessPrompt(model)?.tools["exec"];
+export function codexExecNestedDeclarations(
+	model: Model | undefined,
+	override?: HarnessProfile | null,
+): string | undefined {
+	const exec = servedHarnessPrompt(model, override)?.tools["exec"];
 	const description = exec?.description;
 	if (typeof description !== "string") return undefined;
 	const index = description.indexOf("\n### `");
 	if (index === -1) return undefined;
 	return `\n${description.slice(index + 1).trimEnd()}`;
 }
-
-/**
- * The summary paragraph of one nested `### \`name\`` section from the captured
- * exec description (text between the heading and the `exec tool declaration`
- * fence). Used to describe the matching omp tool under the codex profile.
- */
-export function codexExecNestedSummary(model: Model | undefined, name: string): string | undefined {
-	const declarations = codexExecNestedDeclarations(model);
+export function codexExecNestedSummary(
+	model: Model | undefined,
+	name: string,
+	override?: HarnessProfile | null,
+): string | undefined {
+	const declarations = codexExecNestedDeclarations(model, override);
 	if (declarations === undefined) return undefined;
 	const heading = `### \`${name}\``;
 	const start = declarations.indexOf(heading);

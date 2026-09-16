@@ -385,6 +385,7 @@ import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } fr
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { SessionTools, type SessionToolsHost } from "./session-tools";
 import type { ShakeMode, ShakeResult } from "./shake-types";
@@ -633,6 +634,7 @@ export class AgentSession {
 	#unsubscribeModelRoles?: () => void;
 	#unsubscribeExtendedContext?: () => void;
 	#unsubscribeCodeMode?: () => void;
+	#unsubscribeHarnessMode?: () => void;
 	#unsubscribeEvalPreludeSettings?: () => void;
 	#unsubscribeIdleCloseSetting?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
@@ -2048,6 +2050,16 @@ export class AgentSession {
 		this.#unsubscribeCodeMode = onCodeModeChanged(() => {
 			void this.#tools.reconcileCodeMode().catch(error => {
 				logger.warn("Code Mode reconcile after setting change failed", { error: String(error) });
+			});
+		});
+		// Immediate apply for `harness.mode`: re-apply tool presentation and the
+		// base prompt under the new effective profile without restarting the
+		// session or resetting provider state. The apply runs the same path a
+		// model switch takes (renames + facades + prompt rebuild).
+		this.#unsubscribeHarnessMode = this.settings.onEffectiveChange(path => {
+			if (path !== "harness.mode") return;
+			void this.#tools.onEffectiveHarnessModeChange().catch(error => {
+				logger.warn("Harness mode reconcile after setting change failed", { error: String(error) });
 			});
 		});
 
@@ -4949,6 +4961,10 @@ export class AgentSession {
 		if (this.#unsubscribeCodeMode) {
 			this.#unsubscribeCodeMode();
 			this.#unsubscribeCodeMode = undefined;
+		}
+		if (this.#unsubscribeHarnessMode) {
+			this.#unsubscribeHarnessMode();
+			this.#unsubscribeHarnessMode = undefined;
 		}
 		if (this.#unsubscribeEvalPreludeSettings) {
 			this.#unsubscribeEvalPreludeSettings();
@@ -9365,7 +9381,9 @@ export class AgentSession {
 		const cacheSessionId = this.sessionId;
 		const snapshot = this.#buildEphemeralSnapshot(args.promptText, args.history);
 		const llmMessages = await this.convertMessagesToLlm(snapshot, args.signal);
-		const context = await this.agent.buildSideRequestContext(llmMessages);
+		const context = await this.agent.buildSideRequestContext(llmMessages, undefined, {
+			harnessProfile: effectiveHarnessProfile(this.settings, this.model) ?? null,
+		});
 		const options = this.prepareSimpleStreamOptions(
 			{
 				apiKey: this.#modelRegistry.resolver(model, cacheSessionId),

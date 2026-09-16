@@ -6,6 +6,7 @@ import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import type { Skill } from "../../extensibility/skills";
 import { type HarnessPrompt, servedHarnessPrompt } from "../../harness/capture";
+import { effectiveHarnessProfile } from "../../harness/effective-profile";
 import type { AgentSession } from "../../session/agent-session";
 import { resolveSpeculationMethod } from "../../session/compaction-methods";
 import { estimateInlineSavings, type SnapcompactSavingsEstimate } from "../../session/snapcompact-inline";
@@ -272,7 +273,10 @@ function nonMessageTokenCacheEntry(session: NonMessageTokenSource, tokenizer: To
 	const toolsRevision = getToolSchemaMetadataRevision(toolsRef);
 	const settingsRevision = session.settings?.revision ?? 0;
 	const skillsRef = session.skills ?? EMPTY_SKILLS;
-	const harnessRef = servedHarnessPrompt(session.model);
+	const harnessRef =
+		session.settings === undefined
+			? servedHarnessPrompt(session.model)
+			: servedHarnessPrompt(session.model, effectiveHarnessProfile(session.settings, session.model));
 	let entry = cachedSession[NON_MESSAGE_TOKEN_CACHE];
 	if (
 		entry &&

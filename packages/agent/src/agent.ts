@@ -820,6 +820,7 @@ export class Agent {
 	async buildSideRequestContext(
 		llmMessages: Message[],
 		systemPrompt: string[] = this.#state.systemPrompt,
+		opts?: { harnessProfile?: import("@oh-my-pi/pi-catalog/compat/harness").HarnessProfile | null },
 	): Promise<Context> {
 		const model = this.#state.model;
 		if (!model) throw new Error("No active model on agent");
@@ -828,7 +829,7 @@ export class Agent {
 		const tools = ownedDialect
 			? []
 			: (normalizeTools(this.#toolsForModel(model), {
-					injectIntent: injectsIntent(this.#intentTracing, model),
+					injectIntent: injectsIntent(this.#intentTracing, model, opts?.harnessProfile),
 					pruneDescriptions: this.#pruneToolDescriptions,
 				}) ?? []);
 		let context: Context = { systemPrompt, messages, tools };

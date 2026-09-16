@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Agent, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { resolveDelegationBias } from "@oh-my-pi/pi-catalog/compat/delegation";
-import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { isRecord, logger, prompt, stringProperty, structuredCloneJSON, untilAborted } from "@oh-my-pi/pi-utils";
 
 import { reset as resetCapabilities } from "../capability";
@@ -16,8 +16,9 @@ import type { ExtensionRunner, SourceInfo, ToolInfo } from "../extensibility/ext
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import { SIDEKICK_TOOL_NAME } from "../fusion/config";
-import { harnessFacade, presentedWireName, presentTool } from "../harness/facade";
 import { servedHarnessPrompt, type VendorTool } from "../harness/capture";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
+import { harnessFacade, presentedWireName, presentTool } from "../harness/facade";
 import { harnessFacadeSpecs } from "../harness/facades";
 import { harnessToolBinding } from "../harness/manifest";
 import { type LocalProtocolOptions, stripXdUrlPrefix, XD_URL_PREFIX } from "../internal-urls";
@@ -729,9 +730,9 @@ export class SessionTools {
 	#currentPromptModelKey(): string | undefined {
 		const activeModel = this.#host.model();
 		if (!activeModel) return undefined;
-		const harness = resolveHarnessProfile(activeModel) ?? "native";
+		const harness = this.#harnessProfile() ?? "native";
 		if (this.#host.settings.get("includeModelInPrompt"))
-			return `${formatModelString(activeModel)}|harness:${harness}`;
+			return `${formatModelString(activeModel)}|harness:${harness}|mode:${this.#host.settings.get("harness.mode")}`;
 		return `delegation-bias:${resolveDelegationBias(activeModel)}|harness:${harness}`;
 	}
 
@@ -747,6 +748,17 @@ export class SessionTools {
 		if (modelChanged) this.#representActiveTools();
 	}
 
+	/**
+	 * Re-applies tool presentation and the base prompt after `harness.mode`
+	 * flips at runtime. Runs inside the registry lock: re-apply the enabled
+	 * set (renames + facades follow the new effective profile) and rebuild
+	 * the prompt (the vendor block follows `loadHarnessPrompt` for that
+	 * profile + model, whose cache keys match the served lookups). No model
+	 * changed, so no provider session reset is needed.
+	 */
+	async onEffectiveHarnessModeChange(): Promise<void> {
+		await this.#applyActiveToolsByName(this.getEnabledToolNames(), true);
+	}
 	/** Whether a model transition crosses a Code Mode presentation boundary. */
 	codeModeChangesBetween(previousModel: Model | undefined, nextModel: Model): boolean {
 		const enabledToolNames = this.getEnabledToolNames();
@@ -760,7 +772,7 @@ export class SessionTools {
 				extraDirectTools,
 				enabledToolNames,
 				evalTransportAvailable: this.#hasCodeModeEvalTransport(),
-				...(model && { harnessProfile: resolveHarnessProfile(model) }),
+				...(model && { harnessProfile: effectiveHarnessProfile(this.#host.settings, model) }),
 			});
 		const previous = resolve(previousModel);
 		const next = resolve(nextModel);
@@ -806,8 +818,7 @@ export class SessionTools {
 	}
 
 	#harnessProfile(): HarnessProfile | undefined {
-		const activeModel = this.#host.model();
-		return activeModel === undefined ? undefined : resolveHarnessProfile(activeModel);
+		return effectiveHarnessProfile(this.#host.settings, this.#host.model());
 	}
 
 	/** Registry tools as `profile` presents them; the registry itself when no profile applies. */
@@ -824,10 +835,15 @@ export class SessionTools {
 		return presentTool(tool, binding, () => this.#vendorTool(presentedWireName(tool, binding)));
 	}
 
-	/** The served capture's declaration for `wireName`, once the capture for the active model has loaded. */
+	/**
+	 * The served capture's declaration for `wireName`, once the capture for the
+	 * effective profile + active model has loaded. Served lookups key on the
+	 * effective profile so a forced profile reads its own capture and a native
+	 * session reads nothing.
+	 */
 	#vendorTool(wireName: string | undefined): VendorTool | undefined {
 		if (wireName === undefined) return undefined;
-		return servedHarnessPrompt(this.#host.model())?.tools[wireName];
+		return servedHarnessPrompt(this.#host.model(), this.#harnessProfile())?.tools[wireName];
 	}
 
 	/** Appends `profile`'s facades to an already-presented tool list, replacing the targets they stand in for. */
@@ -992,7 +1008,7 @@ export class SessionTools {
 		signal?.throwIfAborted();
 		toolNames = normalizeToolNames(toolNames);
 		const activeModel = this.#host.model();
-		const profile = activeModel === undefined ? undefined : resolveHarnessProfile(activeModel);
+		const profile = this.#harnessProfile();
 		const codeMode = resolveCodeMode({
 			provider: activeModel?.provider ?? "",
 			toolMode: activeModel?.toolMode,

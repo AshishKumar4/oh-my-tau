@@ -1,5 +1,6 @@
 import type { Model, Static, TSchema } from "@oh-my-pi/pi-ai";
-import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { effectiveHarnessProfile } from "./effective-profile";
 
 export interface HarnessSchemaBridge<TParams, TWire extends TSchema = TSchema> {
 	readonly parameters: TWire;
@@ -10,8 +11,14 @@ export type HarnessBridges<TParams, TWire extends TSchema = TSchema> = Partial<
 	Record<HarnessProfile, HarnessSchemaBridge<TParams, TWire>>
 >;
 
+/**
+ * Bridge hosts are tool sessions, which carry the live `Settings` instance the
+ * session also reads — so the effective profile here follows `harness.mode`
+ * exactly like the presentation and wire layers.
+ */
 interface BridgeHost {
 	getActiveModel?: () => Model | undefined;
+	settings?: { get(path: "harness.mode"): string };
 }
 
 function activeBridge<TParams, TWire extends TSchema>(
@@ -19,7 +26,8 @@ function activeBridge<TParams, TWire extends TSchema>(
 	bridges: HarnessBridges<TParams, TWire>,
 ): HarnessSchemaBridge<TParams, TWire> | undefined {
 	const model = session?.getActiveModel?.();
-	const profile = model === undefined ? undefined : resolveHarnessProfile(model);
+	if (model === undefined) return undefined;
+	const profile = session?.settings === undefined ? undefined : effectiveHarnessProfile(session.settings, model);
 	return profile === undefined ? undefined : bridges[profile];
 }
 

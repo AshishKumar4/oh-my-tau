@@ -9,6 +9,7 @@ import {
 import type { SettingPath, Settings } from "../config/settings";
 import { describeSidekickOwner, listSidekickRefs, resolveSidekickModel } from "../fusion/config";
 import { servedHarnessPrompt } from "../harness/capture";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { describeLoopCondition } from "../modes/loop-condition";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
@@ -427,7 +428,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			}
 
 			const model = runtime.session.model;
-			const harness = servedHarnessPrompt(model);
+			const harness = servedHarnessPrompt(model, effectiveHarnessProfile(runtime.settings, model));
 			const lines = [model ? `Current model: ${model.provider}/${model.id}` : "No model is currently selected."];
 			if (harness !== undefined) {
 				lines.push(

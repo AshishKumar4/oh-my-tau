@@ -1,5 +1,5 @@
 import type { Model } from "@oh-my-pi/pi-ai";
-import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import { $env, $flag } from "@oh-my-pi/pi-utils";
 
@@ -24,6 +24,7 @@ export function normalizeEditMode(mode?: string | null): EditMode | undefined {
 
 export interface EditModeSettingsLike {
 	get(key: "edit.mode"): unknown;
+	get(key: "harness.mode"): "auto" | "native" | "claude-code" | "codex";
 	getEditVariantForModel?(model: string | undefined): EditMode | null;
 }
 
@@ -45,7 +46,7 @@ export function resolveEditMode(session: EditModeSessionLike): EditMode {
 	const mode = settingsMode ?? DEFAULT_EDIT_MODE;
 	if (mode === "hashline" && !$flag("PI_STRICT_EDIT_MODE")) {
 		const model = session.getActiveModel?.();
-		const profile = model && resolveHarnessProfile(model);
+		const profile = model && effectiveHarnessProfile(session.settings, model);
 		if (profile === "claude-code") return "replace";
 		// Codex editing primitive is the freeform V4A apply_patch; the codex
 		// profile serves tools.apply_patch inside exec, which bridges to this

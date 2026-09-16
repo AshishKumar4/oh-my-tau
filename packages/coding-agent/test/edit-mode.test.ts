@@ -29,7 +29,7 @@ function createSession(args: {
 		getActiveModelString: () => args.activeModel,
 		getActiveModel: () => args.activeModelObject,
 		settings: {
-			get: () => args.settingsMode ?? "hashline",
+			get: ((key: string) => (key === "harness.mode" ? "auto" : (args.settingsMode ?? "hashline"))) as EditModeSessionLike["settings"]["get"],
 			getEditVariantForModel: () => args.modelVariant ?? null,
 		},
 	};

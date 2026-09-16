@@ -1,6 +1,6 @@
 import { scheduler } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
-import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	applyCodexResidencyHeader,
@@ -162,6 +162,13 @@ export interface OpenAICodexResponsesOptions extends StreamOptions {
 	 * `useResponsesLite` flag.
 	 */
 	responsesLite?: boolean;
+	/**
+	 * Session effective harness profile (`harness.mode`) threaded by the
+	 * session stream wrapper. Overrides the model's catalog profile for wire
+	 * shape, namespace tools, fork prefix, and snapshot gating: `null` forces
+	 * native, a profile forces that surface, omission keeps catalog behavior.
+	 */
+	harnessProfile?: HarnessProfile | null;
 	/**
 	 * Additional fields embedded in the canonical
 	 * `client_metadata["x-codex-turn-metadata"]` JSON blob. Reserved identity
@@ -1580,7 +1587,12 @@ function createCodexRequestContext(
 		clientMetadata: transformedBody.client_metadata,
 		parentTurnId: options?.parentTurnId,
 		compaction,
-		toolNamespacesInfo: resolveHarnessProfile(model) === "codex" ? undefined : options?.toolNamespacesInfo,
+		toolNamespacesInfo:
+			(options?.harnessProfile !== undefined
+				? (options.harnessProfile ?? undefined)
+				: resolveHarnessProfile(model)) === "codex"
+				? undefined
+				: options?.toolNamespacesInfo,
 		forkSource: getCodexForkSource(model, options),
 	});
 	transformedBody.client_metadata = requestMetadata.clientMetadata;
@@ -1698,15 +1710,18 @@ export async function buildTransformedCodexRequestBody(
 	options: OpenAICodexResponsesOptions | undefined,
 	promptCacheKey?: string,
 	inputPrefix?: InputItem[],
+	override?: HarnessProfile | null,
 ): Promise<RequestBody> {
+	const effective = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
 	const forkSource = getCodexForkSource(model, options);
 	const forkMessageCount = options?.codexFork?.messageCount;
-	const codexHarness = resolveHarnessProfile(model) === "codex";
+	const codexHarness =
+		(options?.harnessProfile !== undefined ? (options.harnessProfile ?? undefined) : effective) === "codex";
 	// The child's own catalog, serialized once and reused for both the request
 	// params and the fork compatibility check below.
 	const childNamespaceTools =
 		codexHarness && context.tools && context.tools.length > 0
-			? buildCodexNamespaceTools(context.tools, model, { strictFalse: true })
+			? buildCodexNamespaceTools(context.tools, model, { strictFalse: true }, options?.harnessProfile)
 			: undefined;
 	// Byte-for-byte prefix reuse additionally requires the same producing model
 	// on the codex harness profile, a non-empty source input, and a
@@ -1786,6 +1801,7 @@ export async function buildTransformedCodexRequestBody(
 		textVerbosity: options?.textVerbosity,
 		include: options?.include,
 		responsesLite: options?.responsesLite,
+		...(options?.harnessProfile !== undefined ? { harnessProfile: options.harnessProfile } : {}),
 	};
 
 	const body = await transformRequestBody(params, model, codexOptions, { developerMessages });
@@ -2831,8 +2847,12 @@ class CodexStreamProcessor {
 	 */
 	#emitCodexRequestSnapshot(status: ResponseStatus | undefined, response: unknown): void {
 		const onSnapshot = this.options?.onCodexRequestSnapshot;
-		if (!onSnapshot || this.options?.codexCompaction || resolveHarnessProfile(this.model) !== "codex") return;
-		if (status === "failed" || status === "cancelled") return;
+		if (!onSnapshot || this.options?.codexCompaction) return;
+		const snapshotProfile =
+			this.options?.harnessProfile !== undefined
+				? (this.options.harnessProfile ?? undefined)
+				: resolveHarnessProfile(this.model);
+		if (snapshotProfile !== "codex") return;
 		// Any error object on the terminal response — regardless of status —
 		// means the turn did not succeed, so it cannot seed a fork lineage.
 		if (response !== null && typeof response === "object" && "error" in response && response.error != null) {
@@ -3314,7 +3334,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				requestSetup,
 				requestContext,
 				startTime,
-				harnessToolNames: buildHarnessToolNames(model, "codex", context.tools),
+				harnessToolNames: buildHarnessToolNames(model, "codex", context.tools, options?.harnessProfile),
 			});
 
 			const completion = await processingContext.process();
@@ -5075,9 +5095,10 @@ function convertCodexToolPayload(
 export function convertOpenAICodexResponsesTools(
 	tools: Tool[],
 	model: Model<"openai-codex-responses">,
+	override?: HarnessProfile | null,
 ): CodexToolPayload[] {
 	const allowFreeform = model.applyPatchToolType === "freeform";
-	const toolNames = buildHarnessToolNames(model, "codex", tools);
+	const toolNames = buildHarnessToolNames(model, "codex", tools, override);
 	return tools.map(tool => convertCodexToolPayload(tool, model, allowFreeform, toolNames));
 }
 
@@ -5089,10 +5110,11 @@ export function buildCodexNamespaceTools(
 	tools: Tool[],
 	model: Model<"openai-codex-responses">,
 	options?: { strictFalse?: boolean },
+	override?: HarnessProfile | null,
 ): CodexAdditionalTool[] {
 	const groups = new Map<string, NamespaceTool>();
 	const surface: CodexAdditionalTool[] = [];
-	const toolNames = buildHarnessToolNames(model, "codex", tools);
+	const toolNames = buildHarnessToolNames(model, "codex", tools, override);
 	for (const tool of tools) {
 		const payload = convertCodexToolPayload(tool, model, true, toolNames, options?.strictFalse === true);
 		if (payload.type === "computer") {

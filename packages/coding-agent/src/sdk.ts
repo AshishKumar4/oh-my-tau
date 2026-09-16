@@ -29,6 +29,7 @@ import {
 	prewarmOpenAICodexResponses,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { effectiveHarnessProfile } from "./harness/effective-profile";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
 import {
@@ -964,6 +965,8 @@ export interface BuildSystemPromptOptions {
 	customPrompt?: string;
 	appendPrompt?: string;
 	model?: Model;
+	/** Session settings carrying `harness.mode`; omitted resolves the model's catalog profile. */
+	settings?: Pick<Settings, "get">;
 	inlineToolDescriptors?: boolean;
 	includeWorkspaceTree?: boolean;
 	/** Include the read-only security:// resource inventory entry. Default: false. */
@@ -989,7 +992,13 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 				options.inlineToolDescriptors ? { mode: "full" } : { mode: "compact", toolNames: toolNames ?? [] },
 			)
 		: undefined;
-	const harnessProfile = options.model === undefined ? undefined : resolveHarnessProfile(options.model);
+	const promptModelOption = options.model;
+	const harnessProfile =
+		promptModelOption === undefined
+			? undefined
+			: options.settings === undefined
+				? resolveHarnessProfile(promptModelOption)
+				: effectiveHarnessProfile(options.settings, promptModelOption);
 	return await buildSystemPromptInternal({
 		cwd: options.cwd,
 		customPrompt: options.customPrompt,
@@ -1006,7 +1015,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		...(harnessProfile && { harnessProfile }),
 	});
 }
-
 // Internal Helpers
 
 function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
@@ -3404,14 +3412,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				browserEnabled: getEvalPreludes().some(definition => definition.name === "browser"),
 				computerEnabled: getEvalPreludes().some(definition => definition.name === "computer"),
 				model: getActiveModelString(),
-				includeModelInPrompt: settings.get("includeModelInPrompt"),
-				personality: agentKind === "sub" ? "none" : settings.get("personality"),
-				renderMermaid: settings.get("tui.renderMermaid"),
-				reactions: agentKind === "main" && options.hasUI === true && settings.get("tui.reactions"),
 				activeRepoContext,
-				...(promptModel && { harnessProfile: resolveHarnessProfile(promptModel) }),
+				...(promptModel && { harnessProfile: effectiveHarnessProfile(settings, promptModel) }),
 			});
-
 			if (options.systemPrompt === undefined) {
 				return defaultPrompt;
 			}
@@ -3816,13 +3819,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					settings.get("externalThinking") &&
 					agent.state.tools.some(tool => tool.name === "think") &&
 					supportsExternalThinking(streamModel);
+				// Codex Code Mode namespaces ride only on effective-codex turns;
+				// effective-native turns on a profiled model must not send them
+				// (the provider drops them there today via the profile check).
+				const namespacesInfo =
+					effectiveHarnessProfile(settings, streamModel) === "codex" ? codeModeState.namespacesInfo : undefined;
 				return settingsAwareStreamFn(streamModel, context, {
 					...streamOptions,
 					anthropicCacheRefresh: true,
 					forceReasoningOff: externalThinking || streamOptions?.forceReasoningOff,
-					...(codeModeState.namespacesInfo === undefined
-						? {}
-						: { toolNamespacesInfo: codeModeState.namespacesInfo }),
+					...(namespacesInfo === undefined ? {} : { toolNamespacesInfo: namespacesInfo }),
 					...(codexFork !== undefined ? { codexFork } : {}),
 					onCodexRequestSnapshot: snapshot => {
 						// A late response from a previous session/agent must not be

@@ -14,6 +14,7 @@ import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import { type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import { type Settings, validateProviderMaxInFlightRequests } from "../config/settings";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 
 function timeoutSecondsToMs(value: number): number | undefined {
 	if (!Number.isFinite(value) || value < 0) return undefined;
@@ -66,6 +67,15 @@ export function createSettingsAwareStreamFn(settings: Settings, base: StreamFn =
 			(serverSideFallbackIdentity.family === "fable" || serverSideFallbackIdentity.family === "mythos");
 		const fallbacks =
 			streamOptions?.fallbacks ?? (serverSideFallbackEnabled ? [{ model: "claude-opus-4-8" }] : undefined);
+		// Session effective harness profile: `auto` resolves the catalog
+		// profile (byte-identical to omitting the override), `native` sends
+		// `null` (providers run native), and a forced profile threads through
+		// to wire naming, head caching, replay, and the Codex request shape.
+		// Caller-supplied overrides win so tests and embeddings can pin the wire.
+		const harnessOverride =
+			streamOptions !== undefined && "harnessProfile" in streamOptions
+				? (streamOptions.harnessProfile ?? null)
+				: (effectiveHarnessProfile(settings, model) ?? null);
 		const merged: SimpleStreamOptions = {
 			...streamOptions,
 			openrouterVariant: streamOptions?.openrouterVariant ?? openrouterVariant,
@@ -85,6 +95,7 @@ export function createSettingsAwareStreamFn(settings: Settings, base: StreamFn =
 			},
 			hideThinkingSummary: streamOptions?.hideThinkingSummary ?? settings.get("omitThinking"),
 			...(fallbacks !== undefined ? { fallbacks } : {}),
+			harnessProfile: harnessOverride,
 		};
 		return base(model, context, merged);
 	};

@@ -2,7 +2,8 @@
  * Contract: `createSettingsAwareStreamFn` layers session provider settings
  * (`providers.openrouterVariant`, `providers.antigravityEndpoint`,
  * `providers.stream*TimeoutSeconds`, `providers.maxInFlightRequests`,
- * `model.loopGuard.*`, `textVerbosity` for Responses-family requests)
+ * `model.loopGuard.*`, `textVerbosity` for Responses-family requests,
+ * `harness.mode` as the `harnessProfile` wire override)
  * options win — the same wiring the main agent and the advisor agent share so
  * OpenRouter sticky-routing / response caching behaves the same on advisor turns
  * (can1357/oh-my-pi#3639).
@@ -49,6 +50,26 @@ describe("createSettingsAwareStreamFn", () => {
 		expect(options?.loopGuard).toEqual({ enabled: true, checkAssistantContent: true });
 		// caller's own option is preserved
 		expect(options?.apiKey).toBe("k");
+	});
+
+	it("threads native as null and forced profiles through, preserving caller pins", () => {
+		const profiled = { api: "anthropic-messages", provider: "anthropic", id: "x", identity: { class: "anthropic" } } as unknown as Model;
+		for (const [mode, expected] of [["native", null], ["claude-code", "claude-code"], ["codex", "codex"]] as const) {
+			const settings = Settings.isolated({ "harness.mode": mode });
+			const { fn: base, calls } = captureBase();
+			createSettingsAwareStreamFn(settings, base)(profiled, stubContext, { apiKey: "k" });
+			expect(calls[0]?.options?.harnessProfile).toBe(expected);
+		}
+		// auto on an identity-less stub resolves no profile -> null (native wire).
+		const autoSettings = Settings.isolated({});
+		const { fn: base, calls } = captureBase();
+		createSettingsAwareStreamFn(autoSettings, base)(stubModel, stubContext, { apiKey: "k" });
+		expect(calls[0]?.options?.harnessProfile).toBeNull();
+		// Caller-supplied overrides win over the session mode.
+		const nativeSettings = Settings.isolated({ "harness.mode": "native" });
+		const { fn: base2, calls: calls2 } = captureBase();
+		createSettingsAwareStreamFn(nativeSettings, base2)(profiled, stubContext, { apiKey: "k", harnessProfile: "codex" });
+		expect(calls2[0]?.options?.harnessProfile).toBe("codex");
 	});
 
 	it("keeps assistant prose loop scanning at its configured default", () => {

@@ -34,6 +34,7 @@ import type {
 	WriteResult,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import type { Api, FetchImpl, KnownApi, Model, Provider, ThinkingBudgets, Usage } from "@oh-my-pi/pi-catalog/types";
 import type { ApiKey } from "./auth-retry";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
@@ -667,6 +668,14 @@ export interface StreamOptions {
 
 	/** Cursor exec/MCP tool handlers (cursor-agent only). */
 	execHandlers?: CursorExecHandlers;
+	/**
+	 * Session effective harness profile threaded by the session stream layer.
+	 * Overrides the model's catalog profile for wire naming, head caching,
+	 * replay, and Codex request shape: `null` forces native (omp surface), a
+	 * profile forces that surface on any model, and omission keeps catalog
+	 * behavior. Ignored by providers without harness-specific wire formats.
+	 */
+	harnessProfile?: HarnessProfile | null;
 }
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()

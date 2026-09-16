@@ -216,9 +216,12 @@ export function loadHarnessPrompt(profile: HarnessProfile, modelId?: string): Pr
 	return pending;
 }
 
-export function servedHarnessPrompt(model: Model | undefined): HarnessPrompt | undefined {
+export function servedHarnessPrompt(
+	model: Model | undefined,
+	override?: HarnessProfile | null,
+): HarnessPrompt | undefined {
 	if (model === undefined || servedPrompts.size === 0) return undefined;
-	const profile = resolveHarnessProfile(model);
+	const profile = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
 	if (profile === undefined) return undefined;
 	return servedPrompts.get(promptCacheKey(profile, model.id)) ?? servedPrompts.get(promptCacheKey(profile, undefined));
 }

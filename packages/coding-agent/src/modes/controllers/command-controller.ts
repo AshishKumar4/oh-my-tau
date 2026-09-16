@@ -29,6 +29,7 @@ import {
 	summarizeMentalModel,
 } from "../../hindsight";
 import { servedHarnessPrompt } from "../../harness/capture";
+import { effectiveHarnessProfile } from "../../harness/effective-profile";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../../memory-backend";
 import { BashExecutionComponent, bashPtyViewport } from "../../modes/components/bash-execution";
 import { BorderedLoader } from "../../modes/components/bordered-loader";
@@ -361,7 +362,7 @@ export class CommandController {
 				providerSessionState: this.ctx.session.providerSessionState,
 			});
 			info += renderProviderSection(providerDetails, theme);
-			const harness = servedHarnessPrompt(model);
+			const harness = servedHarnessPrompt(model, effectiveHarnessProfile(this.ctx.session.settings, model));
 			if (harness !== undefined) {
 				info += `${theme.fg("dim", "Harness Prompt:")} ${replaceTabs(sanitizeText(shortenPath(harness.path)))} ${theme.fg("dim", `(${replaceTabs(sanitizeText(harness.clientVersion))})`)}\n`;
 			}

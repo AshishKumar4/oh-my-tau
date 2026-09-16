@@ -7,7 +7,7 @@ import type {
 	ToolSpeculationPolicy,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, ToolExample } from "@oh-my-pi/pi-ai";
-import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { prompt } from "@oh-my-pi/pi-utils";
 import {
 	DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
@@ -26,7 +26,7 @@ import { EvalShadowCellSession } from "../eval/speculation/cell-session";
 import { runWithEvalShadowCell } from "../eval/speculation/runtime-context";
 import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
 import { codexExecNestedDeclarations } from "../harness/codex-nested";
-
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import evalCodeModeDescription from "../prompts/tools/eval-code-mode.md" with { type: "text" };
 import {
@@ -387,7 +387,7 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 					return typeof summary === "string" ? { ...entry, summary } : entry;
 				}),
 				preludeDeclarations,
-				nestedDeclarations: codexExecNestedDeclarations(this.session?.getActiveModel?.()),
+				nestedDeclarations: codexExecNestedDeclarations(this.session?.getActiveModel?.(), this.#harnessProfile()),
 			});
 		}
 		return prompt.render(evalCodeModeDescription, {
@@ -488,8 +488,10 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 	}
 
 	#harnessProfile(): HarnessProfile | undefined {
-		const model = this.session?.getActiveModel?.();
-		return model === undefined ? undefined : resolveHarnessProfile(model);
+		const session = this.session;
+		const model = session?.getActiveModel?.();
+		if (session === null || model === undefined) return undefined;
+		return effectiveHarnessProfile(session.settings, model);
 	}
 
 	#presentsCodexExec(): boolean {

@@ -1289,15 +1289,21 @@ export interface HarnessToolNames {
 
 /**
  * The renames `profile` applies to this request's tools, or `undefined` when
- * the model runs a different profile or no tool is renamed — callers treat
- * absence as "vendor naming rules apply" rather than consulting an empty map.
+ * the resolved profile differs or no tool is renamed — callers treat absence
+ * as "vendor naming rules apply" rather than consulting an empty map.
+ *
+ * `override` is the session's effective profile (`harness.mode`). When set it
+ * replaces the model's catalog profile (`undefined` forces native); when
+ * omitted the model's own profile applies, preserving today's behavior.
  */
 export function buildHarnessToolNames(
 	model: Model,
 	profile: HarnessProfile,
 	tools: readonly Tool[] | undefined,
+	override?: HarnessProfile | null,
 ): HarnessToolNames | undefined {
-	if (resolveHarnessProfile(model) !== profile) return undefined;
+	const effective = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
+	if (effective !== profile) return undefined;
 	const toWire = new Map<string, string>();
 	const fromWire = new Map<string, string>();
 	for (const tool of tools ?? []) {

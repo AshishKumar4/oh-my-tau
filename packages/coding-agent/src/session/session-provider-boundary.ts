@@ -10,6 +10,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import { formatModelString } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { validateProviderMaxInFlightRequests } from "../config/settings";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { deobfuscateSessionContext, obfuscateMessages } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
@@ -156,7 +157,6 @@ export class SessionProviderBoundary {
 				: undefined;
 		const antigravityEndpointMode =
 			provider === "google-antigravity" ? this.#host.settings.get("providers.antigravityEndpoint") : undefined;
-
 		const preparedOptions: SimpleStreamOptions = {
 			...options,
 			...(openrouterVariant !== undefined && { openrouterVariant }),
@@ -169,6 +169,9 @@ export class SessionProviderBoundary {
 				checkAssistantContent: this.#host.settings.get("model.loopGuard.checkAssistantContent"),
 				...options.loopGuard,
 			},
+			...("harnessProfile" in options
+				? {}
+				: { harnessProfile: effectiveHarnessProfile(this.#host.settings, this.#host.model()) ?? null }),
 		};
 
 		if (sessionMetadata && !options.metadata) {

@@ -1,4 +1,4 @@
-import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { $env } from "@oh-my-pi/pi-utils";
@@ -44,6 +44,12 @@ export interface CodexRequestOptions {
 	 * Responses so the model can emit independent tool calls in parallel.
 	 */
 	responsesLite?: boolean;
+	/**
+	 * Session effective harness profile (`harness.mode`). Overrides the
+	 * model's catalog profile for the `reasoning.context` default: `null`
+	 * forces native, a profile forces that surface, omission keeps catalog.
+	 */
+	harnessProfile?: HarnessProfile | null;
 }
 
 export interface InputItem {
@@ -521,7 +527,12 @@ export async function transformRequestBody(
 			} else {
 				body.reasoning.context = options.reasoningContext;
 			}
-		} else if (resolveHarnessProfile(model) === "codex" && model.compat.supportsAllTurnsReasoningContext) {
+		} else if (
+			(options.harnessProfile !== undefined
+				? (options.harnessProfile ?? undefined)
+				: resolveHarnessProfile(model)) === "codex" &&
+			model.compat.supportsAllTurnsReasoningContext
+		) {
 			// codex-rs sends reasoning.context: "all_turns" on profiled turns.
 			body.reasoning.context = "all_turns";
 		}
@@ -531,9 +542,6 @@ export async function transformRequestBody(
 	if (!model.compat.supportsReasoningSummary && body.reasoning) {
 		delete body.reasoning.summary;
 	}
-	// Catalog pro aliases (`gpt-5.6-*-pro`): applied after the effort branch so
-	// the mode is sent even when no effort is set (the branch above deletes
-	// `body.reasoning` in that case) — mode and effort are independent fields.
 	if (model.reasoningMode && !options.reasoningOff) {
 		body.reasoning = { ...body.reasoning, mode: model.reasoningMode };
 	}

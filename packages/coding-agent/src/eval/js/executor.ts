@@ -1,4 +1,4 @@
-import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { effectiveHarnessProfile } from "../../harness/effective-profile";
 import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "../../session/streaming-output";
 
 import type { ToolSession } from "../../tools";
@@ -116,7 +116,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			timeoutMs: acquireBudgetMs,
 			codex: (() => {
 				const model = options.session.getActiveModel?.();
-				return model && resolveHarnessProfile(model) === "codex"
+				return model && effectiveHarnessProfile(options.session.settings, model) === "codex"
 					? { tools: codexExecToolCatalog(options.session) }
 					: undefined;
 			})(),

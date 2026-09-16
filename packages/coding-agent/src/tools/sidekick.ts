@@ -12,7 +12,7 @@
  */
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { formatDuration, prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
 import {
@@ -114,7 +114,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 
 	get description(): string {
 		const model = this.session.getActiveModel?.();
-		const profile = model ? resolveHarnessProfile(model) : undefined;
+		const profile = model ? effectiveHarnessProfile(this.session.settings, model) : undefined;
 		return prompt.render(sidekickDescription, buildFusionPromptData({ profile, toolRefs: {} }));
 	}
 

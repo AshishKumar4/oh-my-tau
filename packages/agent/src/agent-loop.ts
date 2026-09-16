@@ -953,8 +953,13 @@ export interface NormalizeToolsOptions {
 	pruneDescriptions?: boolean;
 }
 
-export function injectsIntent(intentTracing: boolean | undefined, model: Model): boolean {
-	return !!intentTracing && resolveHarnessProfile(model) === undefined;
+export function injectsIntent(
+	intentTracing: boolean | undefined,
+	model: Model,
+	override?: import("@oh-my-pi/pi-catalog/compat/harness").HarnessProfile | null,
+): boolean {
+	const effective = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
+	return !!intentTracing && effective === undefined;
 }
 
 export function normalizeTools(tools: AgentContext["tools"], options: NormalizeToolsOptions): Context["tools"] {
@@ -1718,7 +1723,7 @@ async function prepareProviderCall(
 	const normalizedMessages = normalizeMessagesForProvider(llmMessages, model);
 	const ownedDialect: Dialect | undefined = config.dialect ?? resolveOwnedDialectFromEnv(Bun.env.PI_DIALECT);
 	const pruneToolDescriptions = !!config.pruneToolDescriptions && !ownedDialect;
-	const intentTracing = injectsIntent(config.intentTracing, model);
+	const intentTracing = injectsIntent(config.intentTracing, model, config.harnessProfile);
 	let llmContext: Context;
 	if (config.appendOnlyContext) {
 		config.appendOnlyContext.syncMessages(normalizedMessages);

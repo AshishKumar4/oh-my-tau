@@ -970,10 +970,12 @@ function replayAnthropicToolName(
 	model: Model<"anthropic-messages">,
 	isOAuthToken: boolean,
 	toolNames: HarnessToolNames | undefined,
+	override?: HarnessProfile | null,
 ): string {
 	const activeWireName = toolNames?.toWire.get(name);
 	if (activeWireName !== undefined) return activeWireName;
-	if (wireName !== undefined && resolveHarnessProfile(model) === "claude-code") return wireName;
+	const effective = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
+	if (wireName !== undefined && effective === "claude-code") return wireName;
 	return encodeAnthropicToolName(name, isOAuthToken, model.compat.escapeBuiltinToolNames, toolNames);
 }
 
@@ -983,11 +985,12 @@ function replayAnthropicToolCall(
 	isOAuthToken: boolean,
 	toolNames: HarnessToolNames | undefined,
 	declaredNames: ReadonlySet<string> | undefined,
+	override?: HarnessProfile | null,
 ): { name: string; input: Record<string, unknown> } {
 	const facade = facadeToolCallReplay(block, declaredNames);
 	if (facade === undefined) {
 		return {
-			name: replayAnthropicToolName(block.name, block.wireName, model, isOAuthToken, toolNames),
+			name: replayAnthropicToolName(block.name, block.wireName, model, isOAuthToken, toolNames, override),
 			input: block.arguments ?? {},
 		};
 	}
@@ -1315,6 +1318,13 @@ export interface AnthropicOptions extends StreamOptions {
 	 * undefined preserves the pre-fallback behavior on every code path.
 	 */
 	fallbacks?: FallbackParam[];
+	/**
+	 * Session effective harness profile (`harness.mode`) threaded by the
+	 * session stream wrapper. Overrides the model's catalog profile for wire
+	 * naming, head caching, and replay: `null` forces native, a profile
+	 * forces that surface, omission keeps catalog behavior.
+	 */
+	harnessProfile?: HarnessProfile | null;
 }
 
 export type AnthropicClientOptionsArgs = {
@@ -2537,7 +2547,12 @@ const streamAnthropicOnce = (
 				isOAuthToken = created.isOAuthToken;
 			}
 			const preparedContext = await prepareAnthropicManyImageContext(context, model.input.includes("image"));
-			const harnessToolNames = buildHarnessToolNames(model, "claude-code", preparedContext.tools);
+			const harnessToolNames = buildHarnessToolNames(
+				model,
+				"claude-code",
+				preparedContext.tools,
+				options?.harnessProfile,
+			);
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
 				let nextParams = buildParams(model, preparedContext, isOAuthToken, options, {
 					compactionSupported,
@@ -2550,6 +2565,7 @@ const streamAnthropicOnce = (
 					droppedThinkingBlocks: providerSessionState?.prefixDroppedThinkingBlocks,
 					providerSessionState,
 					harnessToolNames,
+					...(options?.harnessProfile !== undefined ? { harnessProfile: options.harnessProfile } : {}),
 					fallbacks,
 					effectiveBaseUrl: baseUrl,
 				});
@@ -4483,6 +4499,7 @@ type AnthropicParamBuildOptions = {
 	droppedThinkingBlocks?: ReadonlySet<string>;
 	providerSessionState?: AnthropicProviderSessionState;
 	harnessToolNames?: HarnessToolNames;
+	harnessProfile?: HarnessProfile | null;
 	/** Sanitized server-side fallback entries; defaults to `options?.fallbacks` when omitted. */
 	fallbacks?: AnthropicOptions["fallbacks"];
 	/**
@@ -4516,6 +4533,7 @@ function buildParams(
 		droppedThinkingBlocks,
 		providerSessionState,
 		harnessToolNames,
+		harnessProfile,
 		fallbacks = options?.fallbacks,
 		compactionSupported = supportsAnthropicCompaction(model),
 		effectiveBaseUrl,
@@ -4655,6 +4673,12 @@ function buildParams(
 	// the `effort-2025-11-24` beta, which that adapter can only accept in the body
 	// (`anthropic_beta`), never as the `anthropic-beta` HTTP header this path sets
 	// — so the field is dropped alongside the beta to avoid a 400 (#5614).
+	const effectiveHarness =
+		harnessProfile !== undefined
+			? (harnessProfile ?? undefined)
+			: options?.harnessProfile !== undefined
+				? (options.harnessProfile ?? undefined)
+				: undefined;
 	let wireMessages = convertAnthropicMessages(context.messages, effectiveModel, isOAuthToken, {
 		serverSideFallbackEnabled: !!fallbacks?.length,
 		replayCompaction: compactionSupported,
@@ -4662,6 +4686,7 @@ function buildParams(
 		droppedThinkingBlocks,
 		harnessToolNames,
 		declaredNames: declaredToolNames(context.tools),
+		...(effectiveHarness !== undefined ? { harnessProfile: effectiveHarness } : {}),
 	});
 	const controlState = getAnthropicControlState(providerSessionState, options?.sessionId, systemBlocks, wireMessages);
 	if (controlState) syncAnthropicControlState(controlState, wireMessages);
@@ -4669,7 +4694,12 @@ function buildParams(
 	tools = planStableAnthropicTools(tools, wireMessages, controlState, model.compat.supportsMidConversationToolChanges);
 	// Anchor the stable tools+system head so it stays cached across turns; the
 	// moving message tail is anchored separately in applyPromptCaching below.
-	applyHeadCaching(systemBlocks, tools, headCacheControl, resolveHarnessProfile(model));
+	applyHeadCaching(
+		systemBlocks,
+		tools,
+		headCacheControl,
+		effectiveHarness === undefined ? resolveHarnessProfile(model) : effectiveHarness,
+	);
 	const topLevelEffort = planStableAnthropicEffort(
 		outputConfigEffort,
 		wireMessages,
@@ -4904,10 +4934,12 @@ export function convertAnthropicMessages(
 		droppedThinkingBlocks?: ReadonlySet<string>;
 		harnessToolNames?: HarnessToolNames;
 		declaredNames?: ReadonlySet<string>;
+		harnessProfile?: HarnessProfile | null;
 	},
 ): AnthropicMessageParam[] {
 	const harnessToolNames = opts?.harnessToolNames;
 	const declaredNames = opts?.declaredNames;
+	const harnessOverride = opts?.harnessProfile;
 	// Indices of params emitted from `developer` messages. After the main pass,
 	// the ones whose placement satisfies Anthropic's mid-conversation rules are
 	// upgraded from the `user` role to the authoritative `system` role.
@@ -5111,7 +5143,14 @@ export function convertAnthropicMessages(
 						to: block.to,
 					});
 				} else if (block.type === "toolCall") {
-					const replay = replayAnthropicToolCall(block, model, isOAuthToken, harnessToolNames, declaredNames);
+					const replay = replayAnthropicToolCall(
+						block,
+						model,
+						isOAuthToken,
+						harnessToolNames,
+						declaredNames,
+						harnessOverride,
+					);
 					blocks.push({
 						type: "tool_use",
 						id: block.id,

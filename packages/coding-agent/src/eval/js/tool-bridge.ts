@@ -3,6 +3,7 @@ import { toolWireSchema, validateToolArguments } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { type CodexNestedValue, codexNestedAliasForModel, codexNestedTargetEnabled } from "../../harness/codex-nested";
+import { effectiveHarnessProfile } from "../../harness/effective-profile";
 import type { ToolSession } from "../../tools";
 import { committedTodoPhases } from "../../tools/todo";
 import { ToolError } from "../../tools/tool-errors";
@@ -258,7 +259,11 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 		// messages; a bridged call would report success without taking effect.
 		throw new ToolError(`\`${name}\` cannot run through the eval bridge; call the direct \`${name}\` tool.`);
 	}
-	const codexAlias = codexNestedAliasForModel(name, options.session.getActiveModel?.());
+	const codexAlias = codexNestedAliasForModel(
+		name,
+		options.session.getActiveModel?.(),
+		effectiveHarnessProfile(options.session.settings, options.session.getActiveModel?.()),
+	);
 	if (codexAlias) {
 		if (!codexNestedTargetEnabled(options.session, codexAlias)) {
 			throw new ToolError(`Unknown tool from js runtime: ${name}`);
