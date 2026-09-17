@@ -24,6 +24,7 @@ import type {
 	ModelSpec,
 	ProviderSessionState,
 } from "@oh-my-pi/pi-ai/types";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
@@ -64,6 +65,7 @@ async function captureWireBody(
 	cacheRetention?: CacheRetention,
 	context: Context = CONTEXT,
 	model: Model<"anthropic-messages"> = MODEL,
+	harnessProfile?: HarnessProfile,
 ): Promise<MessageCreateParams> {
 	let body: MessageCreateParams | undefined;
 	const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
@@ -77,6 +79,7 @@ async function captureWireBody(
 	await streamAnthropic(model, context, {
 		apiKey: "sk-ant-api-test",
 		...(cacheRetention ? { cacheRetention } : {}),
+		...(harnessProfile ? { harnessProfile } : {}),
 		fetch: fetchMock,
 	})
 		.result()
@@ -162,6 +165,19 @@ describe("anthropic head caching (general API-key path)", () => {
 		// Only the final tool is anchored, not every tool.
 		const first = tools[0] as { cache_control?: unknown };
 		expect(first.cache_control).toBeUndefined();
+	});
+
+	it("anchors the tool definitions under the claude-code profile too", async () => {
+		const body = await captureWireBody(undefined, CONTEXT, MODEL, "claude-code");
+		const tools = body.tools ?? [];
+		expect(tools.length).toBeGreaterThan(1);
+
+		// The captured vendor client anchors system blocks only. Skipping the tool
+		// anchor re-bills the whole declaration array every turn, so the profile
+		// keeps it: cache_control is wire metadata the model never sees.
+		const last = tools[tools.length - 1] as { cache_control?: { type?: string } };
+		expect(last.cache_control?.type).toBe("ephemeral");
+		expect(countCacheBreakpoints(body)).toBeLessThanOrEqual(4);
 	});
 
 	it("preserves the moving message-tail breakpoint", async () => {
