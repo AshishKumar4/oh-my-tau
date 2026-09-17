@@ -1,7 +1,8 @@
 import type { Model } from "@oh-my-pi/pi-ai";
-import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import { $env, $flag } from "@oh-my-pi/pi-utils";
+import type { SettingPath } from "../config/settings-schema";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 
 export type EditMode = "replace" | "patch" | "hashline" | "apply_patch" | "sloppy";
 
@@ -23,8 +24,7 @@ export function normalizeEditMode(mode?: string | null): EditMode | undefined {
 }
 
 export interface EditModeSettingsLike {
-	get(key: "edit.mode"): unknown;
-	get(key: "harness.mode"): "auto" | "native" | "claude-code" | "codex";
+	get(key: SettingPath): unknown;
 	getEditVariantForModel?(model: string | undefined): EditMode | null;
 }
 

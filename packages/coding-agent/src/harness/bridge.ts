@@ -1,5 +1,6 @@
 import type { Model, Static, TSchema } from "@oh-my-pi/pi-ai";
 import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import type { SettingPath } from "../config/settings-schema";
 import { effectiveHarnessProfile } from "./effective-profile";
 
 export interface HarnessSchemaBridge<TParams, TWire extends TSchema = TSchema> {
@@ -18,7 +19,7 @@ export type HarnessBridges<TParams, TWire extends TSchema = TSchema> = Partial<
  */
 interface BridgeHost {
 	getActiveModel?: () => Model | undefined;
-	settings?: { get(path: "harness.mode"): string };
+	settings?: { get(path: SettingPath): unknown };
 }
 
 function activeBridge<TParams, TWire extends TSchema>(

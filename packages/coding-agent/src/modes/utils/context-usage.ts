@@ -5,6 +5,7 @@ import type { Tool as AiTool, Model } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import type { Skill } from "../../extensibility/skills";
+import type { SettingPath } from "../../config/settings-schema";
 import { type HarnessPrompt, servedHarnessPrompt } from "../../harness/capture";
 import { effectiveHarnessProfile } from "../../harness/effective-profile";
 import type { AgentSession } from "../../session/agent-session";
@@ -93,7 +94,7 @@ export interface NonMessageTokenSource {
 	};
 	readonly skills?: readonly Skill[];
 	readonly settings?: {
-		get(key: "skillful"): boolean;
+		get(key: SettingPath | "skillful"): unknown;
 		/** Effective settings revision; invalidates settings-backed dynamic tool metadata. */
 		readonly revision?: number;
 	};

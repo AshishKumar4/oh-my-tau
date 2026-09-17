@@ -1,9 +1,7 @@
 import type { Model } from "@oh-my-pi/pi-ai";
+import { HARNESS_PROFILES } from "@oh-my-pi/pi-catalog/compat/axes";
 import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
-import type { SettingValue } from "../config/settings-schema";
-
-/** Persisted `harness.mode` value; `auto` follows the active model's catalog profile. */
-export type HarnessMode = SettingValue<"harness.mode">;
+import type { SettingPath, SettingValue } from "../config/settings-schema";
 
 /**
  * Effective harness profile for the active model under the persisted
@@ -15,7 +13,7 @@ export type HarnessMode = SettingValue<"harness.mode">;
  *   leaves unprofiled.
  */
 export function effectiveHarnessProfile(
-	settings: { get(path: "harness.mode"): HarnessMode },
+	settings: { get(path: SettingPath): unknown },
 	model: Model | undefined,
 ): HarnessProfile | undefined {
 	if (model === undefined) return undefined;
@@ -28,5 +26,6 @@ export function effectiveHarnessProfile(
 		if (model.identity === undefined) return undefined;
 		return resolveHarnessProfile(model);
 	}
-	return mode;
+	const profile = mode as HarnessProfile;
+	return (HARNESS_PROFILES as readonly string[]).includes(profile) ? profile : undefined;
 }
