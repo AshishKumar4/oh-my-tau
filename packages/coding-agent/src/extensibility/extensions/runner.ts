@@ -14,6 +14,7 @@ import {
 	clearContextHistoryIndex,
 	getContextHistoryIndex,
 	markPerCallContextMessage,
+	restoreClonedMessageMetadata,
 	setContextHistoryIndex,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { KeyId } from "@oh-my-pi/pi-tui";
@@ -1647,6 +1648,13 @@ export class ExtensionRunner {
 		let currentMessages: AgentMessage[];
 		try {
 			currentMessages = structuredClone(messages);
+			// `structuredClone` drops symbol-keyed markers, which would make every
+			// freshly streamed message compare unequal to its source below.
+			for (let index = 0; index < currentMessages.length; index++) {
+				const message = currentMessages[index];
+				const source = messages[index];
+				if (message && source) restoreClonedMessageMetadata(message, source);
+			}
 		} catch {
 			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
 			// or ProviderPayload). Fall back to a shallow array clone — extensions should

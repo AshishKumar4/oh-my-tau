@@ -9,6 +9,7 @@ import { Type } from "@oh-my-pi/omptype/typebox";
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { MessageCreateParams } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
+import { setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -4114,6 +4115,96 @@ describe("ExtensionRunner", () => {
 				);
 			});
 			expect(cachedTexts).toEqual(["persisted user", "persisted assistant"]);
+		});
+
+		it("keeps rolling breakpoints on the tail when a context handler leaves freshly streamed messages untouched", async () => {
+			// A no-op context handler still routes every message through `structuredClone`,
+			// which cannot carry the symbol-keyed markers a live stream leaves on its
+			// blocks. Treating that loss as a rewrite marked each new assistant turn as
+			// per-call context and pinned the cacheable prefix to the last user turn, so
+			// every later tool round-trip in the turn re-sent the whole tail uncached.
+			await Bun.write(
+				path.join(extensionsDir, "passthrough.ts"),
+				`export default function(pi) { pi.on("context", async event => ({ messages: event.messages })); }`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const model = getBundledModel<"anthropic-messages">("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic model to exist");
+			const streamedToolCall = { type: "toolCall" as const, id: "call-1", name: "lookup", arguments: {} };
+			setStreamingPartialJson(streamedToolCall, "{}");
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "persisted user", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "streamed assistant" }, streamedToolCall],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: model.id,
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 2,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "lookup",
+					content: [{ type: "text", text: "tool output" }],
+					isError: false,
+					timestamp: 3,
+				},
+			];
+			const transformed = await runner.emitContext(messages);
+			let body: MessageCreateParams | undefined;
+			const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+				body = JSON.parse(String(init?.body ?? "{}")) as MessageCreateParams;
+				return new Response(
+					JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
+					{ status: 400, headers: { "Content-Type": "application/json" } },
+				);
+			}) as typeof fetch;
+
+			await streamAnthropic(
+				model,
+				{
+					systemPrompt: ["system"],
+					messages: convertToLlm(wrapSteeringForModel(transformed)),
+					tools: [
+						{
+							name: "lookup",
+							description: "Lookup a value",
+							parameters: { type: "object", properties: {}, additionalProperties: false },
+						},
+					],
+				},
+				{ apiKey: "sk-ant-api-test", fetch: fetchMock },
+			)
+				.result()
+				.catch(() => undefined);
+			if (!body) throw new Error("Expected Anthropic wire body");
+
+			const anchored = body.messages.flatMap((message, index) =>
+				Array.isArray(message.content) &&
+				message.content.some(block => "cache_control" in block && block.cache_control != null)
+					? [index]
+					: [],
+			);
+			// The two newest messages carry the rolling breakpoints, so the next request
+			// reads the streamed turn instead of paying for it again.
+			expect(anchored).toEqual([body.messages.length - 2, body.messages.length - 1]);
 		});
 	});
 });

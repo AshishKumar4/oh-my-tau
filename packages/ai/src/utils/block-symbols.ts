@@ -198,3 +198,43 @@ export function setContextHistoryIndex(message: ContextHistoryIndexCarrier, inde
 export function clearContextHistoryIndex(message: ContextHistoryIndexCarrier): void {
 	delete message[kContextHistoryIndex];
 }
+
+/**
+ * Re-applies the symbol-keyed metadata that `structuredClone` cannot carry.
+ *
+ * Every marker in this module rides on a message or content block as a symbol
+ * property, and `structuredClone` drops symbols outright. A cloned message
+ * therefore compares unequal to its source under `Bun.deepEquals` even when the
+ * outbound bytes are identical — which made per-call change detection report
+ * every freshly streamed assistant message as rewritten, truncating the
+ * Anthropic cacheable prefix at the last user turn for the rest of the turn.
+ *
+ * Own symbols are enumerated rather than listed so a new marker cannot silently
+ * fall out of the clone. Content blocks are restored positionally: the clone is
+ * structurally identical, so indices align.
+ */
+export function restoreClonedMessageMetadata(target: object, source: object): void {
+	copyOwnSymbols(target, source);
+	const targetContent = (target as { content?: unknown }).content;
+	const sourceContent = (source as { content?: unknown }).content;
+	if (!Array.isArray(targetContent) || !Array.isArray(sourceContent)) return;
+	const shared = Math.min(targetContent.length, sourceContent.length);
+	for (let index = 0; index < shared; index++) {
+		const targetBlock = targetContent[index];
+		const sourceBlock = sourceContent[index];
+		if (
+			targetBlock !== null &&
+			typeof targetBlock === "object" &&
+			sourceBlock !== null &&
+			typeof sourceBlock === "object"
+		) {
+			copyOwnSymbols(targetBlock, sourceBlock);
+		}
+	}
+}
+
+function copyOwnSymbols(target: object, source: object): void {
+	for (const symbol of Object.getOwnPropertySymbols(source)) {
+		(target as Record<symbol, unknown>)[symbol] = (source as Record<symbol, unknown>)[symbol];
+	}
+}
