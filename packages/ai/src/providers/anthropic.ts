@@ -4158,12 +4158,17 @@ function applyHeadCaching(
 ): void {
 	if (!cacheControl) return;
 
-	// The tool-definition array is anchored on every profile, including
-	// Claude Code: `cache_control` is wire metadata, invisible to the model,
-	// and skipping it (as the captured client does) re-bills ~14K tokens of
-	// declarations every turn. The vendor prompt text, names, and schemas are
-	// untouched — only the cache breakpoint placement differs.
-	if (tools && tools.length > 0 && !tools.some(tool => tool.cache_control != null)) {
+	// The captured Claude Code client anchors its identity block and its last
+	// system block, never a tool, so anchoring one here would add a declaration
+	// shape the vendor never sends (caught by the claude-code golden's
+	// declarationForms). Fidelity wins under the profile; every other path keeps
+	// the tool anchor, whose stable prefix siblings share byte for byte.
+	if (
+		harnessProfile !== "claude-code" &&
+		tools &&
+		tools.length > 0 &&
+		!tools.some(tool => tool.cache_control != null)
+	) {
 		// Deferred tools are not part of the checked prefix until referenced, so
 		// anchor the last tool that actually sits in the stable prefix.
 		for (let index = tools.length - 1; index >= 0; index--) {

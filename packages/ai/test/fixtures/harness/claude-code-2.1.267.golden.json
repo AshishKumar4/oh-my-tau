@@ -16,7 +16,7 @@
 			"inventoryCarrier": "capture \u2014 flat top-level `tools`",
 			"prefixedToolNames": "capture \u2014 declarations use the harness's own names, no transport prefix",
 			"envelope": "capture \u2014 max_tokens 64000, adaptive thinking with a display field, context_management.edits, output_config.effort, no tool_choice",
-			"declarationForms": "capture \u2014 exactly `{description, input_schema, name}`, plus omp's cache_control anchor on the last declaration (wire metadata; saves re-sending the array every turn)",
+			"declarationForms": "capture \u2014 exactly `{description, input_schema, name}`",
 			"schemaForms": "capture \u2014 JSON Schema objects carrying `$schema` (draft 2020-12), `additionalProperties` and `properties`",
 			"boundNaming": "capture \u2014 every declared name is PascalCase"
 		}
@@ -93,7 +93,6 @@
 	},
 	"ompInventory": {
 		"declarationForms": [
-			"untyped|cache_control,description,eager_input_streaming,input_schema,name",
 			"untyped|description,eager_input_streaming,input_schema,name",
 			"untyped|description,eager_input_streaming,input_schema,name,strict"
 		],
