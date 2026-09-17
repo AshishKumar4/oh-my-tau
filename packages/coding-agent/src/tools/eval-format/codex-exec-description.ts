@@ -1,7 +1,7 @@
 import { jsonSchemaToTypeScript } from "@oh-my-pi/pi-ai/utils/schema/typescript";
 import { arkToWireSchema, isArkSchema } from "@oh-my-pi/pi-ai/utils/schema/wire";
 import { prompt } from "@oh-my-pi/pi-utils";
-import { codeModeIdentifier } from "../../harness/code-mode-identifier";
+import { codeModeIdentifier } from "@oh-my-pi/pi-tui/harness/code-mode-identifier";
 import codexExecTemplate from "../../prompts/tools/eval-codex-exec.md" with { type: "text" };
 
 export interface CodexExecBridgedTool {

@@ -10,7 +10,7 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import type { ToolSession } from "../tools";
-import { ToolError } from "../tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { servedHarnessPrompt } from "./capture";
 
 /** Context handed to alias implementations that need more than a params rewrite. */

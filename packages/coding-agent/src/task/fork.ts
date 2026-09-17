@@ -10,7 +10,7 @@ import {
 	isUserTurnInitiator,
 	sanitizeRehydratedOpenAIResponsesAssistantMessage,
 } from "../session/messages";
-import { ToolError } from "../tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { ToolSession } from "../tools";
 
 /** Fork extent: `"all"` inherits the whole resolved history; `{ lastTurns: N }` keeps the last N user-message-delimited turns. */

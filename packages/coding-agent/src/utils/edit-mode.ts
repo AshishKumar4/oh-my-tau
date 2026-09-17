@@ -4,7 +4,7 @@ import { $env, $flag } from "@oh-my-pi/pi-utils";
 import type { SettingPath } from "../config/settings-schema";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
 
-export type EditMode = "replace" | "patch" | "hashline" | "apply_patch" | "sloppy";
+import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 
 export const DEFAULT_EDIT_MODE: EditMode = "hashline";
 

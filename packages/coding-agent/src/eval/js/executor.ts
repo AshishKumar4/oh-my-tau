@@ -1,6 +1,5 @@
 import { effectiveHarnessProfile } from "../../harness/effective-profile";
-import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "../../session/streaming-output";
-
+import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { ToolSession } from "../../tools";
 import { codexExecToolCatalog } from "../../harness/codex-nested";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";

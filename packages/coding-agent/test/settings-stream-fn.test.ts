@@ -53,8 +53,17 @@ describe("createSettingsAwareStreamFn", () => {
 	});
 
 	it("threads native as null and forced profiles through, preserving caller pins", () => {
-		const profiled = { api: "anthropic-messages", provider: "anthropic", id: "x", identity: { class: "anthropic" } } as unknown as Model;
-		for (const [mode, expected] of [["native", null], ["claude-code", "claude-code"], ["codex", "codex"]] as const) {
+		const profiled = {
+			api: "anthropic-messages",
+			provider: "anthropic",
+			id: "x",
+			identity: { class: "anthropic" },
+		} as unknown as Model;
+		for (const [mode, expected] of [
+			["native", null],
+			["claude-code", "claude-code"],
+			["codex", "codex"],
+		] as const) {
 			const settings = Settings.isolated({ "harness.mode": mode });
 			const { fn: base, calls } = captureBase();
 			createSettingsAwareStreamFn(settings, base)(profiled, stubContext, { apiKey: "k" });
@@ -68,7 +77,10 @@ describe("createSettingsAwareStreamFn", () => {
 		// Caller-supplied overrides win over the session mode.
 		const nativeSettings = Settings.isolated({ "harness.mode": "native" });
 		const { fn: base2, calls: calls2 } = captureBase();
-		createSettingsAwareStreamFn(nativeSettings, base2)(profiled, stubContext, { apiKey: "k", harnessProfile: "codex" });
+		createSettingsAwareStreamFn(nativeSettings, base2)(profiled, stubContext, {
+			apiKey: "k",
+			harnessProfile: "codex",
+		});
 		expect(calls2[0]?.options?.harnessProfile).toBe("codex");
 	});
 

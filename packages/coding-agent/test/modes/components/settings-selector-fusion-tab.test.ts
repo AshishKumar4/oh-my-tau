@@ -1,9 +1,11 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { SETTING_TABS, TAB_METADATA } from "@oh-my-pi/pi-coding-agent/config/settings-schema";
-import { SettingsSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/components/settings-selector";
-import type { SymbolKey } from "@oh-my-pi/pi-coding-agent/modes/theme/symbols";
-import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { SETTING_TABS, TAB_METADATA } from "@oh-my-pi/pi-tui/overlays/settings-defs";
+import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
+import { createSettingsHost } from "@oh-my-pi/pi-coding-agent/config/settings-ui";
+import { createPluginSettingsHost } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/settings-host";
+import type { SymbolKey } from "@oh-my-pi/pi-tui/theme/symbols";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
 
 beforeAll(async () => {
 	await initTheme();
@@ -48,7 +50,8 @@ function createSelector(): SettingsSelectorComponent {
 			thinkingLevel: undefined,
 			availableThemes: ["dark"],
 			providers: [],
-			cwd: process.cwd(),
+			settings: createSettingsHost(),
+			plugins: createPluginSettingsHost(process.cwd()),
 		},
 		{
 			onChange: () => {},

@@ -6,7 +6,7 @@ import { Settings } from "../src/config/settings";
 import evalCodeModeDescription from "../src/prompts/tools/eval-code-mode.md" with { type: "text" };
 import type { ToolSession } from "../src/tools";
 import { EvalTool } from "../src/tools/eval";
-import { generateCodeModeDeclarations } from "../src/tools/eval-format/code-mode-declarations";
+import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
 import { buildCodexExecDescription } from "../src/tools/eval-format/codex-exec-description";
 
 const CODEX_MODEL = buildModel({

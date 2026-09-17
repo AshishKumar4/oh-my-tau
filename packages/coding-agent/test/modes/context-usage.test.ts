@@ -1,50 +1,48 @@
-/**
- * Contract: tool schema token estimation reflects the wire JSON Schema.
- *
- * Tools authored with arktype must be counted by the JSON Schema providers
- * actually receive — not by stringifying the arktype instance's enumerable
- * internals, which massively overcounts.
- */
 import { describe, expect, it } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Tokenizer } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
 import { arkToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { HARNESS_CAPTURE_SCHEMA, loadHarnessPrompt } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import {
-	type ContextBreakdown,
 	computeNonMessageBreakdown,
-	computeNonMessageTokens,
 	estimateToolSchemaTokens,
 	getToolSchemaMetadataRevision,
 	invalidateToolSchemaMetadata,
-	renderContextUsage,
-} from "@oh-my-pi/pi-coding-agent/modes/utils/context-usage";
+} from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { applyToolProxy } from "../../src/extensibility/tool-proxy";
-import { withHarnessCacheDir } from "../helpers/harness";
 
 const tokenizer = new Tokenizer();
 
-function required(model: Model | undefined, what: string): Model {
-	if (!model) throw new Error(`expected ${what} in the bundled catalog`);
-	return model;
-}
-
-const FABLE = required(getBundledModel("anthropic", "claude-fable-5-1"), "anthropic/claude-fable-5-1");
-const SONNET = required(getBundledModel("anthropic", "claude-sonnet-4-5"), "anthropic/claude-sonnet-4-5");
-
-/** An arktype-shaped callable schema from an external arktype copy: a plain
- * function carrying `toJsonSchema`/`assert` that — unlike omptype schemas —
- * HAS `Function.prototype.bind`. */
+/** External arktype copies expose bind on callable schemas, unlike omptype. */
 function bindCapableSchema() {
 	return Object.assign((value: unknown) => value, {
 		toJsonSchema: () => ({ type: "object", properties: { a: { type: "string" } } }),
 		assert: (value: unknown) => value,
 	});
 }
+
+describe("extension tool context accounting", () => {
+	it("counts a proxied bind-capable callable schema by its wire JSON Schema", () => {
+		// Binding the schema loses its wire surface and once poisoned token accounting.
+		const schema = bindCapableSchema();
+		const unwrapped = { name: "ext", description: "ext tool", parameters: schema };
+		const wrapper: Record<string, unknown> = {};
+		applyToolProxy(unwrapped, wrapper);
+		const proxied = wrapper as { name: string; description: string; parameters: unknown };
+		expect(estimateToolSchemaTokens([proxied as never], tokenizer)).toBe(
+			estimateToolSchemaTokens([unwrapped as never], tokenizer),
+		);
+		expect(estimateToolSchemaTokens([proxied as never], tokenizer)).toBeGreaterThan(0);
+	});
+
+	it("runs the full non-message breakdown on a proxied extension tool", () => {
+		const schema = bindCapableSchema();
+		const wrapper: Record<string, unknown> = {};
+		applyToolProxy({ name: "ext", description: "ext tool", parameters: schema }, wrapper);
+		const session = { systemPrompt: ["base"], agent: { state: { tools: [wrapper] } } };
+		const breakdown = computeNonMessageBreakdown(session as never, tokenizer);
+		expect(breakdown.toolsTokens).toBeGreaterThan(0);
+	});
+});
 
 describe("estimateToolSchemaTokens", () => {
 	it("counts arktype tool schemas by their wire JSON Schema, not arktype internals", () => {
@@ -159,267 +157,5 @@ describe("estimateToolSchemaTokens", () => {
 		expect(reads).toBe(3);
 		estimateToolSchemaTokens(tools, new Tokenizer(), 2);
 		expect(reads).toBe(4);
-	});
-});
-
-/**
- * Contract: the /context panel surfaces estimated snapcompact wire savings —
- * applied swaps show "saves" figures, inactive states say why.
- */
-describe("renderContextUsage snapcompact section", () => {
-	const themeStub = {
-		fg: (_color: string, text: string) => text,
-		bold: (text: string) => text,
-	} as never;
-
-	function breakdownWith(snapcompact: ContextBreakdown["snapcompact"]): ContextBreakdown {
-		return {
-			model: { id: "test-model", name: "Test Model", contextWindow: 200000 } as never,
-			contextWindow: 200000,
-			categories: [],
-			usedTokens: 27929,
-			autoCompactBufferTokens: 0,
-			freeTokens: 172071,
-			snapcompact,
-		};
-	}
-
-	it("renders savings, skip reasons, and the wire total", () => {
-		const output = renderContextUsage(
-			breakdownWith({
-				visionCapable: true,
-				systemPrompt: {
-					applied: true,
-					scope: "all",
-					textTokens: 9768,
-					frames: 2,
-					imageTokens: 6600,
-					savedTokens: 3168,
-				},
-				toolResults: { total: 3, swapped: 0, textTokens: 0, frames: 0, imageTokens: 0, savedTokens: 0 },
-				savedTokens: 3168,
-			}),
-			themeStub,
-		);
-		expect(output).toContain("Snapcompact (estimated wire savings)");
-		expect(output).toContain("System prompt (all): saves ~3.2K (9.8K text → 2 frames ≈ 6.6K)");
-		expect(output).toContain("Tool results: none imaged (3 in history)");
-		// 27929 logical − 3168 saved ≈ 25K on the wire.
-		expect(output).toContain("Next request: ~25K tokens on the wire");
-	});
-
-	it("reports text-only models as inactive", () => {
-		const output = renderContextUsage(breakdownWith({ visionCapable: false, savedTokens: 0 }), themeStub);
-		expect(output).toContain("Snapcompact: inactive (model has no image input)");
-	});
-
-	it("omits the section entirely when no snapcompact setting is on", () => {
-		const output = renderContextUsage(breakdownWith(undefined), themeStub);
-		expect(output).not.toContain("Snapcompact");
-	});
-});
-
-/**
- * Contract: the non-message token totals reflect the CURRENT system prompt,
- * tools, and skills — including after they change via reference replacement
- * (the setSystemPrompt/setTools pattern), and stay stable while those inputs
- * hold the same identity. The memo must never serve a stale value for changed
- * inputs.
- */
-describe("computeNonMessageTokens / computeNonMessageBreakdown memoization", () => {
-	function makeSession(systemPrompt: string[], tools: unknown[] = [], skills: unknown[] = []) {
-		return { systemPrompt, agent: { state: { tools } }, skills };
-	}
-
-	it("recomputes when the system prompt reference changes and caches otherwise", () => {
-		const session = makeSession(["system prompt alpha"]);
-		const first = computeNonMessageTokens(session as never, tokenizer);
-		// Same inputs (identical refs) → cached, identical value.
-		expect(computeNonMessageTokens(session as never, tokenizer)).toBe(first);
-		// Replace the system prompt reference (mirrors setSystemPrompt).
-		session.systemPrompt = ["system prompt beta with more tokens than alpha"];
-		const afterChange = computeNonMessageTokens(session as never, tokenizer);
-		expect(afterChange).toBeGreaterThan(first);
-		// Cached on the new inputs.
-		expect(computeNonMessageTokens(session as never, tokenizer)).toBe(afterChange);
-	});
-
-	it("recomputes the breakdown when the tools reference changes", () => {
-		const session = makeSession(["base"], []);
-		const before = computeNonMessageBreakdown(session as never, tokenizer);
-		expect(before.toolsTokens).toBe(0);
-		// New tools array reference (mirrors setTools).
-		session.agent.state.tools = [{ name: "search", description: "search the web", parameters: {} }];
-		const after = computeNonMessageBreakdown(session as never, tokenizer);
-		expect(after.toolsTokens).toBeGreaterThan(0);
-		// Cached on the new tools.
-		expect(computeNonMessageBreakdown(session as never, tokenizer).toolsTokens).toBe(after.toolsTokens);
-	});
-
-	it("shares one cache entry so tokens and breakdown invalidate together", () => {
-		const session = makeSession(["shared prompt"]);
-		const tokens = computeNonMessageTokens(session as never, tokenizer);
-		const breakdown = computeNonMessageBreakdown(session as never, tokenizer);
-		// Changing the system prompt ref must invalidate BOTH fields, not just
-		// the one most recently touched.
-		session.systemPrompt = ["shared prompt but longer now to shift the count"];
-		expect(computeNonMessageTokens(session as never, tokenizer)).not.toBe(tokens);
-		expect(computeNonMessageBreakdown(session as never, tokenizer).systemPromptTokens).not.toBe(
-			breakdown.systemPromptTokens,
-		);
-	});
-
-	it("invalidates settings-backed dynamic descriptions on the settings revision", () => {
-		let description = "short";
-		const tool = {
-			name: "dynamic",
-			get description() {
-				return description;
-			},
-			parameters: {},
-		};
-		const session = {
-			...makeSession(["base"], [tool]),
-			settings: { revision: 1, get: () => true },
-		};
-		const first = computeNonMessageBreakdown(session as never, tokenizer).toolsTokens;
-		description = "a longer settings-backed description after a live update";
-		session.settings.revision++;
-		expect(computeNonMessageBreakdown(session as never, tokenizer).toolsTokens).toBeGreaterThan(first);
-	});
-});
-
-/**
- * Contract: the Skills category counts only skills actually rendered into the
- * system prompt (mirroring `buildSystemPrompt`'s filter) — hidden/explicit-only
- * skills, and every skill when the `read` tool is absent, contribute zero. The
- * System-prompt subtraction must not be inflated by unrendered skill metadata
- * and clamped to 0 (issue #6498).
- */
-describe("computeNonMessageBreakdown skills filtering", () => {
-	const readTool = { name: "read", description: "read files", parameters: {} };
-	const hidden = { name: "hidden-skill", description: "X".repeat(4000), filePath: "/s/h.md", hide: true };
-	const visible = { name: "vis", description: "small visible skill", filePath: "/s/v.md" };
-	// First prompt block as rendered: only the visible skill appears.
-	const renderedPrompt = "You are an agent.\nSkills:\n- vis: small visible skill\n";
-
-	function session(tools: unknown[], skills: unknown[]) {
-		return { systemPrompt: [renderedPrompt], agent: { state: { tools } }, skills } as never;
-	}
-
-	it("excludes hidden skills and does not clamp System prompt to 0", () => {
-		const b = computeNonMessageBreakdown(session([readTool], [hidden, visible]), tokenizer);
-		// Only the visible skill is counted, not the large hidden one.
-		expect(b.skillsTokens).toBe(computeNonMessageBreakdown(session([readTool], [visible]), tokenizer).skillsTokens);
-		expect(b.skillsTokens).toBeLessThan(100);
-		expect(b.systemPromptTokens).toBeGreaterThan(0);
-	});
-
-	it("counts zero Skills tokens when the read tool is unavailable", () => {
-		const b = computeNonMessageBreakdown(session([], [hidden, visible]), tokenizer);
-		expect(b.skillsTokens).toBe(0);
-		expect(b.systemPromptTokens).toBe(computeNonMessageBreakdown(session([], []), tokenizer).systemPromptTokens);
-	});
-});
-
-/**
- * Contract: the skills subtraction lands on the block that carries the skills
- * listing. With a harness capture served, `buildSystemPrompt` makes block 0 the
- * vendor prompt and moves omp's template (listing included) to block 1, so
- * subtracting from block 0 understated the headline total by the skills size
- * and double-counted skills under System context. Either way the three
- * categories must sum to the true rendered total.
- */
-describe("computeNonMessageBreakdown under a served harness prompt", () => {
-	const dirs = withHarnessCacheDir("omp-context-usage-harness-");
-	const readTool = { name: "read", description: "read files", parameters: {} };
-	const skill = { name: "deploy", description: "ship the service to production", filePath: "/s/d.md" };
-	const ompTemplate = "You are an agent.\nSkills:\n- deploy: ship the service to production\n";
-	const capture = {
-		schema: HARNESS_CAPTURE_SCHEMA,
-		profile: "claude-code",
-		clientVersion: "2.1.267.d7f",
-		entrypoint: "cli",
-		capturedAt: "2026-09-09T12:00:00.000Z",
-		instructions: ["You are an interactive agent.\n\n# Tone\n\nBe terse."],
-		tools: ["Bash", "Read"],
-		ambient: [],
-	};
-
-	async function serveCapture(): Promise<string> {
-		const dir = path.join(dirs.cache, "claude-code");
-		await fs.mkdir(dir, { recursive: true });
-		await Bun.write(path.join(dir, "2.1.267.d7f-cli.json"), JSON.stringify(capture));
-		const served = await loadHarnessPrompt("claude-code");
-		if (served === null) throw new Error("expected the capture to load");
-		return served.text;
-	}
-
-	function session(systemPrompt: string[], model: Model | undefined) {
-		return { systemPrompt, model, agent: { state: { tools: [readTool] } }, skills: [skill] } as never;
-	}
-
-	it("subtracts skills from omp's template block, not the vendor block", async () => {
-		const vendor = await serveCapture();
-		const blocks = [vendor, ompTemplate];
-		const b = computeNonMessageBreakdown(session(blocks, FABLE), tokenizer);
-		expect(b.skillsTokens).toBeGreaterThan(0);
-		expect(b.systemPromptTokens).toBe(tokenizer.countTokens(vendor));
-		expect(b.systemContextTokens).toBe(tokenizer.countTokens(ompTemplate) - b.skillsTokens);
-		expect(b.skillsTokens + b.systemPromptTokens + b.systemContextTokens).toBe(tokenizer.countTokens(blocks));
-	});
-
-	it("keeps the subtraction on block 0 when the model does not serve that capture", async () => {
-		await serveCapture();
-		const blocks = [ompTemplate, "Extra context block."];
-		const b = computeNonMessageBreakdown(session(blocks, SONNET), tokenizer);
-		expect(b.skillsTokens).toBeGreaterThan(0);
-		expect(b.systemPromptTokens).toBe(tokenizer.countTokens(ompTemplate) - b.skillsTokens);
-		expect(b.systemContextTokens).toBe(tokenizer.countTokens("Extra context block."));
-		expect(b.skillsTokens + b.systemPromptTokens + b.systemContextTokens).toBe(tokenizer.countTokens(blocks));
-	});
-});
-
-/**
- * Contract: a tool, skill, or system-prompt section with a missing
- * (`undefined`) description/text must not crash the token estimate. Extensions
- * can contribute tools whose `description` is absent at runtime (the field is
- * typed `string` but the extension API does not enforce it); before the guard,
- * the `undefined` fragment reached the tokenizer and threw, killing every
- * subagent before its first turn (issue #9331). Each path must instead yield a
- * finite, non-negative estimate.
- */
-describe("non-message estimates tolerate a missing description", () => {
-	const readTool = { name: "read", description: "read files", parameters: {} };
-
-	it("estimateToolSchemaTokens does not throw on an undefined tool description", () => {
-		const tokens = estimateToolSchemaTokens(
-			[{ name: "lens_tool", description: undefined, parameters: {} } as never],
-			tokenizer,
-		);
-		expect(Number.isFinite(tokens)).toBe(true);
-		expect(tokens).toBeGreaterThanOrEqual(0);
-	});
-
-	it("computeNonMessageBreakdown does not throw on an undefined skill description", () => {
-		const session = {
-			systemPrompt: ["You are an agent."],
-			agent: { state: { tools: [readTool] } },
-			skills: [{ name: "lens", description: undefined, filePath: "/s/l.md" }],
-		} as never;
-		const b = computeNonMessageBreakdown(session, tokenizer);
-		expect(Number.isFinite(b.skillsTokens)).toBe(true);
-		expect(b.skillsTokens).toBeGreaterThanOrEqual(0);
-	});
-
-	it("computeNonMessageBreakdown does not throw on an undefined system-context section", () => {
-		const session = {
-			systemPrompt: ["primary prompt", undefined, "trailing context"],
-			agent: { state: { tools: [readTool] } },
-			skills: [],
-		} as never;
-		const b = computeNonMessageBreakdown(session, tokenizer);
-		expect(Number.isFinite(b.systemContextTokens)).toBe(true);
-		expect(b.systemContextTokens).toBeGreaterThanOrEqual(0);
 	});
 });

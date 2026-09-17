@@ -10,7 +10,8 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import { getSidekickAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import * as executor from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as structured from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
-import type { AgentDefinition, SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { BUILTIN_TOOLS, createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { SidekickTool } from "@oh-my-pi/pi-coding-agent/tools/sidekick";
 import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";

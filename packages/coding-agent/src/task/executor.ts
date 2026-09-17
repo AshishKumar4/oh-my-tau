@@ -14,8 +14,8 @@ import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { ModelRegistry } from "../config/model-registry";
+import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import {
-	formatModelSelectorValue,
 	formatModelStringWithRouting,
 	resolveAgentAdvisorSelection,
 	resolveAgentPrewalkPattern,
@@ -59,13 +59,18 @@ import type { AuthStorage } from "../session/auth-storage";
 import { recordForkRequestSnapshot } from "../session/fork-context";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
-import { truncateTail } from "../session/streaming-output";
-import { type ConfiguredThinkingLevel, prewalkWouldBeNoop, resolveTaskEffortLevel, type TaskEffort } from "../thinking";
+import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import {
+	type ConfiguredThinkingLevel,
+	prewalkWouldBeNoop,
+	resolveTaskEffortLevel,
+	type TaskEffort,
+} from "@oh-my-pi/pi-tui/thinking";
 import type { ContextFileEntry, ToolSession } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
 import { isIrcEnabled } from "../tools/hub";
-import { LIST_STATUS_ORDER } from "../tools/hub/messaging";
-import { DEFAULT_HUB_LIST_LIMIT } from "../tools/hub/types";
+import { LIST_STATUS_ORDER } from "@oh-my-pi/pi-tui/tools/hub";
+import { DEFAULT_HUB_LIST_LIMIT } from "@oh-my-pi/pi-tui/tools/hub";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { ToolAbortError } from "../tools/tool-errors";
@@ -84,22 +89,25 @@ import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import {
 	type AgentDefinition,
-	type AgentProgress,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
+	TASK_SUBAGENT_EVENT_CHANNEL,
+	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+	TASK_SUBAGENT_PROGRESS_CHANNEL,
+} from "./types";
+import {
+	type AgentProgress,
 	type SingleResult,
 	type StructuredSubagentOutput,
 	type StructuredSubagentSchemaMode,
 	type StructuredSubagentSchemaSource,
-	TASK_SUBAGENT_EVENT_CHANNEL,
-	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
-	TASK_SUBAGENT_PROGRESS_CHANNEL,
 	type TaskToolDetails,
 	type YieldItem,
-} from "./types";
-import { arrayValuedLabels, assembleYieldResult } from "./yield-assembly";
+} from "@oh-my-pi/pi-tui/tools/task";
+import { arrayValuedLabels } from "./yield-assembly";
+import { assembleYieldResult } from "@oh-my-pi/pi-tui/tools/task-yield-assembly";
 
-export type { YieldItem } from "./types";
+export type { YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 
 const MCP_CALL_TIMEOUT_MS = 60_000;
 const TASK_ABORT_CLEANUP_GRACE_MS = 10_000;
@@ -3377,6 +3385,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
+	let registryAbortUnsubscribe: (() => void) | null = null;
 	let reviveSession: AgentReviver | null = null;
 	const installIrcWakeTurnMonitor = (target: AgentSession): void => {
 		attachIrcWakeTurnMonitor(target, {
@@ -3698,7 +3707,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				rules: options.rules,
 				extensionRoots: options.extensionRoots,
 				preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
-				preloadedPreparedExtensions: restrictToolNames ? [] : options.preloadedPreparedExtensions,
+				preloadedPreparedExtensions: options.preloadedPreparedExtensions,
 				preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 				systemPrompt: defaultPrompt => {
 					const ircRoster = ircEnabled
@@ -3806,7 +3815,23 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			monitor.setActiveSession(session);
 			// Run-state notifications precede deferrable wire-level `agent_end`,
 			// so adopted keep-alive lifecycle cannot get stuck during prompt unwind.
-			AgentRegistry.global().syncSessionStatus(id, session);
+			const registry = AgentRegistry.global();
+			registry.syncSessionStatus(id, session);
+			const runRef = registry.get(id);
+			if (runRef) {
+				// Agent Hub kills bypass this run's caller signal: lifecycle.release()
+				// detaches the session and publishes an `aborted` tombstone directly.
+				// Bridge that exact registry generation back into the monitor so the
+				// prompt race and owning async task job settle promptly.
+				registryAbortUnsubscribe = registry.onChange(event => {
+					if (event.type === "status_changed" && event.ref === runRef && event.ref.status === "aborted") {
+						monitor.requestAbort("signal");
+					}
+				});
+				// Close the subscribe-after-read race with a kill that landed while
+				// createAgentSession was returning.
+				if (runRef.status === "aborted") monitor.requestAbort("signal");
+			}
 			if (sessionFile !== null) {
 				// Lifecycle reviver: park closed the JSONL writer, so reopening takes
 				// the single-writer lock cleanly and restores the full message history
@@ -4071,6 +4096,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
 					});
 				}
+			}
+			if (registryAbortUnsubscribe) {
+				registryAbortUnsubscribe();
+				registryAbortUnsubscribe = null;
 			}
 			if (unsubscribe) {
 				try {

@@ -5,7 +5,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/harness/code-mode-identifier";
 import { createMCPToolName } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/builtin-names";
-import { generateCodeModeDeclarations } from "@oh-my-pi/pi-coding-agent/tools/eval-format/code-mode-declarations";
+import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
 
 function vendorNormalizeIdentifier(toolKey: string): string {
 	let identifier = "";

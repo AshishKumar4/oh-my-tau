@@ -31,9 +31,9 @@ import { type AgentRef, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { getSidekickAgent } from "../task/agents";
 import { runSubagentFollowUpTurn } from "../task/executor";
 import { runStructuredSubagent, StructuredSubagentError } from "../task/structured-subagent";
-import type { AgentProgress, SingleResult } from "../task/types";
+import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "./index";
-import { ToolError } from "./tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 /**
  * Longest a blocking handoff waits inside one tool call. A handoff that

@@ -1,17 +1,12 @@
 import * as path from "node:path";
 import { type SummaryResult, summarizeCode } from "@oh-my-pi/pi-natives";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
-import { isMarkdownPath } from "../modes/theme/theme";
+import { isMarkdownPath } from "@oh-my-pi/pi-tui/theme";
 import type { ClientBridge } from "../session/client-bridge";
 import type { ToolSession } from "../sdk";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
-import {
-	canMergeBracePair,
-	countTextLines,
-	type ElidedRange,
-	formatMergedBraceLine,
-	formatSingleLine,
-} from "./read-format";
+import type { ElidedRange } from "@oh-my-pi/pi-tui/tools/read";
+import { canMergeBracePair, countTextLines, formatMergedBraceLine, formatSingleLine } from "./read-format";
 import { throwIfAborted } from "./tool-errors";
 
 // Per-session memo for tree-sitter summaries. `summarizeCode` is a pure function

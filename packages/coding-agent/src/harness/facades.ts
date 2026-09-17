@@ -16,8 +16,8 @@ import codexSendMessage from "../prompts/tools/harness/codex-send-message.md" wi
 import codexSpawnAgent from "../prompts/tools/harness/codex-spawn-agent.md" with { type: "text" };
 import codexWaitAgent from "../prompts/tools/harness/codex-wait-agent.md" with { type: "text" };
 import codexWait from "../prompts/tools/harness/codex-wait.md" with { type: "text" };
-import type { TaskEffort } from "../thinking";
-import { ToolError } from "../tools/tool-errors";
+import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { HarnessFacadeSpec } from "./facade";
 import { CODEX_COLLABORATION_NAMESPACE } from "./manifest";
 

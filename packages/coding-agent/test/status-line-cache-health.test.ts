@@ -3,10 +3,11 @@ import { stripVTControlCharacters } from "node:util";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { createGallerySession } from "@oh-my-pi/pi-coding-agent/cli/gallery-fixtures/preview-session";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line/component";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { StatusLineTestComponents } from "./helpers/status-line";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 
 const statusLines = new StatusLineTestComponents();
 
@@ -50,7 +51,7 @@ function sessionWithTurns(turns: Array<[number, number, number]>): AgentSession 
 }
 
 function topBorder(session: AgentSession, width: number): string {
-	const component = statusLines.track(new StatusLineComponent(session));
+	const component = statusLines.track(new StatusLineComponent(session, statusLineHost));
 	component.updateSettings({
 		preset: "custom",
 		leftSegments: ["model"],

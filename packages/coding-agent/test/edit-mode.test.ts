@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { type Model } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { resolveEditMode, type EditMode, type EditModeSessionLike } from "../src/utils/edit-mode";
+import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
+import { type EditModeSessionLike, resolveEditMode } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
 
 const originalEditVariant = Bun.env.PI_EDIT_VARIANT;
 const originalStrictEditMode = Bun.env.PI_STRICT_EDIT_MODE;
@@ -29,7 +30,10 @@ function createSession(args: {
 		getActiveModelString: () => args.activeModel,
 		getActiveModel: () => args.activeModelObject,
 		settings: {
-			get: ((key: string) => (key === "harness.mode" ? "auto" : (args.settingsMode ?? "hashline"))) as EditModeSessionLike["settings"]["get"],
+			get: ((key: string) =>
+				key === "harness.mode"
+					? "auto"
+					: (args.settingsMode ?? "hashline")) as EditModeSessionLike["settings"]["get"],
 			getEditVariantForModel: () => args.modelVariant ?? null,
 		},
 	};

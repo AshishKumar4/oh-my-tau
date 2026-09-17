@@ -11,7 +11,7 @@ import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { forkMessages } from "@oh-my-pi/pi-coding-agent/task/fork";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { ToolError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 function user(text: string): UserMessage {
 	return { role: "user", content: text, timestamp: Date.now() };
