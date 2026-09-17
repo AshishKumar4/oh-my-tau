@@ -4,7 +4,7 @@ import type * as MnemopiNs from "@oh-my-pi/pi-mnemopi";
 import type { Mnemopi, RecallResult } from "@oh-my-pi/pi-mnemopi";
 import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
-import { logger, toError } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, toError } from "@oh-my-pi/pi-utils";
 import {
 	composeRecallQuery,
 	formatCurrentTime,
@@ -20,6 +20,16 @@ import { redactMemorySecrets, redactRememberWrite } from "../memory-backend/reda
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { MnemopiBackendConfig, MnemopiScoping } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
+
+/**
+ * Journal entry holding the recall block this session injected.
+ *
+ * Recall is a once-per-session injection, so a resumed session must replay the
+ * original text rather than query again: the block is the last system block,
+ * which is where the provider anchors its head cache, so any change there
+ * invalidates the cached prefix and re-bills the whole conversation.
+ */
+export const MNEMOPI_RECALL_ENTRY_TYPE = "mnemopi_recall";
 
 // The mnemopi package pulls the embeddings stack; keep it off the CLI startup
 // module graph by loading it lazily at the async boundaries that need it.
@@ -478,11 +488,44 @@ export class MnemopiSessionState {
 		return formatRecallBlock(results);
 	}
 
+	/**
+	 * Reuse the block this session already recalled, if any.
+	 *
+	 * Recall is a once-per-session injection, but a resumed session rebuilds its
+	 * system prompt in a fresh process, so without this replay every `--resume`
+	 * re-queries memory and appends a different trailing system block. That block
+	 * is the one the provider's head cache anchor lands on, so a changed byte
+	 * there invalidates the cached prefix and the whole conversation is re-billed
+	 * as cache writes on every turn (measured: 87.6% -> 98.6% hit rate and a 22x
+	 * drop in cache writes across three resumed turns once the block holds still).
+	 */
+	#persistedRecallBlock(): string | undefined {
+		for (const entry of this.session.sessionManager.getBranch()) {
+			if (entry.type !== "custom" || entry.customType !== MNEMOPI_RECALL_ENTRY_TYPE) continue;
+			if (!isRecord(entry.data)) continue;
+			const { block } = entry.data;
+			if (typeof block === "string" && block.length > 0) return block;
+		}
+		return undefined;
+	}
+
 	async beforeAgentStartPrompt(promptText: string): Promise<MemoryPromptPreparation | undefined> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return undefined;
 		const latestPrompt = promptText.trim();
 		if (!latestPrompt) return undefined;
 		const generation = ++this.#recallGeneration;
+		const replayed = this.#persistedRecallBlock();
+		if (replayed) {
+			return {
+				context: replayed,
+				commit: () => {
+					if (this.#recallGeneration !== generation) return false;
+					this.hasRecalledForFirstTurn = true;
+					this.lastRecallSnippet = replayed;
+					return true;
+				},
+			};
+		}
 		const history = extractMessages(this.session.sessionManager);
 		const queryMessages = [...history, { role: "user" as const, content: latestPrompt }];
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
@@ -493,7 +536,10 @@ export class MnemopiSessionState {
 			commit: () => {
 				if (this.#recallGeneration !== generation) return false;
 				this.hasRecalledForFirstTurn = true;
-				if (context) this.lastRecallSnippet = context;
+				if (context) {
+					this.lastRecallSnippet = context;
+					this.session.sessionManager.appendCustomEntry(MNEMOPI_RECALL_ENTRY_TYPE, { block: context });
+				}
 				return true;
 			},
 		};
@@ -614,6 +660,18 @@ export class MnemopiSessionState {
 	async maybeRecallOnAgentStart(): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
 		const generation = this.#recallGeneration;
+		const replayed = this.#persistedRecallBlock();
+		if (replayed) {
+			this.hasRecalledForFirstTurn = true;
+			this.lastRecallSnippet = replayed;
+			try {
+				await this.session.refreshBaseSystemPrompt();
+			} catch (error) {
+				if (this.config.debug)
+					logger.debug("Mnemopi: prompt refresh after recall replay failed", { error: String(error) });
+			}
+			return;
+		}
 		const messages = extractMessages(this.session.sessionManager);
 		const lastUser = messages.findLast(message => message.role === "user");
 		if (!lastUser) return;
@@ -635,6 +693,7 @@ export class MnemopiSessionState {
 		this.hasRecalledForFirstTurn = true;
 		if (!context) return;
 		this.lastRecallSnippet = context;
+		this.session.sessionManager.appendCustomEntry(MNEMOPI_RECALL_ENTRY_TYPE, { block: context });
 		try {
 			await this.session.refreshBaseSystemPrompt();
 		} catch (error) {

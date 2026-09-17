@@ -184,6 +184,8 @@ function registerMnemopiState(
 			} as never,
 			sessionManager: {
 				getEntries: options.entries ?? (() => []),
+				getBranch: options.entries ?? (() => []),
+				appendCustomEntry: () => "entry",
 				getCwd: () => options.cwd ?? "/tmp",
 			} as never,
 			emitNotice: () => {},
