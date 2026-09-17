@@ -1041,7 +1041,16 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const hasSkillUriAccess = hasSkillReader && skills.length > 0;
 	const filteredSkills = hasSkillReader ? skills.filter(skill => skill.hide !== true) : [];
 
-	const harnessPromptText = harnessPrompt?.text;
+	// The bundled pi prompt carries a `{{cwd}}` placeholder — the one
+	// per-environment scalar its vendor prompt injects — while recorded
+	// captures arrive fully materialized. Render only when the placeholder is
+	// literally present so capture text passes through byte-identical.
+	const harnessPromptText =
+		harnessPrompt?.text === undefined
+			? undefined
+			: harnessPrompt.text.includes("{{cwd}}")
+				? prompt.render(harnessPrompt.text, { cwd: promptCwd })
+				: harnessPrompt.text;
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,
 		resolvedAppendPrompt,

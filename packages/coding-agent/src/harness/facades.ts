@@ -319,17 +319,23 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 	CODEX_WAIT,
 ];
 
+// pi has no built-in subagent or multi-agent surface to facade; every omp
+// tool the profile does not rename keeps its native name.
 const FACADES: Readonly<Record<HarnessProfile, readonly HarnessFacadeSpec[]>> = {
 	"claude-code": CLAUDE_CODE_FACADES,
 	codex: CODEX_FACADES,
+	pi: [],
 };
 
 export function harnessFacadeSpecs(profile: HarnessProfile): readonly HarnessFacadeSpec[] {
 	return FACADES[profile];
 }
 
-/** The facade each profile waits on one background job with (`hub` `op:"wait"` + `ids`). */
-export const HARNESS_JOB_WAIT_FACADE: Readonly<Record<HarnessProfile, HarnessFacadeSpec>> = {
+/**
+ * The facade each profile waits on one background job with (`hub` `op:"wait"`
+ * + `ids`). Profiles without a wait facade (pi) fall back to `hub` itself.
+ */
+export const HARNESS_JOB_WAIT_FACADE: Partial<Readonly<Record<HarnessProfile, HarnessFacadeSpec>>> = {
 	"claude-code": CLAUDE_CODE_TASK_OUTPUT,
 	codex: CODEX_WAIT,
 };

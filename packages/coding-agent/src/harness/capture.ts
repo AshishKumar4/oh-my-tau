@@ -10,12 +10,19 @@ import {
 import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { getHarnessCacheDir, isEnoent, isRecord, logger } from "@oh-my-pi/pi-utils";
+// pi system prompt adapted for OMP from the MIT-licensed pi coding agent
+// (https://github.com/earendil-works/pi), Copyright (c) 2025 Mario Zechner.
+// See THIRD-PARTY-NOTICES.txt.
+import bundledPiPrompt from "../prompts/harness/pi.md" with { type: "text" };
 
 export const HARNESS_CAPTURE_SCHEMA = 1;
 
+// `pi` is never recorded — its prompt ships bundled, not captured — but the
+// table keys every profile so a stray hand-placed capture is still rejected.
 const HARNESS_ENTRYPOINTS: Readonly<Record<HarnessProfile, readonly string[]>> = {
 	"claude-code": [claudeCodeEntrypoint],
 	codex: ["codex_exec"],
+	pi: [],
 };
 
 interface WireOwnedLeading {
@@ -31,6 +38,7 @@ const WIRE_OWNED_LEADING: Readonly<Record<HarnessProfile, WireOwnedLeading>> = {
 		identityBlock: true,
 	},
 	codex: { linePrefixes: [], lines: [], identityBlock: false },
+	pi: { linePrefixes: [], lines: [], identityBlock: false },
 };
 
 export const AMBIENT_CONTAINMENT_MIN_CHARS = 64;
@@ -189,6 +197,19 @@ const resolvedPrompts = new Map<string, Promise<HarnessPrompt | null>>();
 const servedPrompts = new Map<string, HarnessPrompt>();
 
 /**
+ * pi's prompt ships in the binary rather than in a recorded capture: pi is a
+ * local open-source harness whose system prompt is a small static skeleton,
+ * so there is nothing to fingerprint and record. The bundled file carries a
+ * `{{cwd}}` placeholder (the one per-environment scalar pi injects) rendered
+ * at build time; serving shares the capture pipeline's cache and served maps
+ * so downstream consumers (`servedHarnessPrompt`, vendor tool declarations)
+ * are unchanged.
+ */
+const BUNDLED_PROMPTS: Partial<Readonly<Record<HarnessProfile, string>>> = {
+	pi: bundledPiPrompt.trim(),
+};
+
+/**
  * Callers hand over anything from a bare catalog id to a `provider/id`
  * selector, and a capture records whatever the vendor client sent. Compare the
  * trailing segment so the two always meet, instead of missing silently and
@@ -204,16 +225,31 @@ function promptCacheKey(profile: HarnessProfile, modelId: string | undefined): s
 	return `${profile}\u0000${normalizeModelKey(modelId) ?? ""}`;
 }
 
+/**
+ * The prompt `profile` serves as block 0. Recorded profiles read the newest
+ * valid capture (exact-model first, then profile-wide); a bundled profile
+ * skips the capture directory entirely — its text ships with the binary.
+ */
 export function loadHarnessPrompt(profile: HarnessProfile, modelId?: string): Promise<HarnessPrompt | null> {
 	const key = promptCacheKey(profile, modelId);
 	const cached = resolvedPrompts.get(key);
 	if (cached) return cached;
-	const pending = readHarnessPrompt(profile, normalizeModelKey(modelId)).then(prompt => {
+	const bundled = BUNDLED_PROMPTS[profile];
+	const pending =
+		bundled === undefined
+			? readHarnessPrompt(profile, normalizeModelKey(modelId))
+			: Promise.resolve<HarnessPrompt | null>({
+					text: bundled,
+					clientVersion: "bundled",
+					path: `bundled:${profile}`,
+					tools: {},
+				});
+	const tracked = pending.then(prompt => {
 		if (prompt !== null) servedPrompts.set(key, prompt);
 		return prompt;
 	});
-	resolvedPrompts.set(key, pending);
-	return pending;
+	resolvedPrompts.set(key, tracked);
+	return tracked;
 }
 
 export function servedHarnessPrompt(

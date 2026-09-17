@@ -685,7 +685,7 @@ export const SETTINGS_SCHEMA = {
 
 	"harness.mode": {
 		type: "enum",
-		values: ["auto", "native", "claude-code", "codex"] as const,
+		values: ["auto", "native", "claude-code", "codex", "pi"] as const,
 		default: "auto",
 		ui: {
 			tab: "model",
@@ -713,6 +713,11 @@ export const SETTINGS_SCHEMA = {
 					value: "codex",
 					label: "Codex",
 					description: "Apply the Codex surface (renames, facades, prompt) to any model",
+				},
+				{
+					value: "pi",
+					label: "Pi",
+					description: "Apply the pi surface (lowercase renames, bundled prompt) to any model",
 				},
 			],
 		},

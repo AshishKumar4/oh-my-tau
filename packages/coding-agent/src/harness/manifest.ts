@@ -35,9 +35,21 @@ const CODEX_BINDINGS: Readonly<Record<string, HarnessToolBinding>> = {
 	ask: { wireName: "request_user_input" },
 };
 
+/**
+ * pi's built-ins are all lowercase; omp's file-search tool answers to pi's
+ * `find`. pi's `ls` and `powershell` have no omp equivalent and stay
+ * unbound; every other omp tool that shares pi's vocabulary keeps its own
+ * name, which an omitted binding already expresses — so the table lists
+ * only the one true rename.
+ */
+const PI_BINDINGS: Readonly<Record<string, HarnessToolBinding>> = {
+	glob: { wireName: "find" },
+};
+
 const MANIFESTS: Readonly<Record<HarnessProfile, Readonly<Record<string, HarnessToolBinding>>>> = {
 	"claude-code": CLAUDE_CODE_BINDINGS,
 	codex: CODEX_BINDINGS,
+	pi: PI_BINDINGS,
 };
 
 export function harnessToolBinding(
@@ -58,6 +70,7 @@ function collectWireRenames(bindings: Readonly<Record<string, HarnessToolBinding
 const WIRE_RENAMES: Readonly<Record<HarnessProfile, Readonly<Record<string, string>>>> = {
 	"claude-code": collectWireRenames(CLAUDE_CODE_BINDINGS),
 	codex: collectWireRenames(CODEX_BINDINGS),
+	pi: collectWireRenames(PI_BINDINGS),
 };
 
 export function harnessWireRenames(profile: HarnessProfile): Readonly<Record<string, string>> {

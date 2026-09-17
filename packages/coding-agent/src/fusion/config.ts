@@ -25,6 +25,7 @@ export const SIDEKICK_TOOL_NAME = "sidekick";
 const LEAD_IDENTITY_BY_PROFILE: Readonly<Record<HarnessProfile, string>> = {
 	"claude-code": "Claude Code",
 	codex: "Codex",
+	pi: "Pi",
 };
 
 /** Template data the lead prompt and the `sidekick` tool description render their slots from. */
@@ -46,7 +47,10 @@ export function buildFusionPromptData(options: {
 	const hubRef = toolRefs.hub ?? "hub";
 	return {
 		sidekickTool: toolRefs[SIDEKICK_TOOL_NAME] ?? SIDEKICK_TOOL_NAME,
-		readTool: profile === undefined ? hubRef : HARNESS_JOB_WAIT_FACADE[profile].wireName,
+		readTool:
+			profile === undefined || HARNESS_JOB_WAIT_FACADE[profile] === undefined
+				? hubRef
+				: HARNESS_JOB_WAIT_FACADE[profile]!.wireName,
 		leadIdentity: profile === undefined ? "assistant" : LEAD_IDENTITY_BY_PROFILE[profile],
 		gptLead: profile === "codex",
 	};

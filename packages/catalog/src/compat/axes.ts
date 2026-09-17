@@ -54,7 +54,12 @@ export const EFFORT_TIERS: readonly string[] = [...EFFORTS, "off"];
  */
 export const DELEGATION_BIASES = ["eager", "restrained", "gated"] as const;
 
-export const HARNESS_PROFILES = ["claude-code", "codex"] as const;
+/**
+ * Harness surfaces a session can emulate. `claude-code` and `codex` may also
+ * be assigned from KDL rules; `pi` is forced-only — no model line is
+ * post-trained on it, so no rule carries the directive.
+ */
+export const HARNESS_PROFILES = ["claude-code", "codex", "pi"] as const;
 const THINKING_MODES = [
 	"effort",
 	"budget",
