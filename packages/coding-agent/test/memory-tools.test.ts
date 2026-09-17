@@ -22,6 +22,7 @@ import {
 	getMnemopiSessionState,
 	loadMnemopi,
 	loadMnemopiCore,
+	MNEMOPI_RECALL_ENTRY_TYPE,
 	MnemopiSessionState,
 	setMnemopiSessionState,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
@@ -159,6 +160,7 @@ interface RegisterMnemopiStateOptions {
 	cwd?: string;
 	sessionId?: string;
 	entries?: () => unknown[];
+	appendCustomEntry?: (customType: string, data?: unknown) => string;
 	listeners?: Set<AgentSessionEventListener>;
 }
 
@@ -185,7 +187,7 @@ function registerMnemopiState(
 			sessionManager: {
 				getEntries: options.entries ?? (() => []),
 				getBranch: options.entries ?? (() => []),
-				appendCustomEntry: () => "entry",
+				appendCustomEntry: options.appendCustomEntry ?? (() => "entry"),
 				getCwd: () => options.cwd ?? "/tmp",
 			} as never,
 			emitNotice: () => {},
@@ -1444,6 +1446,57 @@ describe("recall.execute", () => {
 
 		const tool = MemoryRecallTool.createIf(makeSession(settings))!;
 		await expect(tool.execute("call-5", { query: "anything" })).rejects.toThrow(/HTTP 503/);
+	});
+});
+
+describe("mnemopi recall injection across a resume", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+		registeredMnemopiState = undefined;
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await registeredMnemopiState?.dispose();
+		registeredMnemopiState = undefined;
+	});
+
+	it("replays the journaled block instead of recalling again", async () => {
+		const block =
+			"<memories>\nFacts recalled from your long-term memory. Current time: 2026-09-17 21:27 UTC\n\n- prior fact\n</memories>";
+		const state = registerMnemopiState(undefined, {
+			entries: () => [{ type: "custom", customType: MNEMOPI_RECALL_ENTRY_TYPE, data: { block } }],
+		});
+		// A resumed process must not re-query: a fresh block would carry a new
+		// timestamp, and it occupies the last system block the provider anchors
+		// its head cache on, so the whole conversation loses its cached prefix.
+		const queried = vi.spyOn(state, "recallForContext");
+
+		const prepared = await state.beforeAgentStartPrompt("what did we decide?");
+
+		expect(prepared?.context).toBe(block);
+		expect(queried).not.toHaveBeenCalled();
+		expect(prepared?.commit?.()).toBe(true);
+		expect(state.hasRecalledForFirstTurn).toBe(true);
+	});
+
+	it("journals the first recall so later turns can reproduce it", async () => {
+		const persisted: Array<{ customType: string; data?: unknown }> = [];
+		const state = registerMnemopiState(undefined, {
+			appendCustomEntry: (customType: string, data?: unknown) => {
+				persisted.push({ customType, data });
+				return "entry";
+			},
+		});
+		const block = "<memories>\nfresh recall\n</memories>";
+		vi.spyOn(state, "recallForContext").mockResolvedValue(block);
+
+		const prepared = await state.beforeAgentStartPrompt("first question");
+		expect(prepared?.context).toBe(block);
+		expect(persisted).toEqual([]);
+
+		expect(prepared?.commit?.()).toBe(true);
+		expect(persisted).toEqual([{ customType: MNEMOPI_RECALL_ENTRY_TYPE, data: { block } }]);
 	});
 });
 
