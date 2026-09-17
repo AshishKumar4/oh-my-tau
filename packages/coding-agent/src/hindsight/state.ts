@@ -1,4 +1,5 @@
 import { logger } from "@oh-my-pi/pi-utils";
+import { journalRecall, readJournaledRecall } from "../memory-backend/recall-journal";
 import type { MemoryPromptPreparation } from "../memory-backend/types";
 import type { AgentSession } from "../session/agent-session";
 import { type BankScope, ensureBankExists } from "./bank";
@@ -438,6 +439,18 @@ export class HindsightSessionState {
 		const latestPrompt = promptText.trim();
 		if (!latestPrompt) return undefined;
 		const generation = ++this.#recallGeneration;
+		const replayed = readJournaledRecall(this.session.sessionManager, "hindsight");
+		if (replayed) {
+			return {
+				context: replayed,
+				commit: () => {
+					if (this.#recallGeneration !== generation) return false;
+					this.hasRecalledForFirstTurn = true;
+					this.lastRecallSnippet = replayed;
+					return true;
+				},
+			};
+		}
 
 		const history = extractMessages(this.session.sessionManager);
 		const queryMessages = [...history, { role: "user" as const, content: latestPrompt }];
@@ -451,7 +464,10 @@ export class HindsightSessionState {
 			commit: () => {
 				if (this.#recallGeneration !== generation) return false;
 				this.hasRecalledForFirstTurn = true;
-				if (context) this.lastRecallSnippet = context;
+				if (context) {
+					this.lastRecallSnippet = context;
+					journalRecall(this.session.sessionManager, "hindsight", context);
+				}
 				return true;
 			},
 		};

@@ -15,6 +15,7 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import type { HindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
+import { RECALL_JOURNAL_ENTRY_TYPE } from "@oh-my-pi/pi-coding-agent/memory-backend/recall-journal";
 import { mnemopiBackend } from "@oh-my-pi/pi-coding-agent/mnemopi/backend";
 import { loadMnemopiConfig, type MnemopiBackendConfig } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
 import {
@@ -22,7 +23,6 @@ import {
 	getMnemopiSessionState,
 	loadMnemopi,
 	loadMnemopiCore,
-	MNEMOPI_RECALL_ENTRY_TYPE,
 	MnemopiSessionState,
 	setMnemopiSessionState,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
@@ -1465,7 +1465,9 @@ describe("mnemopi recall injection across a resume", () => {
 		const block =
 			"<memories>\nFacts recalled from your long-term memory. Current time: 2026-09-17 21:27 UTC\n\n- prior fact\n</memories>";
 		const state = registerMnemopiState(undefined, {
-			entries: () => [{ type: "custom", customType: MNEMOPI_RECALL_ENTRY_TYPE, data: { block } }],
+			entries: () => [
+				{ type: "custom", customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "mnemopi", block } },
+			],
 		});
 		// A resumed process must not re-query: a fresh block would carry a new
 		// timestamp, and it occupies the last system block the provider anchors
@@ -1496,7 +1498,45 @@ describe("mnemopi recall injection across a resume", () => {
 		expect(persisted).toEqual([]);
 
 		expect(prepared?.commit?.()).toBe(true);
-		expect(persisted).toEqual([{ customType: MNEMOPI_RECALL_ENTRY_TYPE, data: { block } }]);
+		expect(persisted).toEqual([{ customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "mnemopi", block } }]);
+	});
+
+	it("recalls again after a reset boundary rather than replaying pre-clear text", async () => {
+		// `/clear` clears the recall-once flag, so the next turn must query.
+		const state = registerMnemopiState(undefined, {
+			entries: () => [
+				{
+					type: "custom",
+					customType: RECALL_JOURNAL_ENTRY_TYPE,
+					data: { backend: "mnemopi", block: "<memories>\nstale\n</memories>" },
+				},
+				{ type: "reset_boundary" },
+			],
+		});
+		const fresh = "<memories>\nafter clear\n</memories>";
+		vi.spyOn(state, "recallForContext").mockResolvedValue(fresh);
+
+		const prepared = await state.beforeAgentStartPrompt("new question");
+
+		expect(prepared?.context).toBe(fresh);
+	});
+
+	it("ignores a block another backend journaled", async () => {
+		const state = registerMnemopiState(undefined, {
+			entries: () => [
+				{
+					type: "custom",
+					customType: RECALL_JOURNAL_ENTRY_TYPE,
+					data: { backend: "hindsight", block: "<memories>\nother backend\n</memories>" },
+				},
+			],
+		});
+		const own = "<memories>\nown recall\n</memories>";
+		vi.spyOn(state, "recallForContext").mockResolvedValue(own);
+
+		const prepared = await state.beforeAgentStartPrompt("question");
+
+		expect(prepared?.context).toBe(own);
 	});
 });
 
