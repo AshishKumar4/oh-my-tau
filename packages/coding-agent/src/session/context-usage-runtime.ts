@@ -66,8 +66,25 @@ export function computeSessionContextBreakdown(
 			});
 		}
 	}
+	// Read each member off the live session. Spreading it (`{ ...session }`)
+	// copies own enumerable properties only, so every class-body getter and
+	// method is dropped: `messages`, `systemPrompt` and `skills` arrive
+	// undefined and `getContextBreakdown` disappears, which silently demotes
+	// this to a local estimate over an empty conversation.
 	return computeContextBreakdown(
-		{ ...session, model: session.model, vendorPromptRef: sessionVendorPromptRef(session) },
+		{
+			model: session.model,
+			vendorPromptRef: sessionVendorPromptRef(session),
+			agent: session.agent,
+			messages: session.messages,
+			systemPrompt: session.systemPrompt,
+			skills: session.skills,
+			settings: session.settings,
+			// Bind rather than wrap: a duck-typed session without the method must
+			// stay absent here, or the local-estimate branch is never taken and
+			// the call throws instead.
+			getContextBreakdown: session.getContextBreakdown?.bind(session),
+		},
 		{
 			compaction: session.settings.getGroup("compaction"),
 			sourceRevision: session.settings.revision,
