@@ -251,6 +251,37 @@ describe("AgentSession extension history rewrite", () => {
 			expect(end.type === "auto_compaction_end" && end.errorMessage).toBeUndefined();
 		});
 
+		it("keeps context accounting honest when no usage anchor survives the rewrite", async () => {
+			// Every recent turn aborted (a provider outage), so no assistant usage
+			// can anchor accounting. The rewrite then lands with nothing to correct
+			// and the gauge must still price the live history it is about to send,
+			// not report an empty conversation.
+			const { toolResultId } = seedToolTurn(90_000);
+			hookAnswer = () => prunedToolResult(toolResultId);
+			mockNativeSummary();
+
+			await triggerThreshold(190_000);
+
+			const aborted = {
+				role: "assistant" as const,
+				content: [{ type: "text" as const, text: "" }],
+				api: "anthropic-messages" as const,
+				provider: "anthropic" as const,
+				model: "claude-sonnet-4-5",
+				stopReason: "aborted" as const,
+				usage: undefined,
+				timestamp: Date.now(),
+			};
+			session.agent.emitExternalEvent({ type: "message_end", message: aborted });
+			await session.waitForIdle();
+
+			const breakdown = session.getContextBreakdown();
+			expect(breakdown).toBeDefined();
+			expect(session.agent.state.messages.length).toBeGreaterThan(0);
+			// Unanchored is fine; reporting the conversation as weightless is not.
+			expect(breakdown && breakdown.messagesTokens).toBeGreaterThan(0);
+		});
+
 		it("runs the configured method natively when the rewrite stops short of the band", async () => {
 			const { toolResultId, userId } = seedToolTurn(20_000);
 			hookAnswer = () => prunedToolResult(toolResultId);
