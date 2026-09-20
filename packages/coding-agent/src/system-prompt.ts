@@ -40,7 +40,8 @@ import projectPromptTemplate from "./prompts/system/project-prompt.md" with { ty
 import xdevDevicesTemplate from "./prompts/system/xdev-devices.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
 import { normalizeConcurrencyLimit } from "./task/parallel";
-import { type ActiveRepoContext, resolveActiveRepoContext } from "./utils/active-repo-context";
+import type { ActiveRepoContext } from "@oh-my-pi/pi-tui/status-line/host";
+import { resolveActiveRepoContext } from "./utils/active-repo-context";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 

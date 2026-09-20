@@ -54,7 +54,6 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
-const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const BASH_APPROVAL_SHELL_CONTROL_CHARS: Record<string, true> = {
 	"\n": true,
 	"\r": true,
@@ -307,7 +306,6 @@ const BASH_TIMEOUT_DESCRIPTION = `timeout in seconds; 0 disables the command dea
 
 const bashSchemaBase = type({
 	command: type("string").describe("command to execute"),
-	"env?": type({ "[string]": "string" }).describe("extra env vars"),
 	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
 	"cwd?": type("string").describe("working directory"),
 	"pty?": type("boolean").describe("run in pty mode"),
@@ -315,7 +313,6 @@ const bashSchemaBase = type({
 
 const bashSchemaWithAsync = type({
 	command: "string",
-	"env?": { "[string]": "string" },
 	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
 	"cwd?": "string",
 	"pty?": "boolean",
@@ -356,7 +353,6 @@ const BASH_BRIDGES: HarnessBridges<BashToolInput, typeof claudeCodeBashSchema> =
 
 export interface BashToolInput {
 	command: string;
-	env?: Record<string, string>;
 	timeout?: number;
 	cwd?: string;
 
@@ -422,18 +418,6 @@ class TerminalSnapshotDecoder {
 		const batches = await Promise.all([...this.#retiredImages, this.#decoder.images()]);
 		return { text, images: batches.flat() };
 	}
-}
-
-function normalizeBashEnv(env: Record<string, string> | undefined): Record<string, string> | undefined {
-	if (!env || Object.keys(env).length === 0) return undefined;
-	const normalized: Record<string, string> = {};
-	for (const [key, value] of Object.entries(env)) {
-		if (!BASH_ENV_NAME_PATTERN.test(key)) {
-			throw new ToolError(`Invalid bash env name: ${key}`);
-		}
-		normalized[key] = value;
-	}
-	return normalized;
 }
 
 function formatTimeoutClampNotice(
@@ -776,8 +760,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		timeoutSec: number | undefined;
 		requestedTimeoutSec?: number;
 		notices?: readonly string[];
-
-		resolvedEnv?: Record<string, string>;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		forwardUpdates: boolean;
 	}): ManagedBashJobHandle {
@@ -805,7 +787,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
 						timeout: options.timeoutMs ?? 0,
 						signal: runSignal,
-						env: options.resolvedEnv,
 						artifactPath,
 						artifactId,
 						onChunk: chunk => {
@@ -891,14 +872,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 		const {
 			command: rawCommand,
-			env: rawEnv,
 			timeout: rawTimeout = 300,
 			async: asyncRequested = false,
 			pty = false,
 		} = params;
 		let { cwd } = params;
 		let command = rawCommand;
-		const env = normalizeBashEnv(rawEnv);
 
 		// Extract a leading `cd <path> && ...` into cwd when the model ignores the
 		// cwd parameter. The scanner captures only a single path token and defers
@@ -949,20 +928,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			},
 		};
 		command = await expandInternalUrls(command, { ...internalUrlOptions, ensureLocalParentDirs: true });
-		const resolvedEnv = env
-			? Object.fromEntries(
-					await Promise.all(
-						Object.entries(env).map(async ([key, value]) => [
-							key,
-							await expandInternalUrls(value, {
-								...internalUrlOptions,
-								ensureLocalParentDirs: true,
-								noEscape: true,
-							}),
-						]),
-					),
-				)
-			: undefined;
 
 		// Resolve protocol URLs (skill://, agent://, etc.) in extracted cwd.
 		// Bare skill:// URIs resolve to the skill directory here: the result must
@@ -1015,8 +980,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				timeoutSec,
 				requestedTimeoutSec,
 				notices: pendingNotices,
-
-				resolvedEnv,
 				onUpdate,
 				forwardUpdates: false,
 			});
@@ -1053,8 +1016,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				timeoutSec,
 				requestedTimeoutSec,
 				notices: pendingNotices,
-
-				resolvedEnv,
 				onUpdate,
 				forwardUpdates: !startBackgrounded,
 			});
@@ -1102,7 +1063,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// that bypass `executeBash` — the ACP client terminal and the PTY. The
 		// `executeBash` branch below is intentionally excluded: it runs its own
 		// preflight internally, so routing the pre-applied command there too
-		// would double-apply the unset prefix and re-merge the env. No
+		// would double-apply the unset prefix. No
 		// `commandPrefix` here: ACP applies the shell prefix via
 		// `wrapShellLineForClientTerminal`, and the PTY path never wrapped one.
 		// `callerTimeoutMs` clamps the direnv load to a positive command timeout
@@ -1112,7 +1073,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) ||
 			canUseInteractiveBashPty(pty, ctx)
 				? await applyDirenvPreflight(command, commandCwd, {
-						callerEnv: resolvedEnv,
 						signal,
 						timeoutMs: this.session.settings.get("bash.direnvLoadTimeoutMs"),
 						callerTimeoutMs: timeoutMs,
@@ -1182,10 +1142,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			signal?.addEventListener("abort", onAbortSignal, { once: true });
 
 			try {
-				// direnv-transformed command (carries any `unset -v` prefix) + merged
-				// env; falls back to the raw command/env when direnv is off/absent.
+				// direnv-transformed command (carries any `unset -v` prefix) + direnv
+				// env; falls back to the raw command when direnv is off/absent.
 				const bridgeCommand = backendPreflight?.command ?? command;
-				const bridgeEnv = backendPreflight?.env ?? resolvedEnv;
+				const bridgeEnv = backendPreflight?.env;
 				const shellSpawn = wrapShellLineForClientTerminal(bridgeCommand, this.session.settings.getShellConfig());
 				const createP = clientBridge.createTerminal({
 					command: shellSpawn.command,
@@ -1397,25 +1357,23 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
 					// PTY bypasses executeBash, so feed it the direnv-transformed
-					// command + merged env (backendPreflight is defined whenever this
+					// command + direnv env (backendPreflight is defined whenever this
 					// branch runs, since both gate on canUseInteractiveBashPty).
 					command: backendPreflight?.command ?? command,
 					cwd: commandCwd,
 					timeoutMs,
 					signal,
-					env: backendPreflight?.env ?? resolvedEnv,
+					env: backendPreflight?.env,
 					artifactPath,
 					artifactId,
 				})
 			: // executeBash runs its OWN direnv preflight internally — pass the RAW
-				// command + resolvedEnv here so the unset prefix / env merge is not
-				// applied twice.
+				// command here so the unset prefix is not applied twice.
 				await executeBash(command, {
 					cwd: commandCwd,
 					sessionKey: this.session.getSessionId?.() ?? undefined,
 					timeout: timeoutMs ?? 0,
 					signal,
-					env: resolvedEnv,
 					artifactPath,
 					artifactId,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
