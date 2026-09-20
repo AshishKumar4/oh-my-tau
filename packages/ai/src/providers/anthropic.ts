@@ -4264,13 +4264,12 @@ function applyHeadCaching(
 
 		// The captured Claude Code client anchors its last system block as well
 		// as its identity block, so the profile adds the second breakpoint the
-		// shared path deliberately skips. Only needed when the block above left
-		// the tail undecorated — otherwise the vendor's two-breakpoint shape is
-		// already satisfied.
-		if (
-			harnessProfile === "claude-code" &&
-			!systemBlocks.some(block => block !== systemBlocks[0] && block.cache_control != null)
-		) {
+		// shared path deliberately skips (identity is systemBlocks[1] — the
+		// billing header comes first). With a volatile suffix the boundary
+		// anchor above already supplies that second breakpoint, so this is
+		// scoped to the no-suffix case; decorating the volatile tail would
+		// cache churn and diverge from the golden's pinned slot set.
+		if (harnessProfile === "claude-code" && suffixStart === systemBlocks.length) {
 			const lastBlock = systemBlocks[systemBlocks.length - 1];
 			if (lastBlock && lastBlock.cache_control == null) {
 				lastBlock.cache_control = cloneAnthropicCacheControl(cacheControl);
