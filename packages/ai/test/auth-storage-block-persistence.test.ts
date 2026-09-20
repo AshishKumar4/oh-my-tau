@@ -30,7 +30,7 @@ function claudeLimit(id: string, usedFraction: number, scope: { shared?: boolean
 	// Window ids mirror the real /usage payload shape (see
 	// auth-storage-claude-fable-fallback.test.ts): bare '5h'/'7d', so the
 	// shared-gate check in healableBlockScopes can match them.
-	const windowId = id.split(':').pop() ?? id;
+	const windowId = id.split(":").pop() ?? id;
 	return {
 		id,
 		label: id,

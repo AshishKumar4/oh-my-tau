@@ -870,12 +870,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (params.async && !this.#asyncEnabled && "run_in_background" in input) {
 			throw new ToolError("Bash.run_in_background is not available: async.enabled is off in this session.");
 		}
-		const {
-			command: rawCommand,
-			timeout: rawTimeout = 300,
-			async: asyncRequested = false,
-			pty = false,
-		} = params;
+		const { command: rawCommand, timeout: rawTimeout = 300, async: asyncRequested = false, pty = false } = params;
 		let { cwd } = params;
 		let command = rawCommand;
 

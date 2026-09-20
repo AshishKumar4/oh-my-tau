@@ -269,7 +269,14 @@ describe("AgentSession extension history rewrite", () => {
 				provider: "anthropic" as const,
 				model: "claude-sonnet-4-5",
 				stopReason: "aborted" as const,
-				usage: undefined,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
 				timestamp: Date.now(),
 			};
 			session.agent.emitExternalEvent({ type: "message_end", message: aborted });
