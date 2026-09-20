@@ -277,6 +277,28 @@ function coerceImageBase64(data: unknown): string | null {
 	return null;
 }
 
+/**
+ * Emit every renderable entry of an `images` array as an image display block.
+ *
+ * Returns how many rendered, so the caller can distinguish a genuine image
+ * payload from an unrelated `images` field (a list of filenames, say) that must
+ * keep falling through to the JSON branch.
+ */
+function renderImageArray(images: unknown, hooks: RuntimeHooks): number {
+	if (!Array.isArray(images) || images.length === 0) return 0;
+	let rendered = 0;
+	for (const entry of images) {
+		if (!entry || typeof entry !== "object") continue;
+		const block = entry as Record<string, unknown>;
+		if (typeof block.mimeType !== "string") continue;
+		const data = coerceImageBase64(block.data);
+		if (data === null) continue;
+		hooks.onDisplay({ type: "image", data, mimeType: block.mimeType });
+		rendered++;
+	}
+	return rendered;
+}
+
 function describeDataType(data: unknown): string {
 	if (data === null) return "null";
 	if (data instanceof Uint8Array) return "Uint8Array";
@@ -589,6 +611,17 @@ export class JsRuntime {
 					`[display: image dropped — \`data\` must be a base64 string, Uint8Array/Buffer, or ArrayBuffer; got ${describeDataType(record.data)}]\n`,
 				);
 				return;
+			}
+			// `{ images: [{ mimeType, data }, …] }` is the shape the tool bridge
+			// returns for image-bearing tool results, and the one `image(…)` in the
+			// prelude emits. Render those blocks instead of letting the JSON branch
+			// print their base64 as text. Remaining fields still display, so
+			// `display(await tool.view_image(…))` shows both the text and the image.
+			const rendered = renderImageArray(record.images, hooks);
+			if (rendered > 0) {
+				const { images: _images, ...rest } = record;
+				if (Object.keys(rest).length === 0) return;
+				value = rest;
 			}
 			try {
 				hooks.onDisplay({ type: "json", data: structuredClone(value) });

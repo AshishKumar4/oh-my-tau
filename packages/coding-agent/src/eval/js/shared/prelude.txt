@@ -561,6 +561,12 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 	// Display a media URL; data URLs render as real image content through the
 	// same `images` surfacing the read bridge uses.
 	const codexDisplayMedia = (item, detail) => {
+		// A tool result carries its images in `images`, not a URL field — hand the
+		// array straight to `display`, which renders each entry.
+		if (item && typeof item === "object" && Array.isArray(item.images) && item.images.length > 0) {
+			display({ images: item.images });
+			return;
+		}
 		const url = codexMediaUrl(item);
 		const match = /^data:([^;,]+);base64,(.*)$/s.exec(url);
 		if (match) {

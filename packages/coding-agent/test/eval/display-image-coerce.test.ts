@@ -100,3 +100,63 @@ describe("JsRuntime.displayValue image coercion", () => {
 		expect(texts.join("")).toMatch(/image dropped/);
 	});
 });
+
+describe("JsRuntime.displayValue images array", () => {
+	beforeAll(() => {
+		runtime = new JsRuntime({
+			initialCwd: process.cwd(),
+			sessionId: "display-images-array-test",
+		});
+	});
+
+	afterAll(() => {
+		runtime.dispose();
+	});
+
+	it("renders the `images` array the tool bridge and `image(...)` emit", () => {
+		// Before this was handled, the object fell through to the JSON branch and
+		// printed its base64 as text instead of rendering.
+		const { hooks, displays } = collect();
+		runtime.displayValue({ images: [{ mimeType: "image/png", data: PNG_BASE64 }] }, hooks);
+		expect(displays).toEqual([{ type: "image", data: PNG_BASE64, mimeType: "image/png" }]);
+	});
+
+	it("renders every entry and coerces their data", () => {
+		const { hooks, displays } = collect();
+		runtime.displayValue(
+			{
+				images: [
+					{ mimeType: "image/png", data: PNG_BYTES },
+					{ mimeType: "image/webp", data: PNG_BASE64 },
+				],
+			},
+			hooks,
+		);
+		expect(displays).toEqual([
+			{ type: "image", data: PNG_BASE64, mimeType: "image/png" },
+			{ type: "image", data: PNG_BASE64, mimeType: "image/webp" },
+		]);
+	});
+
+	it("keeps the remaining fields as JSON so a tool result shows text and image", () => {
+		const { hooks, displays } = collect();
+		runtime.displayValue({ text: "read 28 chars", images: [{ mimeType: "image/png", data: PNG_BASE64 }] }, hooks);
+		expect(displays).toEqual([
+			{ type: "image", data: PNG_BASE64, mimeType: "image/png" },
+			{ type: "json", data: { text: "read 28 chars" } },
+		]);
+	});
+
+	it("leaves an unrelated `images` field on the JSON path", () => {
+		const { hooks, displays } = collect();
+		runtime.displayValue({ images: ["diagram.png", "chart.png"] }, hooks);
+		expect(displays).toEqual([{ type: "json", data: { images: ["diagram.png", "chart.png"] } }]);
+	});
+
+	it("falls back to JSON when every entry has undecodable data", () => {
+		const { hooks, displays } = collect();
+		runtime.displayValue({ images: [{ mimeType: "image/png", data: { not: "a buffer" } }] }, hooks);
+		expect(displays).toHaveLength(1);
+		expect(displays[0]?.type).toBe("json");
+	});
+});
