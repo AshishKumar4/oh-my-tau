@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Local OpenAI-compatible backends—including llama.cpp, LM Studio, vLLM, Ollama, and custom loopback or LAN hosts—now support maxTokens values above 64k without incorrectly applying the hosted OpenAI limit.
+- Fixed Union Alpha requests on OpenCode Go and Zen by using the correct Messages API.
+- Updated SuperGrok’s Grok 4.7 metadata to expose its documented 500K context window and low, medium, high, and xhigh thinking levels.
+- Fixed GPT-OSS tool interactions on Google Antigravity and Gemini CLI so function-call history is preserved correctly.
+- Fixed Devin model discovery for Enterprise credentials by falling back to the legacy Windsurf catalog when native discovery does not return the full model list.
+
 ## [18.2.8] - 2026-09-21
 
 ### Added

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed summaries incorrectly advertising a `¶think:` scope when thinking content is excluded from the archive.
+
 ## [18.2.1] - 2026-09-15
 
 ### Changed

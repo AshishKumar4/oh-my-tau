@@ -315,6 +315,88 @@ describe("executeJs", () => {
 		expect(persisted.output.trim()).toBe("41");
 	});
 
+	it("persists top-level declaration bindings and reassignments after await", async () => {
+		const first = await executeJs(
+			[
+				"var reassignedAfterAwait = 1;",
+				"let demotedAfterAwait = 3;",
+				"const declaredBeforeAwait = 5;",
+				"function replacedAfterAwait() { return 7; }",
+				"await Promise.resolve();",
+				"reassignedAfterAwait = 2;",
+				"demotedAfterAwait = 4;",
+				"replacedAfterAwait = () => 8;",
+				"`${reassignedAfterAwait}:${demotedAfterAwait}:${declaredBeforeAwait}:${replacedAfterAwait()}`;",
+			].join("\n"),
+			{ sessionId, session, sessionFile },
+		);
+		expect(first.exitCode).toBe(0);
+		expect(first.output.trim()).toBe("2:4:5:8");
+
+		const persisted = await executeJs(
+			"return `${reassignedAfterAwait}:${demotedAfterAwait}:${declaredBeforeAwait}:${replacedAfterAwait()}`;",
+			{ sessionId, session, sessionFile },
+		);
+		expect(persisted.exitCode).toBe(0);
+		expect(persisted.output.trim()).toBe("2:4:5:8");
+	});
+
+	it("does not clobber a later explicit global write", async () => {
+		const first = await executeJs(
+			[
+				"var explicitGlobalWrite = 1, reassignedAlongsideGlobal = 1;",
+				"await Promise.resolve();",
+				"reassignedAlongsideGlobal = 2;",
+				"globalThis.explicitGlobalWrite = 2;",
+			].join("\n"),
+			{ sessionId, session, sessionFile },
+		);
+		expect(first.exitCode).toBe(0);
+
+		const persisted = await executeJs("return `${explicitGlobalWrite}:${reassignedAlongsideGlobal}`;", {
+			sessionId,
+			session,
+			sessionFile,
+		});
+		expect(persisted.exitCode).toBe(0);
+		expect(persisted.output.trim()).toBe("2:2");
+	});
+
+	it("does not publish a declaration skipped by an early return", async () => {
+		const first = await executeJs(
+			[
+				"globalThis.skippedDeclaration = 5;",
+				"var reassignedBeforeEarlyReturn = 1;",
+				"await Promise.resolve();",
+				"reassignedBeforeEarlyReturn = 2;",
+				"if (true) return;",
+				"let skippedDeclaration = 1;",
+			].join("\n"),
+			{ sessionId, session, sessionFile },
+		);
+		expect(first.exitCode).toBe(0);
+
+		const persisted = await executeJs("return `${skippedDeclaration}:${reassignedBeforeEarlyReturn}`;", {
+			sessionId,
+			session,
+			sessionFile,
+		});
+		expect(persisted.exitCode).toBe(0);
+		expect(persisted.output.trim()).toBe("5:2");
+	});
+
+	it("persists an assignment performed by finally after return", async () => {
+		const first = await executeJs(
+			"var assignedInFinally = 1; await Promise.resolve(); try { return; } finally { assignedInFinally = 2; }",
+			{ sessionId, session, sessionFile },
+		);
+		expect(first.exitCode).toBe(0);
+
+		const persisted = await executeJs("return assignedInFinally;", { sessionId, session, sessionFile });
+		expect(persisted.exitCode).toBe(0);
+		expect(persisted.output.trim()).toBe("2");
+	});
+
 	it("does not expose the final expression marker as a global property", async () => {
 		const result = await executeJs("const localOnly = 7; localOnly;", { sessionId, session, sessionFile });
 		expect(result.exitCode).toBe(0);

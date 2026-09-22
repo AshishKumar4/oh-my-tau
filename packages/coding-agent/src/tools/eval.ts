@@ -699,9 +699,11 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 			ctx?.toolCall?.steeringSignal,
 		);
 		if (waitResult.kind === "completed") {
+			autoBgManager.consumeJobResultWhenSettled(jobId);
 			return waitResult.result;
 		}
 		if (waitResult.kind === "failed") {
+			autoBgManager.consumeJobResultWhenSettled(jobId);
 			throw waitResult.error;
 		}
 		if (waitResult.kind === "aborted") {

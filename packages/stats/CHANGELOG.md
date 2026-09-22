@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed background statistics spans to use unique identifiers and close jobs correctly.
+
 ## [18.2.5] - 2026-09-17
 
 ### Fixed

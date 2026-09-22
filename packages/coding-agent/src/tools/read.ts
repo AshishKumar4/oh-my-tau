@@ -852,9 +852,14 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 	readonly loadMode = "essential";
 	description: string;
 	get parameters(): ReadInputSchema | typeof readSchemaWithSkills | typeof readSchemaWithoutMemoryWithSkills {
+		// Frozen at the last prompt rebuild (managed sessions). SDK consumers
+		// building a bare ToolSession lack the rebuild lifecycle, so fall back
+		// to the derived form (skillful && skills) instead of dropping the hint.
 		// `skillful: false` removes the system-prompt catalog and must also
 		// strip the provider-side `skill://` hint.
-		const hasSkills = this.session.settings.get("skillful") && (this.session.skills?.length ?? 0) > 0;
+		const hasSkills =
+			(this.session.skillHintVisible ??
+				(this.session.settings.get("skillful") && (this.session.skills?.length ?? 0) > 0)) === true;
 		const native =
 			this.session.settings.get("memory.backend") === "off"
 				? hasSkills

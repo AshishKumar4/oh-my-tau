@@ -2344,6 +2344,15 @@ const streamAnthropicOnce = (
 
 			if (zeroOutputCacheRefresh) {
 				const refreshParams: MessageCreateParams = { ...params, max_tokens: 0, stream: false };
+				// Anthropic rejects `tool_choice: {type:"tool"|"any"}` with `max_tokens: 0`
+				// ("tool_choice ... cannot be used when max_tokens is 0", #12597). A refresh
+				// replays the captured turn's payload, which can carry a forced selector
+				// (e.g. a forced yield). A zero-output keep-alive produces no tokens, so the
+				// forced choice is meaningless here — drop it so the request is accepted.
+				const refreshChoiceType = refreshParams.tool_choice?.type;
+				if (refreshChoiceType === "tool" || refreshChoiceType === "any") {
+					delete refreshParams.tool_choice;
+				}
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,

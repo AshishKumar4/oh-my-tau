@@ -4,7 +4,46 @@
 
 ### Added
 
-- `find` (and `omp find`) accepts an `omp://` docs scope: `omp://` searches every embedded harness doc and `omp://<file>.md` searches one, reporting hits as canonical `omp://` URLs that `read` opens directly, including with `:start-end` selectors ([#12758](https://github.com/can1357/oh-my-pi/pull/12758) by [@H4vC](https://github.com/H4vC)).
+- Added support for searching embedded harness documentation with `find` and `omp find` using `omp://` scopes, including file-specific searches and `:start-end` selectors; results open directly through canonical `omp://` URLs.
+
+### Changed
+
+- Updated the read tool guidance to decode images inline by default and require an explicit `:img` selector for SVG rendering.
+- Improved model discovery and fallback behavior: authentication failures are surfaced in the `/models` hub, and models without a matching role-specific fallback now use the default fallback chain.
+- Improved resilience for subagents by retrying provider stream failures that occur after partial output and preserving configured ordered model fallbacks at startup.
+- MCP OAuth with Google issuers now requests offline access so refresh tokens can be issued; repeated auth-broker token rotations also preserve the required refresh and client metadata.
+- MCP servers from omp-plugins now expand `${CLAUDE_PLUGIN_ROOT}` and `${OMP_PLUGIN_ROOT}` in commands, arguments, and working directories.
+- `/review` now uses the session's current working directory after `/move` or `/wt`.
+- Pasted and dragged image files now retain their original filesystem paths so the agent can act on the source files directly.
+- Custom sessions can now be moved across filesystems without losing transcripts or artifacts.
+- `hub jobs` now returns a compact, non-consuming status summary instead of replaying completed output or consuming pending auto-delivery.
+- The display-reset shortcut now works while the ask dialog has keyboard focus, and `tab.press()` provides a clear error for the legacy argument order.
+- Wayland keyboard input now follows the compositor's active XKB layout instead of assuming a US layout.
+- LSP diagnostics now refresh when watched files are created or deleted and after a server reload.
+- Compiled bytecode binaries now start correctly when bundled dependencies use `import.meta.resolve`.
+
+### Fixed
+
+- Fixed JavaScript `eval` assignments in cells containing top-level `await` so they persist into subsequent cells.
+- Fixed skill hints becoming out of sync with the active prompt after discarded rebuilds and in advisor sessions.
+- Restored `pi.pi.askToolRenderer` for extensions that replace the built-in ask tool, preserving native rendering.
+- Fixed npm plugin upgrades and reinstalls leaving stale or duplicate manifest entries that could break `bun install`.
+- Fixed `eval` waits longer than approximately 24.8 days returning immediately because of native timer overflow.
+- Fixed deleted sessions being resurrected from stale rewrite backups.
+- Fixed `/collab` relay connections honoring `HTTPS_PROXY` and `NO_PROXY`.
+- Fixed sessions remaining blocked by queued turns or Hindsight auto-recall after disposal or cancellation.
+- Fixed edits to auto-generated files aborting the entire turn; they now return a tool-scoped error.
+- Fixed Edit handling of invalid overlapping selections in multibyte text so the worker reports a match error instead of panicking.
+- Fixed local memory consolidation on case-insensitive filesystems when project path casing changes between launches.
+- Fixed first-time Xcode MCP connections on macOS by allowing the signed `omp` binary to request Apple Events permission.
+- Fixed stale or duplicated TTSR trigger events during streaming.
+- Fixed MCP OAuth credentials retaining their refresh endpoint and client metadata across repeated token rotations.
+- Fixed local model and provider retry behavior for streamed and partially buffered failures.
+- Fixed memory and session cleanup issues that could leave stale artifacts or inconsistent state.
+
+### Removed
+
+- Removed support for image query parameters (`?q=`) and bare image paths in the read tool.
 
 ## [18.2.8] - 2026-09-21
 
@@ -1328,30 +1367,14 @@
 - Include token usage statistics in inspect_image tool output
 - Pressing the session model shortcut (alt+p) again inside the picker toggles a red Task mode that switches the Task subagent's model for this session instead.
 - Git TUI: an AI staging wand next to "Stage All" asks "What should we stage?" and stages only the matching changes — the tiny/smol model picks the matching files from the whole change list, then filters their hunks in parallel; file-scoped requests ("git stuff") stage the picked files whole, content-scoped ones ("all comment changes") stage only the matching hunks.
+- Added nonblocking shared model-catalog refresh with cached startup hydration and source freshness diagnostics, allowing newly published models for known providers to appear without a binary release.
+- Added `omp usage clients` to report per-client token usage recorded by the auth broker, including the machine and application responsible for usage by provider. Supports `--days` and `--json` output.
 
 ### Changed
 
 - Enforce a 5-minute timeout and 8 MiB output limit for GitHub CLI operations
 - Apply a 30-minute timeout for marketplace plugin repository cloning
 - Improve large file handling with blob streaming and explicit truncation support
-
-### Fixed
-
-- Fixed the VCS status line counting every file inside an untracked directory instead of collapsing it to one entry like `git status`.
-- Fixed git TUI sidebar wheel scrolling snapping back to the selected row after staging or collapsing entries; the list now follows the selection only when it actually changes.
-- Fixed `inspect_image` selecting a text-only vision/default role when an image-capable model was available on the active provider.
-- Improved unexpected-stop recovery for reasoning-only stalls by requiring the next concrete tool action instead of repeated analysis.
-- The edit tool now repairs a stray closing marker typed in place of the divider in a selection (`old⟫new` inside one selection instead of `old│new`) and applies the intended replacement with a note, instead of failing with an unmatched-marker error.
-
-## [18.0.7] - 2026-08-26
-
-### Added
-
-- Added nonblocking shared model-catalog refresh with cached startup hydration and source freshness diagnostics, allowing newly published models for known providers to appear without a binary release.
-- Added `omp usage clients` to report per-client token usage recorded by the auth broker, including the machine and application responsible for usage by provider. Supports `--days` and `--json` output.
-
-### Changed
-
 - Improved `omp git` responsiveness by streaming file contents, rendering complete lines promptly, progressively applying syntax highlighting, and deferring large commit statistics until after the first interactive frame.
 - Expanded `omp git` navigation and editing shortcuts: refresh with `r`, stage or unstage files and directories with `s`, `u`, or `space`, navigate hunks and files with keyboard shortcuts, use Vim-style motions in both panes, select diff views with `1`–`4`, and open the commit form with `c`.
 - Standardized completed edit results across edit modes with hashline-style paths and numbered previews.
@@ -1360,6 +1383,11 @@
 
 ### Fixed
 
+- Fixed the VCS status line counting every file inside an untracked directory instead of collapsing it to one entry like `git status`.
+- Fixed git TUI sidebar wheel scrolling snapping back to the selected row after staging or collapsing entries; the list now follows the selection only when it actually changes.
+- Fixed `inspect_image` selecting a text-only vision/default role when an image-capable model was available on the active provider.
+- Improved unexpected-stop recovery for reasoning-only stalls by requiring the next concrete tool action instead of repeated analysis.
+- The edit tool now repairs a stray closing marker typed in place of the divider in a selection (`old⟫new` inside one selection instead of `old│new`) and applies the intended replacement with a note, instead of failing with an unmatched-marker error.
 - Fixed hub process waits being incorrectly prolonged or satisfied by a replacement process after an automatic restart.
 - Preserved an explicitly empty `tools: []` configuration for agent definitions instead of adding default work tools.
 - Corrected MCP per-tool approval configuration documentation and behavior to use registered tool names for deny policies.
@@ -1747,62 +1775,4 @@
 - Deleting an attachment's inline token now removes the attachment from the submission (surviving image markers are renumbered).
 - Restored prompts (esc-esc, `/tree`, branch, queued-message dequeue, failed-submit recovery) collapse image markers back into clickable atomic chip tokens and re-materialize their file links instead of degrading to dead text.
 
-## [17.4.1] - 2026-08-21
-
-### Added
-
-- Added `PERSONALITY.md` support: `~/.omp/agent/PERSONALITY.md` (profile/XDG-aware agent dir) replaces the system prompt's personality block text; `personality: none` still omits the block ([#8528](https://github.com/can1357/oh-my-pi/issues/8528))
-- Sloppy edits now support inline replacements with `⟪old│new⟫` syntax (`⟪old│⟫` for deletions and `⟪│new⟫` for insertions), alongside automatic recovery for common formatting mistakes without needing a retry.
-- Sloppy edits now recover operations that mix `⟪old│new⟫` inline replacements with a `»` REWRITE instead of failing the payload: a redundant REWRITE is dropped, a diverging one is applied as the final text, and a note explains the interpretation.
-- Expanded archive support in `read` and `write` tools: `read` can now inspect and extract members from `.rar`, `.7z`, `.iso`, `.cab`, `.deb`, `.rpm`, `.cpio`, `.ar`/`.a`, `.lzh`, `.arj`, compressed tar files (`.tar.bz2`, `.tar.xz`, `.tar.zst`), package formats (`.whl`, `.ipa`, `.xpi`, `.vsix`, `.nupkg`, `.cbz`, `.cbr`), `.asar` archives, and single-file compressed streams; `write` can create `.tar.zst` and update `.asar` archives.
-- Added Code Mode for Codex `code_mode_only` models via `providers.openai-codex.codeMode` (`off`/`on`/`auto`), demoting non-essential tools into an eval bridge with generated TypeScript definitions.
-- MCP tool names longer than 64 characters are now automatically truncated with a deterministic hash suffix to comply with strict provider validators.
-- Marketplace-installed plugins with manifest settings can now be configured through `omp plugin config` and Settings → Plugins.
-- Configured discovery providers with `authHeader` now preserve cached models across application restarts.
-- Added repeat read warning hints when identical file content is read multiple times.
-- Explicit DAP adapters can now attach without a PID or port when `attachDefaults` provide the target arguments.
-- Added `isProjectTrusted()` compatibility shim to `ExtensionContext` for extensions targeting upstream per-directory trust gates.
-
-### Changed
-
-- Added `compaction.asyncEnabled` (default: on) to speculatively summarize context in the background before hitting threshold limits, avoiding blocking summarization pauses.
-- Replaced `compaction.strategy` and `compaction.remoteEnabled` with an ordered `compaction.methodOrder` preference list.
-- Handoff maintenance (`/handoff` and automatic handoff compaction) now commits generated summaries directly to the active session instead of starting a new session.
-- Added `extendedContext` setting (`/settings` → Context → General, default: on) to optionally clamp models with premium long-context pricing tiers (such as OpenAI GPT-5.6 Sol/Terra/Luna) to standard-pricing token limits before compaction triggers.
-- Token counting and token estimations are now dynamically scoped to each specific model tokenizer rather than using a single process-global tokenizer.
-- `omp cleanse` and `/cleanse` now feature a live interactive status board displaying active checkers, repair subagents, tool metrics, and token/cost totals in real time.
-- Eval-bridge nested `tool.<name>()` calls now enforce ACP permission gates and tool allowlists identically to direct tool calls.
-- Added `tokenizer` option to custom models and `modelOverrides` to allow overriding the local tokenizer family for proxied model endpoints.
-- Added `qwenTemplateReasoningEffort` to the `models.yml` `compat` schema to configure or disable reasoning effort flags for strict local inference servers.
-- Settings menus now support click-to-toggle and drag-to-reorder for list items, as well as warning indicators and risk notes on sensitive options such as External Thinking.
-- Supervised process completion notices now render as compact single-line entries.
-- The todo HUD header now displays a consolidated progress bar showing task completion across all stages.
-- `/settings` rows can now carry a risk note: a warning glyph on the row plus a warning-colored line above the description. `External Thinking` (`externalThinking`, `--external-thinking`) is the first user — providers have flagged the request shape it produces as abuse, up to account-level enforcement, so both the settings entry and `--help` now say so.
-
-### Fixed
-
-- Fixed regional HTTP 401 data-residency errors during Codex chat, web search, and image generation requests by passing token residency metadata on requests.
-- Fixed macOS SSH ControlMaster socket creation failures caused by `sun_path` length limits when using named profiles.
-- Fixed an issue where Nix-packaged builds failed to load on-demand native addons (`onnxruntime-node`/`sherpa-onnx`) due to missing shared C++ runtime library paths.
-- Fixed external editor spawning (Ctrl+G, plan review, `/todo edit`) failing to attach to visible terminals for editors like `emacsclient`.
-- Fixed `omp --resume` spinning at 100% CPU when new session entries arrived during initial transcript rendering.
-- Fixed session resume hints and fatal exit messages omitting the active `--profile` argument.
-- Fixed MCP OAuth authorization requests failing on pre-registered clients with restricted scopes by using RFC 9728 `scopes_supported`.
-- Fixed isolated task subagents causing out-of-memory crashes on repositories with large uncommitted binary files by pre-sizing diffs and enforcing snapshot limits.
-- Fixed LM Studio and lazy-loaded local models retaining uninitialized context lengths by re-probing loaded context lengths after initial inference.
-- Fixed project-scoped Claude Code marketplace plugins incorrectly loading into sessions in other projects.
-- Fixed configured advisors backed by discoverable providers remaining inactive on initial session startup until manually toggled.
-- Fixed resolving `--model @<role>` failing for roles backed by discovery providers like oMLX, Ollama, and llama-swap.
-- Fixed retry fallback chains stopping prematurely when encountering nested fallback configurations, and fixed session role priority during fallback chain selection.
-- Fixed cancelled prompts disappearing upon abort during turn setup, properly restoring user text and attachments to the input editor.
-- Fixed built-in shell utilities (`grep`, `rg`, `diff`, `find`, `timeout`, `top`, `date`, `head`, `tail`, `stat`, `truncate`, `kill`) across numerous POSIX/GNU/BSD compatibility edge cases and early-pipeline SIGPIPE handling.
-- Fixed Cursor sessions missing standard string-replacement edit tooling after server tool injection.
-- Fixed `hub wait` duplicating frozen rows into native scrollback during viewport overflow.
-- Fixed dark-theme contrast issues on markdown code-fence headers.
-- Fixed prompt guidance and descriptions for Task tools and SSH usage.
-- ACP editor clients that support elicitation forms (Zed) can now use `ask`, so the agent can pose single-choice, multi-select, and free-text questions inline instead of guessing.
-- `/retry` and `/handoff` now work over ACP, so editor clients (Zed) list them and can run them instead of sending the text to the model.
-- Added `qwenTemplateReasoningEffort` to the `models.yml` `compat` schema, so the auto-enabled Qwen 3.8+ template effort dialect (`chat_template_kwargs.reasoning_effort`) can be switched off per provider/model for strict local servers that reject unknown `chat_template_kwargs`.
-- Extensions can provide a normalized `usage` provider through `pi.registerProvider()`. Its reports now flow through AuthStorage caching, history, and usage displays, and the override is removed when the extension provider is unregistered.
-
-Older entries are archived in [packages/coding-agent/CHANGELOG.md@4c6407864c6e](https://github.com/can1357/oh-my-pi/blob/4c6407864c6e2b66d3d1e7852beab736058abb0f/packages/coding-agent/CHANGELOG.md).
+Older entries are archived in [packages/coding-agent/CHANGELOG.md@1f7329fc2c7c](https://github.com/can1357/oh-my-pi/blob/1f7329fc2c7c366b38731738e0db9c170f9bb348/packages/coding-agent/CHANGELOG.md).
