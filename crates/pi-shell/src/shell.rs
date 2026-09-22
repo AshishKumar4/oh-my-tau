@@ -3720,6 +3720,54 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&tmp);
 	}
 
+	/// Builtins run inside the omp process, so a path naming a standard stream
+	/// must reach the *command's* stream, never the host's. Resolved by the OS,
+	/// `/dev/stdin` is omp's own fd 0 — the TUI's terminal — and a builtin read
+	/// on it blocks on the user's keyboard from a worker thread, past the
+	/// command's timeout, swallowing every keystroke until omp is killed.
+	/// Asserting on content, not just termination, keeps the test red on the
+	/// old path whatever stdin the test runner itself was given.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn stdio_alias_paths_read_the_command_stream_not_the_host() {
+		let tmp = std::env::temp_dir().join(format!("pi-stdio-alias-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).expect("temp dir");
+		let tmp_str = tmp.to_str().expect("utf8 temp path");
+
+		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let mut session = create_session(&config).await.expect("create_session");
+		session.shell.set_working_dir(tmp_str).expect("set cwd");
+
+		let mut params = session.shell.default_exec_params();
+		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null"));
+		params.set_fd(OpenFiles::STDOUT_FD, null_file().expect("null"));
+		params.set_fd(OpenFiles::STDERR_FD, null_file().expect("null"));
+		let source_info = SourceInfo::from("pi-natives:test");
+
+		for (script, out, expected) in [
+			("printf 'hi\\n' | cat /dev/stdin > a.txt", "a.txt", "hi\n"),
+			("printf 'p\\n' | cat /proc/self/fd/0 > b.txt", "b.txt", "p\n"),
+			// The exact command that wedged a live session.
+			("grep -c x /dev/stdin < /dev/null > c.txt", "c.txt", "0\n"),
+			// Redirections take a separate path through the shell's open_file.
+			("printf 'r\\n' | cat < /dev/stdin > d.txt", "d.txt", "r\n"),
+			("{ echo e > /dev/stderr; } 2> e.txt", "e.txt", "e\n"),
+		] {
+			let run = session.shell.run_string(script, &source_info, &params);
+			tokio::time::timeout(std::time::Duration::from_secs(10), run)
+				.await
+				.unwrap_or_else(|_| panic!("`{script}` blocked: it read the host's stdin"))
+				.expect("run_string");
+			assert_eq!(
+				std::fs::read_to_string(tmp.join(out)).unwrap_or_default(),
+				expected,
+				"`{script}` must read the command's stdin",
+			);
+		}
+
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
 	/// `head --help` / invalid flag must be handled in-process (rendered to the
 	/// command streams, returned as an exit code) — head has its own `run`
 	/// entry point bypassing uutils' process-exiting parser, and literalized

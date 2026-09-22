@@ -336,6 +336,29 @@ impl OpenFiles {
 	/// File descriptor used for standard output.
 	pub const STDOUT_FD: ShellFd = 1;
 
+	/// Returns the shell descriptor a path names, if it names one: `/dev/fd/<n>`,
+	/// `/proc/self/fd/<n>`, or the stream aliases `/dev/stdin`, `/dev/stdout`,
+	/// `/dev/stderr`.
+	///
+	/// Such a path must be resolved against the shell's descriptor table, never
+	/// handed to the OS. When the shell is embedded in a long-lived host (a TUI),
+	/// the OS would resolve it against the *host's* descriptors, whose fds 0-2
+	/// are the host's terminal: a read then blocks on the user's keyboard and a
+	/// write lands on the host's screen.
+	pub fn fd_named_by_path(path: &std::path::Path) -> Option<ShellFd> {
+		let path = path.to_str()?;
+		match path {
+			"/dev/stdin" => return Some(Self::STDIN_FD),
+			"/dev/stdout" => return Some(Self::STDOUT_FD),
+			"/dev/stderr" => return Some(Self::STDERR_FD),
+			_ => {},
+		}
+		path.strip_prefix("/dev/fd/")
+			.or_else(|| path.strip_prefix("/proc/self/fd/"))?
+			.parse::<ShellFd>()
+			.ok()
+	}
+
 	/// Creates a new `OpenFiles` instance populated with stdin, stdout, and
 	/// stderr from the host environment.
 	pub(crate) fn new() -> Self {

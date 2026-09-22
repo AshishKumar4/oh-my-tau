@@ -872,7 +872,7 @@ async fn run_utility<U: Utility, SE: ShellExtensions>(
 	#[cfg_attr(not(unix), expect(unused_mut, reason = "rewritten only on unix"))]
 	let mut argv: Vec<OsString> = argv.into_iter().map(OsString::from).collect();
 	#[cfg(unix)]
-	let process_substitution_fds = materialize_process_substitution_fds(&context, &mut argv)?;
+	let shell_fds = materialize_shell_fd_args(&context, &mut argv)?;
 
 	let argv = match U::rewrite_argv(argv) {
 		Ok(argv) => argv,
@@ -905,7 +905,7 @@ async fn run_utility<U: Utility, SE: ShellExtensions>(
 
 	let mut handle = tokio::task::spawn_blocking(move || {
 		#[cfg(unix)]
-		let _process_substitution_fds = process_substitution_fds;
+		let _shell_fds = shell_fds;
 		run_caught::<U>(parsed, &mut host)
 	});
 
@@ -1057,23 +1057,18 @@ fn or_null(file: Option<OpenFile>) -> Result<OpenFile, Error> {
 	}
 }
 
-/// Recognizes brush's process-substitution arguments (`/dev/fd/<shell fd>`).
-#[cfg(unix)]
-fn process_substitution_fd(arg: &std::ffi::OsStr) -> Option<brush_core::ShellFd> {
-	arg.to_str()?
-		.strip_prefix("/dev/fd/")?
-		.parse::<brush_core::ShellFd>()
-		.ok()
-}
-
-/// Rewrites `/dev/fd/<shell fd>` arguments to real descriptors of the host
-/// process, returning the owned descriptors that must stay alive for the
-/// duration of the utility.
+/// Rewrites every argument that names a shell descriptor (see
+/// [`OpenFiles::fd_named_by_path`]) to a real descriptor of the host process
+/// that refers to the shell's stream, returning the owned descriptors that
+/// must stay alive for the duration of the utility.
 ///
-/// Brush allocates process-substitution pipes in its own descriptor table, so
-/// the shell fd number in the argument is meaningless to `open`.
+/// Builtins run inside the host, so the OS would resolve such a path against
+/// the host's descriptors, whose fds 0-2 are the TUI's terminal. A read there
+/// also bypasses [`Stdin`]'s cancellation polling, so it outlives the
+/// command's timeout. A shell descriptor that is not open maps to the null
+/// device, matching how [`build_host`] substitutes it for a closed stream.
 #[cfg(unix)]
-fn materialize_process_substitution_fds<SE: ShellExtensions>(
+fn materialize_shell_fd_args<SE: ShellExtensions>(
 	context: &ExecutionContext<'_, SE>,
 	argv: &mut [OsString],
 ) -> Result<Vec<std::os::fd::OwnedFd>, Error> {
@@ -1081,10 +1076,11 @@ fn materialize_process_substitution_fds<SE: ShellExtensions>(
 
 	let mut fds = Vec::new();
 	for arg in argv {
-		let Some(shell_fd) = process_substitution_fd(arg) else {
+		let Some(shell_fd) = OpenFiles::fd_named_by_path(std::path::Path::new(arg)) else {
 			continue;
 		};
 		let Some(file) = context.try_fd(shell_fd) else {
+			*arg = OsString::from("/dev/null");
 			continue;
 		};
 		let fd = file.try_borrow_as_fd()?.try_clone_to_owned()?;
