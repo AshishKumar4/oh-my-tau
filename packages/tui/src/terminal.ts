@@ -1,4 +1,5 @@
 import { dlopen, FFIType, ptr } from "bun:ffi";
+import { HOST_STDIN_LISTENER } from "./host-stdin";
 import * as fs from "node:fs";
 import { TtyWriter } from "@oh-my-pi/pi-natives";
 import { $env, isBunTestRuntime, isTerminalHeadless, isWsl } from "@oh-my-pi/pi-utils/env";
@@ -1481,6 +1482,11 @@ export class ProcessTerminal implements Terminal {
 		this.#stdinDataHandler = (data: string) => {
 			this.#stdinBuffer!.process(data);
 		};
+		// Marks this reader host-owned for the extension/hook host guard, which
+		// otherwise restores the pre-load listener set and would drop a reader
+		// attached inside its window — the process then reads nothing while it
+		// keeps rendering, so the TUI answers no input until it is killed.
+		Reflect.set(this.#stdinDataHandler, HOST_STDIN_LISTENER, true);
 	}
 
 	/**

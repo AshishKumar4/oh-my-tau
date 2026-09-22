@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { HOST_STDIN_LISTENER } from "@oh-my-pi/pi-tui/host-stdin";
 import { postmortem } from "@oh-my-pi/pi-utils";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import { expandPath, normalizeLocalScheme } from "../tools/path-utils";
@@ -156,33 +157,42 @@ export async function withHostGuard<T>(fn: () => Promise<T>): Promise<T> {
 			}
 			if (hostGuardStdinListeners) {
 				const stdin = process.stdin;
+				let hostReaderAttached = false;
 				for (const event of HOST_GUARD_STDIN_EVENTS) {
 					const before = hostGuardStdinListeners[event];
-					// Reconcile the stream back to the pre-load snapshot: drop any
-					// listener the module added, and reinstate any snapshot listener
-					// it removed (e.g. a factory calling `removeAllListeners("data")`
-					// would otherwise permanently strip ProcessTerminal's input
-					// handler, leaving the parent TUI deaf). removeAllListeners then
-					// re-adding in snapshot order restores both membership and order.
 					const current = stdin.rawListeners(event) as StdinGuardListener[];
-					const differs =
-						current.length !== before.length || current.some((listener, index) => listener !== before[index]);
-					if (!differs) continue;
-					stdin.removeAllListeners(event);
+					// Reconcile toward the pre-load snapshot with the least churn:
+					// drop only listeners the module added, and reinstate snapshot
+					// listeners it removed (a factory calling
+					// `removeAllListeners("data")` would otherwise strip
+					// ProcessTerminal's handler). Host-marked listeners attached
+					// during the window stay. Reconciling in place also avoids
+					// detaching and re-attaching the process-wide stdin reader,
+					// which `removeAllListeners` did on every guarded load.
+					for (const listener of current) {
+						if (Reflect.get(listener, HOST_STDIN_LISTENER) === true) {
+							if (event === "data") hostReaderAttached = true;
+							continue;
+						}
+						if (!before.includes(listener)) stdin.removeListener(event, listener);
+					}
 					for (const listener of before) {
-						stdin.on(event, listener);
+						if (!current.includes(listener)) stdin.on(event, listener);
 					}
 				}
 				if (
 					stdin.isTTY &&
 					typeof stdin.setRawMode === "function" &&
+					!hostReaderAttached &&
 					(stdin.isRaw ?? false) !== hostGuardStdinWasRaw
 				) {
 					stdin.setRawMode(hostGuardStdinWasRaw);
 				}
-				if (hostGuardStdinWasPaused && !stdin.isPaused()) {
+				// A host reader attached inside the window owns the stream's mode
+				// now; re-pausing it from a pre-attach snapshot silences the TUI.
+				if (hostGuardStdinWasPaused && !hostReaderAttached && !stdin.isPaused()) {
 					stdin.pause();
-				} else if (!hostGuardStdinWasPaused && stdin.isPaused()) {
+				} else if ((!hostGuardStdinWasPaused || hostReaderAttached) && stdin.isPaused()) {
 					stdin.resume();
 				}
 				hostGuardStdinListeners = null;

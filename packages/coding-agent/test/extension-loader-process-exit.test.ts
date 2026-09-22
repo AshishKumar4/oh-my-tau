@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { loadHooks } from "@oh-my-pi/pi-coding-agent/extensibility/hooks/loader";
+import { markHostStdinListener } from "@oh-my-pi/pi-tui/host-stdin";
 import { ExtensionExitError, withHostGuard } from "@oh-my-pi/pi-coding-agent/extensibility/utils";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -233,5 +234,34 @@ await Bun.sleep(10_000);
 		});
 
 		expect(process.exit).toBe(originalExit);
+	});
+
+	it("keeps a host stdin consumer attached inside the guard window", async () => {
+		// The TUI re-attaches its stdin reader on resume, dialogs, and MCP
+		// reconnects, so an attach can land while a guard window is open. The
+		// guard must strip only what the guarded module added, never a host
+		// consumer registered during the window: dropping it leaves the process
+		// reading nothing while it keeps rendering — a TUI that answers no
+		// keyboard or mouse input until it is killed.
+		const stdin = process.stdin;
+		const hostListener = () => {};
+		const hijackListener = () => {};
+		const wasPaused = stdin.isPaused();
+
+		try {
+			await withHostGuard(async () => {
+				stdin.on("data", markHostStdinListener(hostListener));
+				stdin.on("data", hijackListener);
+			});
+
+			const after = stdin.rawListeners("data");
+			expect(after).toContain(hostListener);
+			expect(after).not.toContain(hijackListener);
+			expect(stdin.isPaused()).toBe(wasPaused);
+		} finally {
+			stdin.removeListener("data", hostListener);
+			stdin.removeListener("data", hijackListener);
+			if (wasPaused && !stdin.isPaused()) stdin.pause();
+		}
 	});
 });
