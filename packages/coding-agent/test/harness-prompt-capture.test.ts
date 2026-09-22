@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildAnthropicSystemBlocks, claudeCodeSystemInstruction } from "@oh-my-pi/pi-ai";
+import { buildAnthropicSystemBlocks } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { claudeCodeSystemInstruction } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	HARNESS_CAPTURE_SCHEMA,

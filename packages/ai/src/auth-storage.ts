@@ -4765,7 +4765,7 @@ export class AuthStorage {
 	async #resolveCredentialTarget(
 		provider: string,
 		sessionId: string | undefined,
-		options?: { credentialId?: number; apiKey?: string },
+		options?: { credentialId?: number; apiKey?: string; allowStaleOAuthBearer?: boolean },
 	): Promise<{ type: AuthCredential["type"]; index: number; explicit: boolean } | undefined> {
 		const explicit = options?.credentialId !== undefined || options?.apiKey !== undefined;
 		if (explicit) {
@@ -4788,6 +4788,15 @@ export class AuthStorage {
 				if (entry && (await this.#credentialMatchesApiKey(entry.credential, options.apiKey))) {
 					return { type: entry.credential.type, index, explicit: true };
 				}
+			}
+			// Quota and account policy survive token refresh; hard auth failures do not.
+			if (options.allowStaleOAuthBearer && options.credentialId === undefined) {
+				const credentialId = this.#findOAuthCredentialIdForBearer(provider, options.apiKey);
+				const index =
+					credentialId === undefined
+						? -1
+						: stored.findIndex(entry => entry.id === credentialId && entry.credential.type === "oauth");
+				if (index >= 0) return { type: "oauth", index, explicit: true };
 			}
 		}
 		if (explicit) return undefined;
@@ -4924,23 +4933,11 @@ export class AuthStorage {
 		},
 	): Promise<UsageLimitMarkResult> {
 		await this.#adoptExternalCredentialChanges();
-		let sessionCredential = await this.#resolveCredentialTarget(provider, sessionId, {
+		const sessionCredential = await this.#resolveCredentialTarget(provider, sessionId, {
 			credentialId: options?.credentialId,
 			apiKey: options?.apiKey,
+			allowStaleOAuthBearer: true,
 		});
-		if (!sessionCredential && options?.credentialId === undefined && options?.apiKey !== undefined) {
-			// Account quota survives OAuth bearer rotation. Attribute a delayed
-			// usage-limit response through the durable row id captured when this
-			// exact bearer was resolved; never use this alias for hard auth errors.
-			const credentialId = this.#findOAuthCredentialIdForBearer(provider, options.apiKey);
-			const index =
-				credentialId === undefined
-					? -1
-					: this.#getStoredCredentials(provider).findIndex(
-							entry => entry.id === credentialId && entry.credential.type === "oauth",
-						);
-			if (index >= 0) sessionCredential = { type: "oauth", index, explicit: true };
-		}
 		if (!sessionCredential) return { switched: false };
 		const target = this.#getStoredCredentials(provider)[sessionCredential.index];
 		if (!target || target.credential.type !== sessionCredential.type) return { switched: false };
@@ -7043,8 +7040,8 @@ export class AuthStorage {
 	 * stale session stickiness. Fall back to the session-sticky credential only
 	 * when neither explicit target is available. For hard-auth errors, an explicit
 	 * target that no longer matches storage returns `false` without mutation.
-	 * Delayed usage-limit errors may instead recover the durable OAuth row from
-	 * the bearer fingerprint recorded when the request resolved.
+	 * Delayed usage-limit and account-policy errors may instead recover the durable
+	 * OAuth row from the bearer fingerprint recorded when the request resolved.
 	 *
 	 * - usage-limit / account-rate-limit error → {@link AuthStorage.markUsageLimitReached}
 	 *   (temporary block via its own backoff — default plus server usage-report
@@ -7093,16 +7090,16 @@ export class AuthStorage {
 			).switched;
 		}
 
-		const sessionCredential = await this.#resolveCredentialTarget(provider, sessionId, {
-			credentialId: options?.credentialId,
-			apiKey: options?.apiKey,
-		});
-		if (!sessionCredential) return false;
-
 		const deniedModel = AIError.codexChatGPTAccountPolicyModel(error);
 		const exactCodexModelPolicy =
 			deniedModel !== undefined && AIError.isCodexChatGPTAccountPolicyError(error, provider, options?.modelId);
 		const exactModelPolicy = exactCodexModelPolicy || exactCursorModelPolicy;
+		const sessionCredential = await this.#resolveCredentialTarget(provider, sessionId, {
+			credentialId: options?.credentialId,
+			apiKey: options?.apiKey,
+			allowStaleOAuthBearer: accountPolicy || exactModelPolicy,
+		});
+		if (!sessionCredential) return false;
 		// The exact sentence is provider-controlled input. A non-Codex provider,
 		// absent request model, or mismatched model must not turn it into either a
 		// global block or a hard-auth invalidation.
@@ -7127,6 +7124,21 @@ export class AuthStorage {
 			);
 			const blockedUntil =
 				Date.now() + (orgDenial ? AuthStorage.#orgDenialBackoffMs : AuthStorage.#defaultBackoffMs);
+			// Upstream also assigns `routing.blockScope = modelPolicyScope` here. The
+			// override passed to `#credentialBlockRouting` above already carries that
+			// intent and states it more precisely: `""` pins an org denial
+			// provider-wide (an empty string is not nullish, so it survives the
+			// `?? defaultBlockScope` fallback), while a content denial keeps the tier
+			// scope. Re-assigning would hand both cases `undefined` and undo that.
+			// Drop a session's pin on the denied credential so the next turn rotates
+			// instead of re-selecting it and failing the same way.
+			const sticky = this.#getSessionCredential(provider, sessionId);
+			if (
+				!sessionCredential.explicit ||
+				(sticky?.type === sessionCredential.type && sticky.index === sessionCredential.index)
+			) {
+				this.#clearSessionCredential(provider, sessionId);
+			}
 			return this.#blockCredentialForRotation(
 				provider,
 				sessionCredential.type,

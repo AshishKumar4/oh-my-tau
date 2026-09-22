@@ -4,6 +4,8 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WebSearchTool, withDomainOperators } from "@oh-my-pi/pi-coding-agent/web/search";
+import * as modelResolver from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import * as modelRoles from "@oh-my-pi/pi-coding-agent/config/model-roles";
 import * as provider from "@oh-my-pi/pi-coding-agent/web/search/provider";
 import type { SearchParams } from "@oh-my-pi/pi-coding-agent/web/search/providers/base";
 
@@ -13,7 +15,11 @@ const NATIVE = {} as ToolSession;
 
 function captureProvider(): { params: SearchParams | undefined } {
 	const captured: { params: SearchParams | undefined } = { params: undefined };
-	vi.spyOn(provider, "resolveProviderCandidates").mockReturnValue([{ id: "codex", explicit: false }]);
+	// Upstream moved provider selection onto the model role chain; stub that seam
+	// so the tool reaches the fake provider below without a live registry.
+	// The pool is built from live settings before the chain resolves, so stub both.
+	vi.spyOn(modelRoles, "roleCandidatePool").mockReturnValue([CLAUDE_CODE]);
+	vi.spyOn(modelResolver, "resolveRoleChain").mockReturnValue([{ model: CLAUDE_CODE, explicit: false }]);
 	vi.spyOn(provider, "getSearchProvider").mockResolvedValue({
 		id: "codex",
 		label: "codex",
