@@ -226,16 +226,31 @@ describe("error-id classification", () => {
 			AIError.isAccountPolicyError(new Error("denied", { cause: { code: "oauth_not_allowed_for_organization" } })),
 		).toBe(true);
 
-		// A 403 that is not account-scoped must keep falling through to the
-		// generic auth path: blocking the credential would strand it.
-		const unrelated = message({
+		// Upstream widened the classifier: `ANTHROPIC_ACCOUNT_POLICY_PATTERN` now
+		// matches a bare `permission_error`, so every Anthropic 403 of that shape
+		// is account-scoped and rotates the credential. This assertion pins the
+		// wider contract — it previously expected `false`, back when only the
+		// org-OAuth phrasing counted.
+		const bare = message({
 			api: "anthropic-messages",
 			provider: "anthropic",
 			model: "claude-fable-5-1",
 			errorStatus: 403,
 			errorMessage: '403 {"type":"error","error":{"type":"permission_error","message":"Forbidden."}}',
 		});
-		expect(AIError.is(AIError.classifyMessage(unrelated), AIError.Flag.AccountPolicy)).toBe(false);
+		const bareId = AIError.classifyMessage(bare);
+		expect(AIError.is(bareId, AIError.Flag.AccountPolicy)).toBe(true);
+		expect(AIError.is(bareId, AIError.Flag.ContentBlocked)).toBe(false);
+
+		// A 403 from another provider still falls through to the generic auth path.
+		const otherProvider = message({
+			api: "openai-responses",
+			provider: "openai",
+			model: "gpt-6-astra",
+			errorStatus: 403,
+			errorMessage: '403 {"type":"error","error":{"type":"permission_error","message":"Forbidden."}}',
+		});
+		expect(AIError.is(AIError.classifyMessage(otherProvider), AIError.Flag.AccountPolicy)).toBe(false);
 	});
 
 	it("classifies only the matching Codex ChatGPT-account model entitlement denial as account policy", () => {

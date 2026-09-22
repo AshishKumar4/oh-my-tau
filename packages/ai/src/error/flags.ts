@@ -508,9 +508,13 @@ function classifyText(
 		if (isContentBlockedText(errorMessage)) kinds |= Flag.ContentBlocked;
 		const statusClean = errorStatus ? errorStatus : (status({ message: errorMessage }) ?? undefined);
 
+		// An org OAuth denial is deliberately absent here: it is account-scoped,
+		// not a content refusal, and `ContentBlocked` would stop the rotation that
+		// reaches a working credential. `isAnthropicAccountPolicyText` below marks
+		// it `AccountPolicy` alone; `isOrgOAuthDenialError` still drives the longer
+		// set-aside window in `AuthStorage`.
 		if (
 			ACCOUNT_POLICY_PATTERN.test(errorMessage) ||
-			ORG_OAUTH_DENIAL_PATTERN.test(errorMessage) ||
 			isCodexChatGPTAccountPolicyText(errorMessage, provider, modelId) ||
 			(provider === "cursor" && isCursorPlanPolicyText(errorMessage))
 		) {
