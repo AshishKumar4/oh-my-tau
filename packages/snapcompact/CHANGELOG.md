@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [18.2.9] - 2026-09-22
+
 ### Fixed
 
 - Fixed summaries incorrectly advertising a `¶think:` scope when thinking content is excluded from the archive.
