@@ -56,7 +56,7 @@ describe("fusion lead session", () => {
 	beforeAll(() => {
 		tempDir = TempDir.createSync("@pi-fusion-lead-");
 		authStorage = createInMemoryAuthStorage();
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.keys.setRuntime("anthropic", "test-key");
 		modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 	});
 

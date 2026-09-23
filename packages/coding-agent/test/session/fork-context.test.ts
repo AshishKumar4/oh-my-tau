@@ -287,10 +287,12 @@ describe("forkPrefixMessageCount", () => {
 describe("resolveForkCredentialId", () => {
 	it("matches the active account's durable credential row", () => {
 		const authStorage = {
-			listOAuthAccounts: () => [
-				{ credentialId: 1, accountId: "other", active: false },
-				{ credentialId: 9, accountId: "acct-parent", active: true },
-			],
+			oauth: {
+				accounts: () => [
+					{ credentialId: 1, accountId: "other", active: false },
+					{ credentialId: 9, accountId: "acct-parent", active: true },
+				],
+			},
 		};
 		expect(resolveForkCredentialId(authStorage, request(), "sess")).toBe(9);
 		expect(resolveForkCredentialId(authStorage, request({ accountId: undefined }), "sess")).toBeUndefined();

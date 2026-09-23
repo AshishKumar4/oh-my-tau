@@ -150,7 +150,7 @@ async function createHarness(
 	},
 ): Promise<SessionHarness> {
 	const authStorage = await AuthStorage.create(tempDir.join(`auth-${crypto.randomUUID()}.db`));
-	authStorage.setRuntimeApiKey("openai-codex", fakeAccessToken(options.accountId));
+	authStorage.keys.setRuntime("openai-codex", fakeAccessToken(options.accountId));
 	const modelRegistry = new ModelRegistry(authStorage, tempDir.join(`models-${crypto.randomUUID()}.yml`));
 	const result = await createAgentSession({
 		cwd: options.cwd,

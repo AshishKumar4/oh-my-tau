@@ -39,8 +39,8 @@ describe("harness.mode (persisted, model/Prompt, default auto)", () => {
 		tempDir = TempDir.createSync("@pi-harness-mode-");
 		await initTheme();
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
-		authStorage.setRuntimeApiKey("opencode-zen", "opencode-zen-test-key");
+		authStorage.keys.setRuntime("anthropic", "anthropic-test-key");
+		authStorage.keys.setRuntime("opencode-zen", "opencode-zen-test-key");
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 	});
 

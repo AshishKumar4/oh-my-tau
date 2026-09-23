@@ -28,6 +28,10 @@ export interface SessionSnapshot {
 	 * resolves — omp tools plus the nested vendor aliases.
 	 */
 	codex?: { tools: { name: string; description: string }[] };
+	/** Selected package directory consulted only after the importing file's project. */
+	packageRoot?: string;
+	/** Model-visible description of the selected package environment. */
+	packageEnvironment?: string;
 }
 
 export interface RunErrorPayload {

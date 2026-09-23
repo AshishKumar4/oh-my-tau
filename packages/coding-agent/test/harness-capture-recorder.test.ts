@@ -172,7 +172,7 @@ describe("harness capture recorder", () => {
 	async function bootGateway(options: { record: boolean }): Promise<Gateway> {
 		registerMockApi();
 		const storage = await AuthStorage.create(path.join(dirs.root, `auth-${gateways.length}.db`));
-		storage.setRuntimeApiKey("openrouter", "test-key");
+		storage.keys.setRuntime("openrouter", "test-key");
 		const mock = createMockModel({ provider: "openrouter", id: "mock/harness-recorder" });
 		const handle = startAuthGateway({
 			bind: "127.0.0.1:0",

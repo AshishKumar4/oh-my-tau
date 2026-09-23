@@ -522,7 +522,7 @@ function classifyText(
 		// not a content refusal, and `ContentBlocked` would stop the rotation that
 		// reaches a working credential. `isAnthropicAccountPolicyText` below marks
 		// it `AccountPolicy` alone; `isOrgOAuthDenialError` still drives the longer
-		// set-aside window in `AuthStorage`.
+		// set-aside window in `RateLimits.rotate`.
 		if (
 			ACCOUNT_POLICY_PATTERN.test(errorMessage) ||
 			isCodexChatGPTAccountPolicyText(errorMessage, provider, modelId) ||

@@ -285,17 +285,19 @@ export function forkAnchorIsCurrent(
 /** Resolve the durable credential row behind a snapshot's account, for pinning. */
 export function resolveForkCredentialId(
 	authStorage: {
-		listOAuthAccounts(
-			provider: string,
-			sessionId?: string,
-		): Array<{ credentialId: number; accountId?: string; active: boolean }>;
+		oauth: {
+			accounts(
+				provider: string,
+				sessionId?: string,
+			): Array<{ credentialId: number; accountId?: string; active: boolean }>;
+		};
 	},
 	snapshot: CodexRequestSnapshot,
 	sessionId?: string,
 ): number | undefined {
 	if (snapshot.accountId === undefined) return undefined;
-	const account = authStorage
-		.listOAuthAccounts(snapshot.provider, sessionId)
+	const account = authStorage.oauth
+		.accounts(snapshot.provider, sessionId)
 		.find(candidate => candidate.active && candidate.accountId === snapshot.accountId);
 	return account?.credentialId;
 }

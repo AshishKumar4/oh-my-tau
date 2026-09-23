@@ -38,7 +38,11 @@ import { getConfigRootDir, getHarnessCacheDir, isEnoent, logger, VERSION } from 
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { recordHarnessRequest } from "../harness/record";
-import { type AuthBrokerClientConfig, resolveAuthBrokerConfig } from "../session/auth-broker-config";
+import {
+	type AuthBrokerClientConfig,
+	loadEffectiveAuthAccountPolicyConfig,
+	resolveAuthBrokerConfig,
+} from "../session/auth-broker-config";
 
 export type AuthGatewayAction = "serve" | "token" | "status" | "check";
 
@@ -266,6 +270,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// Build a broker-backed AuthStorage — same pattern as discoverAuthStorage()
 	// in sdk.ts. The gateway never touches local SQLite.
 	const accountPool = await loadAuthBrokerAccountPool();
+	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig();
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
 	const store = new RemoteAuthCredentialStore({
@@ -279,8 +284,10 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// gateway only needs to construct the store and pass it in.
 	const storage = new AuthStorage(store, {
 		sourceLabel: `broker ${brokerConfig.url}`,
+		accountPolicies,
+		defaultReservePct,
 	});
-	await storage.reload();
+	await storage.credentials.reload();
 
 	// Build the model resolver + catalog from the ModelRegistry — the same
 	// component the TUI/CLI use — scoped to providers we hold credentials for.
@@ -300,7 +307,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// advertised until restart.
 	const providersWithCreds = (): Set<string> => {
 		const providers = new Set<string>();
-		for (const entry of storage.exportSnapshot().credentials) providers.add(entry.provider);
+		for (const entry of storage.credentials.snapshot().credentials) providers.add(entry.provider);
 		return providers;
 	};
 	let modelById = new Map<string, Model<Api>>();
@@ -362,7 +369,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	const credentialSync = setInterval(() => {
 		void (async () => {
 			try {
-				if (await storage.pollExternalChanges()) await rebuildCatalog(true);
+				if (await storage.credentials.poll()) await rebuildCatalog(true);
 			} catch (error) {
 				logger.warn("auth-gateway credential sync failed", {
 					error: error instanceof Error ? error.message : String(error),
@@ -562,7 +569,7 @@ const STRICT_PROBE_MAX_CANDIDATES = 4;
 const STRICT_PROBE_PER_ATTEMPT_TIMEOUT_MS = 15_000;
 
 /**
- * Overall per-credential budget passed to {@link AuthStorage.checkCredentials}.
+ * Overall per-credential budget passed to {@link AuthStorage.health.check}.
  * Big enough to walk every candidate at the per-attempt cap with a small
  * margin for refresh/network overhead.
  */
@@ -655,7 +662,7 @@ async function probeOneModel(
 
 /**
  * Build the {@link CompletionProbe} consumed by
- * {@link AuthStorage.checkCredentials} in `--strict` mode. Walks the cheapest
+ * {@link AuthStorage.health.check} in `--strict` mode. Walks the cheapest
  * candidates per provider, retrying on "model not found / invalid model"
  * errors so a stale catalog entry doesn't masquerade as a bad credential.
  * Stops as soon as one model returns a successful response (the credential
@@ -723,6 +730,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	}
 
 	const accountPool = await loadAuthBrokerAccountPool();
+	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig();
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
 	const store = new RemoteAuthCredentialStore({
@@ -730,10 +738,14 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		initialSnapshot,
 		accountPool,
 	});
-	const storage = new AuthStorage(store, { sourceLabel: `broker ${brokerConfig.url}` });
+	const storage = new AuthStorage(store, {
+		sourceLabel: `broker ${brokerConfig.url}`,
+		accountPolicies,
+		defaultReservePct,
+	});
 	try {
-		await storage.reload();
-		const results = await storage.checkCredentials(
+		await storage.credentials.reload();
+		const results = await storage.health.check(
 			flags.strict
 				? { completionProbe: createStrictCompletionProbe(), completionTimeoutMs: STRICT_PROBE_OVERALL_TIMEOUT_MS }
 				: undefined,

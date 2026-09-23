@@ -36,8 +36,8 @@ describe("harness surface as the provider request sees it", () => {
 		tempDir = TempDir.createSync("@pi-present-smoke-");
 		await initTheme();
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "anthropic-test-key");
-		authStorage.setRuntimeApiKey("openai-codex", "openai-codex-test-key");
+		authStorage.keys.setRuntime("anthropic", "anthropic-test-key");
+		authStorage.keys.setRuntime("openai-codex", "openai-codex-test-key");
 		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 	});
 
