@@ -1,12 +1,12 @@
 {
 	"harness": "codex",
-	"clientVersion": "0.154.0",
+	"clientVersion": "0.155.1",
 	"models": ["gpt-6-astra", "gpt-5.6-sol"],
 	"source": {
-		"client": "Codex CLI 0.154.0 (codex_cli_rs), Apache-2.0 \u2014 fixtures derived from its own request bytes",
+		"client": "Codex CLI 0.155.1 (codex_cli_rs), Apache-2.0 \u2014 fixtures derived from its own request bytes",
 		"captures": ["cx-gpt-6-astra.json", "cx-gpt-5.6-sol.json"],
-		"recorded": "POST /responses request body, interactive turn, sandbox_mode danger-full-access",
-		"derivation": "codexFraming(body) and harnessInventoryShape(codexDeclarations(body), <every declared name>) from test/helpers/harness-golden.ts. Passing the vendor's own names as `boundNames` makes `boundNaming` the harness's naming convention \u2014 the half omp's renamed tools must match \u2014 and leaves `unboundNaming` empty. Only the projections are vendored: the ~21k-char harness prompt and the vendor tool descriptions take part in no assertion here.",
+		"recorded": "POST /responses request body (zstd-decoded), `codex exec` turn (originator codex_exec), sandbox_mode danger-full-access, captured by a loopback logging proxy set as `openai_base_url`",
+		"derivation": "codexFraming(body) and harnessInventoryShape(codexDeclarations(body), <every declared name>) from test/helpers/harness-golden.ts. Passing the vendor's own names as `boundNames` makes `boundNaming` the harness's naming convention \u2014 the half omp's renamed tools must match \u2014 and leaves `unboundNaming` empty. Only the projections are vendored: the ~18-21k-char harness prompt and the vendor tool descriptions take part in no assertion here.",
 		"regenerate": "point OMP_HARNESS_CAPTURE_DIR at the capture directory and run the local-only block in harness-golden-contract.test.ts; it re-projects the captures and asserts they still match vendorFraming/vendorInventory."
 	},
 	"vendorFraming": {

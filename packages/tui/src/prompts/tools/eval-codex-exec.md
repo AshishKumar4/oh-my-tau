@@ -3,7 +3,7 @@
 
 	Everything from "Run JavaScript code" down to `yield_control()` is
 	EXEC_DESCRIPTION_TEMPLATE, reproduced verbatim from codex-rs
-	`code-mode-protocol/src/description.rs:15` (Codex 0.154.0, Copyright
+	`code-mode-protocol/src/description.rs:15` (Codex 0.155.1, Copyright
 	OpenAI, Apache-2.0 <https://www.apache.org/licenses/LICENSE-2.0>). It is
 	the fixed head a codex-profile model was post-trained against, so it is
 	copied rather than paraphrased; `build_exec_tool_description` at :253
