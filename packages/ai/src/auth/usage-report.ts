@@ -7,6 +7,18 @@ import type {
 	UsageLogger,
 	UsageReport,
 } from "../usage";
+import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
+
+/**
+ * Whether a report is recent enough to decide block state. A failed fetch
+ * serves the last good report, however old, so a stored report can describe
+ * an account before it recovered or before a saved reset cleared it. Only a
+ * report inside the usage TTL may heal a block, confirm a reset, or set a
+ * block's deadline.
+ */
+export function isLiveUsageReport(report: UsageReport, nowMs: number): boolean {
+	return Number.isFinite(report.fetchedAt) && nowMs - report.fetchedAt <= USAGE_REPORT_TTL_MS;
+}
 
 /** Read a string identity field from report metadata. */
 export function usageReportMetadataValue(report: UsageReport, key: string): string | undefined {

@@ -1,5 +1,4 @@
 import { logger } from "@oh-my-pi/pi-utils";
-import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
 import type { UsageReport } from "../usage";
 import { claudeResetClearedBlockScopes, consumeClaudeResetCredit, listClaudeResetCredits } from "../usage/claude-reset";
 import { consumeCodexResetCredit, listCodexResetCredits, pickSoonestExpiringCredit } from "../usage/openai-codex-reset";
@@ -18,6 +17,7 @@ import type {
 } from "./types";
 import type { UsageService } from "./usage";
 import type { UsageCache } from "./usage-cache";
+import { isLiveUsageReport } from "./usage-report";
 
 /** Dependencies for listing and redeeming stored-account reset credits. */
 export interface ResetCreditsDeps {
@@ -229,7 +229,7 @@ export class ResetCredits implements ResetsApi {
 					const cleared = result.cleared ?? [];
 					if (
 						report &&
-						Date.now() - report.fetchedAt <= USAGE_REPORT_TTL_MS &&
+						isLiveUsageReport(report, Date.now()) &&
 						cleared.length > 0 &&
 						this.#deps.pool.entries(provider).some(entry => entry.id === access.credentialId)
 					) {

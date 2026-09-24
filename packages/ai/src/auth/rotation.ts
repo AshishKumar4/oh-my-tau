@@ -26,6 +26,7 @@ import type {
 } from "./types";
 import type { UsageService } from "./usage";
 import {
+	isLiveUsageReport,
 	isUsageLimitExhausted,
 	isUsageLimitReached,
 	scopedUsageLimits,
@@ -254,7 +255,12 @@ export class RateLimits implements LimitsApi {
 				options?.signal,
 				"usage fetch aborted",
 			);
-			if (report) {
+			// A failed fetch serves the last good report, however old. Only a live
+			// one may stretch this block past the provider's own retry hint: a
+			// report from before a saved reset (or before the window rolled)
+			// still shows the account exhausted until its old reset, and would
+			// re-block a recovered account for days.
+			if (report && isLiveUsageReport(report, Date.now())) {
 				const scopedLimits = scopedUsageLimits(routing.strategy, report, routing.rankingContext);
 				if (isUsageLimitReached(scopedLimits)) {
 					const resetAtMs = usageResetAtMs(scopedLimits, Date.now());

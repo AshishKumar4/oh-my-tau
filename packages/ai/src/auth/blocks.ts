@@ -5,7 +5,12 @@ import type { RankingStrategyResolver } from "../usage/registry";
 import type { CredentialPool } from "./pool";
 import { isSqliteCorruptionError, USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
 import type { AuthCredentialStore } from "./store";
-import { isUsageLimitReached, usageReportMetadataValue, usageReportScopeAccountId } from "./usage-report";
+import {
+	isLiveUsageReport,
+	isUsageLimitReached,
+	usageReportMetadataValue,
+	usageReportScopeAccountId,
+} from "./usage-report";
 import type { UsageCache, UsageRequestDescriptor } from "./usage-cache";
 import { type AuthCredential, type BlocksApi, CREDENTIAL_HOLD_SCOPE, type StoredCredentialBlock } from "./types";
 
@@ -481,7 +486,7 @@ export class CredentialBlocks implements BlocksApi {
 		// Only a live report proves recovery. A broker can serve its retained
 		// last-good report for hours after `/usage` starts failing, and those
 		// healthy limits describe the account before the 429 that blocked it.
-		if (!Number.isFinite(report.fetchedAt) || Date.now() - report.fetchedAt > USAGE_REPORT_TTL_MS) return;
+		if (!isLiveUsageReport(report, Date.now())) return;
 		for (const { blockScope, limits, healthy } of strategy?.healableBlockScopes?.(report) ?? []) {
 			if (healthy === false || isUsageLimitReached(limits) || (healthy === undefined && limits.length === 0))
 				continue;

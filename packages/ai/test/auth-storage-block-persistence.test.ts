@@ -224,6 +224,67 @@ describe("AuthStorage credential block persistence", () => {
 		}
 	});
 
+	// A failed usage fetch serves the last good report, however old. When a
+	// saved reset cleared an account, that report still shows the week spent
+	// until its old reset, so a 429 on the recovered account must not stretch
+	// the block to that reset: doing so re-blocked it for four days while its
+	// live week stood at 4%.
+	for (const [label, reportAgeMs, stretched] of [
+		["a stale report cannot stretch", 30 * 60_000, false],
+		["a live report still stretches", 0, true],
+	] as const) {
+		it(`${label} a usage-limit block to its exhausted window's reset`, async () => {
+			const weekResetMs = Date.now() + 4 * 24 * 3_600_000;
+			const setup = await SqliteAuthCredentialStore.open(dbPath);
+			setup.saveOAuth(PROVIDER, oauthCredential("reset"));
+			setup.close();
+
+			const store = await SqliteAuthCredentialStore.open(dbPath);
+			const storage = new AuthStorage(store, {
+				usageProviderResolver: provider =>
+					provider === PROVIDER
+						? {
+								id: PROVIDER,
+								fetchUsage: async params => ({
+									provider: PROVIDER,
+									fetchedAt: Date.now() - reportAgeMs,
+									limits: [
+										claudeLimit("anthropic:5h", 0.1, { shared: true }),
+										{
+											...claudeLimit("anthropic:7d", 1, { shared: true }),
+											window: { id: "7d", label: "7d", resetsAt: weekResetMs },
+										},
+									],
+									metadata: { accountId: params.credential.accountId },
+								}),
+							}
+						: undefined,
+			});
+			await storage.credentials.reload();
+			try {
+				expect(await storage.keys.get(PROVIDER, "session-reset", { modelId: "claude-opus-5" })).toBe(
+					"access-reset",
+				);
+				const before = Date.now();
+				const outcome = await storage.limits.markReached(PROVIDER, "session-reset", {
+					retryAfterMs: 60_000,
+					providerTimed: true,
+					modelId: "claude-opus-5",
+				});
+
+				const blockedUntil = outcome.blockedUntilMs ?? 0;
+				if (stretched) {
+					expect(blockedUntil).toBe(weekResetMs);
+				} else {
+					expect(blockedUntil).toBeGreaterThanOrEqual(before + 60_000);
+					expect(blockedUntil).toBeLessThan(before + 10 * 60_000);
+				}
+			} finally {
+				storage.close();
+			}
+		});
+	}
+
 	it("never selects a held account, even as the last resort or by direct id, until it is released", async () => {
 		const setup = await SqliteAuthCredentialStore.open(dbPath);
 		setup.saveOAuth(PROVIDER, oauthCredential("held"));
