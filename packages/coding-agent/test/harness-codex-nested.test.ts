@@ -1,9 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { callSessionTool } from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
+import { MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
@@ -44,7 +46,7 @@ function stubTool(name: string, respond: (args: Record<string, unknown>) => unkn
 function session(
 	model: Model,
 	tools: StubTool[],
-	options: { asyncJobIds?: readonly string[]; disabled?: readonly string[] } = {},
+	options: { asyncJobIds?: readonly string[]; disabled?: readonly string[]; manager?: AsyncJobManager } = {},
 ): ToolSession {
 	const disabled = new Set(options.disabled ?? []);
 	const registry = new Map(tools.filter(t => !disabled.has(t.tool.name)).map(t => [t.tool.name, t.tool]));
@@ -58,11 +60,18 @@ function session(
 		getToolForEvalBridge: (name: string) => registry.get(name),
 		getEvalBridgeToolNames: () => [...registry.keys()],
 		getToolContext: () => undefined,
-		asyncJobManager: options.asyncJobIds
-			? ({ getJob: (id: string) => (options.asyncJobIds?.includes(id) ? { id } : undefined) } as never)
-			: undefined,
+		asyncJobManager:
+			options.manager ??
+			(options.asyncJobIds
+				? ({ getJob: (id: string) => (options.asyncJobIds?.includes(id) ? { id } : undefined) } as never)
+				: undefined),
 	} as unknown as ToolSession;
 }
+
+const managers: AsyncJobManager[] = [];
+afterEach(async () => {
+	for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 200 });
+});
 
 const call = (s: ToolSession, name: string, args: unknown) => callSessionTool(name, args, { session: s });
 
@@ -89,23 +98,59 @@ describe("codex nested exec aliases", () => {
 		expect((out as Record<string, unknown>).exit_code).toBeUndefined();
 	});
 
-	test("write_stdin with empty chars polls via hub wait", async () => {
-		const hub = stubTool("hub", () => ({ text: "…output…", details: {} }));
-		const s = session(CODEX, [hub]);
+	test("write_stdin with empty chars waits on a background job and returns its settled result", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		managers.push(manager);
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("bash", "sleep 1", () => gate.promise, { ownerId: MAIN_AGENT_ID });
+		const write = stubTool("write", () => ({ text: "unused", details: {} }));
+		const read = stubTool("read", () => ({ text: "unused", details: {} }));
+		const s = session(CODEX, [write, read], { manager });
 
-		const out = await call(s, "write_stdin", { session_id: "bg_2", yield_time_ms: 2000 });
-		expect(hub.calls).toEqual([{ op: "wait", ids: ["bg_2"] }]);
-		expect(out).toMatchObject({ output: "…output…" });
+		const polled = call(s, "write_stdin", { session_id: jobId, yield_time_ms: 5000 });
+		gate.resolve("slept\n");
+		const out = (await polled) as Record<string, unknown>;
+		expect(out).toMatchObject({ output: "slept\n", exit_code: 0 });
+		expect(out.session_id).toBeUndefined();
+		// The poll consumed the settled result, so it is not delivered a second time.
+		expect(manager.isJobResultConsumed(jobId)).toBe(true);
+		expect(read.calls).toEqual([]);
+	});
+
+	test("write_stdin with empty chars reads a still-running session back from proc://", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		managers.push(manager);
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("bash", "tail -f log", () => gate.promise, { ownerId: MAIN_AGENT_ID });
+		const write = stubTool("write", () => ({ text: "unused", details: {} }));
+		const read = stubTool("read", () => ({ text: `${jobId} [bash] — running — tail -f log\nline 1`, details: {} }));
+		const s = session(CODEX, [write, read], { manager });
+
+		const out = await call(s, "write_stdin", { session_id: jobId, yield_time_ms: 1 });
+		expect(out).toMatchObject({ output: `${jobId} [bash] — running — tail -f log\nline 1`, session_id: jobId });
+		expect((out as Record<string, unknown>).exit_code).toBeUndefined();
+		expect(read.calls).toEqual([{ path: `proc://${jobId}` }]);
+		expect(manager.getJob(jobId)?.status).toBe("running");
+		gate.resolve("");
+	});
+
+	test("write_stdin with chars reaches a service's stdin through write proc://", async () => {
+		const write = stubTool("write", () => ({ text: "Sent input to dev-server: running", details: {} }));
+		const s = session(CODEX, [write]);
+
+		const out = await call(s, "write_stdin", { session_id: "dev-server", chars: "rs\n" });
+		expect(write.calls).toEqual([{ path: "proc://dev-server", content: "rs\n" }]);
+		expect(out).toMatchObject({ output: "Sent input to dev-server: running", session_id: "dev-server" });
 	});
 
 	test("write_stdin with chars to a backgrounded job refuses stdin honestly", async () => {
-		const hub = stubTool("hub", () => ({ text: "ok", details: {} }));
-		const s = session(CODEX, [hub], { asyncJobIds: ["bg_2"] });
+		const write = stubTool("write", () => ({ text: "ok", details: {} }));
+		const s = session(CODEX, [write], { asyncJobIds: ["bg_2"] });
 
 		const error = await call(s, "write_stdin", { session_id: "bg_2", chars: "yes\n" }).catch(e => e);
 		expect(error).toBeInstanceOf(ToolError);
 		expect(String(error)).toContain("no stdin");
-		expect(hub.calls).toEqual([]);
+		expect(write.calls).toEqual([]);
 	});
 
 	test("apply_patch forwards the raw patch document to edit", async () => {

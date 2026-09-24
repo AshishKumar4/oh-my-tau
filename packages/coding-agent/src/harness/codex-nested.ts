@@ -9,6 +9,7 @@
 
 import type { Model } from "@oh-my-pi/pi-ai";
 import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { EVAL_WAIT_BRIDGE_NAME } from "../eval/handle-bridge";
 import type { ToolSession } from "../tools";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { servedHarnessPrompt } from "./capture";
@@ -16,7 +17,7 @@ import { servedHarnessPrompt } from "./capture";
 /** Context handed to alias implementations that need more than a params rewrite. */
 export interface CodexNestedCallContext {
 	session: ToolSession;
-	/** Invoke an enabled omp tool by name; returns the bridge-normalized result. */
+	/** Invoke an enabled omp tool (or an eval bridge helper such as the handle wait) by name; returns the bridge-normalized result. */
 	invoke: (toolName: string, params: Record<string, unknown>) => Promise<unknown>;
 	/** Wall-clock seconds since the alias call started. */
 	elapsedSeconds: () => number;
@@ -123,6 +124,14 @@ function settledExitCode(status: unknown): number {
 	}
 }
 
+/**
+ * write_stdin: an empty `chars` polls — a background job is waited on for at
+ * most `yield_time_ms` (the eval handle wait: scoped to this id, abortable, and
+ * it consumes the settled result so it is not delivered twice); anything still
+ * running, or a service, is read back from `proc://<id>`. Non-empty `chars`
+ * reach a service's stdin through `write proc://<id>`; background jobs take no
+ * input.
+ */
 async function writeStdinCall(
 	args: Record<string, unknown>,
 	ctx: CodexNestedCallContext,
@@ -133,33 +142,35 @@ async function writeStdinCall(
 	}
 	const id = String(sessionId);
 	const chars = stringArg(args, "chars");
+	const job = ctx.session.asyncJobManager?.getJob(id);
 	if (chars === undefined || chars === "") {
-		const result = await ctx.invoke("hub", {
-			op: "wait",
-			ids: [id],
-		});
-		const output: Record<string, unknown> = {
-			output: resultText(result),
-			wall_time_seconds: ctx.elapsedSeconds(),
-		};
-		const jobs = asRecord(resultDetails(result)?.jobs)?.jobs;
-		const snapshot = Array.isArray(jobs) ? asRecord(jobs[0]) : undefined;
-		if (snapshot && snapshot.status !== "running") {
-			output.exit_code = settledExitCode(snapshot.status);
-		} else {
-			output.session_id = id;
+		if (job) {
+			const waited = await ctx.invoke(EVAL_WAIT_BRIDGE_NAME, {
+				items: [{ kind: "agent", id }],
+				timeoutMs: Math.max(0, numberArg(args, "yield_time_ms") ?? 0),
+			});
+			const items = asRecord(waited)?.items;
+			const settled = Array.isArray(items) ? asRecord(items[0]) : undefined;
+			if (settled && settled.status !== "running") {
+				const text = typeof settled.text === "string" ? settled.text : undefined;
+				const error = typeof settled.error === "string" ? settled.error : undefined;
+				const exitCode = job.latestDetails?.exitCode;
+				return {
+					output: text ?? error ?? "",
+					wall_time_seconds: ctx.elapsedSeconds(),
+					exit_code: typeof exitCode === "number" ? exitCode : settledExitCode(settled.status),
+				};
+			}
 		}
-		return output;
+		const snapshot = await ctx.invoke("read", { path: `proc://${id}` });
+		return { output: resultText(snapshot), wall_time_seconds: ctx.elapsedSeconds(), session_id: id };
 	}
-	// exec_command sessions background as omp async jobs, which have no stdin —
-	// only hub-launched processes take input, and hub surfaces its own error
-	// for names that match neither.
-	if (ctx.session.asyncJobManager?.getJob(id)) {
+	if (job) {
 		throw new ToolError(
-			"background jobs have no stdin; start interactive processes with tools.hub({op:'start', ...}) and write with {op:'send'}",
+			"background jobs have no stdin; start interactive processes as services with tools.bash({command, name}) and write to them with tools.write({path: 'proc://<name>', content})",
 		);
 	}
-	const result = await ctx.invoke("hub", { op: "send", name: id, text: chars });
+	const result = await ctx.invoke("write", { path: `proc://${id}`, content: chars });
 	if (resultFailed(result)) {
 		throw new ToolError(resultText(result) || `no interactive process named ${id}`);
 	}
@@ -212,7 +223,7 @@ const CODEX_NESTED_ALIASES: readonly CodexNestedAlias[] = [
 	{
 		name: "write_stdin",
 		summary: "Poll a running exec session for output, or write to an interactive process.",
-		target: "hub",
+		target: "write",
 		call: writeStdinCall,
 	},
 	{

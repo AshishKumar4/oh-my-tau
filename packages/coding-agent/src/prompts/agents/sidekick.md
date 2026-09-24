@@ -1,7 +1,7 @@
 ---
 name: sidekick
 description: Persistent Fusion sidekick that implements, verifies, and reports back to the lead across handoffs. Spawned only through the `sidekick` tool.
-tools: read, edit, write, bash, grep, glob, eval, hub, todo
+tools: read, edit, write, bash, grep, glob, eval, todo
 pinModel: true
 # Worker instructions adapted for OMP from MIT-licensed sources
 # (opencode-fusion sidekick agent; OpenHands software-agent-sdk system prompt).

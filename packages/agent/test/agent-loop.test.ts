@@ -6,6 +6,7 @@ import {
 	agentLoopContinue,
 	agentLoopDetailed,
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
+	TOOL_INTERRUPT_ABORT_REASON,
 } from "@oh-my-pi/pi-agent-core/agent-loop";
 import { SpeculativeOperationCoordinator } from "@oh-my-pi/pi-agent-core/speculative-execution";
 import type {
@@ -1214,29 +1215,29 @@ describe("agentLoop with AgentMessage", () => {
 	});
 
 	it("persists a persistAs tool call under its target name while dispatching by its own name", async () => {
-		const hubSchema = type({ op: "'send'", to: "string", message: "string" });
+		const writeSchema = type({ path: "string", content: "string" });
 		const facadeSchema = type({ to: "string", message: "string" });
-		const hubCalls: unknown[] = [];
-		const hub: AgentTool<typeof hubSchema> = {
-			name: "hub",
-			label: "Hub",
-			description: "hub",
-			parameters: hubSchema,
+		const writeCalls: unknown[] = [];
+		const write: AgentTool<typeof writeSchema> = {
+			name: "write",
+			label: "Write",
+			description: "write",
+			parameters: writeSchema,
 			async execute(_id, params) {
-				hubCalls.push(params);
+				writeCalls.push(params);
 				return { content: [{ type: "text", text: "delivered" }] };
 			},
 		};
 		const facade: AgentTool<typeof facadeSchema> = {
 			name: "SendMessage",
-			persistAs: "hub",
-			label: "Hub",
+			persistAs: "write",
+			label: "Write",
 			description: "send",
 			parameters: facadeSchema,
 			execute: (id, params, signal, onUpdate, ctx) =>
-				hub.execute(id, { op: "send", ...params }, signal, onUpdate, ctx),
+				write.execute(id, { path: `agent://${params.to}`, content: params.message }, signal, onUpdate, ctx),
 		};
-		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [hub, facade] };
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [write, facade] };
 		const mock = createMockModel({
 			responses: [
 				{
@@ -1257,38 +1258,38 @@ describe("agentLoop with AgentMessage", () => {
 			mock.stream,
 		).result();
 
-		expect(hubCalls).toEqual([{ op: "send", to: "Main", message: "hi" }]);
+		expect(writeCalls).toEqual([{ path: "agent://Main", content: "hi" }]);
 		const assistant = messages[1] as AssistantMessage;
 		const call = assistant.content.find(block => block.type === "toolCall");
-		expect(call).toMatchObject({ name: "hub", wireName: "SendMessage", arguments: { to: "Main", message: "hi" } });
+		expect(call).toMatchObject({ name: "write", wireName: "SendMessage", arguments: { to: "Main", message: "hi" } });
 		const result = messages.find((m): m is ToolResultMessage => m.role === "toolResult");
-		expect(result?.toolName).toBe("hub");
+		expect(result?.toolName).toBe("write");
 		expect(result?.content).toContainEqual({ type: "text", text: "delivered" });
 	});
 
 	it("emits persistAs event args in the target shape while persisting the wire shape", async () => {
-		const hubSchema = type({ op: "'send'", to: "string", message: "string" });
+		const writeSchema = type({ path: "string", content: "string" });
 		const facadeSchema = type({ to: "string", message: "string" });
-		const hub: AgentTool<typeof hubSchema> = {
-			name: "hub",
-			label: "Hub",
-			description: "hub",
-			parameters: hubSchema,
+		const write: AgentTool<typeof writeSchema> = {
+			name: "write",
+			label: "Write",
+			description: "write",
+			parameters: writeSchema,
 			async execute() {
 				return { content: [{ type: "text", text: "delivered" }] };
 			},
 		};
 		const facade: AgentTool<typeof facadeSchema> = {
 			name: "SendMessage",
-			persistAs: "hub",
-			label: "Hub",
+			persistAs: "write",
+			label: "Write",
 			description: "send",
 			parameters: facadeSchema,
-			toNativeArgs: args => ({ op: "send", ...args }),
+			toNativeArgs: args => ({ path: `agent://${args.to}`, content: args.message }),
 			execute: (id, params, signal, onUpdate, ctx) =>
-				hub.execute(id, { op: "send", ...params }, signal, onUpdate, ctx),
+				write.execute(id, { path: `agent://${params.to}`, content: params.message }, signal, onUpdate, ctx),
 		};
-		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [hub, facade] };
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [write, facade] };
 		const mock = createMockModel({
 			responses: [
 				{
@@ -1310,44 +1311,44 @@ describe("agentLoop with AgentMessage", () => {
 
 		const start = events.find(event => event.type === "tool_execution_start");
 		expect(start?.type === "tool_execution_start" ? [start.toolName, start.args] : undefined).toEqual([
-			"hub",
-			{ op: "send", to: "Main", message: "hi" },
+			"write",
+			{ path: "agent://Main", content: "hi" },
 		]);
 		const assistant = messages[1] as AssistantMessage;
 		const call = assistant.content.find(block => block.type === "toolCall");
 		expect(call).toMatchObject({
-			name: "hub",
+			name: "write",
 			wireName: "SendMessage",
 			arguments: { to: "Main", message: "hi" },
-			nativeArguments: { op: "send", to: "Main", message: "hi" },
+			nativeArguments: { path: "agent://Main", content: "hi" },
 		});
 	});
 
 	it("falls back to the raw args when a persistAs event projection throws", async () => {
-		const hubSchema = type({ op: "'send'", to: "string", message: "string" });
+		const writeSchema = type({ path: "string", content: "string" });
 		const facadeSchema = type({ to: "string", message: "string" });
-		const hub: AgentTool<typeof hubSchema> = {
-			name: "hub",
-			label: "Hub",
-			description: "hub",
-			parameters: hubSchema,
+		const write: AgentTool<typeof writeSchema> = {
+			name: "write",
+			label: "Write",
+			description: "write",
+			parameters: writeSchema,
 			async execute() {
 				return { content: [{ type: "text", text: "delivered" }] };
 			},
 		};
 		const facade: AgentTool<typeof facadeSchema> = {
 			name: "SendMessage",
-			persistAs: "hub",
-			label: "Hub",
+			persistAs: "write",
+			label: "Write",
 			description: "send",
 			parameters: facadeSchema,
 			toNativeArgs: () => {
 				throw new Error("no native shape for this payload");
 			},
 			execute: (id, params, signal, onUpdate, ctx) =>
-				hub.execute(id, { op: "send", ...params }, signal, onUpdate, ctx),
+				write.execute(id, { path: `agent://${params.to}`, content: params.message }, signal, onUpdate, ctx),
 		};
-		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [hub, facade] };
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [write, facade] };
 		const mock = createMockModel({
 			responses: [
 				{
@@ -1374,7 +1375,7 @@ describe("agentLoop with AgentMessage", () => {
 		});
 		const assistant = messages[1] as AssistantMessage;
 		const call = assistant.content.find(block => block.type === "toolCall");
-		expect(call).toMatchObject({ name: "hub", wireName: "SendMessage", arguments: { to: "Main", message: "hi" } });
+		expect(call).toMatchObject({ name: "write", wireName: "SendMessage", arguments: { to: "Main", message: "hi" } });
 		expect(call?.type === "toolCall" ? "nativeArguments" in call : undefined).toBe(false);
 		const result = messages.find((m): m is ToolResultMessage => m.role === "toolResult");
 		expect(result?.isError).toBeFalsy();
@@ -2255,6 +2256,7 @@ describe("agentLoop with AgentMessage", () => {
 		let steerReady = false;
 		let drained = false;
 		let observedAbort = false;
+		let observedReason: unknown;
 		let resolvedByTimeout = false;
 
 		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
@@ -2284,6 +2286,7 @@ describe("agentLoop with AgentMessage", () => {
 				}
 				await promise;
 				observedAbort = signal?.aborted === true;
+				observedReason = signal?.reason;
 				return { content: [{ type: "text", text: "waited" }], details: {} };
 			},
 		};
@@ -2315,11 +2318,91 @@ describe("agentLoop with AgentMessage", () => {
 		}
 
 		expect(observedAbort).toBe(true);
+		expect(observedReason).toBe(TOOL_INTERRUPT_ABORT_REASON);
 		expect(resolvedByTimeout).toBe(false);
 		expect(drained).toBe(true);
 		expect(
 			events.some(e => e.type === "message_start" && e.message.role === "user" && e.message.content === "interrupt"),
 		).toBe(true);
+	});
+
+	it("aborts an interruptible wait on queued steering in wait mode without soft-signalling other tools", async () => {
+		const toolSchema = type({});
+		let steerReady = false;
+		let drained = false;
+		let workSoftAborted: boolean | undefined;
+		let steeringSignal: AbortSignal | undefined;
+		const waitAborted = Promise.withResolvers<void>();
+
+		const waitTool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "wait",
+			label: "Wait",
+			description: "Blocks until aborted",
+			parameters: toolSchema,
+			interruptible: true,
+			async execute(_toolCallId, _params, signal) {
+				steerReady = true;
+				const { promise, resolve } = Promise.withResolvers<void>();
+				signal?.addEventListener("abort", () => resolve(), { once: true });
+				await promise;
+				waitAborted.resolve();
+				signal?.throwIfAborted();
+				return { content: [{ type: "text", text: "waited" }], details: {} };
+			},
+		};
+		const workTool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "work",
+			label: "Work",
+			description: "Foreground work that outlives the interrupt",
+			parameters: toolSchema,
+			async execute() {
+				await waitAborted.promise;
+				await new Promise<void>(resolve => setImmediate(resolve));
+				workSoftAborted = steeringSignal?.aborted === true;
+				return { content: [{ type: "text", text: "worked" }], details: {} };
+			},
+		};
+
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [waitTool, workTool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "wait", arguments: {} },
+						{ type: "toolCall", id: "tool-2", name: "work", arguments: {} },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			interruptMode: "wait",
+			hasSteeringMessages: () => steerReady && !drained,
+			getSteeringMessages: async () => {
+				if (!steerReady || drained) return [];
+				drained = true;
+				return [createUserMessage("interrupt")];
+			},
+			getToolContext: toolCall => {
+				steeringSignal = toolCall?.steeringSignal;
+				return { toolCall } as AgentToolContext;
+			},
+		};
+
+		const events: AgentEvent[] = [];
+		for await (const event of agentLoop([createUserMessage("start")], context, config, undefined, mock.stream)) {
+			events.push(event);
+		}
+
+		expect(workSoftAborted).toBe(false);
+		const results = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_execution_end" }> => event.type === "tool_execution_end",
+		);
+		expect(results.find(event => event.toolName === "wait")?.result.details).toMatchObject({ __interrupted: true });
+		expect(results.find(event => event.toolName === "work")?.isError).toBe(false);
+		expect(drained).toBe(true);
 	});
 
 	it("distinguishes an in-flight abort from a never-executed steering skip", async () => {
@@ -2463,6 +2546,7 @@ describe("agentLoop with AgentMessage", () => {
 		let ircReady = false;
 		let ircDrained = false;
 		let observedAbort = false;
+		let observedReason: unknown;
 		let resolvedByTimeout = false;
 		const ircMessage = createUserMessage("irc interrupt");
 
@@ -2493,6 +2577,7 @@ describe("agentLoop with AgentMessage", () => {
 				}
 				await promise;
 				observedAbort = signal?.aborted === true;
+				observedReason = signal?.reason;
 				return { content: [{ type: "text", text: "waited" }], details: {} };
 			},
 		};
@@ -2524,6 +2609,7 @@ describe("agentLoop with AgentMessage", () => {
 		}
 
 		expect(observedAbort).toBe(true);
+		expect(observedReason).toBe(TOOL_INTERRUPT_ABORT_REASON);
 		expect(resolvedByTimeout).toBe(false);
 		expect(ircDrained).toBe(true);
 		expect(

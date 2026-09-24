@@ -59,7 +59,7 @@ function createTools(): AgentTool[] {
 		tool("grep"),
 		tool("read"),
 		tool("task"),
-		tool("hub"),
+		tool("write"),
 		tool("eval"),
 		{
 			...tool("edit"),
@@ -119,7 +119,7 @@ describe("harness tool binding through the session surface", () => {
 		const session = createSession(CODEX_MODEL);
 
 		expect(presented(session, "spawn_agent")).toMatchObject({ namespace: "agents", persistAs: "task" });
-		expect(presented(session, "hub").namespace).toBeUndefined();
+		expect(presented(session, "write").namespace).toBeUndefined();
 		expect(presented(session, "read").namespace).toBeUndefined();
 		expect(presented(session, "eval").wireName).toBe("exec");
 		expect(presented(session, "bash").wireName).toBeUndefined();

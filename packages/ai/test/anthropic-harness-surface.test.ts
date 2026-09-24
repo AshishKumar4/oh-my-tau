@@ -169,10 +169,10 @@ describe("anthropic claude-code harness surface", () => {
 
 	it("replays the omp identity with native arguments once the facade is gone", async () => {
 		const history = facadeHistory({
-			name: "hub",
+			name: "write",
 			wireName: "SendMessage",
 			arguments: { to: "Main", message: "hi", summary: "hi" },
-			nativeArguments: { op: "send", to: "Main", message: "hi" },
+			nativeArguments: { path: "agent://Main", content: "hi" },
 		});
 		const profiled = await runTurn(harnessModel, "Bash", { messages: history, tools: [...TOOLS, SEND_MESSAGE] });
 		expect(anthropicReplayedToolCalls(profiled.payload)).toEqual([
@@ -181,7 +181,7 @@ describe("anthropic claude-code harness surface", () => {
 		const switched = await runTurn(plainModel, "Bash", { messages: history });
 		expect(declaredNames(anthropicDeclarations(switched.payload))).not.toContain("SendMessage");
 		expect(anthropicReplayedToolCalls(switched.payload)).toEqual([
-			{ name: "_hub", input: { op: "send", to: "Main", message: "hi" } },
+			{ name: "_write", input: { path: "agent://Main", content: "hi" } },
 		]);
 	});
 
@@ -203,6 +203,7 @@ describe("anthropic claude-code harness surface", () => {
 	});
 
 	it("replays history persisted without native arguments exactly as before", async () => {
+		// Builds before native arguments persisted this facade call under the since-removed `hub` tool.
 		const history = facadeHistory({
 			name: "hub",
 			wireName: "SendMessage",

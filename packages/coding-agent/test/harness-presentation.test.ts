@@ -47,7 +47,7 @@ describe("harness surface as the provider request sees it", () => {
 	});
 
 	it("carries each model's own wire identity across an automatic mid-turn fallback", async () => {
-		const tools = [tool("bash"), tool("read"), tool("task"), tool("hub"), tool("eval")];
+		const tools = [tool("bash"), tool("read"), tool("task"), tool("write"), tool("eval")];
 		const requests: Array<{
 			model: string;
 			names: string[];
@@ -101,7 +101,7 @@ describe("harness surface as the provider request sees it", () => {
 		expect(codex?.names).toContain("spawn_agent");
 		expect(codex?.names).not.toContain("task");
 		// `collaboration` is reserved server-side for Codex's own functions; natives stay in the default namespace.
-		expect(codex?.namespaces[codex.names.indexOf("hub")]).toBeUndefined();
+		expect(codex?.namespaces[codex.names.indexOf("eval")]).toBeUndefined();
 		expect(codex?.namespaces[codex.names.indexOf("spawn_agent")]).toBe("agents");
 		// The identity lives on the presented copies only; the shared registry tools keep their own.
 		for (const t of tools) expect(t.customWireName).toBeUndefined();

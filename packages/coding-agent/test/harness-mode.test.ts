@@ -50,7 +50,7 @@ describe("harness.mode (persisted, model/Prompt, default auto)", () => {
 	});
 
 	async function makeSession(settings: Settings, model: Model) {
-		const tools = [tool("bash"), tool("read"), tool("task"), tool("hub"), tool("eval")];
+		const tools = [tool("bash"), tool("read"), tool("task"), tool("write"), tool("eval")];
 		const requests: Array<{ model: string; names: string[]; wire: Array<string | undefined> }> = [];
 		const mock = createMockModel();
 		const agent = new Agent({

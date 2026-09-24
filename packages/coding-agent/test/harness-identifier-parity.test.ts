@@ -53,9 +53,9 @@ describe("codex code-mode identifier normalization", () => {
 
 	it("keeps native tool names as their exec identifiers; the collaboration namespace is the facades' alone", () => {
 		expect(codeModeIdentifier("task")).toBe("task");
-		expect(codeModeIdentifier("hub")).toBe("hub");
+		expect(codeModeIdentifier("wait")).toBe("wait");
 		expect(codeModeIdentifier("read")).toBe("read");
-		expect(vendorNormalizeIdentifier("hub")).toBe("hub");
+		expect(vendorNormalizeIdentifier("wait")).toBe("wait");
 	});
 
 	it("mints MCP tool names that survive normalization, however hostile the server name", () => {

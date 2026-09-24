@@ -85,8 +85,10 @@ describe("subagent harness surface", () => {
 
 		const [claudeCode, codex] = await Promise.all([build("surface-fable", FABLE), build("surface-astra", ASTRA)]);
 
-		expect(codex.getActiveToolNames()).toEqual(expect.arrayContaining(["eval", "task", "hub"]));
-		expect(codex.getActiveToolNames()).not.toContain("read");
+		// Facades report the omp identity they persist as: `task`, `write` (messages, kills) and `read` (the agent index).
+		expect(codex.getActiveToolNames()).toEqual(expect.arrayContaining(["eval", "task", "write", "read"]));
+		// omp's own `read` is not declared directly: under Code Mode it is reachable only inside exec.
+		expect(codex.agent.state.tools.map(tool => tool.name)).not.toContain("read");
 		expect(codex.getEnabledToolNames()).toContain("read");
 		expect(codex.getToolForEvalBridge("read")?.name).toBe("read");
 		expect(claudeCode.getActiveToolNames()).toContain("read");
@@ -96,7 +98,7 @@ describe("subagent harness surface", () => {
 	});
 
 	it("keeps the subagent orchestration protocol direct under an active harness profile", () => {
-		const enabled = ["eval", "task", "hub", "read", ...ORCHESTRATION_BRIDGE_TOOLS];
+		const enabled = ["eval", "task", "wait", "read", ...ORCHESTRATION_BRIDGE_TOOLS];
 		const direct = resolveCodeMode({
 			provider: ASTRA.provider,
 			toolMode: ASTRA.toolMode,

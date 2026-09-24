@@ -52,7 +52,7 @@ function baseTools(model: Model): Tool[] {
 		{ name: "grep", description: "Search files", parameters: type({ pattern: type("string").describe("regex") }) },
 		evalToolFor(model),
 		{ name: "task", description: "Delegate", parameters: type({ prompt: type("string").describe("task") }) },
-		{ name: "hub", description: "Coordinate", parameters: type({ op: type("string").describe("op") }) },
+		{ name: "wait", description: "Wait for background work", parameters: type({}) },
 		...STATE_MACHINE_TOOLS.map(name => ({
 			name,
 			description: `omp ${name} tool`,

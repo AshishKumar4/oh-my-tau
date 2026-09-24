@@ -28,7 +28,8 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
-import { HubTool } from "@oh-my-pi/pi-coding-agent/tools/hub";
+import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
+import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 
@@ -62,7 +63,8 @@ function toolSession(options: { agentId?: string; manager?: AsyncJobManager } = 
 	return {
 		cwd: process.cwd(),
 		hasUI: false,
-		settings: { get: () => undefined },
+		// No supervised services: proc:// resolves jobs and agents without the launch broker.
+		settings: Settings.isolated({ "launch.enabled": false }),
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
 		getAgentId: () => options.agentId ?? SENDER,
@@ -99,7 +101,8 @@ async function codexSession(): Promise<{ session: AgentSession; registry: Map<st
 	const tools = [
 		stubTool("eval", { supportsCodeModeTransport: () => true } as Partial<AgentTool>),
 		stubTool("task"),
-		stubTool("hub"),
+		stubTool("write"),
+		stubTool("wait"),
 		stubTool("read"),
 	];
 	const registry = new Map(tools.map(value => [value.name, value]));
@@ -282,7 +285,7 @@ describe("vendor descriptions under a profile", () => {
 		const presented = presentTool(read, { wireName: "Read" }, () => served.tool);
 		const spec = harnessFacadeSpecs("claude-code").find(entry => entry.wireName === "SendMessage");
 		if (!spec) throw new Error("no SendMessage facade");
-		const facade = harnessFacade(stubTool("hub"), spec, { settings: Settings.isolated() }, () => served.tool);
+		const facade = harnessFacade(stubTool("write"), spec, { settings: Settings.isolated() }, () => served.tool);
 
 		// Tools are presented before the capture loads: omp's own surface until then.
 		expect(presented.description).toBe("read");
@@ -305,33 +308,33 @@ describe("vendor descriptions under a profile", () => {
 });
 
 describe("claude-code SendMessage facade", () => {
-	it("delivers through hub send, persists as hub, and replays to Anthropic as SendMessage", async () => {
+	it("delivers through write agent://, persists as write, and replays to Anthropic as SendMessage", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: PEER, displayName: PEER, kind: "sub", session: null, status: "running" });
 		const inbox = IrcBus.global().wait(PEER, { from: SENDER }, 0);
-		const hub = new HubTool(toolSession()) as unknown as AgentTool;
-		const facade = facadeFor("claude-code", "SendMessage", hub);
+		const write = new WriteTool(toolSession()) as unknown as AgentTool;
+		const facade = facadeFor("claude-code", "SendMessage", write);
 
-		const { agent, events, assistant, result } = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facade], {
+		const { agent, events, assistant, result } = await runFacadeCall(CLAUDE_CODE_MODEL, [write, facade], {
 			name: "SendMessage",
 			arguments: { to: PEER, message: "ping from the facade", summary: "ping" },
 		});
 
 		expect((await inbox)?.body).toBe("ping from the facade");
-		expect(result.toolName).toBe("hub");
+		expect(result.toolName).toBe("write");
 		expect(result.isError).toBeFalsy();
-		expect(result.content).toContainEqual({ type: "text", text: `Delivered to 1 peer(s):\n- ${PEER}: injected` });
+		expect(result.content).toContainEqual({ type: "text", text: `Delivered to ${PEER}.` });
 		expect(assistant.content.find(block => block.type === "toolCall")).toMatchObject({
-			name: "hub",
+			name: "write",
 			wireName: "SendMessage",
 			arguments: { to: PEER, message: "ping from the facade", summary: "ping" },
 		});
 		const end = events.find(event => event.type === "tool_execution_end");
-		expect(end?.type === "tool_execution_end" ? end.toolName : undefined).toBe("hub");
+		expect(end?.type === "tool_execution_end" ? end.toolName : undefined).toBe("write");
 
 		const replayed = await replayedAnthropicToolNames({
 			messages: agent.state.messages as Message[],
-			tools: [hub, facade],
+			tools: [write, facade],
 		});
 		expect(replayed).toEqual(["SendMessage"]);
 	});
@@ -339,32 +342,36 @@ describe("claude-code SendMessage facade", () => {
 	it("emits tool_execution_start under the omp name with omp-shaped args", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: PEER, displayName: PEER, kind: "sub", session: null, status: "running" });
-		const hub = new HubTool(toolSession()) as unknown as AgentTool;
-		const facade = facadeFor("claude-code", "SendMessage", hub);
+		const write = new WriteTool(toolSession()) as unknown as AgentTool;
+		const facade = facadeFor("claude-code", "SendMessage", write);
 
-		const { assistant, events } = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facade], {
+		const { assistant, events } = await runFacadeCall(CLAUDE_CODE_MODEL, [write, facade], {
 			name: "SendMessage",
 			arguments: { to: PEER, message: "ping", summary: "ping" },
 		});
 
 		const start = events.find(event => event.type === "tool_execution_start");
 		expect(start?.type === "tool_execution_start" ? [start.toolName, start.args] : undefined).toEqual([
-			"hub",
-			{ op: "send", to: PEER, message: "ping" },
+			"write",
+			{ path: `agent://${PEER}`, content: "ping" },
 		]);
 		expect(assistant.content.find(block => block.type === "toolCall")).toMatchObject({
-			name: "hub",
+			name: "write",
 			wireName: "SendMessage",
 			arguments: { to: PEER, message: "ping", summary: "ping" },
 		});
 	});
 
 	it("rejects notify_when_idle by name instead of dropping it", async () => {
-		const hub = new HubTool(toolSession()) as unknown as AgentTool;
-		const { result } = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facadeFor("claude-code", "SendMessage", hub)], {
-			name: "SendMessage",
-			arguments: { to: PEER, message: "hi", notify_when_idle: true },
-		});
+		const write = new WriteTool(toolSession()) as unknown as AgentTool;
+		const { result } = await runFacadeCall(
+			CLAUDE_CODE_MODEL,
+			[write, facadeFor("claude-code", "SendMessage", write)],
+			{
+				name: "SendMessage",
+				arguments: { to: PEER, message: "hi", notify_when_idle: true },
+			},
+		);
 		expect(result.isError).toBe(true);
 		expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("notify_when_idle") });
 	});
@@ -373,12 +380,12 @@ describe("claude-code SendMessage facade", () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: PEER, displayName: PEER, kind: "sub", session: null, status: "running" });
 		const inbox = IrcBus.global().wait(PEER, { from: SENDER }, 0);
-		const hub = new HubTool(toolSession()) as unknown as AgentTool;
-		const facade = facadeFor("claude-code", "SendMessage", hub);
+		const write = new WriteTool(toolSession()) as unknown as AgentTool;
+		const facade = facadeFor("claude-code", "SendMessage", write);
 		const vendorArgs = { to: PEER, message: "ping", summary: "ping" };
-		const nativeArgs = { op: "send", to: PEER, message: "ping" };
+		const nativeArgs = { path: `agent://${PEER}`, content: "ping" };
 
-		const { agent } = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facade], {
+		const { agent } = await runFacadeCall(CLAUDE_CODE_MODEL, [write, facade], {
 			name: "SendMessage",
 			arguments: vendorArgs,
 		});
@@ -386,23 +393,23 @@ describe("claude-code SendMessage facade", () => {
 		const messages = await reopenedFromDisk(agent.state.messages as Message[]);
 		const assistant = messages.find((message): message is AssistantMessage => message.role === "assistant");
 		expect(assistant?.content[0]).toMatchObject({
-			name: "hub",
+			name: "write",
 			wireName: "SendMessage",
 			arguments: vendorArgs,
 			nativeArguments: nativeArgs,
 		});
 
-		expect(await replayedAnthropicToolCalls(CLAUDE_CODE_MODEL, { messages, tools: [hub, facade] }, true)).toEqual([
+		expect(await replayedAnthropicToolCalls(CLAUDE_CODE_MODEL, { messages, tools: [write, facade] }, true)).toEqual([
 			{ name: "SendMessage", input: vendorArgs },
 		]);
-		expect(await replayedAnthropicToolCalls(NATIVE_ANTHROPIC_MODEL, { messages, tools: [hub] }, false)).toEqual([
-			{ name: "hub", input: nativeArgs },
+		expect(await replayedAnthropicToolCalls(NATIVE_ANTHROPIC_MODEL, { messages, tools: [write] }, false)).toEqual([
+			{ name: "write", input: nativeArgs },
 		]);
-		expect(await replayedResponsesToolCalls({ messages, tools: [hub] })).toEqual([
-			{ name: "hub", arguments: JSON.stringify(nativeArgs), namespace: undefined },
+		expect(await replayedResponsesToolCalls({ messages, tools: [write] })).toEqual([
+			{ name: "write", arguments: JSON.stringify(nativeArgs), namespace: undefined },
 		]);
-		expect(await replayedCompletionsToolCalls({ messages, tools: [hub] })).toEqual([
-			{ name: "hub", arguments: JSON.stringify(nativeArgs) },
+		expect(await replayedCompletionsToolCalls({ messages, tools: [write] })).toEqual([
+			{ name: "write", arguments: JSON.stringify(nativeArgs) },
 		]);
 	});
 
@@ -410,11 +417,11 @@ describe("claude-code SendMessage facade", () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: PEER, displayName: PEER, kind: "sub", session: null, status: "running" });
 		const inbox = IrcBus.global().wait(PEER, { from: SENDER }, 0);
-		const hub = new HubTool(toolSession()) as unknown as AgentTool;
-		const facade = facadeFor("claude-code", "SendMessage", hub);
+		const write = new WriteTool(toolSession()) as unknown as AgentTool;
+		const facade = facadeFor("claude-code", "SendMessage", write);
 		const vendorArgs = { to: PEER, message: "ping", summary: "ping" };
 
-		const { agent } = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facade], {
+		const { agent } = await runFacadeCall(CLAUDE_CODE_MODEL, [write, facade], {
 			name: "SendMessage",
 			arguments: vendorArgs,
 		});
@@ -433,35 +440,38 @@ describe("claude-code SendMessage facade", () => {
 		);
 		const messages = await reopenedFromDisk(olderBuild);
 		const assistant = messages.find((message): message is AssistantMessage => message.role === "assistant");
-		expect(assistant?.content[0]).toMatchObject({ name: "hub", wireName: "SendMessage", arguments: vendorArgs });
+		expect(assistant?.content[0]).toMatchObject({ name: "write", wireName: "SendMessage", arguments: vendorArgs });
 		expect(assistant?.content[0]).not.toHaveProperty("nativeArguments");
 
-		expect(await replayedAnthropicToolCalls(CLAUDE_CODE_MODEL, { messages, tools: [hub, facade] }, true)).toEqual([
+		expect(await replayedAnthropicToolCalls(CLAUDE_CODE_MODEL, { messages, tools: [write, facade] }, true)).toEqual([
 			{ name: "SendMessage", input: vendorArgs },
 		]);
-		expect(await replayedAnthropicToolCalls(NATIVE_ANTHROPIC_MODEL, { messages, tools: [hub] }, false)).toEqual([
-			{ name: "hub", input: vendorArgs },
+		expect(await replayedAnthropicToolCalls(NATIVE_ANTHROPIC_MODEL, { messages, tools: [write] }, false)).toEqual([
+			{ name: "write", input: vendorArgs },
 		]);
-		expect(await replayedResponsesToolCalls({ messages, tools: [hub] })).toEqual([
+		expect(await replayedResponsesToolCalls({ messages, tools: [write] })).toEqual([
 			{ name: "SendMessage", arguments: JSON.stringify(vendorArgs), namespace: undefined },
 		]);
 	});
 });
 
 describe("claude-code ListAgents facade", () => {
-	it("lists the hub roster under toolName hub and rejects the unavailable filters by name", async () => {
+	it("lists the agent index through read history:// and rejects the unavailable filters by name", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: PEER, displayName: PEER, kind: "sub", session: null, status: "running" });
-		const hub = new HubTool(toolSession()) as unknown as AgentTool;
-		const facade = facadeFor("claude-code", "ListAgents", hub);
+		const read = new ReadTool(toolSession()) as unknown as AgentTool;
+		const facade = facadeFor("claude-code", "ListAgents", read);
 
-		const listed = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facade], { name: "ListAgents", arguments: {} });
-		expect(listed.result.toolName).toBe("hub");
+		const listed = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], { name: "ListAgents", arguments: {} });
+		expect(listed.result.toolName).toBe("read");
 		expect(listed.result.isError).toBeFalsy();
-		expect(listed.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining(`- ${PEER} [`) });
-		expect(listed.result.details).toMatchObject({ op: "list", peers: [expect.objectContaining({ id: PEER })] });
+		expect(listed.result.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining(`| ${PEER} | running | sub |`),
+		});
+		expect(listed.assistant.content[0]).toMatchObject({ name: "read", wireName: "ListAgents" });
 
-		const filtered = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facade], {
+		const filtered = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], {
 			name: "ListAgents",
 			arguments: { q: "peer" },
 		});
@@ -471,44 +481,51 @@ describe("claude-code ListAgents facade", () => {
 });
 
 describe("claude-code TaskOutput facade", () => {
-	it("waits on the job through hub wait when blocking and snapshots jobs otherwise", async () => {
+	it("waits through the wait tool when blocking and names the snapshot primitive otherwise", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		managers.push(manager);
-		const hub = new HubTool(toolSession({ manager })) as unknown as AgentTool;
-		const facade = facadeFor("claude-code", "TaskOutput", hub);
+		const wait = new WaitTool(toolSession({ manager })) as unknown as AgentTool;
+		const facade = facadeFor("claude-code", "TaskOutput", wait);
 		const gate = Promise.withResolvers<string>();
 		const jobId = manager.register("bash", "facade job", () => gate.promise, { ownerId: SENDER });
 
-		const snapshot = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facade], {
+		// No single target both blocks and snapshots: the non-blocking branch is
+		// rejected by name and points at proc://, the read-only snapshot.
+		const snapshot = await runFacadeCall(CLAUDE_CODE_MODEL, [wait, facade], {
 			name: "TaskOutput",
 			arguments: { task_id: jobId, block: false, timeout: 1000 },
 		});
-		expect(snapshot.result.toolName).toBe("hub");
-		expect(snapshot.result.details).toMatchObject({
-			op: "jobs",
-			jobs: [expect.objectContaining({ id: jobId, status: "running" })],
+		expect(snapshot.result.isError).toBe(true);
+		expect(snapshot.result.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining(
+				`TaskOutput.block false is not supported: this build has no non-blocking task output. Read proc://${jobId}`,
+			),
 		});
+		expect(manager.getJob(jobId)?.status).toBe("running");
 
 		gate.resolve("finished");
-		const waited = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facade], {
+		await manager.getJob(jobId)?.promise;
+		const waited = await runFacadeCall(CLAUDE_CODE_MODEL, [wait, facade], {
 			name: "TaskOutput",
 			arguments: { task_id: jobId, block: true, timeout: 5000 },
 		});
-		expect(waited.result.toolName).toBe("hub");
+		expect(waited.result.toolName).toBe("wait");
 		expect(waited.result.details).toMatchObject({
 			op: "wait",
 			jobs: [expect.objectContaining({ id: jobId, status: "completed" })],
 		});
-		expect(waited.assistant.content[0]).toMatchObject({ name: "hub", wireName: "TaskOutput" });
+		expect(waited.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("finished") });
+		expect(waited.assistant.content[0]).toMatchObject({ name: "wait", wireName: "TaskOutput" });
 	});
 });
 
 describe("claude-code TaskStop facade", () => {
-	it("cancels the job through hub cancel, accepting the deprecated shell_id alias", async () => {
+	it("cancels the job through write proc://<id>/kill, accepting the deprecated shell_id alias", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		managers.push(manager);
-		const hub = new HubTool(toolSession({ manager })) as unknown as AgentTool;
-		const facade = facadeFor("claude-code", "TaskStop", hub);
+		const write = new WriteTool(toolSession({ manager })) as unknown as AgentTool;
+		const facade = facadeFor("claude-code", "TaskStop", write);
 		const jobId = manager.register(
 			"bash",
 			"facade job",
@@ -519,27 +536,32 @@ describe("claude-code TaskStop facade", () => {
 			{ ownerId: SENDER },
 		);
 
-		const stopped = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facade], {
+		const stopped = await runFacadeCall(CLAUDE_CODE_MODEL, [write, facade], {
 			name: "TaskStop",
 			arguments: { shell_id: jobId },
 		});
-		expect(stopped.result.toolName).toBe("hub");
+		expect(stopped.result.toolName).toBe("write");
 		expect(stopped.result.isError).toBeFalsy();
+		expect(stopped.assistant.content[0]).toMatchObject({
+			name: "write",
+			wireName: "TaskStop",
+			nativeArguments: { path: `proc://${jobId}/kill` },
+		});
 		await manager.getJob(jobId)?.promise;
 		expect(manager.getJob(jobId)?.status).toBe("cancelled");
 
-		const missing = await runFacadeCall(CLAUDE_CODE_MODEL, [hub, facade], { name: "TaskStop", arguments: {} });
+		const missing = await runFacadeCall(CLAUDE_CODE_MODEL, [write, facade], { name: "TaskStop", arguments: {} });
 		expect(missing.result.isError).toBe(true);
 		expect(missing.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("task_id") });
 	});
 });
 
 describe("codex interrupt_agent facade", () => {
-	it("cancels the job through hub cancel under the vendor name", async () => {
+	it("cancels the job through write proc://<id>/kill under the vendor name", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		managers.push(manager);
-		const hub = new HubTool(toolSession({ manager })) as unknown as AgentTool;
-		const facade = facadeFor("codex", "interrupt_agent", hub);
+		const write = new WriteTool(toolSession({ manager })) as unknown as AgentTool;
+		const facade = facadeFor("codex", "interrupt_agent", write);
 		const jobId = manager.register(
 			"bash",
 			"facade job",
@@ -550,11 +572,11 @@ describe("codex interrupt_agent facade", () => {
 			{ ownerId: SENDER },
 		);
 
-		const stopped = await runFacadeCall(CODEX_MODEL, [hub, facade], {
+		const stopped = await runFacadeCall(CODEX_MODEL, [write, facade], {
 			name: "interrupt_agent",
 			arguments: { target: jobId },
 		});
-		expect(stopped.result.toolName).toBe("hub");
+		expect(stopped.result.toolName).toBe("write");
 		expect(stopped.result.isError).toBeFalsy();
 		await manager.getJob(jobId)?.promise;
 		expect(manager.getJob(jobId)?.status).toBe("cancelled");
@@ -628,6 +650,9 @@ describe("codex collaboration facades on the wire", () => {
 			collaboration?.type === "namespace" ? collaboration.tools.map(entry => "name" in entry && entry.name) : [],
 		).toEqual(["spawn_agent", "send_message", "followup_task", "list_agents", "interrupt_agent", "wait_agent"]);
 		expect(tools.map(tool => tool.name)).not.toContain("task");
+		// The vendor `wait` shares omp's tool name and stands in for it: one declaration, never two.
+		expect(tools.filter(tool => tool.name === "wait")).toHaveLength(1);
+		expect(tools.find(tool => tool.name === "wait")?.persistAs).toBe("wait");
 
 		const evalTool = new EvalTool({
 			cwd: process.cwd(),
@@ -640,10 +665,11 @@ describe("codex collaboration facades on the wire", () => {
 			getCodeModeDirectToolNames: () => session.getCodeModeDirectToolNames(),
 		} as unknown as ToolSession);
 		// Only the facades are direct (they mount after the Code Mode partition);
-		// omp's own `task` and `hub` stay reachable inside exec under their names.
+		// omp's own `task`, `write` and `wait` stay reachable inside exec under their names.
 		expect(session.getCodeModeDirectToolNames()).toEqual(["eval"]);
 		expect(evalTool.description).toContain("### `read`");
-		expect(evalTool.description).toContain("### `hub`");
+		expect(evalTool.description).toContain("### `write`");
+		expect(evalTool.description).toContain("### `wait`");
 		expect(evalTool.description).not.toContain("spawn_agent");
 		expect(evalTool.description).not.toContain("## collaboration");
 	});
@@ -766,36 +792,36 @@ describe("codex spawn_agent facade", () => {
 });
 
 describe("codex send_message facade", () => {
-	it("delivers through hub send and persists as hub", async () => {
+	it("delivers through write agent:// and persists as write", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: PEER, displayName: PEER, kind: "sub", session: null, status: "running" });
 		const inbox = IrcBus.global().wait(PEER, { from: SENDER }, 0);
-		const hub = new HubTool(toolSession()) as unknown as AgentTool;
-		const facade = facadeFor("codex", "send_message", hub);
+		const write = new WriteTool(toolSession()) as unknown as AgentTool;
+		const facade = facadeFor("codex", "send_message", write);
 		expect(facade.namespace?.name).toBe("agents");
 
-		const { assistant, result } = await runFacadeCall(CODEX_MODEL, [hub, facade], {
+		const { assistant, result } = await runFacadeCall(CODEX_MODEL, [write, facade], {
 			name: "send_message",
 			arguments: { target: PEER, message: "ping from codex" },
 		});
 
 		expect((await inbox)?.body).toBe("ping from codex");
-		expect(result.toolName).toBe("hub");
+		expect(result.toolName).toBe("write");
 		expect(result.isError).toBeFalsy();
-		expect(result.content).toContainEqual({ type: "text", text: `Delivered to 1 peer(s):\n- ${PEER}: injected` });
-		expect(assistant.content[0]).toMatchObject({ name: "hub", wireName: "send_message" });
+		expect(result.content).toContainEqual({ type: "text", text: `Delivered to ${PEER}.` });
+		expect(assistant.content[0]).toMatchObject({ name: "write", wireName: "send_message" });
 	});
 
-	it("replays under its own name on codex and as hub with native arguments elsewhere", async () => {
+	it("replays under its own name on codex and as write with native arguments elsewhere", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: PEER, displayName: PEER, kind: "sub", session: null, status: "running" });
 		const inbox = IrcBus.global().wait(PEER, { from: SENDER }, 0);
-		const hub = new HubTool(toolSession()) as unknown as AgentTool;
-		const facade = facadeFor("codex", "send_message", hub);
+		const write = new WriteTool(toolSession()) as unknown as AgentTool;
+		const facade = facadeFor("codex", "send_message", write);
 		const vendorArgs = { target: PEER, message: "ping from codex" };
-		const nativeArgs = { op: "send", to: PEER, message: "ping from codex" };
+		const nativeArgs = { path: `agent://${PEER}`, content: "ping from codex" };
 
-		const { agent } = await runFacadeCall(CODEX_MODEL, [hub, facade], {
+		const { agent } = await runFacadeCall(CODEX_MODEL, [write, facade], {
 			name: "send_message",
 			arguments: vendorArgs,
 		});
@@ -812,14 +838,14 @@ describe("codex send_message facade", () => {
 		);
 		const assistant = messages.find((message): message is AssistantMessage => message.role === "assistant");
 		expect(assistant?.content[0]).toMatchObject({
-			name: "hub",
+			name: "write",
 			wireName: "send_message",
 			nativeArguments: nativeArgs,
 		});
 
 		const body = await buildTransformedCodexRequestBody(
 			CODEX_MODEL,
-			{ messages, tools: [hub, facade] },
+			{ messages, tools: [write, facade] },
 			{
 				reasoning: Effort.High,
 			},
@@ -832,17 +858,17 @@ describe("codex send_message facade", () => {
 		expect(codexCalls).toEqual([
 			{ name: "send_message", arguments: JSON.stringify(vendorArgs), namespace: "agents" },
 		]);
-		expect(await replayedAnthropicToolCalls(NATIVE_ANTHROPIC_MODEL, { messages, tools: [hub] }, false)).toEqual([
-			{ name: "hub", input: nativeArgs },
+		expect(await replayedAnthropicToolCalls(NATIVE_ANTHROPIC_MODEL, { messages, tools: [write] }, false)).toEqual([
+			{ name: "write", input: nativeArgs },
 		]);
-		expect(await replayedResponsesToolCalls({ messages, tools: [hub] })).toEqual([
-			{ name: "hub", arguments: JSON.stringify(nativeArgs), namespace: undefined },
+		expect(await replayedResponsesToolCalls({ messages, tools: [write] })).toEqual([
+			{ name: "write", arguments: JSON.stringify(nativeArgs), namespace: undefined },
 		]);
 	});
 });
 
 describe("codex followup_task facade", () => {
-	it("hands the task to an idle agent through hub send and reports the wake", async () => {
+	it("hands the task to an idle agent through write agent:// and wakes it", async () => {
 		const delivered: unknown[] = [];
 		AgentRegistry.global().register({
 			id: PEER,
@@ -856,34 +882,38 @@ describe("codex followup_task facade", () => {
 				},
 			} as unknown as AgentSession,
 		});
-		const hub = new HubTool(toolSession()) as unknown as AgentTool;
-		const facade = facadeFor("codex", "followup_task", hub);
+		const write = new WriteTool(toolSession()) as unknown as AgentTool;
+		const facade = facadeFor("codex", "followup_task", write);
 
-		const { assistant, result } = await runFacadeCall(CODEX_MODEL, [hub, facade], {
+		const { assistant, result } = await runFacadeCall(CODEX_MODEL, [write, facade], {
 			name: "followup_task",
 			arguments: { target: PEER, message: "now also check the tests" },
 		});
 
 		expect(delivered).toEqual(["now also check the tests"]);
-		expect(result.toolName).toBe("hub");
-		expect(result.content).toContainEqual({ type: "text", text: `Delivered to 1 peer(s):\n- ${PEER}: woken` });
-		expect(assistant.content[0]).toMatchObject({ name: "hub", wireName: "followup_task" });
+		expect(result.toolName).toBe("write");
+		expect(result.content).toContainEqual({ type: "text", text: `Delivered to ${PEER}.` });
+		expect(result.details).toMatchObject({ message: { receipts: [expect.objectContaining({ outcome: "woken" })] } });
+		expect(assistant.content[0]).toMatchObject({ name: "write", wireName: "followup_task" });
 	});
 });
 
 describe("codex list_agents facade", () => {
-	it("lists the hub roster under toolName hub and rejects path_prefix by name", async () => {
+	it("lists the agent index through read history:// and rejects path_prefix by name", async () => {
 		AgentRegistry.global().register({ id: PEER, displayName: PEER, kind: "sub", session: null, status: "running" });
-		const hub = new HubTool(toolSession()) as unknown as AgentTool;
-		const facade = facadeFor("codex", "list_agents", hub);
+		const read = new ReadTool(toolSession()) as unknown as AgentTool;
+		const facade = facadeFor("codex", "list_agents", read);
 
-		const listed = await runFacadeCall(CODEX_MODEL, [hub, facade], { name: "list_agents", arguments: {} });
-		expect(listed.result.toolName).toBe("hub");
+		const listed = await runFacadeCall(CODEX_MODEL, [read, facade], { name: "list_agents", arguments: {} });
+		expect(listed.result.toolName).toBe("read");
 		expect(listed.result.isError).toBeFalsy();
-		expect(listed.result.details).toMatchObject({ op: "list", peers: [expect.objectContaining({ id: PEER })] });
-		expect(listed.assistant.content[0]).toMatchObject({ name: "hub", wireName: "list_agents" });
+		expect(listed.result.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining(`| ${PEER} | running | sub |`),
+		});
+		expect(listed.assistant.content[0]).toMatchObject({ name: "read", wireName: "list_agents" });
 
-		const filtered = await runFacadeCall(CODEX_MODEL, [hub, facade], {
+		const filtered = await runFacadeCall(CODEX_MODEL, [read, facade], {
 			name: "list_agents",
 			arguments: { path_prefix: "/root/task1" },
 		});
@@ -896,7 +926,7 @@ describe("codex list_agents facade", () => {
 });
 
 describe("codex wait_agent facade", () => {
-	it("returns a queued peer message, else the job snapshot once the wait window elapses", async () => {
+	it("returns a queued peer message, else the first background job to settle", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({
 			id: SENDER,
@@ -913,40 +943,38 @@ describe("codex wait_agent facade", () => {
 		await IrcBus.global().send({ from: PEER, to: SENDER, body: "peer finished" });
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		managers.push(manager);
-		const hub = new HubTool(toolSession({ manager })) as unknown as AgentTool;
-		const facade = facadeFor("codex", "wait_agent", hub);
+		const wait = new WaitTool(toolSession({ manager })) as unknown as AgentTool;
+		const facade = facadeFor("codex", "wait_agent", wait);
 
-		const messaged = await runFacadeCall(CODEX_MODEL, [hub, facade], { name: "wait_agent", arguments: {} });
-		expect(messaged.result.toolName).toBe("hub");
+		const messaged = await runFacadeCall(CODEX_MODEL, [wait, facade], { name: "wait_agent", arguments: {} });
+		expect(messaged.result.toolName).toBe("wait");
 		expect(messaged.result.details).toMatchObject({
 			op: "wait",
 			waited: expect.objectContaining({ body: "peer finished" }),
 		});
-		expect(messaged.assistant.content[0]).toMatchObject({ name: "hub", wireName: "wait_agent" });
+		expect(messaged.assistant.content[0]).toMatchObject({ name: "wait", wireName: "wait_agent" });
 
-		const jobId = manager.register(
-			"bash",
-			"facade job",
-			({ signal }) =>
-				new Promise<string>(resolve => {
-					signal.addEventListener("abort", () => resolve(""), { once: true });
-				}),
-			{ ownerId: SENDER },
-		);
-		vi.spyOn(manager, "nextPollWaitMs").mockReturnValue(1);
-		const timedOut = await runFacadeCall(CODEX_MODEL, [hub, facade], {
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("bash", "facade job", () => gate.promise, { ownerId: SENDER });
+		gate.resolve("settled output");
+		await manager.getJob(jobId)?.promise;
+		const settled = await runFacadeCall(CODEX_MODEL, [wait, facade], {
 			name: "wait_agent",
 			arguments: { timeout_ms: 1 },
 		});
-		expect(timedOut.result.details).toMatchObject({
+		expect(settled.result.details).toMatchObject({
 			op: "wait",
-			jobs: [expect.objectContaining({ id: jobId, status: "running" })],
+			jobs: [expect.objectContaining({ id: jobId, status: "completed" })],
+		});
+		expect(settled.result.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining("settled output"),
 		});
 	});
 });
 
 describe("codex wait facade", () => {
-	it("resumes a backgrounded exec cell by its cell ID through hub wait and terminates through hub cancel", async () => {
+	it("resumes a backgrounded exec cell through wait and names interrupt_agent for terminate", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		managers.push(manager);
 		const gate = Promise.withResolvers<void>();
@@ -970,7 +998,11 @@ describe("codex wait facade", () => {
 		}) as never);
 		const session = {
 			...toolSession({ manager }),
-			settings: Settings.isolated({ "eval.autoBackground.enabled": true, "eval.autoBackground.thresholdMs": 0 }),
+			settings: Settings.isolated({
+				"eval.autoBackground.enabled": true,
+				"eval.autoBackground.thresholdMs": 0,
+				"launch.enabled": false,
+			}),
 			getActiveModel: () => CODEX_MODEL,
 		} as unknown as ToolSession;
 		const exec = new EvalTool(session);
@@ -979,22 +1011,23 @@ describe("codex wait facade", () => {
 		if (!cellId) throw new Error("exec did not background the cell");
 		expect(started.content[0]).toMatchObject({ type: "text", text: expect.stringContaining(`cell ID ${cellId}`) });
 
-		const hub = new HubTool(session) as unknown as AgentTool;
-		const facade = facadeFor("codex", "wait", hub);
+		const wait = new WaitTool(session) as unknown as AgentTool;
+		const facade = facadeFor("codex", "wait", wait);
 		expect(facade.namespace).toBeUndefined();
 		gate.resolve();
 		await manager.getJob(cellId)?.promise;
-		const waited = await runFacadeCall(CODEX_MODEL, [hub, facade], {
+		// The facade replaces omp's same-named `wait` on the codex surface, so it is the only `wait` declared.
+		const waited = await runFacadeCall(CODEX_MODEL, [facade], {
 			name: "wait",
 			arguments: { cell_id: cellId, yield_time_ms: 5000, max_tokens: 10000 },
 		});
-		expect(waited.result.toolName).toBe("hub");
+		expect(waited.result.toolName).toBe("wait");
 		expect(waited.result.details).toMatchObject({
 			op: "wait",
 			jobs: [expect.objectContaining({ id: cellId, status: "completed" })],
 		});
 		expect(waited.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("done") });
-		expect(waited.assistant.content[0]).toMatchObject({ name: "hub", wireName: "wait" });
+		expect(waited.assistant.content[0]).toMatchObject({ name: "wait" });
 
 		const jobId = manager.register(
 			"eval",
@@ -1005,13 +1038,18 @@ describe("codex wait facade", () => {
 				}),
 			{ ownerId: SENDER },
 		);
-		const terminated = await runFacadeCall(CODEX_MODEL, [hub, facade], {
+		const terminated = await runFacadeCall(CODEX_MODEL, [facade], {
 			name: "wait",
 			arguments: { cell_id: jobId, terminate: true },
 		});
-		expect(terminated.result.details).toMatchObject({ op: "cancel" });
-		await manager.getJob(jobId)?.promise;
-		expect(manager.getJob(jobId)?.status).toBe("cancelled");
+		expect(terminated.result.isError).toBe(true);
+		expect(terminated.result.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining(
+				`wait.terminate is not supported: stop the cell with interrupt_agent (target "${jobId}")`,
+			),
+		});
+		expect(manager.getJob(jobId)?.status).toBe("running");
 	});
 });
 
@@ -1079,10 +1117,10 @@ describe("claude-code Skill facade", () => {
 
 describe("facade predicates stay total on unsupported vendor fields", () => {
 	function policyTarget(): AgentTool {
-		return stubTool("hub", {
+		return stubTool("write", {
 			approval: (params: unknown) =>
-				typeof params === "object" && params !== null && "op" in params ? "read" : "exec",
-			formatApprovalDetails: () => "hub details",
+				typeof params === "object" && params !== null && "path" in params ? "read" : "exec",
+			formatApprovalDetails: () => "write details",
 			concurrency: () => "shared",
 			interruptible: () => true,
 		});
@@ -1094,7 +1132,7 @@ describe("facade predicates stay total on unsupported vendor fields", () => {
 		const approval = facade.approval;
 		expect(typeof approval === "function" ? approval(hostile) : approval).toEqual({
 			tier: "exec",
-			policyKey: "hub",
+			policyKey: "write",
 		});
 		expect(resolveApproval(facade, hostile, "write", {})).toMatchObject({ policy: "prompt" });
 		expect(facade.formatApprovalDetails?.(hostile)).toBeUndefined();
@@ -1110,9 +1148,9 @@ describe("facade predicates stay total on unsupported vendor fields", () => {
 		const approval = facade.approval;
 		expect(typeof approval === "function" ? approval(convertible) : approval).toEqual({
 			tier: "read",
-			policyKey: "hub",
+			policyKey: "write",
 		});
-		expect(facade.formatApprovalDetails?.(convertible)).toBe("hub details");
+		expect(facade.formatApprovalDetails?.(convertible)).toBe("write details");
 		const concurrency = facade.concurrency;
 		expect(typeof concurrency === "function" ? concurrency(convertible) : concurrency).toBe("shared");
 		const interruptible = facade.interruptible;

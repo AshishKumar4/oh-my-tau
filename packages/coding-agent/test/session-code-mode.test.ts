@@ -166,7 +166,7 @@ describe("resolveCodeMode", () => {
 			provider: "openai-codex",
 			toolMode: "code_mode_only",
 			setting: "auto",
-			enabledToolNames: ["eval", "read", "bash", "task", "hub", "web_search"],
+			enabledToolNames: ["eval", "read", "bash", "task", "wait", "web_search"],
 			evalTransportAvailable: true,
 		});
 		expect([...r.directToolNames]).toEqual(["eval"]);
@@ -627,8 +627,11 @@ describe("Code Mode session startup", () => {
 
 		const active = session.getActiveToolNames();
 		expect(active).toContain("eval");
-		expect(active).not.toContain("read");
 		expect(active).not.toContain("bash");
+		// Harness facades report the omp identity they persist as (the codex
+		// list_agents facade persists as `read`), so demotion is checked on the
+		// declared surface.
+		expect(session.agent.state.tools.map(tool => tool.name)).not.toContain("read");
 		// Demoted tools stay enabled and bridge-reachable instead of vanishing.
 		expect(session.getEnabledToolNames()).toContain("read");
 		expect(session.getToolForEvalBridge("read")?.name).toBe("read");

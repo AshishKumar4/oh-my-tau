@@ -7,7 +7,7 @@ describe("harness manifests", () => {
 		// `collaboration` is reserved server-side for Codex's own multi-agent
 		// functions, which the facades provide; a native name there is rejected.
 		expect(harnessToolBinding("codex", "task")).toBeUndefined();
-		expect(harnessToolBinding("codex", "hub")).toBeUndefined();
+		expect(harnessToolBinding("codex", "wait")).toBeUndefined();
 	});
 
 	it("pins the claude-code table: seven renames", () => {

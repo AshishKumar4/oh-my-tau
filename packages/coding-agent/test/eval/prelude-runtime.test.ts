@@ -106,7 +106,7 @@ describe("eval prelude runtime", () => {
 
 	it("installs the codex exec surface per run under the codex profile", async () => {
 		const codex = getBundledModel("openai-codex", "gpt-6-astra");
-		const enabled = new Set(["read", "bash", "edit", "hub", "goal"]);
+		const enabled = new Set(["read", "bash", "edit", "write", "goal"]);
 		const fakeTool = (name: string): AgentTool => ({
 			name,
 			label: name,

@@ -41,21 +41,21 @@ describe("fusion lead prompt section", () => {
 	}
 
 	it("renders only when the sidekick tool is mounted, resolving the wait tool and identity natively", async () => {
-		const text = await build({ toolNames: ["read", "hub", "sidekick"] });
+		const text = await build({ toolNames: ["read", "wait", "sidekick"] });
 		expect(text).toContain("`sidekick` tool");
 		expect(text).toContain("persistent");
 		// The readTool slot resolves to the native job-wait tool.
-		expect(text).toContain("wait for the report with `hub`");
+		expect(text).toContain("wait for the report with `wait`");
 		expect(text).not.toContain("{{");
 
-		const off = await build({ toolNames: ["read", "hub"] });
+		const off = await build({ toolNames: ["read", "wait"] });
 		expect(off).not.toContain("`sidekick` tool");
 		expect(off).not.toContain("persistent");
 	});
 
 	it("renders in the custom (harness) template with the profile's wait facade and identity", async () => {
 		const text = await build({
-			toolNames: ["read", "hub", "sidekick"],
+			toolNames: ["read", "wait", "sidekick"],
 			harnessProfile: "claude-code",
 			customPrompt: "VENDOR PROMPT",
 			browserEnabled: true,
@@ -66,12 +66,12 @@ describe("fusion lead prompt section", () => {
 		// The GPT-lead extra-detail block stays gated to the Codex profile.
 		expect(text).not.toContain("Concrete implementation packets");
 
-		const codex = await build({ toolNames: ["hub", "sidekick"], harnessProfile: "codex", customPrompt: "VENDOR" });
+		const codex = await build({ toolNames: ["wait", "sidekick"], harnessProfile: "codex", customPrompt: "VENDOR" });
 		expect(codex).toContain("wait for the report with `wait`");
 		expect(codex).toContain("one Codex: you");
 		expect(codex).toContain("Concrete implementation packets");
 
-		const customOff = await build({ toolNames: ["read", "hub"], customPrompt: "VENDOR PROMPT" });
+		const customOff = await build({ toolNames: ["read", "wait"], customPrompt: "VENDOR PROMPT" });
 		expect(customOff).not.toContain("`sidekick` tool");
 	});
 });

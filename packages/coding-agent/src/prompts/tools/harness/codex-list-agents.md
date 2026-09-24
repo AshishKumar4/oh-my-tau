@@ -1,1 +1,1 @@
-List live agents: running and idle peers with their kind and status, plus counts of parked agents. Address a peer by the exact id shown. Agents have flat ids rather than task paths, so `path_prefix` is not available; leave it unset.
+List the agents in this session: every registered agent with its status, kind, parent, and last activity, plus transcripts found on disk. Address a peer by the exact id shown. Agents have flat ids rather than task paths, so `path_prefix` is not available; leave it unset.

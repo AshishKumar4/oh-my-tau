@@ -41,6 +41,7 @@ import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { routeWriteThroughBridge, shouldRouteWriteThroughBridge } from "./acp-bridge";
 import { resolveToolTier, truncateForPrompt } from "./approval";
 import { assertEditableFile } from "./auto-generated-guard";
+
 import {
 	formatHashlineHeader,
 	isReadTruncationNotice,
@@ -294,10 +295,11 @@ function resolveBulkDirectives(raw: string, stripped: string): Map<number, strin
 }
 
 const writeSchema = type({
-	path: type("string").describe("file path"),
-	content: type("string").describe("file content"),
+	path: "string",
+	"content?": "string",
 });
 
+/** Write arguments; only proc://<id>/kill permits omitted content. */
 export type WriteToolInput = typeof writeSchema.infer;
 
 const claudeCodeWriteSchema = type({
@@ -353,6 +355,11 @@ function stripWriteContent(session: ToolSession, content: string): { text: strin
 	}
 	return stripWriteContentWithPotentialLooseHeader(content.split("\n"));
 }
+/** `write agent://<id>`: a peer message (read tier, allowed in plan mode and device-only sessions). */
+const AGENT_URL_RE = /^agent:\/\//i;
+/** `write proc://<id>[/kill|/mode]`: service stdin, cancellation, or service mode (exec tier). */
+const PROC_URL_RE = /^proc:\/\//i;
+
 function endsWithReadTruncationNotice(content: string): boolean {
 	const lines = splitAddressableFileLines(normalizeToLF(content));
 	const noticeIndex = lines.findLastIndex(line => line.trim().length > 0);
@@ -474,7 +481,12 @@ function emitWriteProgress(
 	resolvedPath?: string,
 ): void {
 	onUpdate?.({
-		content: [{ type: "text", text: `Writing ${content.length} bytes to ${shortenPath(displayPath)}...` }],
+		content: [
+			{
+				type: "text",
+				text: `Writing ${Buffer.byteLength(content, "utf8")} bytes to ${shortenPath(displayPath)}...`,
+			},
+		],
 		details: resolvedPath ? { resolvedPath } : {},
 	});
 }
@@ -625,6 +637,10 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 				return "exec";
 			}
 		}
+		// Peer messages are coordination, not mutation; proc:// writes drive
+		// processes (stdin, stop, mode).
+		if (AGENT_URL_RE.test(path)) return "read";
+		if (PROC_URL_RE.test(path)) return "exec";
 		// Remote SSH writes open an outbound connection and run a remote shell —
 		// gate them like the exec-tier `ssh` tool, ahead of the handler-write
 		// logic. Substring match also covers selector-suffixed targets.
@@ -779,7 +795,9 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 			resolvedArchivePath.archiveSubPath
 		}`;
 		return {
-			content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${outputPath}` }],
+			content: [
+				{ type: "text", text: `Successfully wrote ${Buffer.byteLength(content, "utf8")} bytes to ${outputPath}` },
+			],
 			details: { resolvedPath: resolvedArchivePath.absolutePath },
 		};
 	}
@@ -1190,7 +1208,7 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 		onUpdate?: AgentToolUpdateCallback<WriteToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<WriteToolDetails>> {
-		const { path: rawPath, content } = harnessParams(this.session, WRITE_BRIDGES, input);
+		const { path: rawPath, content: rawContent } = harnessParams(this.session, WRITE_BRIDGES, input);
 		// Strip a hashline `[path#TAG]` wrapper up front so every downstream
 		// decision (scheme routing, internal-URL handler dispatch, plan-mode
 		// guard, plan path resolution, ACP bridge routing) sees the same
@@ -1202,6 +1220,10 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 		// Peel a read-tool selector (`:raw`, `:1-20`, …) so the write target matches
 		// what `read` resolves for the same URL; line-range/malformed selectors throw.
 		const path = peelWriteUrlSelector(unwrapHashlineHeaderPath(rawPath));
+		if (rawContent === undefined && !(PROC_URL_RE.test(path) && path.endsWith("/kill"))) {
+			throw new ToolError("content is required except for proc://<id>/kill.");
+		}
+		const content = rawContent ?? "";
 		// A device-only session grants `write` purely as the xd:// transport (see
 		// createTools): device dispatches proceed, every other target is rejected
 		// before any handler, guard, conflict resolver, or bridge sees it. Active
@@ -1210,6 +1232,7 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 		if (
 			this.session.deviceOnlyWrite === true &&
 			!parseXdUrl(path) &&
+			!AGENT_URL_RE.test(path) &&
 			!(this.session.getPlanModeState?.()?.enabled === true && targetsLocalSandbox(this.session, path))
 		) {
 			throw new ToolError(
@@ -1217,8 +1240,12 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 			);
 		}
 		return untilAborted(signal, async () => {
-			// Strip hashline display prefixes ([PATH#HASH] + LINE:) if the model copied them from read output
-			const { text: cleanContent, stripped } = stripWriteContent(this.session, content);
+			// Strip hashline display prefixes ([PATH#HASH] + LINE:) if the model copied them from read output.
+			// Messages and process stdin are verbatim payloads, never file text.
+			const { text: cleanContent, stripped } =
+				AGENT_URL_RE.test(path) || PROC_URL_RE.test(path)
+					? { text: content, stripped: false }
+					: stripWriteContent(this.session, content);
 			const internalRouter = InternalUrlRouter.instance();
 			assertWriteTargetAddressable(path, internalRouter);
 			if (internalRouter.canHandle(path)) {
@@ -1226,7 +1253,12 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 				const scheme = parsed.protocol.replace(/:$/, "").toLowerCase();
 				const handler = internalRouter.getHandler(scheme);
 				if (handler?.write) {
-					if (scheme !== "xd" && endsWithReadTruncationNotice(content)) {
+					if (
+						scheme !== "xd" &&
+						scheme !== "agent" &&
+						scheme !== "proc" &&
+						endsWithReadTruncationNotice(content)
+					) {
 						const currentResource = await internalRouter.resolve(path, {
 							cwd: this.session.cwd,
 							settings: this.session.settings,
@@ -1235,15 +1267,17 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 						assertNotShorterReadProjection(path, content, currentResource.content, cleanContent);
 					}
 					// Handler-owned writes mutate user data outside the local
-					// sandbox. xd:// dispatches retain each wrapped tool's tier.
+					// sandbox. xd:// dispatches retain each wrapped tool's tier;
+					// agent:// messages are coordination and stay allowed.
 					if (scheme !== "xd") {
-						enforcePlanModeWrite(this.session, path, { op: "update" });
+						if (scheme !== "agent") enforcePlanModeWrite(this.session, path, { op: "update" });
 						emitWriteProgress(onUpdate, cleanContent, path);
 					}
 					let xdResult: AgentToolResult<WriteToolDetails> | undefined;
-					await internalRouter.write(path, cleanContent, {
+					const handlerResult = await internalRouter.write(path, cleanContent, {
 						cwd: this.session.cwd,
 						signal,
+						session: this.session,
 						xd: {
 							write: async (name, deviceContent) => {
 								if (name === REPORT_ISSUE_DEVICE_NAME) {
@@ -1295,7 +1329,13 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 						},
 					});
 					if (xdResult) return xdResult;
-					let resultText = `Successfully wrote ${cleanContent.length} bytes to ${path}`;
+					if (handlerResult)
+						return {
+							content: [{ type: "text", text: handlerResult.text }],
+							details: handlerResult.details ?? {},
+							isError: handlerResult.isError,
+						};
+					let resultText = `Successfully wrote ${Buffer.byteLength(cleanContent, "utf8")} bytes to ${path}`;
 					if (stripped) {
 						resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
 					}
@@ -1403,7 +1443,7 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 				// hands back a tag that matches what's actually on disk.
 				const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, bridgeWrite.text);
 				const header = maybeWriteSnapshotHeader(this.session, absolutePath, bridgeWrite.text);
-				const writeLine = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
+				const writeLine = `Successfully wrote ${Buffer.byteLength(cleanContent, "utf8")} bytes to ${displayPath}`;
 				let resultText = header ? `${header}\n${writeLine}` : writeLine;
 				if (stripped) {
 					resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;
@@ -1433,7 +1473,7 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 			const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, finalContent);
 
 			const header = maybeWriteSnapshotHeader(this.session, absolutePath, finalContent);
-			const writeLine = `Successfully wrote ${finalContent.length} bytes to ${displayPath}`;
+			const writeLine = `Successfully wrote ${Buffer.byteLength(finalContent, "utf8")} bytes to ${displayPath}`;
 			let resultText = header ? `${header}\n${writeLine}` : writeLine;
 			if (stripped) {
 				resultText += `\nNote: auto-stripped hashline display prefixes from content before writing.`;

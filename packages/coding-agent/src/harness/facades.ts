@@ -40,7 +40,7 @@ const claudeCodeListAgentsSchema = type({
 const claudeCodeTaskOutputSchema = type({
 	task_id: type("string").describe("The task ID to get output from"),
 	block: type("boolean").describe("Whether to wait for completion"),
-	timeout: type("number >= 0").describe("Not applied; blocking polls the adaptive wait window"),
+	timeout: type("number >= 0").describe("Not applied; the wait returns on the next background result"),
 });
 
 const claudeCodeTaskStopSchema = type({
@@ -68,13 +68,24 @@ const claudeCodeSkillSchema = type({
 	"args?": type("string").describe("Not available in this build; leave unset"),
 });
 
+// Background-job control spans omp's `wait` (block for the next result),
+// `write proc://<id>/kill` (cancel) and `write agent://<id>` (message), with
+// `read proc://` / `read history://` for snapshots. A facade persists under one
+// identity, so a vendor call spanning two of those keeps its schema and rejects
+// the branch its target cannot serve, naming the primitive that can.
 const CLAUDE_CODE_TASK_OUTPUT: HarnessFacadeSpec<typeof claudeCodeTaskOutputSchema> = {
-	target: "hub",
+	target: "wait",
 	wireName: "TaskOutput",
 	description: claudeCodeTaskOutput,
 	parameters: claudeCodeTaskOutputSchema,
-	toParams: (args: typeof claudeCodeTaskOutputSchema.infer) =>
-		args.block ? { op: "wait", ids: [args.task_id] } : { op: "jobs" },
+	toParams: (args: typeof claudeCodeTaskOutputSchema.infer) => {
+		if (!args.block) {
+			throw new ToolError(
+				`TaskOutput.block false is not supported: this build has no non-blocking task output. Read proc://${args.task_id} for a snapshot, or retry with block: true to wait.`,
+			);
+		}
+		return {};
+	},
 };
 
 const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
@@ -105,7 +116,7 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 		},
 	},
 	{
-		target: "hub",
+		target: "write",
 		wireName: "SendMessage",
 		description: claudeCodeSendMessage,
 		parameters: claudeCodeSendMessageSchema,
@@ -113,30 +124,30 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 			if (args.notify_when_idle === true) {
 				unsupported("SendMessage.notify_when_idle", "omp has no idle notice; use TaskOutput to wait on an agent");
 			}
-			return { op: "send", to: args.to, message: args.message };
+			return { path: `agent://${args.to}`, content: args.message };
 		},
 	},
 	{
-		target: "hub",
+		target: "read",
 		wireName: "ListAgents",
 		description: claudeCodeListAgents,
 		parameters: claudeCodeListAgentsSchema,
 		toParams: (args: typeof claudeCodeListAgentsSchema.infer) => {
 			if (args.channel !== undefined) unsupported("ListAgents.channel", "omp has no agent channels");
 			if (args.q !== undefined) unsupported("ListAgents.q", "omp does not filter the roster");
-			return { op: "list" };
+			return { path: "history://" };
 		},
 	},
 	CLAUDE_CODE_TASK_OUTPUT,
 	{
-		target: "hub",
+		target: "write",
 		wireName: "TaskStop",
 		description: claudeCodeTaskStop,
 		parameters: claudeCodeTaskStopSchema,
 		toParams: (args: typeof claudeCodeTaskStopSchema.infer) => {
 			const id = args.task_id ?? args.shell_id;
 			if (id === undefined) throw new ToolError("TaskStop.task_id is required.");
-			return { op: "cancel", ids: [id] };
+			return { path: `proc://${id}/kill` };
 		},
 	},
 	{
@@ -195,23 +206,31 @@ const codexInterruptAgentSchema = type({
 });
 
 const codexWaitAgentSchema = type({
-	"timeout_ms?": type("number").describe(`Accepted but not applied; the wait window adapts automatically.`),
+	"timeout_ms?": type("number").describe("Accepted but not applied; the wait returns on the next result or message."),
 });
 
 const codexWaitSchema = type({
 	cell_id: type("string").describe("Identifier of the running exec cell."),
 	"max_tokens?": type("number").describe("Accepted but not applied; output is capped by the session."),
-	"terminate?": type("boolean").describe("True stops the running exec cell; false or omitted waits for output."),
-	"yield_time_ms?": type("number").describe(`Accepted but not applied; the wait window adapts automatically.`),
+	"terminate?": type("boolean").describe("Not available; stop a running cell with interrupt_agent."),
+	"yield_time_ms?": type("number").describe("Accepted but not applied; the wait returns on the next result."),
 });
 
 const CODEX_WAIT: HarnessFacadeSpec<typeof codexWaitSchema> = {
-	target: "hub",
+	target: "wait",
 	wireName: "wait",
+	// The vendor's `wait` shares omp's tool name, so it stands in for it on this surface.
+	replacesTarget: true,
 	description: codexWait,
 	parameters: codexWaitSchema,
-	toParams: (args: typeof codexWaitSchema.infer) =>
-		args.terminate ? { op: "cancel", ids: [args.cell_id] } : { op: "wait", ids: [args.cell_id] },
+	toParams: (args: typeof codexWaitSchema.infer) => {
+		if (args.terminate === true) {
+			throw new ToolError(
+				`wait.terminate is not supported: stop the cell with interrupt_agent (target "${args.cell_id}"). Retry without the field to wait.`,
+			);
+		}
+		return {};
+	},
 };
 
 const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
@@ -262,31 +281,29 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 		},
 	},
 	{
-		target: "hub",
+		target: "write",
 		wireName: "send_message",
 		namespace: CODEX_COLLABORATION,
 		description: codexSendMessage,
 		parameters: codexTargetMessageSchema,
 		toParams: (args: typeof codexTargetMessageSchema.infer) => ({
-			op: "send",
-			to: args.target,
-			message: args.message,
+			path: `agent://${args.target}`,
+			content: args.message,
 		}),
 	},
 	{
-		target: "hub",
+		target: "write",
 		wireName: "followup_task",
 		namespace: CODEX_COLLABORATION,
 		description: codexFollowupTask,
 		parameters: codexTargetMessageSchema,
 		toParams: (args: typeof codexTargetMessageSchema.infer) => ({
-			op: "send",
-			to: args.target,
-			message: args.message,
+			path: `agent://${args.target}`,
+			content: args.message,
 		}),
 	},
 	{
-		target: "hub",
+		target: "read",
 		wireName: "list_agents",
 		namespace: CODEX_COLLABORATION,
 		description: codexListAgents,
@@ -295,26 +312,24 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 			if (args.path_prefix !== undefined) {
 				unsupported("list_agents.path_prefix", "agents have flat ids, not task paths");
 			}
-			return { op: "list" };
+			return { path: "history://" };
 		},
 	},
 	{
-		target: "hub",
+		target: "write",
 		wireName: "interrupt_agent",
 		namespace: CODEX_COLLABORATION,
 		description: codexInterruptAgent,
 		parameters: codexInterruptAgentSchema,
-		toParams: (args: typeof codexInterruptAgentSchema.infer) => ({ op: "cancel", ids: [args.target] }),
+		toParams: (args: typeof codexInterruptAgentSchema.infer) => ({ path: `proc://${args.target}/kill` }),
 	},
 	{
-		target: "hub",
+		target: "wait",
 		wireName: "wait_agent",
 		namespace: CODEX_COLLABORATION,
 		description: codexWaitAgent,
 		parameters: codexWaitAgentSchema,
-		toParams: () => ({
-			op: "wait",
-		}),
+		toParams: () => ({}),
 	},
 	CODEX_WAIT,
 ];
@@ -332,8 +347,8 @@ export function harnessFacadeSpecs(profile: HarnessProfile): readonly HarnessFac
 }
 
 /**
- * The facade each profile waits on one background job with (`hub` `op:"wait"`
- * + `ids`). Profiles without a wait facade (pi) fall back to `hub` itself.
+ * The facade each profile waits on background work with (omp's `wait`).
+ * Profiles without a wait facade (pi) fall back to `wait` itself.
  */
 export const HARNESS_JOB_WAIT_FACADE: Partial<Readonly<Record<HarnessProfile, HarnessFacadeSpec>>> = {
 	"claude-code": CLAUDE_CODE_TASK_OUTPUT,

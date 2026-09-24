@@ -1,1 +1,1 @@
-List the agents you can message: running and idle peers with their kind and status, plus counts of parked agents. Address a peer by the exact id shown. `channel` and `q` are not available in this build; leave them unset.
+List the agents in this session: every registered agent with its status, kind, parent, and last activity, plus transcripts found on disk. Address a peer by the exact id shown. `channel` and `q` are not available in this build; leave them unset.

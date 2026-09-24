@@ -31,7 +31,7 @@ const LEAD_IDENTITY_BY_PROFILE: Readonly<Record<HarnessProfile, string>> = {
 /** Template data the lead prompt and the `sidekick` tool description render their slots from. */
 export interface FusionPromptData extends Record<string, unknown> {
 	sidekickTool: string;
-	/** The tool the lead waits for a background handoff with: the profile's job-wait facade, else `hub`. */
+	/** The tool the lead waits for a background handoff with: the profile's job-wait facade, else `wait`. */
 	readTool: string;
 	leadIdentity: string;
 	/** GPT leads (the Codex profile) get two extra delegation bullets that Claude leads do not. */
@@ -44,12 +44,12 @@ export function buildFusionPromptData(options: {
 	toolRefs: Readonly<Record<string, string>>;
 }): FusionPromptData {
 	const { profile, toolRefs } = options;
-	const hubRef = toolRefs.hub ?? "hub";
+	const waitRef = toolRefs.wait ?? "wait";
 	return {
 		sidekickTool: toolRefs[SIDEKICK_TOOL_NAME] ?? SIDEKICK_TOOL_NAME,
 		readTool:
 			profile === undefined || HARNESS_JOB_WAIT_FACADE[profile] === undefined
-				? hubRef
+				? waitRef
 				: HARNESS_JOB_WAIT_FACADE[profile]!.wireName,
 		leadIdentity: profile === undefined ? "assistant" : LEAD_IDENTITY_BY_PROFILE[profile],
 		gptLead: profile === "codex",
