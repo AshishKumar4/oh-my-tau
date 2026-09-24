@@ -165,6 +165,7 @@ import type { AuthStorage } from "./session/auth-storage";
 import { DateCwdReminderInjector } from "./session/date-cwd-reminder";
 import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import { recoverInlineSloppyEdit } from "./session/inline-edit-recovery";
+import { ADVISOR_LAUNCH_OWNER } from "./session/launch-completion";
 import {
 	createForkJournalStateReader,
 	type ForkRequestSnapshot,
@@ -4064,7 +4065,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			queueLaunchCompletion: notification =>
 				session?.queueLaunchCompletion(notification) ??
 				Promise.reject(new Error("Session unavailable for launch completion delivery")),
-			getAgentId: () => "advisor",
+			getAgentId: () => ADVISOR_LAUNCH_OWNER,
 			// The primary's availability signals are wrong for advisors: their tool
 			// slate is filtered separately at runtime (default read/grep/glob, no
 			// write transport), so xd:// devices are unreachable. Images are inlined,

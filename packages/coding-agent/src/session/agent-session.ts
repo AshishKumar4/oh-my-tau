@@ -1657,7 +1657,8 @@ export class AgentSession {
 		});
 		this.yieldQueue.register<LaunchCompletionEntry>(LAUNCH_COMPLETION_MESSAGE_TYPE, {
 			isStale: entry =>
-				this.#isDisposed || !isLaunchCompletionOwner(entry.owner, this.sessionManager.getSessionId()),
+				this.#isDisposed ||
+				!isLaunchCompletionOwner(entry.owner, this.#agentId ?? this.sessionManager.getSessionId()),
 			build: buildLaunchCompletionBatchMessage,
 		});
 		// Background-job completions / late diagnostics are pulled into the run at
