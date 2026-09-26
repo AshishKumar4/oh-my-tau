@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { type Model } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgEditFuzzyMatch } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { type EditModeSessionLike, resolveEditMode } from "@oh-my-pi/pi-coding-agent/utils/edit-mode";
 
@@ -23,20 +25,17 @@ function restoreEnv(): void {
 function createSession(args: {
 	activeModel?: string;
 	activeModelObject?: Model;
-	modelVariant?: EditMode | null;
+	/** Configured `edit.modelVariants` entry keyed by the whole active model selector. */
+	modelVariant?: EditMode;
 	settingsMode?: EditMode;
 }): EditModeSessionLike {
-	return {
-		getActiveModelString: () => args.activeModel,
-		getActiveModel: () => args.activeModelObject,
-		settings: {
-			get: ((key: string) =>
-				key === "harness.mode"
-					? "auto"
-					: (args.settingsMode ?? "hashline")) as EditModeSessionLike["settings"]["get"],
-			getEditVariantForModel: () => args.modelVariant ?? null,
-		},
-	};
+	const settings = Settings.isolated({
+		"edit.mode": args.settingsMode ?? "hashline",
+		...(args.modelVariant && args.activeModel
+			? { "edit.modelVariants": { [args.activeModel]: args.modelVariant } }
+			: {}),
+	});
+	return { getActiveModelString: () => args.activeModel, getActiveModel: () => args.activeModelObject, settings };
 }
 
 describe("resolveEditMode", () => {
@@ -152,5 +151,28 @@ describe("resolveEditMode", () => {
 		).toBe("patch");
 		// Unprofiled codex models keep the hashline default.
 		expect(resolveEditMode(createSession({ activeModel: "openai-codex/gpt-5.1-codex" }))).toBe("hashline");
+	});
+});
+
+describe("PI_EDIT_FUZZY", () => {
+	const originalEditFuzzy = Bun.env.PI_EDIT_FUZZY;
+
+	afterEach(() => {
+		if (originalEditFuzzy === undefined) delete Bun.env.PI_EDIT_FUZZY;
+		else Bun.env.PI_EDIT_FUZZY = originalEditFuzzy;
+	});
+
+	test("forces fuzzy matching with 1/true and 0/false, deferring to edit.fuzzyMatch for auto or other text", () => {
+		const fuzzyWith = (raw: string, configured: boolean) => {
+			Bun.env.PI_EDIT_FUZZY = raw;
+			return cfgEditFuzzyMatch.get(Settings.isolated({ "edit.fuzzyMatch": configured }));
+		};
+		expect(fuzzyWith("1", false)).toBe(true);
+		expect(fuzzyWith("true", false)).toBe(true);
+		expect(fuzzyWith("0", true)).toBe(false);
+		expect(fuzzyWith("false", true)).toBe(false);
+		expect(fuzzyWith("auto", true)).toBe(true);
+		expect(fuzzyWith("auto", false)).toBe(false);
+		expect(fuzzyWith("bogus", true)).toBe(true);
 	});
 });

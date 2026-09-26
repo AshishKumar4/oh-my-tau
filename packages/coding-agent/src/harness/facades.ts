@@ -18,6 +18,7 @@ import codexWaitAgent from "../prompts/tools/harness/codex-wait-agent.md" with {
 import codexWait from "../prompts/tools/harness/codex-wait.md" with { type: "text" };
 import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { cfgTaskEnableEffort, cfgTaskIsolationEnabled } from "../task/settings";
 import type { HarnessFacadeSpec } from "./facade";
 import { CODEX_COLLABORATION_NAMESPACE } from "./manifest";
 
@@ -101,7 +102,7 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 			// agent definition owns the model, so the field is accepted and ignored
 			// rather than costing the model a rejected delegation.
 			if (args.isolation === "remote") unsupported('Agent.isolation "remote"', "omp has no remote execution");
-			if (args.isolation === "worktree" && !host.settings.get("task.isolation.enabled")) {
+			if (args.isolation === "worktree" && !cfgTaskIsolationEnabled.get(host.settings)) {
 				unsupported('Agent.isolation "worktree"', "task.isolation.enabled is off in this session");
 			}
 			// `subagent_type: "fork"` forks the conversation, not an agent type:
@@ -268,7 +269,7 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 						"use low, medium, high, xhigh, max, or ultra",
 					);
 				}
-				if (!host.settings.get("task.enableEffort")) {
+				if (!cfgTaskEnableEffort.get(host.settings)) {
 					unsupported("spawn_agent.reasoning_effort", "task.enableEffort is off in this session");
 				}
 			}

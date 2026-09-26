@@ -3,6 +3,7 @@
  */
 
 import { effectiveHarnessProfile } from "../harness/effective-profile";
+import { cfgReadLineNumbers } from "../tools/settings";
 import { type EditModeSessionLike, resolveEditMode } from "./edit-mode";
 
 /**
@@ -23,9 +24,6 @@ export interface FileDisplayMode {
 export interface FileDisplayModeSession extends EditModeSessionLike {
 	/** Whether the edit tool is available. Hashlines are suppressed without it. */
 	hasEditTool?: boolean;
-	settings: EditModeSessionLike["settings"] & {
-		get(key: "readLineNumbers" | "edit.mode"): unknown;
-	};
 }
 
 /**
@@ -52,6 +50,6 @@ export function resolveFileDisplayMode(
 	return {
 		hashLines,
 		numbering: vendorNumbering ? "cat" : "pipe",
-		lineNumbers: !raw && (hashLines || vendorNumbering || settings.get("readLineNumbers") === true),
+		lineNumbers: !raw && (hashLines || vendorNumbering || cfgReadLineNumbers.get(settings) === true),
 	};
 }

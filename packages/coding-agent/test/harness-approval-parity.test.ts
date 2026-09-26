@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type Model, validateToolArguments } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { harnessToolBinding } from "@oh-my-pi/pi-coding-agent/harness/manifest";
 import { type ApprovalMode, resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
@@ -26,19 +27,13 @@ function toolSession(bashPatterns: readonly BashPatternRule[] = [], model?: Mode
 		skills: [],
 		getSessionFile: () => null,
 		getActiveModel: () => model,
-		settings: {
-			get(key: string) {
-				if (key === "bash.patterns") return bashPatterns;
-				if (key === "bash.allowCompoundCommands") return false;
-				if (key === "async.enabled") return false;
-				if (key === "bash.autoBackground.enabled") return false;
-				if (key === "bash.autoBackground.thresholdMs") return 60_000;
-				return undefined;
-			},
-			getShellConfig() {
-				return { shell: "/bin/bash", args: ["-l", "-c"], env: {}, prefix: undefined };
-			},
-		},
+		settings: Settings.isolated({
+			"bash.patterns": [...bashPatterns],
+			"bash.allowCompoundCommands": false,
+			"async.enabled": false,
+			"bash.autoBackground.enabled": false,
+			"bash.autoBackground.thresholdMs": 60_000,
+		}),
 	} as unknown as ToolSession;
 }
 

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { renderDemotedThinking } from "../dialect/demotion";
@@ -440,14 +441,23 @@ function hasPlausibleCredentialEntropy(token: string): boolean {
 }
 
 /**
- * Whether outbound credential-pattern redaction is active. Off by default;
- * hosts opt in explicitly (the coding agent wires this to the
- * `secrets.enabled` setting).
+ * Whether outbound credential-pattern redaction is active outside any
+ * {@link withCredentialRedaction} scope. Off by default; hosts opt in
+ * explicitly (the coding agent wires this to the `secrets.enabled` setting).
  */
 let credentialRedactionEnabled = false;
 
+/** Per-request override of {@link credentialRedactionEnabled}; see {@link withCredentialRedaction}. */
+const credentialRedactionScope = new AsyncLocalStorage<boolean>();
+
+/** Redaction policy for the request being built: its scope's, else the process-wide switch. */
+function isCredentialRedactionActive(): boolean {
+	return credentialRedactionScope.getStore() ?? credentialRedactionEnabled;
+}
+
 /**
- * Toggle outbound credential-pattern redaction. When disabled (the default),
+ * Toggle process-wide outbound credential-pattern redaction (requests outside
+ * any {@link withCredentialRedaction} scope). When disabled (the default),
  * {@link redactSensitiveCredentials} and {@link redactSensitiveInObject} are
  * pass-throughs and outbound messages/system prompts leave the process
  * unmodified.
@@ -456,8 +466,18 @@ export function configureCredentialRedaction(enabled: boolean): void {
 	credentialRedactionEnabled = enabled;
 }
 
+/**
+ * Runs `fn` with outbound credential-pattern redaction forced on or off for
+ * every request it starts (including the async work those requests spawn),
+ * overriding {@link configureCredentialRedaction}. Lets concurrent sessions in
+ * one process each apply their own policy.
+ */
+export function withCredentialRedaction<T>(enabled: boolean, fn: () => T): T {
+	return credentialRedactionScope.run(enabled, fn);
+}
+
 export function redactSensitiveCredentials(text: string): string {
-	if (!credentialRedactionEnabled) return text;
+	if (!isCredentialRedactionActive()) return text;
 	return text.replace(SENSITIVE_TOKEN_RE, match => {
 		if (!hasPlausibleCredentialEntropy(match)) return match;
 		const lower = match.toLowerCase();
@@ -478,7 +498,7 @@ export function redactSensitiveCredentials(text: string): string {
 }
 
 export function redactSensitiveInObject(val: unknown): { result: unknown; changed: boolean } {
-	if (!credentialRedactionEnabled) return { result: val, changed: false };
+	if (!isCredentialRedactionActive()) return { result: val, changed: false };
 	if (typeof val === "string") {
 		const redacted = redactSensitiveCredentials(val);
 		return { result: redacted, changed: redacted !== val };
@@ -519,7 +539,7 @@ function redactToolCallPayloads(block: ToolCall): ToolCall {
 }
 
 function redactSensitiveCredentialsInMessages(messages: Message[]): Message[] {
-	if (!credentialRedactionEnabled) return messages;
+	if (!isCredentialRedactionActive()) return messages;
 	return messages.map((msg): Message => {
 		if (msg.role === "user" || msg.role === "developer") {
 			const userMsg = msg as UserMessage | DeveloperMessage;

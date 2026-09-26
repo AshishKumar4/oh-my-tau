@@ -6,6 +6,11 @@ import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mo
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import {
+	cfgFusionEnabled,
+	cfgFusionSidekickModel,
+	cfgFusionSidekickThinking,
+} from "@oh-my-pi/pi-coding-agent/fusion/settings";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -130,7 +135,7 @@ describe("fusion lead session", () => {
 
 	it("/fusion toggles the setting and remounts through the session", async () => {
 		const settings = Settings.isolated();
-		const applyFusionMode = vi.fn(async () => settings.get("fusion.enabled"));
+		const applyFusionMode = vi.fn(async () => cfgFusionEnabled.get(settings));
 		const output: string[] = [];
 		const runtime = {
 			session: {
@@ -148,17 +153,17 @@ describe("fusion lead session", () => {
 		} as unknown as SlashCommandRuntime;
 
 		expect(await executeAcpBuiltinSlashCommand("/fusion", runtime)).toEqual({ consumed: true });
-		expect(settings.get("fusion.enabled")).toBe(true);
+		expect(cfgFusionEnabled.get(settings)).toBe(true);
 		expect(applyFusionMode).toHaveBeenCalledTimes(1);
 		expect(output.at(-1)).toContain("Fusion mode enabled");
 
 		await executeAcpBuiltinSlashCommand("/fusion anthropic/claude-sonnet-4-6:high", runtime);
-		expect(settings.get("fusion.sidekickModel")).toBe("anthropic/claude-sonnet-4-6");
-		expect(settings.get("fusion.sidekickThinking")).toBe(Effort.High);
+		expect(cfgFusionSidekickModel.get(settings)).toBe("anthropic/claude-sonnet-4-6");
+		expect(cfgFusionSidekickThinking.get(settings)).toBe(Effort.High);
 		expect(applyFusionMode).toHaveBeenCalledTimes(2);
 
 		await executeAcpBuiltinSlashCommand("/fusion off", runtime);
-		expect(settings.get("fusion.enabled")).toBe(false);
+		expect(cfgFusionEnabled.get(settings)).toBe(false);
 		expect(applyFusionMode).toHaveBeenCalledTimes(3);
 		expect(output.at(-1)).toBe("Fusion mode disabled.");
 

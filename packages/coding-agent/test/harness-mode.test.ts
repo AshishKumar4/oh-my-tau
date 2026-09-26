@@ -8,6 +8,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgHarnessMode } from "@oh-my-pi/pi-coding-agent/harness/settings";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -120,19 +121,19 @@ describe("harness.mode (persisted, model/Prompt, default auto)", () => {
 		await session.waitForIdle();
 		expect(requests[0]?.wire).toContain("Bash");
 
-		settings.override("harness.mode", "native");
+		cfgHarnessMode.override(settings, "native");
 		await session.prompt("again");
 		await session.waitForIdle();
 		expect(requests[1]?.wire.every(name => name === undefined)).toBe(true);
 		expect(requests[1]?.names).toContain("task");
 
-		settings.override("harness.mode", "claude-code");
+		cfgHarnessMode.override(settings, "claude-code");
 		await session.prompt("third");
 		await session.waitForIdle();
 		expect(requests[2]?.wire).toContain("Bash");
 		expect(requests[2]?.names).toContain("Agent");
 
-		settings.clearOverride("harness.mode");
+		cfgHarnessMode.clearOverride(settings);
 		await session.dispose();
 	});
 
@@ -141,7 +142,7 @@ describe("harness.mode (persisted, model/Prompt, default auto)", () => {
 		const configPath = path.join(configDir, "config.yml");
 		await fs.writeFile(configPath, 'harness:\n  mode: "codex"\n');
 		const loaded = await Settings.loadIsolated({ configFiles: [configPath], agentDir: configDir });
-		expect(loaded.get("harness.mode")).toBe("codex");
+		expect(cfgHarnessMode.get(loaded)).toBe("codex");
 		await fs.rm(configDir, { recursive: true, force: true });
 	});
 });

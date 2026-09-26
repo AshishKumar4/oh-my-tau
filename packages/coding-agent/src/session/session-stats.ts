@@ -9,6 +9,7 @@ import type { AssistantMessage, Model, ProviderResponseMetadata, Usage } from "@
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
+
 import type { ContextUsage } from "../extensibility/extensions/types";
 import {
 	computeNonMessageBreakdown,
@@ -20,6 +21,7 @@ import { harnessLabel, PromptCacheRollup } from "./prompt-cache-stats";
 import { getLatestCompactionEntry } from "./session-context";
 import type { ModelUsageEntry, SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
+import { cfgSkillful } from "./settings";
 
 interface PendingContextSnapshot {
 	promptTokens: number;
@@ -35,7 +37,7 @@ interface PendingContextSnapshot {
 
 /** Capabilities the stats tracker borrows from its owning session. */
 export interface SessionStatsTrackerHost {
-	session: NonMessageTokenSource & { readonly settings?: Pick<Settings, "revision" | "get"> };
+	session: NonMessageTokenSource & { readonly settings?: Settings };
 	agent: Agent;
 	sessionManager: SessionManager;
 	modelRegistry: ModelRegistry;
@@ -215,11 +217,12 @@ export class SessionStatsTracker {
 	}): ContextUsageBreakdown | undefined {
 		const rawContextWindow = options?.contextWindow ?? this.#host.model()?.contextWindow ?? 0;
 		const contextWindow = Number.isFinite(rawContextWindow) && rawContextWindow > 0 ? rawContextWindow : 0;
+		const settings = this.#host.session.settings;
 		const { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens } = computeNonMessageBreakdown(
 			this.#host.session,
 			this.#tokenizer,
-			this.#host.session.settings?.revision,
-			this.#host.session.settings?.get("skillful") as boolean | undefined,
+			settings?.revision,
+			settings ? cfgSkillful.get(settings) : undefined,
 		);
 		const categoryNonMessageTokens = skillsTokens + toolsTokens + systemContextTokens + systemPromptTokens;
 		const currentNonMessageTokens = computeNonMessageTokens(

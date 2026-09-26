@@ -143,11 +143,6 @@ export interface NonMessageTokenSource {
 		};
 	};
 	readonly skills?: readonly ContextSkill[];
-	readonly settings?: {
-		get(key: string | "skillful"): unknown;
-		/** Effective settings revision; invalidates settings-backed dynamic tool metadata. */
-		readonly revision?: number;
-	};
 	/** Reference to the served vendor prompt when block 0 carries it, for skills-subtraction placement. */
 	readonly vendorPromptRef?: { readonly text: string };
 	/** Provider-facing, session-frozen descriptions when available. */

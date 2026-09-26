@@ -1,5 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgFusionEnabled } from "@oh-my-pi/pi-coding-agent/fusion/settings";
 import { SETTING_TABS, TAB_METADATA } from "@oh-my-pi/pi-tui/overlays/settings-defs";
 import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { createSettingsHost } from "@oh-my-pi/pi-coding-agent/config/settings-ui";
@@ -93,8 +94,8 @@ describe("SettingsSelectorComponent fusion tab", () => {
 		expect(before).toContain("Sidekick Thinking");
 
 		// The boolean "Fusion" row is first in the tab; Enter toggles it.
-		expect(settings.get("fusion.enabled")).toBe(false);
+		expect(cfgFusionEnabled.get(settings)).toBe(false);
 		comp.handleInput("\n");
-		expect(settings.get("fusion.enabled")).toBe(true);
+		expect(cfgFusionEnabled.get(settings)).toBe(true);
 	});
 });

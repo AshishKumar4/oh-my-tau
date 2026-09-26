@@ -13,6 +13,7 @@ import type { Settings } from "../config/settings";
 import { HARNESS_JOB_WAIT_FACADE } from "../harness/facades";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentDefinition } from "../task/types";
+import { cfgFusionEnabled, cfgFusionSidekickModel } from "./settings";
 
 /** Agent definition name of the sidekick; also its registry display name. */
 export const SIDEKICK_AGENT_NAME = "sidekick";
@@ -79,7 +80,7 @@ export interface FusionSessionLike {
  * lead prompt, direct-edit reminder, report-first notice) goes through here.
  */
 export function isFusionLead(session: FusionSessionLike): boolean {
-	if (!session.settings.get("fusion.enabled")) return false;
+	if (!cfgFusionEnabled.get(session.settings)) return false;
 	return (session.taskDepth ?? 0) === 0 || session.agentDefinition?.sidekick === true;
 }
 
@@ -96,7 +97,7 @@ export interface SidekickModelResolution {
  * every call fails at spawn.
  */
 export function resolveSidekickModel(settings: Settings, modelRegistry: ModelRegistry): SidekickModelResolution {
-	const pattern = (settings.get("fusion.sidekickModel") ?? "").trim();
+	const pattern = cfgFusionSidekickModel.get(settings).trim();
 	if (!pattern) return { pattern, model: undefined, error: "fusion.sidekickModel is empty." };
 	const resolved = resolveCliModel({
 		cliModel: pattern,

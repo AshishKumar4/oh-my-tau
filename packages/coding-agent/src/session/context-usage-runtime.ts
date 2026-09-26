@@ -7,7 +7,7 @@ import {
 	type ContextBreakdown,
 	type ContextSavingsEstimate,
 } from "@oh-my-pi/pi-tui/status-line/context-usage";
-import type { Settings } from "../config/settings";
+import type { ScopeLike } from "../config/registry";
 import type { AgentSession } from "./agent-session";
 import { resolveSpeculationMethod } from "./compaction-methods";
 import { servedHarnessPrompt } from "../harness/capture";
@@ -15,14 +15,22 @@ import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { estimateInlineSavings } from "./snapcompact-inline";
 import { resolveSpeculationLeadTokens } from "./speculation-lead";
 
+import { cfgSkillful } from "./settings";
+import {
+	cfgCompaction,
+	cfgSnapcompactShape,
+	cfgSnapcompactSystemPrompt,
+	cfgSnapcompactToolResults,
+} from "./context-settings";
+
 /** Resolve session policy before handing pure boundary arithmetic to the UI. */
 export function getSessionCompactionBoundaries(
-	settings: Pick<Settings, "getGroup">,
+	settings: ScopeLike,
 	contextWindow: number,
 	model?: Model | null,
 ): CompactionBoundaries | null {
 	if (!(contextWindow > 0)) return null;
-	const configured = settings.getGroup("compaction");
+	const configured = cfgCompaction.get(settings);
 	const compaction: CompactionSettings = configured;
 	if (!compaction.enabled || compaction.strategy === "off") return null;
 	const threshold = resolveThresholdTokens(contextWindow, compaction);
@@ -42,8 +50,8 @@ export function getSessionCompactionBoundaries(
  * prompt object is stable per profile, so identity comparison is cheap.
  */
 export function sessionVendorPromptRef(session: {
-	model?: import("@oh-my-pi/pi-ai").Model;
-	settings: Pick<Settings, "get">;
+	model?: Model;
+	settings: ScopeLike;
 }): { readonly text: string } | undefined {
 	return servedHarnessPrompt(session.model, effectiveHarnessProfile(session.settings, session.model));
 }
@@ -55,11 +63,11 @@ export function computeSessionContextBreakdown(
 ): ContextBreakdown {
 	let snapcompact: ContextSavingsEstimate | undefined;
 	if (options?.snapcompactSavings) {
-		const renderSystemPrompt = session.settings.get("snapcompact.systemPrompt");
-		const renderToolResults = session.settings.get("snapcompact.toolResults");
+		const renderSystemPrompt = cfgSnapcompactSystemPrompt.get(session.settings);
+		const renderToolResults = cfgSnapcompactToolResults.get(session.settings);
 		if (renderSystemPrompt !== "none" || renderToolResults) {
 			snapcompact = estimateInlineSavings({
-				options: { renderSystemPrompt, renderToolResults, shape: session.settings.get("snapcompact.shape") },
+				options: { renderSystemPrompt, renderToolResults, shape: cfgSnapcompactShape.get(session.settings) },
 				model: session.model,
 				systemPrompt: session.systemPrompt ?? [],
 				messages: session.messages ?? [],
@@ -79,16 +87,15 @@ export function computeSessionContextBreakdown(
 			messages: session.messages,
 			systemPrompt: session.systemPrompt,
 			skills: session.skills,
-			settings: session.settings,
 			// Bind rather than wrap: a duck-typed session without the method must
 			// stay absent here, or the local-estimate branch is never taken and
 			// the call throws instead.
 			getContextBreakdown: session.getContextBreakdown?.bind(session),
 		},
 		{
-			compaction: session.settings.getGroup("compaction"),
+			compaction: cfgCompaction.get(session.settings),
 			sourceRevision: session.settings.revision,
-			skillful: session.settings.get("skillful"),
+			skillful: cfgSkillful.get(session.settings),
 			snapcompact,
 		},
 	);

@@ -1,7 +1,7 @@
 import type { Model } from "@oh-my-pi/pi-ai";
-import { HARNESS_PROFILES } from "@oh-my-pi/pi-catalog/compat/axes";
 import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
-import type { SettingPath, SettingValue } from "../config/settings-schema";
+import type { ScopeLike } from "../config/registry";
+import { cfgHarnessMode } from "./settings";
 
 /**
  * Effective harness profile for the active model under the persisted
@@ -12,12 +12,9 @@ import type { SettingPath, SettingValue } from "../config/settings-schema";
  * - A profile value forces that surface onto any model, even one the catalog
  *   leaves unprofiled.
  */
-export function effectiveHarnessProfile(
-	settings: { get(path: SettingPath): unknown },
-	model: Model | undefined,
-): HarnessProfile | undefined {
+export function effectiveHarnessProfile(settings: ScopeLike, model: Model | undefined): HarnessProfile | undefined {
 	if (model === undefined) return undefined;
-	const mode = settings.get("harness.mode");
+	const mode = cfgHarnessMode.get(settings);
 	if (mode === "native") return undefined;
 	if (mode === "auto") {
 		// `resolveHarnessProfile` walks the compat cascade, which reads
@@ -26,6 +23,5 @@ export function effectiveHarnessProfile(
 		if (model.identity === undefined) return undefined;
 		return resolveHarnessProfile(model);
 	}
-	const profile = mode as HarnessProfile;
-	return (HARNESS_PROFILES as readonly string[]).includes(profile) ? profile : undefined;
+	return mode;
 }

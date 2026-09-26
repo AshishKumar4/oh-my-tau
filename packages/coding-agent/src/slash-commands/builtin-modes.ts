@@ -6,8 +6,9 @@ import {
 	resolveCliModel,
 	type ResolveCliModelResult,
 } from "../config/model-resolver";
-import type { SettingPath, Settings } from "../config/settings";
+import type { Settings } from "../config/settings";
 import { describeSidekickOwner, listSidekickRefs, resolveSidekickModel } from "../fusion/config";
+import { cfgFusionEnabled, cfgFusionSidekickModel, cfgFusionSidekickThinking } from "../fusion/settings";
 import { servedHarnessPrompt } from "../harness/capture";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { describeLoopCondition } from "../modes/loop-condition";
@@ -19,6 +20,13 @@ import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
 import { handleSecurityCommand } from "./helpers/security";
 import type { ParsedSlashCommand, SlashCommandSpec, TuiSlashCommandRuntime } from "./types";
+
+import { cfgComputerDisplay, cfgComputerEnabled, cfgComputerMaxHeight, cfgComputerMaxWidth } from "../tools/settings";
+import { cfgSkillful } from "../session/settings";
+import { formatSlowModeResetClock } from "../session/anthropic-slow-mode";
+import { cfgExtendedContext } from "../session/context-settings";
+import { cfgGoalEnabled } from "../goals/settings";
+import { cfgPlanEnabled } from "../plan-mode/settings";
 
 export function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.statusLine.invalidate();
@@ -79,26 +87,58 @@ function formatFastModeStatus(session: AgentSession): string {
 	return session.isFastModeEnabled() ? "on" : "off";
 }
 
+const SLOW_UNSUPPORTED =
+	"The current model has no slow mode: /slow uses the flex tier on OpenAI/Google models and low priority on Anthropic subscriptions.";
+
+/**
+ * `/slow [on|off|status]` for the active model: the `flex` service tier on
+ * OpenAI/Google, subscription low priority (`providers.anthropic.slowMode`
+ * `auto`/`off`) on Anthropic. Bare invocation toggles. Returns the user-facing
+ * reply, or `undefined` for an unknown argument.
+ */
+function runSlowCommand(arg: string, session: AgentSession): string | undefined {
+	if (arg !== "" && arg !== "toggle" && arg !== "on" && arg !== "off" && arg !== "status") return undefined;
+	const anthropic = session.model?.provider === "anthropic";
+	if (arg === "status") {
+		const label = anthropic ? session.getAnthropicSlowModeLabel() : undefined;
+		if (!session.isSlowModeEnabled()) return label ? `Slow mode is off (${label}).` : "Slow mode is off.";
+		if (!anthropic) return "Slow mode is on (flex tier).";
+		return label ? `Slow mode is on (${label}).` : "Slow mode is on (low priority at the Claude session limit).";
+	}
+	const enabled = arg === "on" || (arg !== "off" && !session.isSlowModeEnabled());
+	if (!session.setSlowMode(enabled)) return SLOW_UNSUPPORTED;
+	if (!session.isSlowModeEnabled()) {
+		return anthropic
+			? "Slow mode off: at your Claude usage limit, requests may get a short wrap-up allowance, then wait for the limit to reset."
+			: "Slow mode off.";
+	}
+	if (!anthropic) return "Slow mode on: requests use the flex tier (lower cost, higher latency).";
+	const resetsAtSec = session.getAnthropicSlowModeLane()?.activeResetsAtSec();
+	return resetsAtSec !== undefined
+		? `Slow mode on: continuing at low priority until your limit resets at ${formatSlowModeResetClock(resetsAtSec)}. Your weekly limit still applies, and responses may pause while waiting for spare capacity.`
+		: "Slow mode on: when your Claude subscription hits its session limit and Anthropic offers low priority, requests switch to it after any wrap-up allowance.";
+}
+
 /** `/extended-context status` label for the premium long-context window setting. */
 function formatExtendedContextStatus(settings: Settings): string {
-	return settings.get("extendedContext") ? "on" : "off";
+	return cfgExtendedContext.get(settings) ? "on" : "off";
 }
 
 /** Applies an `/extended-context` argument and returns its operator feedback. */
 function applyExtendedContextCommand(settings: Settings, args: string): string | undefined {
 	const arg = args.trim().toLowerCase();
-	const current = settings.get("extendedContext");
+	const current = cfgExtendedContext.get(settings);
 	if (!arg || arg === "toggle") {
 		const enabled = !current;
-		settings.set("extendedContext", enabled);
+		cfgExtendedContext.set(settings, enabled);
 		return `Extended context ${enabled ? "enabled" : "disabled"}.`;
 	}
 	if (arg === "on") {
-		settings.set("extendedContext", true);
+		cfgExtendedContext.set(settings, true);
 		return "Extended context enabled.";
 	}
 	if (arg === "off") {
-		settings.set("extendedContext", false);
+		cfgExtendedContext.set(settings, false);
 		return "Extended context disabled.";
 	}
 	if (arg === "status") return `Extended context is ${formatExtendedContextStatus(settings)}.`;
@@ -107,12 +147,12 @@ function applyExtendedContextCommand(settings: Settings, args: string): string |
 
 /** Detailed, session-effective `/computer status` diagnostics. */
 function formatComputerUseStatus(session: AgentSession): string {
-	const enabled = session.settings.get("computer.enabled");
+	const enabled = cfgComputerEnabled.get(session.settings);
 	const active = session.getEvalPreludes().some(definition => definition.name === "computer");
 	const configured = {
-		display: session.settings.get("computer.display"),
-		maxWidth: session.settings.get("computer.maxWidth"),
-		maxHeight: session.settings.get("computer.maxHeight"),
+		display: cfgComputerDisplay.get(session.settings),
+		maxWidth: cfgComputerMaxWidth.get(session.settings),
+		maxHeight: cfgComputerMaxHeight.get(session.settings),
 	};
 	return [
 		`Computer use: ${enabled ? "enabled" : "disabled"}`,
@@ -126,16 +166,16 @@ function formatComputerUseStatus(session: AgentSession): string {
  * The override is never persisted to settings.json.
  */
 async function applyComputerUseToggle(session: AgentSession, enable: boolean): Promise<string> {
-	const previous = session.settings.get("computer.enabled");
-	session.settings.override("computer.enabled", enable);
+	const previous = cfgComputerEnabled.get(session.settings);
+	cfgComputerEnabled.override(session.settings, enable);
 	if (enable && !session.getEvalPreludes().some(definition => definition.name === "computer")) {
-		session.settings.override("computer.enabled", previous);
+		cfgComputerEnabled.override(session.settings, previous);
 		return "Computer use is unavailable in this session.";
 	}
 	try {
 		await session.refreshBaseSystemPrompt();
 	} catch (error) {
-		session.settings.override("computer.enabled", previous);
+		cfgComputerEnabled.override(session.settings, previous);
 		throw error;
 	}
 	return enable
@@ -164,9 +204,9 @@ function formatFusionStatus(session: AgentSession): string {
 	const lead = session.model;
 	const sidekick = resolveSidekickModel(settings, session.modelRegistry);
 	const lines = [
-		`Fusion: ${settings.get("fusion.enabled") ? "enabled" : "disabled"}`,
+		`Fusion: ${cfgFusionEnabled.get(settings) ? "enabled" : "disabled"}`,
 		`lead: ${lead ? formatModelString(lead) : "none selected"}`,
-		`sidekick: ${sidekick.model ? formatModelString(sidekick.model) : `${sidekick.pattern} (${sidekick.error})`} · thinking ${settings.get("fusion.sidekickThinking")}`,
+		`sidekick: ${sidekick.model ? formatModelString(sidekick.model) : `${sidekick.pattern} (${sidekick.error})`} · thinking ${cfgFusionSidekickThinking.get(settings)}`,
 	];
 	const refs = listSidekickRefs();
 	lines.push(
@@ -187,18 +227,18 @@ async function applyFusionCommand(session: AgentSession, settings: Settings, arg
 	if (lowered === "status") return formatFusionStatus(session);
 	let enable: boolean;
 	if (!arg || lowered === "toggle") {
-		enable = !settings.get("fusion.enabled");
+		enable = !cfgFusionEnabled.get(settings);
 	} else if (lowered === "on" || lowered === "off") {
 		enable = lowered === "on";
 	} else {
 		const resolved = resolveSessionModelSelector(arg, session, settings);
 		if (!resolved.model) throw new Error(resolved.error ?? `Unknown model: ${arg}`);
-		settings.set("fusion.sidekickModel", formatModelString(resolved.model));
+		cfgFusionSidekickModel.set(settings, formatModelString(resolved.model));
 		const suffixEffort = THINKING_EFFORTS.find(effort => effort === resolved.thinkingLevel);
-		if (suffixEffort !== undefined) settings.set("fusion.sidekickThinking", suffixEffort);
+		if (suffixEffort !== undefined) cfgFusionSidekickThinking.set(settings, suffixEffort);
 		enable = true;
 	}
-	settings.set("fusion.enabled", enable);
+	cfgFusionEnabled.set(settings, enable);
 	const mounted = await session.applyFusionMode();
 	if (!enable) return "Fusion mode disabled.";
 	if (!mounted) {
@@ -277,7 +317,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		inlineHint: "[prompt]",
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime => {
-			if (!runtime.ctx.settings.get("plan.enabled" as SettingPath)) return "Plan: disabled in settings";
+			if (!cfgPlanEnabled.get(runtime.ctx.settings)) return "Plan: disabled in settings";
 			if (runtime.ctx.planModeEnabled) {
 				const planFile = runtime.ctx.planModePlanFilePath;
 				return `Plan: on${planFile ? ` (${path.basename(planFile)})` : ""}`;
@@ -335,7 +375,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		inlineHint: "[objective]",
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime => {
-			if (!runtime.ctx.settings.get("goal.enabled" as SettingPath)) return "Goal: disabled in settings";
+			if (!cfgGoalEnabled.get(runtime.ctx.settings)) return "Goal: disabled in settings";
 			if (runtime.ctx.planModeEnabled) return "Goal: blocked by plan mode";
 			const state = runtime.ctx.session.getGoalModeState();
 			return state ? `Goal: ${state.goal.status} (${shortDetail(state.goal.objective)})` : "Goal: off";
@@ -563,6 +603,34 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "slow",
+		icon: "fast",
+		description:
+			"Toggle slow mode: flex tier on OpenAI/Google; on Anthropic, continue at low priority after the Claude session limit",
+		acpDescription: "Toggle slow mode",
+		acpInputHint: "[on|off|status]",
+		subcommands: [
+			{ name: "on", description: "Flex tier, or Anthropic low priority at the session limit (auto)" },
+			{ name: "off", description: "Standard service; stop Anthropic low priority" },
+			{ name: "status", description: "Show slow mode status" },
+		],
+		allowArgs: true,
+		getTuiAutocompleteDescription: runtime =>
+			runtime.ctx.session.isSlowModeEnabled() ? "Slow mode: on" : "Slow mode: off",
+		handle: async (command, runtime) => {
+			const message = runSlowCommand(command.args.trim().toLowerCase(), runtime.session);
+			if (message === undefined) return usage("Usage: /slow [on|off|status]", runtime);
+			await runtime.output(message);
+			return commandConsumed();
+		},
+		handleTui: (command, runtime) => {
+			const message = runSlowCommand(command.args.trim().toLowerCase(), runtime.ctx.session);
+			refreshStatusLine(runtime.ctx);
+			runtime.ctx.showStatus(message ?? "Usage: /slow [on|off|status]");
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "skillful",
 		icon: "compass",
 		description: "Toggle listing available skills in the system prompt (session only)",
@@ -575,12 +643,12 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		],
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime =>
-			`Skill listing: ${runtime.ctx.session.settings.get("skillful") ? "on" : "off"}`,
+			`Skill listing: ${cfgSkillful.get(runtime.ctx.session.settings) ? "on" : "off"}`,
 		handle: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
 			if (arg === "status") {
 				await runtime.output(
-					`Skill listing: ${runtime.session.settings.get("skillful") ? "on" : "off"} (session override; default from the skillful setting).`,
+					`Skill listing: ${cfgSkillful.get(runtime.session.settings) ? "on" : "off"} (session override; default from the skillful setting).`,
 				);
 				return commandConsumed();
 			}
@@ -599,7 +667,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
 			if (arg === "status") {
-				runtime.ctx.showStatus(`Skill listing: ${runtime.ctx.session.settings.get("skillful") ? "on" : "off"}.`);
+				runtime.ctx.showStatus(`Skill listing: ${cfgSkillful.get(runtime.ctx.session.settings) ? "on" : "off"}.`);
 				runtime.ctx.editor.setText("");
 				return;
 			}
@@ -658,7 +726,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		],
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime =>
-			`Computer: ${runtime.ctx.session.settings.get("computer.enabled") ? "on" : "off"}`,
+			`Computer: ${cfgComputerEnabled.get(runtime.ctx.session.settings) ? "on" : "off"}`,
 		handle: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
 			if (arg === "status") {
@@ -666,7 +734,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				return commandConsumed();
 			}
 			if (!arg || arg === "toggle" || arg === "on" || arg === "off") {
-				const enable = arg === "off" ? false : arg === "on" || !runtime.session.settings.get("computer.enabled");
+				const enable = arg === "off" ? false : arg === "on" || !cfgComputerEnabled.get(runtime.session.settings);
 				await runtime.output(await applyComputerUseToggle(runtime.session, enable));
 				return commandConsumed();
 			}
@@ -681,7 +749,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			}
 			if (!arg || arg === "toggle" || arg === "on" || arg === "off") {
 				const enable =
-					arg === "off" ? false : arg === "on" || !runtime.ctx.session.settings.get("computer.enabled");
+					arg === "off" ? false : arg === "on" || !cfgComputerEnabled.get(runtime.ctx.session.settings);
 				runtime.ctx.showStatus(await applyComputerUseToggle(runtime.ctx.session, enable));
 				runtime.ctx.editor.setText("");
 				return;
@@ -703,8 +771,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			{ name: "status", description: "Show lead and sidekick models and every live sidekick with its owner" },
 		],
 		allowArgs: true,
-		getTuiAutocompleteDescription: runtime =>
-			`Fusion: ${runtime.ctx.settings.get("fusion.enabled" as SettingPath) ? "on" : "off"}`,
+		getTuiAutocompleteDescription: runtime => `Fusion: ${cfgFusionEnabled.get(runtime.ctx.settings) ? "on" : "off"}`,
 		handle: async (command, runtime) => {
 			try {
 				await runtime.output(await applyFusionCommand(runtime.session, runtime.settings, command.args));

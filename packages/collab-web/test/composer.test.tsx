@@ -26,6 +26,7 @@ function snapshot(uiRequest: GuestSnapshot["uiRequest"]): GuestSnapshot {
 		readOnly: false,
 		uiRequest,
 		notices: [],
+		loading: null,
 	};
 }
 
@@ -51,7 +52,10 @@ describe("Composer host UI requests", () => {
 
 	it("renders a submit field for custom ask responses", () => {
 		const html = renderToStaticMarkup(
-			<Composer client={client} snapshot={snapshot({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })} />,
+			<Composer
+				client={client}
+				snapshot={snapshot({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })}
+			/>,
 		);
 
 		expect(html).toContain("Other");

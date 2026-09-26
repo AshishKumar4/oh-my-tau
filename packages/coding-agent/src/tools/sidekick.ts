@@ -32,7 +32,10 @@ import { getSidekickAgent } from "../task/agents";
 import { runSubagentFollowUpTurn } from "../task/executor";
 import { runStructuredSubagent, StructuredSubagentError } from "../task/structured-subagent";
 import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import { cfgFusionSidekickThinking } from "../fusion/settings";
+import { cfgTaskEnableLsp } from "../task/settings";
 import type { ToolSession } from "./index";
+import { cfgAsyncEnabled } from "./settings";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 /**
@@ -127,7 +130,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		const brief = params.message.trim();
 		const block = params.block ?? true;
 		const leadId = this.#leadId();
-		const manager = this.session.settings.get("async.enabled") ? this.session.asyncJobManager : undefined;
+		const manager = cfgAsyncEnabled.get(this.session.settings) ? this.session.asyncJobManager : undefined;
 
 		const ref = this.#spawning ? await this.#spawning : findSidekickRef(leadId);
 		const runningJob =
@@ -248,7 +251,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			if (ref) registered.resolve(ref);
 		};
 		const sidekick = getSidekickAgent();
-		const thinkingLevel = settings.get("fusion.sidekickThinking");
+		const thinkingLevel = cfgFusionSidekickThinking.get(settings);
 		try {
 			const execution = await runStructuredSubagent({
 				session: this.session,
@@ -263,7 +266,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 				identity: { label: SIDEKICK_LABEL },
 				keepAlive: true,
 				retainArtifacts: true,
-				enableLsp: (this.session.enableLsp ?? true) && settings.get("task.enableLsp"),
+				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(settings),
 				signal,
 				onProgress: progress => {
 					settleRegistered();
