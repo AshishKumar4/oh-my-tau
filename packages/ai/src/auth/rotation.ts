@@ -459,16 +459,18 @@ export class RateLimits implements LimitsApi {
 			).switched;
 		}
 
-		const providerKey = providerTypeKey(provider, sessionCredential.type);
+		const routing = this.#credentialBlockRouting(provider, sessionCredential.type, options?.modelId);
+		const providerKey = routing.providerKey;
 		// Snapshot sibling availability before mutating so a soft-deleting
-		// suspect hook can't reindex the answer out from under us.
+		// suspect hook can't reindex the answer out from under us. Read the scopes
+		// selection reads, or a usage-walled sibling counts as available.
 		const hasSibling = this.#deps.pool
 			.credentials(provider)
 			.some(
 				(credential, index) =>
 					credential.type === sessionCredential.type &&
 					index !== sessionCredential.index &&
-					!this.#deps.blocks.isBlocked(provider, providerKey, index),
+					!this.#deps.blocks.isBlocked(provider, providerKey, index, routing.siblingBlockScopes),
 			);
 		const target = this.#deps.pool.entries(provider)[sessionCredential.index];
 		const sticky = this.#deps.affinity.get(provider, sessionId);

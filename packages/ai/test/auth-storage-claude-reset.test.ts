@@ -216,7 +216,8 @@ describe("Claude saved reset account safety", () => {
 
 	it("clears the restored shared block but retains an exhausted uncovered model tier", async () => {
 		const f = await fixture();
-		for (const blockScope of ["", "tier:fable"]) {
+		// `shared` is where usage walls land; `""` is where earlier releases wrote them.
+		for (const blockScope of ["", "shared", "tier:fable"]) {
 			f.storage.blocks.upsert({
 				credentialId: f.target.credentialId,
 				providerKey: "anthropic:oauth",
@@ -232,14 +233,16 @@ describe("Claude saved reset account safety", () => {
 	it("retains a shared block when a session reset leaves the weekly quota exhausted", async () => {
 		const f = await fixture();
 		f.state.weeklyUsed = 100;
-		f.storage.blocks.upsert({
-			credentialId: f.target.credentialId,
-			providerKey: "anthropic:oauth",
-			blockScope: "",
-			blockedUntilMs: Date.now() + 3_600_000,
-		});
+		for (const blockScope of ["", "shared"]) {
+			f.storage.blocks.upsert({
+				credentialId: f.target.credentialId,
+				providerKey: "anthropic:oauth",
+				blockScope,
+				blockedUntilMs: Date.now() + 3_600_000,
+			});
+		}
 		const outcome = await f.storage.resets.redeem({ target: f.target, baseUrlResolver: f.baseUrlResolver });
 		expect(outcome.ok).toBe(true);
-		expect(f.storage.blocks.list([f.target.credentialId]).map(block => block.blockScope)).toEqual([""]);
+		expect(f.storage.blocks.list([f.target.credentialId]).map(block => block.blockScope)).toEqual(["", "shared"]);
 	});
 });

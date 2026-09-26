@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a Claude account staying blocked for Opus/Sonnet until its old weekly reset after the quota was restored outside OMP (a reset redeemed on claude.ai or in Claude Code); a fresh usage report showing the shared windows and Opus/Sonnet weekly rows recovered now lifts the block, while account-policy denials and refresh failures still expire only on their deadline
+- Fixed rotation after a failed Claude login treating a sibling behind an Opus/Sonnet usage limit as available
+
 ## [18.3.2] - 2026-09-25
 
 ### Fixed

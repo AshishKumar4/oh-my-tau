@@ -934,8 +934,8 @@ describe("claude ranking strategy", () => {
 		]);
 		expect(claudeRankingStrategy.blockScope?.({ modelId: "claude-fable-5" })).toBe("tier:fable");
 		expect(claudeRankingStrategy.blockScope?.({ modelId: "claude-mythos-5" })).toBe("tier:mythos");
-		expect(claudeRankingStrategy.blockScope?.({ modelId: "claude-opus-4-8" })).toBeUndefined();
-		expect(claudeRankingStrategy.blockScope?.({})).toBeUndefined();
+		expect(claudeRankingStrategy.blockScope?.({ modelId: "claude-opus-4-8" })).toBe("shared");
+		expect(claudeRankingStrategy.blockScope?.({})).toBe("shared");
 	});
 
 	it("uses the Fable weekly cap as secondary when it is more used than the shared weekly cap", () => {

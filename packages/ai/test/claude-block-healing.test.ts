@@ -158,7 +158,7 @@ describe("claude usage-block healing", () => {
 		// Shared walls must judge the scope too, else a spent 5h window heals.
 		expect(ids).toContain("anthropic:5h");
 		expect(ids).toContain("anthropic:7d");
-		// Opus/Sonnet requests never take a scoped block, so nothing to heal.
+		// Opus/Sonnet weekly rows gate the shared scope, not a tier of their own.
 		expect(ids).not.toContain("anthropic:7d:opus");
 		expect(scopes.some(scope => scope.blockScope === "tier:opus")).toBe(false);
 	});
@@ -218,7 +218,7 @@ describe("claude usage-block healing", () => {
 	});
 
 	it("spends no usage request on a block its scopes cannot heal", async () => {
-		// An unscoped block (Opus/Sonnet usage limit, refresh failure) is outside
+		// An unscoped block (account-policy denial, refresh failure) is outside
 		// every scope the strategy vouches for, so probing cannot change it.
 		const { storage, clearedScopes, probeCount } = makeHarness(
 			claudeReport([sharedLimit("5h", "5h", 0.1), sharedLimit("7d", "7d", 0.2), tierLimit("fable", 0)]),

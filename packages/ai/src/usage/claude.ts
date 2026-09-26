@@ -844,6 +844,15 @@ function scopeClaudeLimitsForModelHardBlock(
 /** Tiers Anthropic meters separately, so a block scoped to one leaves the others selectable. */
 const CLAUDE_TIER_BLOCK_SCOPES = ["fable", "mythos"] as const;
 
+/**
+ * Scope of every Claude usage wall outside the Fable/Mythos meters (the shared
+ * windows and the Opus/Sonnet weekly rows). Every Claude request honours it,
+ * and a live report can heal it. The unscoped `""` scope stays reserved for
+ * blocks no usage report can vouch for: account-policy denials, refresh and
+ * auth failures, and usage walls persisted before this scope existed.
+ */
+export const CLAUDE_SHARED_BLOCK_SCOPE = "shared";
+
 function isClaudeTierBlockScope(kind: ClaudeModelKind | undefined): kind is (typeof CLAUDE_TIER_BLOCK_SCOPES)[number] {
 	return kind === "fable" || kind === "mythos";
 }
@@ -914,28 +923,34 @@ export const claudeRankingStrategy: CredentialRankingStrategy = {
 	// a healthy candidate rather than serve until 100%.
 	scopeLimitsForReserve: scopeClaudeLimitsForModel,
 	/**
-	 * Fable/Mythos usage-limit errors map to tier-local weekly counters. Scope
-	 * reactive backoff blocks for those tiers, mirroring the per-counter
-	 * precedent in packages/ai/src/usage/google-antigravity.ts:466-497.
+	 * Fable/Mythos usage-limit errors map to tier-local weekly counters, so their
+	 * reactive blocks are tier-scoped, mirroring the per-counter precedent in
+	 * packages/ai/src/usage/google-antigravity.ts:466-497. Every other wall lands
+	 * in {@link CLAUDE_SHARED_BLOCK_SCOPE}.
 	 */
 	blockScope(context) {
 		const kind = getClaudeModelKind(context);
-		return isClaudeTierBlockScope(kind) ? `tier:${kind}` : undefined;
+		return isClaudeTierBlockScope(kind) ? `tier:${kind}` : CLAUDE_SHARED_BLOCK_SCOPE;
+	},
+	// A shared wall stops every Claude request, tier requests included. Without
+	// a context (reconciliation) this is the full set.
+	blockScopes(context) {
+		if (!context) return [CLAUDE_SHARED_BLOCK_SCOPE, ...CLAUDE_TIER_BLOCK_SCOPES.map(tier => `tier:${tier}`)];
+		const kind = getClaudeModelKind(context);
+		return isClaudeTierBlockScope(kind) ? [`tier:${kind}`, CLAUDE_SHARED_BLOCK_SCOPE] : [CLAUDE_SHARED_BLOCK_SCOPE];
 	},
 	/**
-	 * A reactive Fable/Mythos block carries the reset the 429 reported, but
-	 * Anthropic can restore the tier earlier (plan change, corrected counter),
-	 * and the block then idles a usable account for days. Judge each tier scope
-	 * against the limits that actually gate a request of that kind — its own
-	 * weekly row plus the shared umbrella windows — so a healthy report lifts
-	 * the block while a spent shared 5-hour wall keeps it.
-	 *
-	 * Only Fable/Mythos appear: {@link blockScope} scopes reactive blocks for
-	 * those tiers alone, so no other scope can exist to heal.
+	 * A reactive block carries the reset the 429 reported, but Anthropic can
+	 * restore the quota earlier (a reset redeemed outside OMP, a plan change, a
+	 * corrected counter), and the block then idles a usable account for days.
+	 * Judge each scope against the limits that actually gate it — a tier scope
+	 * against its own weekly row plus the shared umbrella windows, the shared
+	 * scope against the shared windows plus the Opus/Sonnet weekly rows — so a
+	 * healthy report lifts the block while any spent gate keeps it.
 	 */
 	healableBlockScopes(report) {
 		const sharedLimits = report.limits.filter(limit => limit.scope.shared === true);
-		// The endpoint returns a report as soon as one window parses, and a tier
+		// The endpoint returns a report as soon as one window parses, and a
 		// 429 can be caused by a shared wall. A payload missing a shared gate
 		// leaves the block's cause unknown, so vouch for nothing rather than
 		// clear a block that still holds.
@@ -948,10 +963,18 @@ export const claudeRankingStrategy: CredentialRankingStrategy = {
 			const tier = limit.scope.tier;
 			if (tier === "fable" || tier === "mythos") tiers.add(tier);
 		}
-		return [...tiers].map(tier => ({
-			blockScope: `tier:${tier}`,
-			limits: [...sharedLimits, ...report.limits.filter(limit => limit.scope.tier === tier)],
-		}));
+		return [
+			{
+				blockScope: CLAUDE_SHARED_BLOCK_SCOPE,
+				limits: report.limits.filter(
+					limit => limit.scope.shared === true || limit.scope.tier === "opus" || limit.scope.tier === "sonnet",
+				),
+			},
+			...[...tiers].map(tier => ({
+				blockScope: `tier:${tier}`,
+				limits: [...sharedLimits, ...report.limits.filter(limit => limit.scope.tier === tier)],
+			})),
+		];
 	},
 	windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 7 * 24 * 60 * 60 * 1000 },
 };

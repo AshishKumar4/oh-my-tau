@@ -455,11 +455,11 @@ export class CredentialBlocks implements BlocksApi {
 	 * Whether a fresh report could lift what currently blocks this credential.
 	 *
 	 * A strategy that names healable scopes can only vouch for those scopes, so
-	 * a live unscoped block — an Opus/Sonnet usage limit, a refresh failure — or
+	 * a live unscoped block — an account-policy denial, a refresh failure — or
 	 * a manual hold keeps the credential unusable whatever the report says about
-	 * a tier. A probe then cannot change the outcome and must not be spent; the
-	 * tier scope heals on a later pass, once the block that actually holds the
-	 * credential has lifted.
+	 * its quota. A probe then cannot change the outcome and must not be spent;
+	 * the scoped block heals on a later pass, once the block that actually holds
+	 * the credential has lifted.
 	 */
 	canHeal(
 		provider: Provider,

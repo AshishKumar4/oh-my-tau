@@ -50,6 +50,97 @@ function ageCredentialBlocks(dbPath: string, updatedAtSec: number): void {
 	}
 }
 
+function claudeTierLimit(tier: string, usedFraction: number): UsageLimit {
+	const limit = claudeLimit(`anthropic:7d:${tier}`, usedFraction, { tier });
+	return {
+		...limit,
+		scope: { ...limit.scope, windowId: "7d" },
+		window: { id: "7d", label: "7d", resetsAt: Date.now() + 60_000 },
+	};
+}
+
+interface ClaudeWeekUsage {
+	fiveHour: number;
+	sevenDay: number;
+	opus: number;
+	sonnet: number;
+	fable: number;
+}
+
+const HEALTHY_WEEK: ClaudeWeekUsage = { fiveHour: 0, sevenDay: 0, opus: 0, sonnet: 0, fable: 0 };
+const OPUS_SPENT_WEEK: ClaudeWeekUsage = { ...HEALTHY_WEEK, opus: 1 };
+/** Serves but has nearly nothing left, so ranking prefers the walled account whenever its block lifts. */
+const NEARLY_SPENT_WEEK: ClaudeWeekUsage = { fiveHour: 0.8, sevenDay: 0.97, opus: 0.97, sonnet: 0.97, fable: 0.97 };
+
+/**
+ * Two Claude accounts over the store at `dbPath`: `walled` reports `walledWeek`,
+ * `sibling` reports {@link NEARLY_SPENT_WEEK}. `keys.get` therefore returns
+ * `access-walled` exactly when the walled account is selectable.
+ */
+async function openWalledClaudeStorage(dbPath: string, walledWeek: ClaudeWeekUsage): Promise<AuthStorage> {
+	const store = await SqliteAuthCredentialStore.open(dbPath);
+	const storage = new AuthStorage(store, {
+		usageProviderResolver: provider =>
+			provider === PROVIDER
+				? {
+						id: PROVIDER,
+						fetchUsage: async params => {
+							const week = params.credential.accountId === "account-walled" ? walledWeek : NEARLY_SPENT_WEEK;
+							return {
+								provider: PROVIDER,
+								fetchedAt: Date.now(),
+								limits: [
+									claudeLimit("anthropic:5h", week.fiveHour, { shared: true }),
+									claudeLimit("anthropic:7d", week.sevenDay, { shared: true }),
+									claudeTierLimit("opus", week.opus),
+									claudeTierLimit("sonnet", week.sonnet),
+									claudeTierLimit("fable", week.fable),
+								],
+								metadata: { accountId: params.credential.accountId },
+							};
+						},
+					}
+				: undefined,
+	});
+	await storage.credentials.reload();
+	return storage;
+}
+
+/** Seeds `walled` and `sibling`, then lets `wall` block the walled account from an earlier process. */
+async function wallClaudeAccount(
+	dbPath: string,
+	wall: (storage: AuthStorage, walledId: number) => Promise<unknown>,
+): Promise<number> {
+	const setup = await SqliteAuthCredentialStore.open(dbPath);
+	setup.saveOAuth(PROVIDER, oauthCredential("walled"));
+	setup.saveOAuth(PROVIDER, oauthCredential("sibling"));
+	const walledId = setup.listAuthCredentials(PROVIDER)[0]?.id;
+	setup.close();
+	if (walledId === undefined) throw new Error("expected the walled credential row");
+	const storage = await openWalledClaudeStorage(dbPath, OPUS_SPENT_WEEK);
+	try {
+		await wall(storage, walledId);
+	} finally {
+		storage.close();
+	}
+	return walledId;
+}
+
+/** An Opus usage-limit 429 whose block runs to a weekly reset days away. */
+function markOpusWall(storage: AuthStorage, walledId: number): Promise<unknown> {
+	return storage.limits.markReached(PROVIDER, undefined, {
+		credentialId: walledId,
+		modelId: "claude-opus-5",
+		retryAfterMs: 4 * 24 * 3_600_000,
+		providerTimed: true,
+	});
+}
+
+const ORG_OAUTH_DENIAL =
+	'403 {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_code":"oauth_not_allowed_for_organization"}}}';
+
+const CLAUDE_MODELS = ["claude-opus-5", "claude-sonnet-4-5", "claude-fable-5-1"] as const;
+
 function readAuthSchemaVersion(dbPath: string): number | null {
 	const db = new Database(dbPath, { readonly: true });
 	try {
@@ -375,13 +466,15 @@ describe("AuthStorage credential block persistence", () => {
 		setup.saveOAuth(PROVIDER, oauthCredential("held"));
 		setup.saveOAuth(PROVIDER, oauthCredential("other"));
 		const [heldRow] = setup.listAuthCredentials(PROVIDER);
-		// A stale Fable block, aged past the usage-cache window so a healthy report may heal it.
-		setup.upsertCredentialBlock({
-			credentialId: heldRow!.id,
-			providerKey: PROVIDER_KEY,
-			blockScope: "tier:fable",
-			blockedUntilMs: FUTURE_BLOCK_MS,
-		});
+		// Stale Fable and shared usage walls, aged past the usage-cache window so a healthy report may heal them.
+		for (const blockScope of ["tier:fable", "shared"]) {
+			setup.upsertCredentialBlock({
+				credentialId: heldRow!.id,
+				providerKey: PROVIDER_KEY,
+				blockScope,
+				blockedUntilMs: FUTURE_BLOCK_MS,
+			});
+		}
 		setup.close();
 		ageCredentialBlocks(dbPath, LEGACY_TIMESTAMP);
 		// A hold row exactly as earlier releases persisted it.
@@ -418,7 +511,7 @@ describe("AuthStorage credential block persistence", () => {
 			// The first read fetches, the second is served from cache; both reconcile.
 			await storage.usage.reports();
 			await storage.usage.reports();
-			// The healthy report lifted the stale Fable block and left the hold alone.
+			// The healthy report lifted the stale usage walls and left the hold alone.
 			expect(
 				readCredentialBlockRows(dbPath)
 					.filter(row => row.credential_id === heldRow!.id)
@@ -529,6 +622,101 @@ describe("AuthStorage credential block persistence", () => {
 			}
 		} finally {
 			contentStorage.close();
+		}
+	});
+
+	describe("Claude usage walls outside the tier meters", () => {
+		// A weekly reset redeemed on claude.ai or in Claude Code never reaches
+		// OMP; the next live report showing headroom is the only signal.
+		it("lifts a stale Opus usage wall once a live report shows every gating limit recovered", async () => {
+			const walledId = await wallClaudeAccount(dbPath, markOpusWall);
+			ageCredentialBlocks(dbPath, LEGACY_TIMESTAMP);
+			const storage = await openWalledClaudeStorage(dbPath, HEALTHY_WEEK);
+			try {
+				expect(await storage.keys.get(PROVIDER, "session-healed", { modelId: "claude-opus-5" })).toBe(
+					"access-walled",
+				);
+				expect(readCredentialBlockRows(dbPath).filter(row => row.credential_id === walledId)).toEqual([]);
+			} finally {
+				storage.close();
+			}
+		});
+
+		it("never lets a healthy report lift an org-wide OAuth denial", async () => {
+			const walledId = await wallClaudeAccount(dbPath, (storage, credentialId) =>
+				storage.limits.rotate(PROVIDER, undefined, {
+					error: new Error(ORG_OAUTH_DENIAL),
+					modelId: "claude-opus-5",
+					credentialId,
+				}),
+			);
+			ageCredentialBlocks(dbPath, LEGACY_TIMESTAMP);
+			const storage = await openWalledClaudeStorage(dbPath, HEALTHY_WEEK);
+			try {
+				// Selection spends no probe on an unhealable block, but `omp usage`
+				// and the status line fetch every account's report and reconcile it.
+				await storage.usage.reports();
+				for (const modelId of CLAUDE_MODELS) {
+					expect(await storage.keys.get(PROVIDER, `session-${modelId}`, { modelId })).toBe("access-sibling");
+				}
+				expect(
+					readCredentialBlockRows(dbPath)
+						.filter(row => row.credential_id === walledId)
+						.map(row => row.block_scope),
+				).toEqual([""]);
+			} finally {
+				storage.close();
+			}
+		});
+
+		it("keeps an Opus usage wall in force for Fable requests", async () => {
+			await wallClaudeAccount(dbPath, markOpusWall);
+			// Fable's own week is untouched; only the wall can keep this account out.
+			const storage = await openWalledClaudeStorage(dbPath, OPUS_SPENT_WEEK);
+			try {
+				expect(await storage.keys.get(PROVIDER, "session-fable", { modelId: "claude-fable-5-1" })).toBe(
+					"access-sibling",
+				);
+			} finally {
+				storage.close();
+			}
+		});
+
+		it("counts a usage-walled sibling as unavailable when rotating off a failed login", async () => {
+			await wallClaudeAccount(dbPath, markOpusWall);
+			const storage = await openWalledClaudeStorage(dbPath, OPUS_SPENT_WEEK);
+			try {
+				const sibling = storage.oauth.accounts(PROVIDER).find(account => account.email === "sibling@example.com");
+				if (!sibling) throw new Error("expected the sibling account");
+				const switched = await storage.limits.rotate(PROVIDER, undefined, {
+					error: new Error("401 Unauthorized"),
+					modelId: "claude-opus-5",
+					credentialId: sibling.credentialId,
+				});
+				expect(switched).toBe(false);
+			} finally {
+				storage.close();
+			}
+		});
+
+		for (const [label, week] of [
+			["the shared weekly window", { ...HEALTHY_WEEK, sevenDay: 1 }],
+			["the Opus weekly row", OPUS_SPENT_WEEK],
+		] as const) {
+			it(`keeps an Opus usage wall while ${label} is still spent`, async () => {
+				const walledId = await wallClaudeAccount(dbPath, markOpusWall);
+				ageCredentialBlocks(dbPath, LEGACY_TIMESTAMP);
+				const storage = await openWalledClaudeStorage(dbPath, week);
+				try {
+					expect(await storage.keys.get(PROVIDER, "session-spent", { modelId: "claude-opus-5" })).toBe(
+						"access-sibling",
+					);
+					const walledRows = readCredentialBlockRows(dbPath).filter(row => row.credential_id === walledId);
+					expect(walledRows.some(row => row.blocked_until_ms > Date.now() + 24 * 3_600_000)).toBe(true);
+				} finally {
+					storage.close();
+				}
+			});
 		}
 	});
 

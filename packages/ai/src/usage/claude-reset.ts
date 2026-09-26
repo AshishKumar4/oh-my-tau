@@ -1,6 +1,6 @@
 import type { UsageReport, UsageResetCredit, UsageResetCredits } from "../usage";
 import { isUsageLimitReached } from "../auth/usage-report";
-import { claudeRankingStrategy } from "./claude";
+import { CLAUDE_SHARED_BLOCK_SCOPE, claudeRankingStrategy } from "./claude";
 import type { FetchImpl } from "../types";
 import { isRecord } from "../utils";
 import {
@@ -27,20 +27,19 @@ const CLAUDE_RESET_WINDOW_IDS: Readonly<Record<string, string>> = {
 };
 
 /** Return the block scopes healed by a partial Claude reset, without mutating stored blocks. */
-export function claudeResetClearedBlockScopes(cleared: readonly string[], report: UsageReport): (string | undefined)[] {
+export function claudeResetClearedBlockScopes(cleared: readonly string[], report: UsageReport): string[] {
 	const shared = report.limits.filter(limit => limit.scope.shared);
 	if (!["anthropic:5h", "anthropic:7d"].every(id => shared.some(limit => limit.id === id))) return [];
-	const unscoped = report.limits.filter(
-		limit => limit.scope.shared || limit.scope.tier === "opus" || limit.scope.tier === "sonnet",
+	return (
+		(claudeRankingStrategy.healableBlockScopes?.(report) ?? [])
+			.filter(scope => scope.limits.some(limit => cleared.includes(limit.id)))
+			.filter(scope => !isUsageLimitReached(scope.limits.filter(limit => !cleared.includes(limit.id))))
+			// Earlier releases persisted shared usage walls unscoped; a reset that
+			// restores the shared limits keeps lifting those rows too.
+			.flatMap(scope =>
+				scope.blockScope === CLAUDE_SHARED_BLOCK_SCOPE ? [scope.blockScope, ""] : [scope.blockScope],
+			)
 	);
-	const scopes = [
-		{ blockScope: undefined, limits: unscoped },
-		...(claudeRankingStrategy.healableBlockScopes?.(report) ?? []),
-	];
-	return scopes
-		.filter(scope => scope.limits.some(limit => cleared.includes(limit.id)))
-		.filter(scope => !isUsageLimitReached(scope.limits.filter(limit => !cleared.includes(limit.id))))
-		.map(scope => scope.blockScope);
 }
 
 /** OAuth credential and transport used for an account's Claude reset operations. */
