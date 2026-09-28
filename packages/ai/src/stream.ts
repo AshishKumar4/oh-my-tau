@@ -1867,6 +1867,9 @@ function mapOptionsForApi<TApi extends Api>(
 		anthropicCompaction: options?.anthropicCompaction,
 		anthropicSlowMode: options?.anthropicSlowMode,
 		userProfileId: options?.userProfileId,
+		// `null` forces the native surface and differs from absent (catalog
+		// profile), so only an absent field may stay unset.
+		...(options?.harnessProfile !== undefined ? { harnessProfile: options.harnessProfile } : {}),
 		...simpleProviderOptions,
 	};
 

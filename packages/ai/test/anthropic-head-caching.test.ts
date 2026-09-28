@@ -13,6 +13,7 @@
  * a 400 so the request short-circuits.
  */
 import { describe, expect, it } from "bun:test";
+import { streamSimple } from "@oh-my-pi/pi-ai";
 import { type AnthropicOptions, streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { MessageCreateParams, TextBlockParam } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import { claudeCodeSystemInstruction } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
@@ -829,6 +830,34 @@ describe("anthropic cache breakpoints per harness profile", () => {
 				expect(cacheControls(body.tools)).toEqual([HEAD_TTL]);
 				expect(cacheControls(body.tools?.slice(-1))).toEqual([HEAD_TTL]);
 			}
+		}
+	});
+
+	it("honours the session's native override through streamSimple, the path sessions use", async () => {
+		const systemPrompt = [...STATIC_PROMPT, projectContext("/work/a")];
+		for (const [harnessProfile, anchoredText] of [
+			[null, STATIC_PROMPT[1]],
+			["claude-code", projectContext("/work/a")],
+		] as const) {
+			const controller = new AbortController();
+			let body: MessageCreateParams | undefined;
+			await streamSimple(
+				PROFILED_MODEL,
+				{ systemPrompt, messages: CONTEXT.messages, tools: CONTEXT.tools },
+				{
+					apiKey: "sk-ant-oat-test",
+					signal: controller.signal,
+					harnessProfile,
+					onPayload: payload => {
+						body = payload as unknown as MessageCreateParams;
+						controller.abort();
+					},
+				},
+			).result();
+			if (!body) throw new Error("wire body was not captured");
+			const anchored = textSystemBlocks(body).filter(block => block.cache_control != null);
+			expect(anchored.at(-1)?.text).toBe(anchoredText);
+			if (harnessProfile === null) expect(anchored).toHaveLength(1);
 		}
 	});
 
