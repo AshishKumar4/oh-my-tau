@@ -13,11 +13,16 @@
  * a 400 so the request short-circuits.
  */
 import { describe, expect, it } from "bun:test";
+import { type AnthropicOptions, streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { MessageCreateParams, TextBlockParam } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
-import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { claudeCodeSystemInstruction } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import type { AssistantMessage, CacheRetention, Context, Message, Model, ModelSpec } from "@oh-my-pi/pi-ai/types";
 import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { isRecord } from "@oh-my-pi/pi-utils";
+import claudeCodeGoldenJson from "./fixtures/harness/claude-code-2.1.267.golden.json" with { type: "json" };
+import { anthropicFraming } from "./helpers/harness-golden";
 
 const MODEL_SPEC: ModelSpec<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -81,12 +86,14 @@ async function captureWireBody(
 /**
  * Builds one OAuth request and aborts it once the payload is built. `message`
  * is the terminal message; its `requestControls` go on the reply appended for
- * the next turn.
+ * the next turn. `options` override the OAuth defaults (harness profile, auth,
+ * retention).
  */
 async function captureTurn(
 	model: Model<"anthropic-messages">,
 	context: Context,
 	sessionId: string,
+	options: AnthropicOptions = {},
 ): Promise<{ body: MessageCreateParams; message: AssistantMessage }> {
 	const controller = new AbortController();
 	let body: MessageCreateParams | undefined;
@@ -95,6 +102,7 @@ async function captureTurn(
 		signal: controller.signal,
 		isOAuth: true,
 		sessionId,
+		...options,
 		onPayload: payload => {
 			body = payload as unknown as MessageCreateParams;
 			controller.abort();
@@ -606,12 +614,15 @@ describe("anthropic head caching (general API-key path)", () => {
 		expect(cached).toHaveLength(4);
 	});
 	it("keeps the head breakpoint on the stable prefix when the recall suffix refreshes", async () => {
+		// Claude Opus 5 carries the claude-code catalog profile; `harness.mode:
+		// native` (a null override) puts it on the native placement.
 		const oAuthModel = buildModel({ ...MODEL_SPEC, id: "claude-opus-5", name: "Claude Opus 5" });
 		const captureRecall = (recall: string, messages: Message[]) =>
 			captureTurn(
 				oAuthModel,
 				{ systemPrompt: ["You are helpful.", "Follow the house style.", recall], messages, tools: CONTEXT.tools },
 				"sess-recall",
+				{ harnessProfile: null },
 			);
 		const messages: Message[] = [{ role: "user", content: "hello", timestamp: 1 }];
 		const first = await captureRecall("<memories>\nrecall v1\n</memories>", messages);
@@ -624,14 +635,15 @@ describe("anthropic head caching (general API-key path)", () => {
 		expect(countCacheBreakpoints(after)).toBeLessThanOrEqual(4);
 		// The boundary breakpoint sits on the last stable block: with 2 OAuth
 		// identity blocks + 2 stable prompt blocks + 1 recall suffix, the
-		// anchor is index 3 — not the pre-decorated identity block (index 1)
-		// and not the volatile suffix at the tail (index 4).
+		// anchor is index 3. The pre-decorated identity block (index 1) loses
+		// its breakpoint so the head stays at tool + system and both rolling
+		// message breakpoints survive.
 		const systemAfter = textSystemBlocks(after);
 		const cachedSystem = systemAfter
 			.map((block, index) => ("cache_control" in block && block.cache_control != null ? index : -1))
 			.filter(index => index >= 0);
-		expect(cachedSystem).toContain(systemAfter.length - 2);
-		expect(cachedSystem).not.toContain(systemAfter.length - 1);
+		expect(cachedSystem).toEqual([systemAfter.length - 2]);
+		expect(findCachedMessageIndices(after)).toHaveLength(2);
 		expect(textSystemBlocks(before).length).toBe(systemAfter.length);
 		// Stable prefix bytes survive the recall refresh: strip the volatile
 		// suffix and the per-turn cache_control, then compare.
@@ -640,6 +652,56 @@ describe("anthropic head caching (general API-key path)", () => {
 				.filter(block => !block.text.startsWith("<memories>"))
 				.map(block => block.text);
 		expect(stableText(after)).toEqual(stableText(before));
+	});
+
+	it("anchors before the first volatile segment so blocks appended behind it stay out of the cached head", async () => {
+		// Coding-agent layout: static prompt, cwd-derived `<project-context>`,
+		// per-spawn subagent role text, then per-turn recall.
+		const capture = (cwd: string, role: string) =>
+			captureWireBody(undefined, {
+				...CONTEXT,
+				systemPrompt: [
+					"Static agent prompt.",
+					`<project-context>\n<file path="${cwd}/AGENTS.md">rules</file>\n</project-context>`,
+					role,
+					"<memories>\nrecall\n</memories>",
+				],
+			});
+		const first = textSystemBlocks(await capture("/work/a", "Role: spawn 1"));
+		const second = textSystemBlocks(await capture("/work/b", "Role: spawn 2"));
+		for (const system of [first, second]) {
+			expect(system.flatMap((block, index) => (block.cache_control != null ? [index] : []))).toEqual([0]);
+		}
+		expect(second[0]).toEqual(first[0]);
+	});
+
+	it("spends the OAuth system breakpoint on the last system block without taking one from the messages", async () => {
+		const oAuthModel = buildModel({ ...MODEL_SPEC, id: "claude-opus-5", name: "Claude Opus 5" });
+		const { body } = await captureTurn(
+			oAuthModel,
+			{
+				systemPrompt: ["You are helpful.", "Follow the house style."],
+				messages: [
+					{ role: "user", content: "hello", timestamp: 1 },
+					assistantMessage("hi there", 2),
+					{ role: "user", content: "again", timestamp: 3 },
+				],
+				tools: CONTEXT.tools,
+			},
+			"sess-oauth-anchor",
+			{ harnessProfile: null },
+		);
+		// 2 OAuth identity blocks + 2 caller prompt blocks. The only system
+		// breakpoint is on the last block, so a message-prefix miss still reads
+		// tools + the whole system prompt from cache.
+		const system = textSystemBlocks(body);
+		const cachedSystem = system
+			.map((block, index) => ("cache_control" in block && block.cache_control != null ? index : -1))
+			.filter(index => index >= 0);
+		expect(cachedSystem).toEqual([system.length - 1]);
+		// The move keeps the head at tool + system, so both rolling message
+		// breakpoints survive.
+		expect(findCachedMessageIndices(body)).toEqual([1, 2]);
 	});
 
 	it("falls back to tail anchoring when every system block is volatile", async () => {
@@ -653,5 +715,233 @@ describe("anthropic head caching (general API-key path)", () => {
 			.map((block, index) => ("cache_control" in block && block.cache_control != null ? index : -1))
 			.filter(index => index >= 0);
 		expect(cachedSystem).toContain(systemAfter.length - 1);
+	});
+});
+
+/**
+ * Breakpoint placement per harness profile. Claude Opus 5 carries the
+ * claude-code catalog profile, so a `harnessProfile: null` override is the
+ * user's `harness.mode: native` on the same model.
+ */
+describe("anthropic cache breakpoints per harness profile", () => {
+	const PROFILED_MODEL = buildModel({ ...MODEL_SPEC, id: "claude-opus-5", name: "Claude Opus 5" });
+	const HEAD_TTL = { type: "ephemeral", ttl: "1h" } as const;
+	const STATIC_PROMPT = ["Static agent prompt.", "Eval prelude guidance."];
+	const MEMORIES = "<memories>\nrecall\n</memories>";
+	const projectContext = (cwd: string) =>
+		`<project-context>\n<workstation>\n- cwd: ${cwd}\n</workstation>\n</project-context>`;
+	const PROFILES: readonly (HarnessProfile | null)[] = [null, "claude-code"];
+
+	function cacheControls(nodes: readonly unknown[] | undefined): unknown[] {
+		return (nodes ?? []).flatMap(node => (isRecord(node) && node.cache_control != null ? [node.cache_control] : []));
+	}
+
+	function breakpoints(body: MessageCreateParams): { head: unknown[]; messages: unknown[] } {
+		return {
+			head: [...cacheControls(body.tools), ...cacheControls(Array.isArray(body.system) ? body.system : [])],
+			messages: body.messages.flatMap(message =>
+				Array.isArray(message.content) ? cacheControls(message.content) : [],
+			),
+		};
+	}
+
+	function systemSlots(body: MessageCreateParams): string[] {
+		return anthropicFraming(body, [claudeCodeSystemInstruction]).cachedSystemSlots;
+	}
+
+	function conversation(turns: number): Message[] {
+		const messages: Message[] = [];
+		for (let turn = 1; turn <= turns; turn++) {
+			messages.push({ role: "user", content: `question ${turn}`, timestamp: turn * 2 });
+			messages.push(assistantMessage(`answer ${turn}`, turn * 2 + 1));
+		}
+		messages.push({ role: "user", content: "last question", timestamp: turns * 2 + 2 });
+		return messages;
+	}
+
+	it("keeps the claude-code golden's identity and last-block slots, working-directory context included", async () => {
+		const golden = claudeCodeGoldenJson.ompFraming.cachedSystemSlots;
+		expect(golden).toEqual(["identity:ephemeral/1h", "prompt-last:ephemeral/1h"]);
+		const layouts = [
+			["# Reporting outcomes\n\nBe brief.", "You are omp, a coding agent."],
+			[...STATIC_PROMPT, projectContext("/work/a")],
+		];
+		for (const systemPrompt of layouts) {
+			for (const tools of [CONTEXT.tools, []]) {
+				const { body } = await captureTurn(
+					PROFILED_MODEL,
+					{ systemPrompt, messages: CONTEXT.messages, tools },
+					"sess-claude-code",
+					{ harnessProfile: "claude-code" },
+				);
+				expect(systemSlots(body)).toEqual(golden);
+				expect(cacheControls(body.tools)).toEqual([]);
+			}
+		}
+	});
+
+	it("anchors the claude-code head before per-turn recall and keeps the identity slot", async () => {
+		const { body } = await captureTurn(
+			PROFILED_MODEL,
+			{
+				systemPrompt: [...STATIC_PROMPT, projectContext("/work/a"), MEMORIES],
+				messages: CONTEXT.messages,
+				tools: CONTEXT.tools,
+			},
+			"sess-claude-code-recall",
+			{ harnessProfile: "claude-code" },
+		);
+		// Recall never appears in the captured client, so the second system
+		// breakpoint stops before it and a refresh re-bills only the suffix.
+		expect(systemSlots(body)).toEqual(["identity:ephemeral/1h", "prompt:ephemeral/1h"]);
+		const system = textSystemBlocks(body);
+		expect(system.at(-2)?.text).toBe(projectContext("/work/a"));
+		expect(system.at(-2)?.cache_control).toEqual(HEAD_TTL);
+		expect(system.at(-1)?.cache_control).toBeUndefined();
+	});
+
+	it("moves the native identity breakpoint onto the block before the first volatile segment", async () => {
+		const layouts: readonly { systemPrompt: string[]; slots: string[] }[] = [
+			{ systemPrompt: STATIC_PROMPT, slots: ["prompt-last:ephemeral/1h"] },
+			{ systemPrompt: [...STATIC_PROMPT, projectContext("/work/a")], slots: ["prompt:ephemeral/1h"] },
+			{
+				systemPrompt: [...STATIC_PROMPT, projectContext("/work/a"), "Role: spawn 1", MEMORIES],
+				slots: ["prompt:ephemeral/1h"],
+			},
+			{ systemPrompt: [...STATIC_PROMPT, MEMORIES], slots: ["prompt:ephemeral/1h"] },
+		];
+		for (const { systemPrompt, slots } of layouts) {
+			for (const isOAuth of [true, false]) {
+				const { body } = await captureTurn(
+					PROFILED_MODEL,
+					{ systemPrompt, messages: CONTEXT.messages, tools: CONTEXT.tools },
+					"sess-native",
+					{ harnessProfile: null, isOAuth, cacheRetention: "long" },
+				);
+				const system = textSystemBlocks(body);
+				const anchored = system.filter(block => block.cache_control != null);
+				expect(anchored.map(block => block.text)).toEqual([STATIC_PROMPT[1]]);
+				expect(anchored[0]?.cache_control).toEqual(HEAD_TTL);
+				if (isOAuth) {
+					expect(system[1]?.text).toBe(claudeCodeSystemInstruction);
+					expect(systemSlots(body)).toEqual(slots);
+				}
+				expect(cacheControls(body.tools)).toEqual([HEAD_TTL]);
+				expect(cacheControls(body.tools?.slice(-1))).toEqual([HEAD_TTL]);
+			}
+		}
+	});
+
+	it("pins head breakpoints at 1h and keeps message breakpoints at 5m unless retention is long", async () => {
+		const cases: readonly { isOAuth: boolean; cacheRetention?: CacheRetention; messageTtl: unknown }[] = [
+			{ isOAuth: true, messageTtl: { type: "ephemeral" } },
+			{ isOAuth: true, cacheRetention: "long", messageTtl: HEAD_TTL },
+			{ isOAuth: false, cacheRetention: "long", messageTtl: HEAD_TTL },
+		];
+		for (const harnessProfile of PROFILES) {
+			for (const { isOAuth, cacheRetention, messageTtl } of cases) {
+				const { body } = await captureTurn(
+					PROFILED_MODEL,
+					{
+						systemPrompt: [...STATIC_PROMPT, projectContext("/work/a")],
+						messages: conversation(3),
+						tools: CONTEXT.tools,
+					},
+					"sess-ttl",
+					{ harnessProfile, isOAuth, ...(cacheRetention ? { cacheRetention } : {}) },
+				);
+				const { head, messages } = breakpoints(body);
+				expect(head.length).toBeGreaterThan(0);
+				expect(messages.length).toBeGreaterThan(0);
+				for (const control of head) expect(control).toEqual(HEAD_TTL);
+				for (const control of messages) expect(control).toEqual(messageTtl);
+			}
+		}
+	});
+
+	it("never sends more than 4 breakpoints on any profile, auth, layout, or tool set", async () => {
+		for (const harnessProfile of PROFILES) {
+			for (const isOAuth of [true, false]) {
+				for (const withProjectContext of [true, false]) {
+					for (const withMemories of [true, false]) {
+						for (const tools of [CONTEXT.tools, []]) {
+							for (const cacheRetention of [undefined, "long"] as const) {
+								const systemPrompt = [
+									...STATIC_PROMPT,
+									...(withProjectContext ? [projectContext("/work/a")] : []),
+									...(withMemories ? [MEMORIES] : []),
+								];
+								const { body } = await captureTurn(
+									PROFILED_MODEL,
+									{ systemPrompt, messages: conversation(40), tools },
+									"sess-budget",
+									{ harnessProfile, isOAuth, ...(cacheRetention ? { cacheRetention } : {}) },
+								);
+								const { head, messages } = breakpoints(body);
+								expect(head.length).toBeGreaterThan(0);
+								expect(head.length + messages.length).toBeLessThanOrEqual(4);
+							}
+						}
+					}
+				}
+			}
+		}
+	});
+
+	it("keeps tools and system bytes identical across consecutive turns of one session", async () => {
+		for (const harnessProfile of PROFILES) {
+			for (const isOAuth of [true, false]) {
+				const systemPrompt = [...STATIC_PROMPT, projectContext("/work/a"), MEMORIES];
+				const history: Message[] = [{ role: "user", content: "hello", timestamp: 1 }];
+				const options: AnthropicOptions = { harnessProfile, isOAuth };
+				const first = await captureTurn(
+					PROFILED_MODEL,
+					{ systemPrompt, messages: history, tools: CONTEXT.tools },
+					"sess-stable",
+					options,
+				);
+				history.push(
+					{ ...assistantMessage("hi there", 2), requestControls: first.message.requestControls },
+					{ role: "user", content: "again", timestamp: 3 },
+				);
+				const second = await captureTurn(
+					PROFILED_MODEL,
+					{ systemPrompt, messages: history, tools: CONTEXT.tools },
+					"sess-stable",
+					options,
+				);
+				expect(JSON.stringify(second.body.tools)).toBe(JSON.stringify(first.body.tools));
+				expect(JSON.stringify(second.body.system)).toBe(JSON.stringify(first.body.system));
+				expect(findCachedMessageIndices(first.body)).toEqual([0]);
+				expect(findCachedMessageIndices(second.body)).toEqual([1, 2]);
+			}
+		}
+	});
+
+	it("shares the native head across working directories up to and including the anchor", async () => {
+		for (const isOAuth of [true, false]) {
+			const capture = (cwd: string, role: string) =>
+				captureTurn(
+					PROFILED_MODEL,
+					{
+						systemPrompt: [...STATIC_PROMPT, projectContext(cwd), role, MEMORIES],
+						messages: CONTEXT.messages,
+						tools: CONTEXT.tools,
+					},
+					`sess-${cwd}`,
+					{ harnessProfile: null, isOAuth },
+				);
+			const first = (await capture("/work/a", "Role: spawn 1")).body;
+			const second = (await capture("/work/b", "Role: spawn 2")).body;
+			expect(JSON.stringify(second.tools)).toBe(JSON.stringify(first.tools));
+			const firstSystem = textSystemBlocks(first);
+			const secondSystem = textSystemBlocks(second);
+			const anchorIndex = firstSystem.findIndex(block => block.cache_control != null);
+			expect(firstSystem[anchorIndex]?.text).toBe(STATIC_PROMPT[1]);
+			expect(JSON.stringify(secondSystem.slice(0, anchorIndex + 1))).toBe(
+				JSON.stringify(firstSystem.slice(0, anchorIndex + 1)),
+			);
+			expect(secondSystem[anchorIndex + 1]?.text).not.toBe(firstSystem[anchorIndex + 1]?.text);
+		}
 	});
 });

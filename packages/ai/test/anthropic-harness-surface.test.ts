@@ -250,8 +250,8 @@ describe("anthropic OAuth surface without a harness profile", () => {
 		expect(anthropicReplayedToolNames(payload)).toEqual(["_bash"]);
 	});
 
-	it("still anchors only the identity block", async () => {
-		expect(await cachedSystemSlots(plainModel)).toEqual(["identity:ephemeral/1h"]);
-		expect(await cachedSystemSlots(plainModel, "short")).toEqual(["identity:ephemeral"]);
+	it("moves the identity breakpoint to the last system block", async () => {
+		expect(await cachedSystemSlots(plainModel)).toEqual(["prompt-last:ephemeral/1h"]);
+		expect(await cachedSystemSlots(plainModel, "short")).toEqual(["prompt-last:ephemeral"]);
 	});
 });

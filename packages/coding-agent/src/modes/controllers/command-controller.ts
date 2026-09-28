@@ -78,6 +78,7 @@ import {
 } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
+import { resumeCommand } from "../../utils/resume-command";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import {
 	collapseSharedUsageReports,
@@ -85,8 +86,9 @@ import {
 	summarizeUsageResetCredits,
 } from "@oh-my-pi/pi-tui/overlays/usage-display";
 import { formatRemainingOnlyTotal, isUsedOnlyAbsoluteAmount } from "@oh-my-pi/pi-tui/prompt/usage-amounts";
+import type { UnavailableUsageAccount } from "@oh-my-pi/pi-tui/overlays/usage-dashboard";
 
-import { cfgDisplayCollapseCompacted, cfgTerminalShowImages } from "../settings";
+import { cfgTerminalShowImages } from "../settings";
 import { cfgProviderAppendOnlyContext } from "../../session/settings";
 import { cfgShareRedactSecrets, cfgShareServerUrl, cfgShareStore } from "../../commands/settings";
 
@@ -656,16 +658,10 @@ export class CommandController {
 				usageReports = await provider.fetchUsageReports();
 			} catch (error) {
 				this.ctx.showError(`Failed to fetch usage data: ${error instanceof Error ? error.message : String(error)}`);
-				return;
 			}
 		}
 
-		if (!usageReports || usageReports.length === 0) {
-			this.ctx.showWarning("No usage data available.");
-			return;
-		}
-
-		this.ctx.showUsageDashboard(usageReports);
+		this.ctx.showUsageDashboard(usageReports ?? []);
 	}
 
 	async handleChangelogCommand(args = ""): Promise<void> {
@@ -1166,6 +1162,12 @@ export class CommandController {
 		}
 		this.ctx.statusContainer.disposeChildren();
 
+		// After a `/fork`, the current session ID is changed to the forked one,
+		// so the session ID before the fork is the one we want to show in the hint.
+		const previousSessionId = this.ctx.sessionManager.isSessionOnDisk()
+			? this.ctx.sessionManager.getSessionId()
+			: undefined;
+
 		const success = await this.ctx.session.fork();
 		if (!success) {
 			this.ctx.showError("Fork failed (session not persisted or cancelled)");
@@ -1175,11 +1177,18 @@ export class CommandController {
 		this.ctx.statusLine.invalidate();
 		this.ctx.ui.requestRender();
 
-		const sessionFile = this.ctx.session.sessionFile;
-		const shortPath = sessionFile ? sessionFile.split("/").pop() : "new session";
 		this.ctx.present([
 			new Spacer(1),
-			new Text(`${theme.fg("accent", `${theme.status.success} Session forked to ${shortPath}`)}`, 1, 1),
+			new Text(
+				theme.fg(
+					"accent",
+					previousSessionId
+						? `${theme.status.success} Session forked · return to original: ${resumeCommand(previousSessionId)} or /resume ${previousSessionId}`
+						: `${theme.status.success} Session forked`,
+				),
+				1,
+				1,
+			),
 		]);
 	}
 
@@ -1640,15 +1649,12 @@ export class CommandController {
 			this.ctx.rebuildChatFromMessages({ reuseSettledComponents: true });
 
 			this.ctx.statusLine.invalidate();
-			// Same as the auto-compaction rebuild: a collapsed transcript is an
-			// intentional replacement, so drop the stale pre-compaction scrollback
-			// instead of repainting the shrunken frame below it. With collapse
-			// disabled the full history stays inline and scrollback is kept.
-			if (cfgDisplayCollapseCompacted.get(this.ctx.settings)) {
-				this.ctx.ui.requestRender(true, { clearScrollback: true });
-			} else {
-				this.ctx.ui.requestRender();
-			}
+			// Same pairing as the auto-compaction arm in event-controller: the
+			// rebuild clears the container's emission ledger, so every block
+			// re-emits on this frame while the previous copy is still in native
+			// scrollback — without a clear the collapse-disabled path appends a
+			// duplicate transcript, exactly as `/compact` reproduced (#12140).
+			this.ctx.ui.requestRender(true, { clearScrollback: true });
 		} catch (error) {
 			if (error instanceof CompactionCancelledError) {
 				outcome = "cancelled";
@@ -2103,10 +2109,11 @@ export function renderUsageReports(
 	availableWidth: number,
 	resolveActiveAccount?: (provider: string) => OAuthAccountIdentity | undefined,
 	usageModelSelectors: readonly string[] = [],
+	unavailableAccounts: readonly UnavailableUsageAccount[] = [],
 ): string {
 	const displayReports = collapseSharedUsageReports(reports);
 	const lines: string[] = [];
-	const latestFetchedAt = Math.max(...reports.map(report => report.fetchedAt ?? 0));
+	const latestFetchedAt = Math.max(0, ...reports.map(report => report.fetchedAt ?? 0));
 	const headerSuffix = latestFetchedAt ? ` (${formatDuration(nowMs - latestFetchedAt)} ago)` : "";
 	lines.push(uiTheme.bold(uiTheme.fg("accent", `Usage${headerSuffix}`)));
 	const grouped = new Map<string, UsageReport[]>();
@@ -2114,6 +2121,9 @@ export function renderUsageReports(
 		const list = grouped.get(report.provider) ?? [];
 		list.push(report);
 		grouped.set(report.provider, list);
+	}
+	for (const account of unavailableAccounts) {
+		if (!grouped.has(account.provider)) grouped.set(account.provider, []);
 	}
 	const providerEntries = Array.from(grouped.entries())
 		.map(([provider, providerReports]) => ({
@@ -2189,6 +2199,13 @@ export function renderUsageReports(
 			for (const selector of reportingModels) {
 				lines.push(`    ${replaceTabs(truncateToWidth(sanitizeText(selector), availableWidth - 4))}`);
 			}
+		}
+		for (const account of unavailableAccounts) {
+			if (account.provider !== provider) continue;
+			const label = replaceTabs(sanitizeText(account.label.replace(/[\r\n]+/g, " ")));
+			const status = " — usage unavailable";
+			const boundedLabel = truncateToWidth(label, Math.max(0, availableWidth - 2 - visibleWidth(status)));
+			lines.push(`  ${uiTheme.fg("dim", truncateToWidth(`${boundedLabel}${status}`, availableWidth - 2))}`);
 		}
 
 		// Provider-wide disclaimers (e.g. "OMP-observed spend only") render once

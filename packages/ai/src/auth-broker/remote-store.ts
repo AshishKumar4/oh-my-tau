@@ -16,6 +16,7 @@ import {
 	CREDENTIAL_HOLD_SCOPE,
 	type DisabledCredentialSummary,
 	type OAuthCredential,
+	type OAuthRefreshReason,
 	REMOTE_REFRESH_SENTINEL,
 	type StoredAuthCredential,
 	type StoredCredentialBlock,
@@ -859,7 +860,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	async markCredentialSuspect(credentialId: number, opts: { signal?: AbortSignal } = {}): Promise<void> {
 		this.#noteActivity();
-		const { entry } = await this.#client.refreshCredential(credentialId, opts.signal);
+		const { entry } = await this.#client.refreshCredential(credentialId, opts.signal, "auth-recovery");
 		if (entry.credential.type !== "oauth") {
 			throw new AIError.AuthBrokerError(`Broker returned non-OAuth credential for id=${credentialId}`);
 		}
@@ -1176,9 +1177,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		credentialId: number,
 		_credential: OAuthCredential,
 		signal?: AbortSignal,
+		reason?: OAuthRefreshReason,
 	): Promise<OAuthCredentials> {
 		this.#noteActivity();
-		const { entry } = await this.#client.refreshCredential(credentialId, signal);
+		const { entry } = await this.#client.refreshCredential(credentialId, signal, reason);
 		if (entry.credential.type !== "oauth") {
 			throw new AIError.AuthBrokerError(`Broker returned non-OAuth credential for id=${credentialId}`);
 		}

@@ -1291,6 +1291,106 @@ describe("agentLoop with AgentMessage", () => {
 		expect(result?.isError).toBeFalsy();
 	});
 
+	it("records fallback-resolved alias calls under the resolved tool's name", async () => {
+		// Providers reject `xd://recall` as a replayed function-call name, so the
+		// alias must not reach history, persistence, or the next request.
+		const toolSchema = type({ value: "string" });
+		const deviceTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "recall",
+			label: "Recall",
+			description: "Mounted device tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: `recall: ${params.value}` }], details: params };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "tool-1", name: "xd://recall", arguments: { value: "x" } }] },
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			resolveFallbackTool: name => (name === "xd://recall" || name === "recall" ? deviceTool : undefined),
+		};
+
+		const messages = await agentLoop([createUserMessage("recall")], context, config, undefined, mock.stream).result();
+
+		const assistant = messages.find((m): m is AssistantMessage => m.role === "assistant");
+		expect(assistant?.content).toContainEqual(
+			expect.objectContaining({ type: "toolCall", id: "tool-1", name: "recall" }),
+		);
+		const result = messages.find((m): m is ToolResultMessage => m.role === "toolResult");
+		expect(result).toMatchObject({ toolCallId: "tool-1", toolName: "recall", isError: false });
+		// The follow-up request replays the canonical name.
+		const replayed = mock.calls[1]?.context.messages.find((m): m is AssistantMessage => m.role === "assistant");
+		expect(replayed?.content).toContainEqual(expect.objectContaining({ type: "toolCall", name: "recall" }));
+	});
+
+	it("records a fallback-resolved facade alias under its target with the facade's own wire name", async () => {
+		// The wire name is what claude-code replay re-emits, so the alias must be
+		// canonicalized before the facade rewrite captures it.
+		const writeSchema = type({ path: "string", content: "string" });
+		const facadeSchema = type({ to: "string", message: "string" });
+		const write: AgentTool<typeof writeSchema> = {
+			name: "write",
+			label: "Write",
+			description: "write",
+			parameters: writeSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "delivered" }] };
+			},
+		};
+		const facade: AgentTool<typeof facadeSchema> = {
+			name: "SendMessage",
+			persistAs: "write",
+			label: "Write",
+			description: "send",
+			parameters: facadeSchema,
+			execute: (id, params, signal, onUpdate, ctx) =>
+				write.execute(id, { path: `agent://${params.to}`, content: params.message }, signal, onUpdate, ctx),
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [write] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tool-1",
+							name: "xd://SendMessage",
+							arguments: { to: "Main", message: "hi" },
+						},
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			resolveFallbackTool: name => (name === "xd://SendMessage" ? facade : undefined),
+		};
+
+		const messages = await agentLoop(
+			[createUserMessage("ping main")],
+			context,
+			config,
+			undefined,
+			mock.stream,
+		).result();
+
+		const assistant = messages.find((m): m is AssistantMessage => m.role === "assistant");
+		expect(assistant?.content).toContainEqual(
+			expect.objectContaining({ type: "toolCall", id: "tool-1", name: "write", wireName: "SendMessage" }),
+		);
+		const result = messages.find((m): m is ToolResultMessage => m.role === "toolResult");
+		expect(result).toMatchObject({ toolCallId: "tool-1", toolName: "write", isError: false });
+	});
+
 	it("hands resolveFallbackTool the request's advertised snapshot", async () => {
 		// A host that recovers a mis-spelled name must resolve it against the set
 		// THIS request advertised, not its own live tool state: an MCP
@@ -1719,7 +1819,7 @@ describe("agentLoop with AgentMessage", () => {
 		expect(unknownText).toContain("Tool nope not found");
 	});
 
-	it("runs shared tools in parallel and emits completion-ordered results", async () => {
+	it("runs shared tools in parallel and records results in call order", async () => {
 		const toolSchema = type({ value: "string" });
 		const startTimes: Record<string, number> = {};
 		const finishTimes: Record<string, number> = {};
@@ -1790,13 +1890,18 @@ describe("agentLoop with AgentMessage", () => {
 				e.type === "message_start" && e.message.role === "toolResult",
 		);
 		expect(toolResultStarts).toHaveLength(2);
-		expect((toolResultStarts[0].message as ToolResultMessage).toolCallId).toBe("tool-2");
-		expect((toolResultStarts[1].message as ToolResultMessage).toolCallId).toBe("tool-1");
+		expect((toolResultStarts[0].message as ToolResultMessage).toolCallId).toBe("tool-1");
+		expect((toolResultStarts[1].message as ToolResultMessage).toolCallId).toBe("tool-2");
+		// Live execution events still report the fast call as soon as it settles.
+		expect(events.flatMap(e => (e.type === "tool_execution_end" ? [e.toolCallId] : []))).toEqual([
+			"tool-2",
+			"tool-1",
+		]);
 
 		const turnEndEvent = events.find((e): e is Extract<AgentEvent, { type: "turn_end" }> => e.type === "turn_end");
 		expect(turnEndEvent).toBeDefined();
 		if (!turnEndEvent) return;
-		expect(turnEndEvent.toolResults.map(result => result.toolCallId)).toEqual(["tool-2", "tool-1"]);
+		expect(turnEndEvent.toolResults.map(result => result.toolCallId)).toEqual(["tool-1", "tool-2"]);
 	});
 
 	it("resolves function-form concurrency per call", async () => {
@@ -6306,6 +6411,71 @@ describe("agentLoop streaming snapshots", () => {
 		expect(cloned.str).toBe("hi");
 		expect(cloned.flag).toBe(true);
 		expect(cloned.nul).toBeNull();
+	});
+
+	it("isolates snapshots from providers that mutate streaming arguments in place", async () => {
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
+		const config: AgentLoopConfig = { model: createMockModel().model, convertToLlm: identityConverter };
+
+		// Owned-stream / GLM style: the live arguments object and its nested
+		// containers are mutated in place between deltas. `__proto__` arrives as
+		// an own data key the way JSON.parse produces it.
+		const args: Record<string, unknown> = JSON.parse('{"__proto__":{"k":1},"meta":{"tags":["a"]},"content":""}');
+		const toolCall = { type: "toolCall" as const, id: "tc-inplace", name: "noop", arguments: args };
+		const partial = createAssistantMessage([], "toolUse");
+		let advance = (): void => {};
+		let turn = 0;
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			if (turn++ > 0) {
+				const done = createAssistantMessage([{ type: "text", text: "ok" }], "stop");
+				stream.push({ type: "start", partial: done });
+				stream.push({ type: "done", reason: "stop", message: done });
+				return stream;
+			}
+			stream.push({ type: "start", partial });
+			const steps: (() => void)[] = [
+				() => {
+					partial.content.push(toolCall);
+					stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+				},
+				...["x", "y", "z"].map(delta => () => {
+					args.content = `${args.content}${delta}`;
+					const meta = args.meta;
+					if (meta && typeof meta === "object" && "tags" in meta && Array.isArray(meta.tags))
+						meta.tags.push(delta);
+					stream.push({ type: "toolcall_delta", contentIndex: 0, delta, partial });
+				}),
+				() => stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial }),
+				() => stream.push({ type: "done", reason: "toolUse", message: partial }),
+			];
+			let step = 0;
+			advance = () => {
+				if (step < steps.length) steps[step++]!();
+			};
+			return stream;
+		};
+
+		const seen: { event: AgentEvent; json: string }[] = [];
+		for await (const event of agentLoop([createUserMessage("go")], context, config, undefined, streamFn)) {
+			if (event.type === "message_update" && turn === 1) seen.push({ event, json: JSON.stringify(event) });
+			if (
+				(event.type === "message_start" && event.message.role === "assistant") ||
+				event.type === "message_update"
+			) {
+				advance();
+			}
+		}
+
+		expect(seen.length).toBe(5);
+		for (const { event, json } of seen) expect(JSON.stringify(event)).toBe(json);
+		const first = seen[1]!.event;
+		if (first.type !== "message_update" || first.message.role !== "assistant") throw new Error("expected update");
+		const block = first.message.content[0];
+		if (block?.type !== "toolCall") throw new Error("expected toolCall");
+		expect(block.arguments).toEqual({ meta: { tags: ["a", "x"] }, content: "x", ["__proto__"]: { k: 1 } });
+		expect(Object.hasOwn(block.arguments, "__proto__")).toBe(true);
+		expect(Object.getPrototypeOf(block.arguments)).toBe(Object.prototype);
 	});
 
 	it("shares one immutable snapshot between message and assistantMessageEvent.partial on message_update", async () => {

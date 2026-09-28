@@ -401,6 +401,7 @@ export class KeyCascade implements KeysApi {
 				baseUrl,
 				modelId,
 				forceRefresh: true,
+				refreshReason: AIError.status(error) === 401 ? "auth-recovery" : undefined,
 				signal,
 			});
 		};

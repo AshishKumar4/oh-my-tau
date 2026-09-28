@@ -2134,9 +2134,10 @@ export class SessionMaintenance {
 		}
 		const model = this.#model;
 		if (!model) return;
-		const method = resolveSpeculationMethod(model, settings);
+		const method = resolveSpeculationMethod(model, settings, {
+			skipRemote: this.#nativeSpeculationFailed(model),
+		});
 		if (!method) return;
-		if (method === "remote" && this.#failedNativeSpeculation === this.#nativeSpeculationKey(model)) return;
 		this.#startSpeculationRun(contextTokens, method);
 	}
 
@@ -2176,6 +2177,11 @@ export class SessionMaintenance {
 		return `${this.#host.sessionManager.getSessionId()}/${model.provider}/${model.id}`;
 	}
 
+	/** Whether `model`'s native speculation already failed for good this cycle. */
+	#nativeSpeculationFailed(model: Model): boolean {
+		return this.#failedNativeSpeculation === this.#nativeSpeculationKey(model);
+	}
+
 	/**
 	 * Grace band above the compaction threshold: when a single turn jumps past
 	 * the threshold before the background speculation armed (or even started),
@@ -2203,9 +2209,10 @@ export class SessionMaintenance {
 		if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) return false;
 		const model = this.#model;
 		if (!model) return false;
-		const method = resolveSpeculationMethod(model, settings);
+		const method = resolveSpeculationMethod(model, settings, {
+			skipRemote: this.#nativeSpeculationFailed(model),
+		});
 		if (!method) return false;
-		if (method === "remote" && this.#failedNativeSpeculation === this.#nativeSpeculationKey(model)) return false;
 		const thresholdTokens = resolveThresholdTokens(contextWindow, settings);
 		const graceCapTokens = Math.min(
 			thresholdTokens + resolveSpeculationLeadTokens(thresholdTokens),
@@ -4300,7 +4307,7 @@ export class SessionMaintenance {
 			if (
 				candidate === "remote" &&
 				liveModel &&
-				this.#failedNativeSpeculation === this.#nativeSpeculationKey(liveModel) &&
+				this.#nativeSpeculationFailed(liveModel) &&
 				methods
 					.slice(index + 1)
 					.some(next =>

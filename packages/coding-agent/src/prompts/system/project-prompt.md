@@ -1,6 +1,5 @@
-{{#unless vendorPrompt}}PROJECT
-
-{{/unless}}<workstation>
+<project-context>
+<workstation>
 {{#list environment prefix="- " join="\n"}}{{label}}: {{value}}{{/list}}
 {{#if model}}- Model: {{model}}{{/if}}
 </workstation>
@@ -47,6 +46,10 @@ Additional workspace directories. This CURRENT workspace state supersedes worksp
 {{/each}}
 </workspace-roots>
 {{/if}}
+{{#if activeRepoContext}}
+{{activeRepoContext}}
+{{/if}}
+</project-context>
 
 {{#unless vendorPrompt}}
 <critical>

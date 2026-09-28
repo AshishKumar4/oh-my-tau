@@ -15,12 +15,13 @@ const DEVIN_OS = process.platform === "darwin" ? "darwin" : process.platform ===
 const DEVIN_LOCALE = "en";
 
 /**
- * Released Devin CLI (3000.10.21) request identity: `ideName` and
- * `extensionName` are both `chisel`, and no `ideType` is sent. The CLI also
- * sends a per-request `Metadata.f` value the schema cannot derive; the backend
- * serves requests without it.
+ * Released Devin CLI request identity: `ideName` and `extensionName` are both
+ * `chisel`, and no `ideType` is sent (captured from devin 3000.10.21). The
+ * version is the current stable CLI, the release line that routes Fusion
+ * pairings. The CLI also sends a per-request `Metadata.f` value the schema
+ * cannot derive; the backend serves requests without it.
  */
-const DEVIN_CLI_VERSION = "3000.10.21";
+const DEVIN_CLI_VERSION = "3000.11.3";
 const DEVIN_CLI_METADATA = {
 	ideName: "chisel",
 	ideVersion: DEVIN_CLI_VERSION,
@@ -51,17 +52,21 @@ export function normalizeDevinSessionToken(apiKey: string | undefined): string {
 	return apiKey.startsWith(DEVIN_SESSION_TOKEN_PREFIX) ? apiKey : `${DEVIN_SESSION_TOKEN_PREFIX}${apiKey}`;
 }
 
-/**
- * Fields for `Metadata` on released-CLI calls (`GetUserJwt`, `AssignModel`,
- * `GetChatMessage`, `GetUserStatus`). `userJwt` stays empty for the calls the
- * CLI makes with the session token alone (auth, model assignment, usage).
- */
-export function devinCliMetadata(apiKey: string | undefined, userJwt = "") {
+/** Released-CLI metadata with credential bytes already encoded for the wire. */
+export function devinWireMetadata(apiKey: string | undefined, userJwt = "") {
 	return {
-		apiKey: normalizeDevinSessionToken(apiKey),
+		apiKey: apiKey ?? "",
 		userJwt,
 		...DEVIN_CLI_METADATA,
 	};
+}
+
+/**
+ * Fields for `Metadata` on released-CLI calls (`GetUserJwt`, `AssignModel`,
+ * `GetChatMessage`, `GetUserStatus`) authenticated by a Devin session token.
+ */
+export function devinCliMetadata(apiKey: string | undefined, userJwt = "") {
+	return devinWireMetadata(normalizeDevinSessionToken(apiKey), userJwt);
 }
 
 /** Fields for `Metadata` on the dev-channel `GetCliModelConfigs` call. */
