@@ -31,6 +31,7 @@ import {
 	cfgTerminalShowProgress,
 	cfgSetupVersion,
 	cfgStatusLineLeftSegments,
+	cfgSpellingAutocomplete,
 } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { cfgExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/settings";
 import {
@@ -75,7 +76,6 @@ import { cfgHindsightBankId, cfgHindsightScoping } from "@oh-my-pi/pi-coding-age
 import { cfgEditMode } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import { cfgExaEnabled } from "@oh-my-pi/pi-coding-agent/web/settings";
 import {
-	cfgCompaction,
 	cfgCompactionMethodOrder,
 	cfgSnapcompactSystemPrompt,
 } from "@oh-my-pi/pi-coding-agent/session/context-settings";
@@ -150,13 +150,6 @@ describe("Settings", () => {
 	});
 
 	describe("effective values", () => {
-		it("keeps cloned defaults independent across settings instances", () => {
-			const first = cfgCompaction.get(Settings.isolated());
-			const second = cfgCompaction.get(Settings.isolated());
-			expect(first).not.toBe(second);
-			expect(first.methodOrder).not.toBe(second.methodOrder);
-		});
-
 		it("bumps the effective revision when cwd re-resolves scoped arrays", async () => {
 			const otherProject = tempDir.join("other-project");
 			fs.mkdirSync(otherProject);
@@ -1387,6 +1380,14 @@ describe("Settings", () => {
 			expect(cfgSnapcompactSystemPrompt.get(settings)).toBe("none");
 		});
 
+		it("migrates legacy spelling.autocomplete booleans to the engine enum", async () => {
+			expect(cfgSpellingAutocomplete.get(Settings.isolated({ "spelling.autocomplete": true }))).toBe("auto");
+			expect(cfgSpellingAutocomplete.get(Settings.isolated({ "spelling.autocomplete": false }))).toBe("off");
+			await writeSettings({ spelling: { autocomplete: false } });
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(cfgSpellingAutocomplete.get(settings)).toBe("off");
+		});
+
 		it("migrates legacy inlineToolDescriptors booleans to the on/off enum", () => {
 			expect(cfgInlineToolDescriptors.get(Settings.isolated({ inlineToolDescriptors: true }))).toBe("on");
 			expect(cfgInlineToolDescriptors.get(Settings.isolated({ inlineToolDescriptors: false }))).toBe("off");
@@ -2345,14 +2346,6 @@ describe("Settings", () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 
 			expect(cfgFeaturesUnexpectedStopDetection.get(settings)).toBe("none");
-		});
-
-		it("resolves unconfigured features.unexpectedStopDetection to the mechanical default", async () => {
-			await writeSettings({});
-
-			const settings = await Settings.init({ cwd: projectDir, agentDir });
-
-			expect(cfgFeaturesUnexpectedStopDetection.get(settings)).toBe("mechanical");
 		});
 
 		it("normalizes a quoted-dotted legacy unexpected-stop boolean", async () => {

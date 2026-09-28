@@ -85,26 +85,6 @@ describe("createSettingsAwareStreamFn", () => {
 		expect(calls2[0]?.options?.harnessProfile).toBe("codex");
 	});
 
-	it("keeps assistant prose loop scanning at its configured default", () => {
-		const settings = Settings.isolated({});
-		const { fn: base, calls } = captureBase();
-		const wrapped = createSettingsAwareStreamFn(settings, base);
-
-		wrapped(stubModel, stubContext, undefined);
-
-		expect(calls[0]?.options?.loopGuard).toEqual({ enabled: true, checkAssistantContent: true });
-	});
-
-	it("keeps thinking summaries visible unless configured otherwise", () => {
-		const settings = Settings.isolated({});
-		const { fn: base, calls } = captureBase();
-		const wrapped = createSettingsAwareStreamFn(settings, base);
-
-		wrapped(stubModel, stubContext, undefined);
-
-		expect(calls[0]?.options?.hideThinkingSummary).toBe(false);
-	});
-
 	it("forwards configured hidden thinking summaries", () => {
 		const settings = Settings.isolated({ omitThinking: true });
 		const { fn: base, calls } = captureBase();

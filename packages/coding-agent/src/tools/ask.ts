@@ -18,12 +18,14 @@ import type { AskToolDetails, QuestionResult } from "@oh-my-pi/pi-tui/tools/ask"
 
 import { type as arkType } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import type { ToolExample } from "@oh-my-pi/pi-ai";
+import { type ToolExample, validateToolArguments } from "@oh-my-pi/pi-ai";
 import { Ellipsis, replaceTabs, TERMINAL, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
-import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 
 import type { ExtensionUISelectItem } from "../extensibility/extensions";
 import { type HarnessBridges, type HarnessSchemaBridge, harnessParameters, harnessParams } from "../harness/bridge";
+import { formatKeyHint, formatKeyHints } from "@oh-my-pi/pi-tui/app-keybindings";
+import { editorKey, editorKeys } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import { vocalizer } from "../tts/vocalizer";
@@ -77,6 +79,8 @@ const askSchema = arkType({
 	questions: QuestionItem.array().atLeastLength(1),
 });
 
+const askRecoveryTool = { name: "ask", description: "", parameters: askSchema };
+
 export type AskToolInput = typeof askSchema.infer;
 
 const claudeCodeAskSchema = arkType({
@@ -120,17 +124,26 @@ const CLAUDE_CODE_ASK: HarnessSchemaBridge<AskToolInput, typeof claudeCodeAskSch
 const ASK_BRIDGES: HarnessBridges<AskToolInput, typeof claudeCodeAskSchema> = { "claude-code": CLAUDE_CODE_ASK };
 
 /**
- * Recover a validated `questions` payload from a persisted `ask` toolCall's
- * `arguments`. Used by `/tree` re-answer (issue #5642): selecting a past
- * `ask` toolResult re-opens the picker with the *original* questions, so the
- * new answer branches as a sibling instead of mutating the old one. Runs the
- * same schema the live tool call validated against — legacy/corrupted
- * persisted args fail closed (`undefined`) rather than feeding malformed
- * data back into the picker.
+ * Recover valid questions from a persisted `ask` tool call for `/tree` re-answer.
+ * Apply live tool-call normalization first so optional null placeholders in saved
+ * arguments do not prevent reopening; malformed questions still fail closed.
  */
 export function recoverAskQuestions(toolCallArguments: unknown): AskToolInput["questions"] | undefined {
-	const parsed = askSchema(toolCallArguments);
-	if (!(parsed instanceof arkType.errors)) return parsed.questions;
+	if (!isRecord(toolCallArguments)) return undefined;
+	let normalized: Record<string, unknown> | undefined;
+	try {
+		normalized = validateToolArguments(askRecoveryTool, {
+			type: "toolCall",
+			id: "",
+			name: "ask",
+			arguments: toolCallArguments,
+		});
+	} catch {
+		normalized = undefined;
+	}
+	const parsed = normalized === undefined ? undefined : askSchema(normalized);
+	if (parsed !== undefined && !(parsed instanceof arkType.errors)) return parsed.questions;
+	// A call recorded under the claude-code profile carries the vendor's shape.
 	const vendor = claudeCodeAskSchema(toolCallArguments);
 	if (vendor instanceof arkType.errors) return undefined;
 	return CLAUDE_CODE_ASK.toParams(vendor).questions;
@@ -482,9 +495,8 @@ async function askSingleQuestion(
 			timeoutTriggered = true;
 		};
 		let navigationAction: "back" | "forward" | undefined;
-		const helpText = navigation
-			? "up/down navigate  enter select  ←/→ question  esc cancel"
-			: "up/down navigate  enter select  esc cancel";
+		const questionHint = navigation ? `${formatKeyHints(["left", "right"])} question  ` : "";
+		const helpText = `${editorKeys("tui.select.up", "tui.select.down")} navigate  ${formatKeyHint("enter")} select  ${questionHint}${editorKey("tui.select.cancel")} cancel`;
 		const timeoutMs = typeof timeout === "number" && timeout > 0 ? timeout : undefined;
 		const timeoutController = timeoutMs === undefined ? undefined : new AbortController();
 		const dialogSignal =

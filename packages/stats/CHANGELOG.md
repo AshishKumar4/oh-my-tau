@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Ensure synchronization of session statistics is atomic, preventing duplicate entries during interrupted syncs
+- Sped up initial imports and repeat syncs in `omp stats`, including histories with tens of thousands of session files.
+- Fixed prolonged `omp stats` full replays on large, already-indexed session histories.
+
 ## [18.2.9] - 2026-09-22
 
 ### Fixed

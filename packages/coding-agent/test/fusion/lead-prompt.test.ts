@@ -33,7 +33,7 @@ describe("fusion lead prompt section", () => {
 			tools,
 			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir.path() },
 			personality: "none",
-			browserEnabled: options.browserEnabled ?? false,
+			evalPreludes: options.browserEnabled ? [{ name: "browser" }] : [],
 			...(options.customPrompt !== undefined && { resolvedCustomPrompt: options.customPrompt }),
 			...(options.harnessProfile !== undefined && { harnessProfile: options.harnessProfile }),
 		});

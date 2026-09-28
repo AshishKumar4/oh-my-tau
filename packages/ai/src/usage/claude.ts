@@ -12,7 +12,6 @@ import {
 	type UsageLimit,
 	type UsageProvider,
 	type UsageReport,
-	type UsageResetCredits,
 	type UsageStatus,
 	type UsageWindow,
 } from "../usage";
@@ -667,8 +666,61 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 		if (!result.endpointAbsent) break;
 	}
 	if (!payload || baseUrl === undefined) return null;
-	const url = `${baseUrl}/usage`;
+	const report = parseClaudeUsagePayload(payload, credential, `${baseUrl}/usage`);
+	const resetCreditList =
+		parseClaudeResetCreditsFromUsagePayload(payload, credential.orgId, baseUrl) ??
+		(await listClaudeResetCredits({
+			accessToken: credential.accessToken,
+			accountId: credential.accountId,
+			email: credential.email,
+			orgId: credential.orgId,
+			baseUrl: params.baseUrl,
+			fetch: ctx.fetch,
+			signal: params.signal,
+		}));
+	const hasResetInventory =
+		resetCreditList !== null &&
+		(resetCreditList.availableCount > 0 ||
+			resetCreditList.nextCreditId !== undefined ||
+			resetCreditList.credits.length > 0);
+	if (!report && !hasResetInventory) return null;
+	const result: UsageReport = report ?? {
+		provider: "anthropic",
+		fetchedAt: Date.now(),
+		limits: [],
+		metadata: { endpoint: `${baseUrl}/usage`, ...extractUsageIdentity(payload) },
+		raw: payload,
+	};
+	let accountId = result.metadata?.accountId ?? credential.accountId;
+	let email = result.metadata?.email ?? credential.email;
+	if ((!accountId || !email) && !params.signal?.aborted) {
+		const profileIdentity = extractProfileIdentity(await fetchProfile(baseUrl, headers, ctx, params.signal));
+		accountId ??= profileIdentity.accountId;
+		email ??= profileIdentity.email;
+	}
+	if (resetCreditList) {
+		const { orgId, baseUrl: _baseUrl, report: _report, ...resetCredits } = resetCreditList;
+		result.resetCredits = resetCredits;
+		if (orgId) result.metadata = { ...result.metadata, orgId };
+	}
+	result.metadata = {
+		...result.metadata,
+		...(accountId ? { accountId } : {}),
+		...(email ? { email } : {}),
+		...(credential.orgId ? { orgId: credential.orgId } : {}),
+	};
+	return result;
+}
 
+/** Parse the quota evidence in one live usage response, without any additional requests. */
+export function parseClaudeUsagePayload(
+	raw: unknown,
+	identity: { accountId?: string; email?: string; orgId?: string } = {},
+	endpoint?: string,
+	fetchedAt = Date.now(),
+): UsageReport | null {
+	if (!isRecord(raw)) return null;
+	const payload: ClaudeUsageResponse = raw;
 	const apiLimitEntries = parseApiLimitEntries(payload.limits);
 	const fiveHour = parseBucket(payload.five_hour) ?? apiLimitEntries.find(entry => entry.kind === "session")?.bucket;
 	const sevenDay =
@@ -721,53 +773,23 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 		buildClaudeExtraUsageLimit(payload),
 	].filter((limit): limit is UsageLimit => limit !== null);
 
-	const resetCreditList =
-		parseClaudeResetCreditsFromUsagePayload(payload, credential.orgId, baseUrl) ??
-		(await listClaudeResetCredits({
-			accessToken: credential.accessToken,
-			...(credential.orgId ? { orgId: credential.orgId } : {}),
-			...(params.baseUrl ? { baseUrl: params.baseUrl } : {}),
-			fetch: ctx.fetch,
-			...(params.signal ? { signal: params.signal } : {}),
-		}));
-	const hasResetInventory =
-		resetCreditList !== null &&
-		(resetCreditList.availableCount > 0 ||
-			resetCreditList.nextCreditId !== undefined ||
-			resetCreditList.credits.length > 0);
-	if (limits.length === 0 && !hasResetInventory) return null;
-
-	const identity = extractUsageIdentity(payload);
-	let accountId = identity.accountId ?? credential.accountId;
-	let email = identity.email ?? credential.email;
-	if ((!accountId || !email) && !params.signal?.aborted) {
-		const profileIdentity = extractProfileIdentity(await fetchProfile(baseUrl, headers, ctx, params.signal));
-		accountId = accountId ?? profileIdentity.accountId;
-		email = email ?? profileIdentity.email;
-	}
-	let resetCredits: UsageResetCredits | undefined;
-	let reportOrgId = credential.orgId;
-	if (resetCreditList) {
-		const { orgId, baseUrl: _baseUrl, ...usageResetCredits } = resetCreditList;
-		resetCredits = usageResetCredits;
-		reportOrgId ??= orgId;
-	}
-
-	const report: UsageReport = {
-		provider: params.provider,
-		fetchedAt: Date.now(),
+	if (limits.length === 0) return null;
+	// The response speaks for the token that fetched it; stored metadata may be stale.
+	const payloadIdentity = extractUsageIdentity(payload);
+	const accountId = payloadIdentity.accountId ?? identity.accountId;
+	const email = payloadIdentity.email ?? identity.email;
+	return {
+		provider: "anthropic",
+		fetchedAt,
 		limits,
-		...(resetCredits ? { resetCredits } : {}),
 		metadata: {
-			endpoint: url,
+			...(endpoint ? { endpoint } : {}),
 			...(accountId ? { accountId } : {}),
 			...(email ? { email } : {}),
-			...(reportOrgId ? { orgId: reportOrgId } : {}),
+			...(identity.orgId ? { orgId: identity.orgId } : {}),
 		},
 		raw: payload,
 	};
-
-	return report;
 }
 
 export const claudeUsageProvider: UsageProvider = {
@@ -841,22 +863,6 @@ function scopeClaudeLimitsForModelHardBlock(
 	});
 }
 
-/** Tiers Anthropic meters separately, so a block scoped to one leaves the others selectable. */
-const CLAUDE_TIER_BLOCK_SCOPES = ["fable", "mythos"] as const;
-
-/**
- * Scope of every Claude usage wall outside the Fable/Mythos meters (the shared
- * windows and the Opus/Sonnet weekly rows). Every Claude request honours it,
- * and a live report can heal it. The unscoped `""` scope stays reserved for
- * blocks no usage report can vouch for: account-policy denials, refresh and
- * auth failures, and usage walls persisted before this scope existed.
- */
-export const CLAUDE_SHARED_BLOCK_SCOPE = "shared";
-
-function isClaudeTierBlockScope(kind: ClaudeModelKind | undefined): kind is (typeof CLAUDE_TIER_BLOCK_SCOPES)[number] {
-	return kind === "fable" || kind === "mythos";
-}
-
 function rankingUsedFraction(limit: UsageLimit): number {
 	const fraction = resolveUsedFraction(limit);
 	if (typeof fraction !== "number" || !Number.isFinite(fraction)) return 0.5;
@@ -902,6 +908,7 @@ function findClaudeSecondaryLimit(
 }
 
 export const claudeRankingStrategy: CredentialRankingStrategy = {
+	healsGlobalBlocks: true,
 	/**
 	 * Anthropic-only idle window after which a session's pinned credential no
 	 * longer suppresses usage-based re-ranking. Anthropic caps OAuth prompt-cache
@@ -923,34 +930,28 @@ export const claudeRankingStrategy: CredentialRankingStrategy = {
 	// a healthy candidate rather than serve until 100%.
 	scopeLimitsForReserve: scopeClaudeLimitsForModel,
 	/**
-	 * Fable/Mythos usage-limit errors map to tier-local weekly counters, so their
-	 * reactive blocks are tier-scoped, mirroring the per-counter precedent in
-	 * packages/ai/src/usage/google-antigravity.ts:466-497. Every other wall lands
-	 * in {@link CLAUDE_SHARED_BLOCK_SCOPE}.
+	 * Fable/Mythos usage-limit errors map to tier-local weekly counters. Scope
+	 * reactive backoff blocks for those tiers, mirroring the per-counter
+	 * precedent in packages/ai/src/usage/google-antigravity.ts:466-497.
 	 */
 	blockScope(context) {
 		const kind = getClaudeModelKind(context);
-		return isClaudeTierBlockScope(kind) ? `tier:${kind}` : CLAUDE_SHARED_BLOCK_SCOPE;
-	},
-	// A shared wall stops every Claude request, tier requests included. Without
-	// a context (reconciliation) this is the full set.
-	blockScopes(context) {
-		if (!context) return [CLAUDE_SHARED_BLOCK_SCOPE, ...CLAUDE_TIER_BLOCK_SCOPES.map(tier => `tier:${tier}`)];
-		const kind = getClaudeModelKind(context);
-		return isClaudeTierBlockScope(kind) ? [`tier:${kind}`, CLAUDE_SHARED_BLOCK_SCOPE] : [CLAUDE_SHARED_BLOCK_SCOPE];
+		return kind === "fable" || kind === "mythos" ? `tier:${kind}` : undefined;
 	},
 	/**
-	 * A reactive block carries the reset the 429 reported, but Anthropic can
-	 * restore the quota earlier (a reset redeemed outside OMP, a plan change, a
-	 * corrected counter), and the block then idles a usable account for days.
-	 * Judge each scope against the limits that actually gate it — a tier scope
-	 * against its own weekly row plus the shared umbrella windows, the shared
-	 * scope against the shared windows plus the Opus/Sonnet weekly rows — so a
-	 * healthy report lifts the block while any spent gate keeps it.
+	 * A reactive Fable/Mythos block carries the reset the 429 reported, but
+	 * Anthropic can restore the tier earlier (plan change, corrected counter),
+	 * and the block then idles a usable account for days. Judge each tier scope
+	 * against the limits that actually gate a request of that kind — its own
+	 * weekly row plus the shared umbrella windows — so a healthy report lifts
+	 * the block while a spent shared 5-hour wall keeps it.
+	 *
+	 * Legacy and shared quota errors also leave account-wide blocks. Only a
+	 * complete report with every reported quota healthy can heal that scope.
 	 */
 	healableBlockScopes(report) {
 		const sharedLimits = report.limits.filter(limit => limit.scope.shared === true);
-		// The endpoint returns a report as soon as one window parses, and a
+		// The endpoint returns a report as soon as one window parses, and a tier
 		// 429 can be caused by a shared wall. A payload missing a shared gate
 		// leaves the block's cause unknown, so vouch for nothing rather than
 		// clear a block that still holds.
@@ -965,10 +966,9 @@ export const claudeRankingStrategy: CredentialRankingStrategy = {
 		}
 		return [
 			{
-				blockScope: CLAUDE_SHARED_BLOCK_SCOPE,
-				limits: report.limits.filter(
-					limit => limit.scope.shared === true || limit.scope.tier === "opus" || limit.scope.tier === "sonnet",
-				),
+				blockScope: "",
+				limits: report.limits.filter(limit => limit.scope.shared === true || limit.scope.tier !== undefined),
+				healthy: report.metadata?.source === "ratelimit-headers" ? false : undefined,
 			},
 			...[...tiers].map(tier => ({
 				blockScope: `tier:${tier}`,

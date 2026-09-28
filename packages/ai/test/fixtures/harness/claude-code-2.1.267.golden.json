@@ -73,7 +73,7 @@
 		"inventoryCarrier": "tools",
 		"namespaceStructure": null,
 		"envelope": {
-			"max_tokens": "64000",
+			"max_tokens": "128000",
 			"thinking": "object{display,type}",
 			"context_management": "object{edits}",
 			"output_config": "object{effort}",
@@ -108,7 +108,9 @@
 		],
 		"argumentDocStyle": "inline-property-descriptions"
 	},
-	"documentedFramingDeltas": {},
+	"documentedFramingDeltas": {
+		"envelope.max_tokens": "omp requests the model's full catalog output ceiling on every Anthropic request, OAuth included (128k on Opus 5 and Fable 5.1); the 2.1.267 capture sent 64000. Later Claude Code clients request 128k on Opus 5.5, so the ceiling follows the catalog rather than this capture."
+	},
 	"documentedInventoryDeltas": {
 		"declarationForms": "omp adds Anthropic's `eager_input_streaming` beta flag to every declaration (from catalog compat, not the profile) and `strict: true` to schema-strict tools; the captured client sends exactly `{description, input_schema, name}`. Behaviour-neutral for the backend, but a fingerprint difference on every request.",
 		"schemaForms": "the captured client emits `\"$schema\": \"https://json-schema.org/draft/2020-12/schema\"` on every `input_schema`; omp emits none. Same schema semantics, different bytes.",
@@ -117,6 +119,6 @@
 	"notes": {
 		"fingerprintVersion": "omp's wire fingerprint version comes from `getClaudeCodeVersion()` in packages/ai/src/providers/claude-code-fingerprint.ts (pinned default 2.1.280, raised at runtime when Anthropic answers claude_code_version_too_old); this golden and its manifests were captured from 2.1.267. The 2.1.280 client still reports SDK 0.112.1 in X-Stainless-Package-Version.",
 		"betaList": "omp's OAuth agent beta list (`claudeCodeAgentBetaDefaults` in packages/ai/src/providers/anthropic.ts) and the client's diverge in both directions. The client's list carries `redact-thinking-2026-02-12`, `advanced-tool-use-2025-11-20`, `effort-2025-11-24` and `extended-cache-ttl-2025-04-11`, which omp omits (omp adds `effort-2025-11-24` only on thinking requests); omp sends `thinking-token-count-2026-05-13`, which the client's does not. The comparison list is sourced from the headers the client sends to the usage endpoint (`CLAUDE_HEADERS` in packages/ai/src/usage/claude.ts), so the `/v1/messages` beta list is inferred rather than captured. Betas are feature flags, not inert fingerprint strings: each one changes what the server accepts, and removing `thinking-token-count` would drop the thinking-token accounting omp relies on today. `ttl: \"1h\"` was accepted live on the OAuth agent path without `extended-cache-ttl-2025-04-11`. Reported, not fixed here.",
-		"cacheTailTtl": "The capture pins system slots only (identity and prompt-last, both ephemeral/1h) and attests nothing about message-level cache_control, so omp matches the vendor on every slot the capture records. It deliberately diverges on the message tail: the tail is rewritten every turn and Anthropic charges 2x base input for a 1h write against 1.25x for 5m, so pinning it taxes every turn to insure against idle gaps measured at 0.8% of real inter-request gaps. Over 116 Fable 5.1 sessions (46,698 requests) head-1h/tail-5m cost $14,051 against $18,069 for uniform 1h. An explicit cacheRetention of long still pins both, which also keeps the label-driven keep-warm gate in stream.ts coherent."
+		"cacheTailTtl": "The capture pins system slots only (identity and prompt-last, both ephemeral/1h) and attests nothing about message-level cache_control, so omp matches the vendor on every slot the capture records. It deliberately diverges on the message tail: the tail is rewritten every turn and Anthropic charges 2x base input for a 1h write against 1.25x for 5m, so pinning it taxes every turn to insure against idle gaps measured at 0.8% of real inter-request gaps. Over 116 Fable 5.1 sessions (46,698 requests) head-1h/tail-5m cost $14,051 against $18,069 for uniform 1h. An explicit cacheRetention of long still pins both."
 	}
 }

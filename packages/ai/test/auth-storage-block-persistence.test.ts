@@ -466,8 +466,8 @@ describe("AuthStorage credential block persistence", () => {
 		setup.saveOAuth(PROVIDER, oauthCredential("held"));
 		setup.saveOAuth(PROVIDER, oauthCredential("other"));
 		const [heldRow] = setup.listAuthCredentials(PROVIDER);
-		// Stale Fable and shared usage walls, aged past the usage-cache window so a healthy report may heal them.
-		for (const blockScope of ["tier:fable", "shared"]) {
+		// Stale Fable and account-wide usage walls, aged past the usage-cache window so a healthy report may heal them.
+		for (const blockScope of ["tier:fable", ""]) {
 			setup.upsertCredentialBlock({
 				credentialId: heldRow!.id,
 				providerKey: PROVIDER_KEY,
@@ -582,22 +582,22 @@ describe("AuthStorage credential block persistence", () => {
 			// selectable on every other Anthropic tier.
 			const denied = await storage.keys.get(PROVIDER, "session-org", { modelId: "claude-fable-5-1" });
 			expect(denied).toBeDefined();
-			expect(
-				await storage.limits.rotate(PROVIDER, "session-org", {
-					error: orgDenial,
-					modelId: "claude-fable-5-1",
-				}),
-			).toBe(true);
+			const rotation = await storage.limits.rotate(PROVIDER, "session-org", {
+				error: orgDenial,
+				modelId: "claude-fable-5-1",
+			});
+			expect(rotation.switched).toBe(true);
 			const orgId = store.listAuthCredentials(PROVIDER)[0]!.id;
 			const orgRows = readCredentialBlockRows(dbPath);
 			expect(orgRows).toHaveLength(1);
 			const orgBlock = orgRows[0]!;
 			expect(orgBlock.credential_id).toBe(orgId);
-			// Provider-wide, not tier-scoped: an org prohibition denies every model.
-			expect(orgBlock.block_scope).toBe("");
-			// Bounded so an administrator lifting the org policy self-heals.
-			expect(orgBlock.blocked_until_ms).toBeGreaterThan(before + 60 * 60 * 1000);
-			expect(orgBlock.blocked_until_ms).toBeLessThanOrEqual(before + 24 * 60 * 60 * 1000);
+			// Provider-wide, not tier-scoped: an org prohibition denies every model,
+			// and no usage report can vouch for it.
+			expect(orgBlock.block_scope).toBe("account-policy");
+			// Six hours, so an administrator lifting the org policy self-heals.
+			expect(orgBlock.blocked_until_ms).toBeGreaterThanOrEqual(before + 6 * 60 * 60 * 1000);
+			expect(orgBlock.blocked_until_ms).toBeLessThanOrEqual(Date.now() + 6 * 60 * 60 * 1000);
 		} finally {
 			storage.close();
 		}
@@ -613,7 +613,9 @@ describe("AuthStorage credential block persistence", () => {
 			);
 			const before = Date.now();
 			expect(await contentStorage.keys.get(CODEX_PROVIDER, "session-cyber")).toBeDefined();
-			expect(await contentStorage.limits.rotate(CODEX_PROVIDER, "session-cyber", { error: cyber })).toBe(true);
+			expect((await contentStorage.limits.rotate(CODEX_PROVIDER, "session-cyber", { error: cyber })).switched).toBe(
+				true,
+			);
 			// A flagged prompt must not sideline a healthy account for hours.
 			const contentRows = readCredentialBlockRows(path.join(tempDir, "content.db"));
 			expect(contentRows.length).toBeGreaterThan(0);
@@ -663,7 +665,7 @@ describe("AuthStorage credential block persistence", () => {
 					readCredentialBlockRows(dbPath)
 						.filter(row => row.credential_id === walledId)
 						.map(row => row.block_scope),
-				).toEqual([""]);
+				).toEqual(["account-policy"]);
 			} finally {
 				storage.close();
 			}
@@ -688,12 +690,12 @@ describe("AuthStorage credential block persistence", () => {
 			try {
 				const sibling = storage.oauth.accounts(PROVIDER).find(account => account.email === "sibling@example.com");
 				if (!sibling) throw new Error("expected the sibling account");
-				const switched = await storage.limits.rotate(PROVIDER, undefined, {
+				const rotation = await storage.limits.rotate(PROVIDER, undefined, {
 					error: new Error("401 Unauthorized"),
 					modelId: "claude-opus-5",
 					credentialId: sibling.credentialId,
 				});
-				expect(switched).toBe(false);
+				expect(rotation.switched).toBe(false);
 			} finally {
 				storage.close();
 			}

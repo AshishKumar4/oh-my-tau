@@ -60,6 +60,7 @@ function session(
 		modelRoles?: Record<string, string>;
 		agentServiceTierOverrides?: Record<string, string>;
 		agentCompactionThresholdOverrides?: Record<string, AgentCompactionThresholdOverride>;
+		sessionAgents?: readonly AgentDefinition[];
 	} = {},
 ): ToolSession {
 	return {
@@ -84,6 +85,7 @@ function session(
 			}),
 		getSessionFile: () => null,
 		getSessionSpawns: () => options.spawns ?? "*",
+		getSessionAgents: () => options.sessionAgents ?? [],
 		getPlanModeState: () => (options.planMode ? { enabled: true } : undefined),
 		taskDepth: options.taskDepth,
 	} as unknown as ToolSession;
@@ -346,6 +348,21 @@ describe("structured subagent primitive", () => {
 		}
 	});
 
+	it("forwards parent-authorized model agents to nested subagent sessions", async () => {
+		mockDiscovery();
+		const inheritedAgent: AgentDefinition = { ...AGENT, name: "m1", model: ["b/y"] };
+		const parentSession = session({ sessionAgents: [inheritedAgent] });
+		const dispatched: executorModule.ExecutorOptions[] = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			dispatched.push(options);
+			return result();
+		});
+
+		const settled = await runStructuredSubagent(request({ session: parentSession, retainArtifacts: true }));
+
+		expect(dispatched[0]?.inheritedSessionAgents).toEqual([inheritedAgent]);
+		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
 	it("propagates a custom thinking-suffixed role alias through policy, dispatch, and settlement", async () => {
 		const customAgent = { ...AGENT, model: ["@reviewer:high"] };
 		mockDiscovery(customAgent);

@@ -117,6 +117,8 @@ export interface StructuredSubagentRequest {
 	schemaMode?: StructuredSubagentSchemaMode;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
 	effort?: TaskEffort;
+	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
+	solutionSpace?: string;
 	/**
 	 * Resolved parent history for a forked spawn, seeded into the child's
 	 * journal before its first prompt (Codex `fork_turns` / Claude Code
@@ -523,6 +525,7 @@ function buildExecutorOptions(
 		parentActiveModelPattern: policy.parentActiveModelPattern,
 		thinkingLevel: policy.effectiveAgent.thinkingLevel,
 		effort: request.effort,
+		solutionSpace: request.solutionSpace?.trim() || undefined,
 		...(policy.schema.source === "none"
 			? {}
 			: {
@@ -546,6 +549,7 @@ function buildExecutorOptions(
 		authStorage: session.authStorage,
 		modelRegistry: session.modelRegistry,
 		settings: session.settings,
+		inheritedSessionAgents: session.getSessionAgents?.(),
 		mcpManager: enableMCP ? (session.mcpManager ?? MCPManager.instance()) : undefined,
 		enableMCP,
 		customTools: request.customTools,

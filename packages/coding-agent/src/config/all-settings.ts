@@ -41,12 +41,14 @@ import * as commandsSettings from "../commands/settings";
 import * as streamSettings from "../stream/settings";
 import * as commitSettings from "../commit/settings";
 import * as cliGcSettings from "../cli/gc-settings";
+import * as telemetrySettings from "../telemetry-settings";
 
 const DOMAINS: readonly Readonly<Record<string, unknown>>[] = [
 	configModelSettings,
 	modesSettings,
 	sessionSettings,
 	harnessSettings,
+	telemetrySettings,
 	advisorSettings,
 	sessionContextSettings,
 	memoryBackendSettings,

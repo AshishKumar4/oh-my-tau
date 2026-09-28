@@ -2,6 +2,96 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `telemetry.otlpExportEnabled` setting (`/settings` → Providers → Privacy) that stops OMP from exporting OTLP traces, logs, and metrics even when `OTEL_*` endpoints are set in its environment; export stays enabled by default ([#13444](https://github.com/can1357/oh-my-pi/pull/13444) by [@krizh-p](https://github.com/krizh-p))
+- Added a first-launch warning when Python eval is enabled but no working Python interpreter is found, pointing to `python.interpreter` and `omp setup python --check` ([#13529](https://github.com/can1357/oh-my-pi/pull/13529) by [@H4vC](https://github.com/H4vC))
+
+### Changed
+
+- The `eval` tool description now notes that the kernel may be shared with the parent session and concurrent `task` subagents ([#13521](https://github.com/can1357/oh-my-pi/pull/13521) by [@radkawar](https://github.com/radkawar))
+
+### Fixed
+- Fixed `/tree` navigating past saved Ask results instead of reopening their questions when an optional preview was saved as `null` ([#13570](https://github.com/can1357/oh-my-pi/issues/13570)).
+- Fixed legacy `createGrepTool()` failing to search a file when a `glob` filter is also supplied ([#13571](https://github.com/can1357/oh-my-pi/issues/13571)).
+- Fixed ongoing Claude tasks stopping instead of automatically redeeming eligible saved resets when usage polling is throttled or earlier failures exhausted the retry budget; concurrent tasks now share confirmed resets without spending again
+- Fixed user-tagged `^model` agents from the main session being unavailable to nested subagents.
+- Fixed SDK requests using an `ApiKeyResolver` from `createApiKeyResolver` failing with a drained account's multi-hour quota error instead of briefly waiting for a healthy sibling credential whose block expires within seconds ([#13270](https://github.com/can1357/oh-my-pi/issues/13270))
+- Fixed headless subagents losing an assignment during a session transition and then entering yield reminders without ever receiving it ([#13538](https://github.com/can1357/oh-my-pi/issues/13538)).
+
+- Fixed Anthropic requests failing with "`compaction` block must be sent first" after a native compaction when experimental context notes were active; the notes now follow the compaction summary and any retained turn it opens ([#13569](https://github.com/can1357/oh-my-pi/pull/13569) by [@H4vC](https://github.com/H4vC))
+- Fixed Windows sessions started from an 8.3 short path (such as `C:\Users\ADMINI~1\project`) using the short spelling as the project directory, and home-directory paths written with 8.3 aliases not being shortened to `~` in the status line, tool labels, and errors ([#13394](https://github.com/can1357/oh-my-pi/pull/13394) by [@CoderTCY](https://github.com/CoderTCY))
+- Fixed `edit` `PUT >N` moving a shallower insert (Go `case`, `} else {`) past a closing brace when that breaks the file's syntax ([#13520](https://github.com/can1357/oh-my-pi/pull/13520) by [@radkawar](https://github.com/radkawar))
+- Fixed `omp update` and other one-shot commands on Windows printing "ended before completing" and exiting 1 after they had actually completed ([#13470](https://github.com/can1357/oh-my-pi/issues/13470))
+- Fixed `omp update` on Windows printing "ended before completing: the event loop drained" and exiting 1 when no `~/.npmrc` or `~/.bunfig.toml` exists ([#13470](https://github.com/can1357/oh-my-pi/issues/13470))
+- Fixed `wait` with no owned background jobs blocking silently for up to 30 minutes while its parent or a peer kept running; it now returns after a 5-second window that grows to 5 minutes on repeated waits and names who is still running ([#13513](https://github.com/can1357/oh-my-pi/issues/13513), [#13516](https://github.com/can1357/oh-my-pi/pull/13516) by [@H4vC](https://github.com/H4vC))
+- Fixed missing judge token counts corrupting session usage totals and showing `$NaN` in the status line ([#13490](https://github.com/can1357/oh-my-pi/issues/13490)).
+- Fixed Cursor sessions under-reporting token usage and cost, and compacting from output tokens instead of real context occupancy ([#13082](https://github.com/can1357/oh-my-pi/issues/13082))
+- Fixed Cursor shell commands running with their millisecond timeout read as seconds (a 15 s budget became `requested 15000s`) ([#13082](https://github.com/can1357/oh-my-pi/issues/13082))
+- Goal mode now waits for input instead of repeatedly asking for approval when all remaining todos are blocked ([#13494](https://github.com/can1357/oh-my-pi/issues/13494)).
+- Fixed installing `pi-background-tasks` 2.6.0 or newer failing to load because the legacy `pi-ai` compatibility shim did not export `anthropicMessagesApi` ([#13250](https://github.com/can1357/oh-my-pi/issues/13250))
+- Fixed blob broker requests failing when `PI_PROXY` is set ([#13505](https://github.com/can1357/oh-my-pi/issues/13505)).
+- Fixed `generate_image` reporting the selected catalog model instead of the image model the ChatGPT/Codex backend actually ran, and saved image paths now list the size and quality the provider returned ([#13403](https://github.com/can1357/oh-my-pi/issues/13403))
+- Fixed the fast-model fallback picking Gemini and MiniMax models when no `smol` role is configured; the built-in `mini` pattern now matches only `-mini` model ids ([#13292](https://github.com/can1357/oh-my-pi/issues/13292))
+- Fixed extension tool renderers written in upstream pi's `renderCall(args, theme, context)` order failing to render and logging `Tool renderer failed` on every call ([#13081](https://github.com/can1357/oh-my-pi/issues/13081))
+- Fixed the Nix flake / NixOS module build failing with "does not carry the @oh-my-pi/pi-natives version stamp" ([#13493](https://github.com/can1357/oh-my-pi/issues/13493)).
+
+## [18.3.5] - 2026-09-27
+
+### Added
+
+- Added API-key-billed OpenAI Responses web search (`openai/gpt-6-luna`, then `openai/gpt-5.6-luna`), tried after every Codex entry in the default search fallback chain so ChatGPT-subscription search is exhausted before any API usage is billed ([#13467](https://github.com/can1357/oh-my-pi/pull/13467) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
+- Added prompt-cache warming, ported from [earendil-works/pi](https://github.com/earendil-works/pi): shortly before a prompt-cache entry expires, the main agent loop replays its last request and cuts the replay off at the first generated token, so idle gaps no longer force a full-prefix cache re-write. A refresh fires only when the expected avoided-miss cost clears its cost by $0.05, and warming stops as soon as a refresh misses the cache. Controlled by `providers.cacheWarming` (`off` / `streaming` / `idle`, default `idle`); idle warming covers 5-minute entries only, and models without a declared `promptCache` lifetime are never warmed. Extensions can override each decision through the `cache_warming_decision` event ([#12699](https://github.com/can1357/oh-my-pi/pull/12699) by [@KamijoToma](https://github.com/KamijoToma)).
+
+## [18.3.4] - 2026-09-27
+
+### Breaking Changes
+
+- Replaced the `task` tool's `complexity` field with `solutionSpace`, a description of how open-ended the subtask is; `auto` thinking for spawned subagents now picks effort from it alone
+
+### Changed
+
+- `auto` thinking now picks effort for every turn by how open-ended the problem is, so large volumes of mechanical work no longer raise it
+
+### Fixed
+
+- Fixed agents looping for hours when every turn spends the whole output limit on reasoning: length-stop retries now tell the model its reasoning was discarded and to act in smaller steps, and a subagent whose length-stop recovery gives up now fails with that error instead of being re-prompted into the same loop
+- Fixed tagging a model with `^` mid-session dropping the provider prompt cache for every following turn: new `m<N>` pseudonyms now arrive as a hidden session notice instead of rewriting the `task` description, which only absorbs them at a base-prompt rebuild
+
+## [18.3.3] - 2026-09-27
+
+### Added
+
+- Added a unified predictive text engine with N-gram, SmolLM2, and macOS native providers, including cross-engine blending, background model downloads, and a cross-process prediction daemon.
+- Added the `omp predict` command for evaluating completion performance and support for ingesting existing Claude Code and Codex prompt histories to bootstrap predictions on new installations.
+- Added `omp skill list [dir] [--json]` to report skills resolved for a session directory, including discovery warnings in JSON output.
+- Added a centralized progress display for background tool and model downloads, including support for downloading the SmolLM2-135M word-completion model.
+- Added dynamic evaluation guidance through hidden session notices.
+- Added a required `complexity` rationale to the `task` tool to improve automatic thinking-depth selection.
+- Agents using `task` or `bash` now receive the `wait` tool for background-process coordination, and subagents can receive it when explicitly requested.
+- Added context-aware suggestions to empty composers based on agent activity and effort.
+- Added optional global or per-project memory scopes to the `retain` and `learn` tools when Mnemopi scoping is enabled.
+- Added `/btw` to focused subagent views for asking questions about that agent's transcript with separate side-conversation history.
+
+### Changed
+
+- Completion behavior now uses the N-gram engine for standard `auto` completion across platforms, with blended N-gram and SmolLM confidence scoring where applicable; the SmolLM2 model uses a 145 MB GGUF (Q8_0) download and is prefetched only when explicitly activated.
+- Updated `spelling.autocomplete` to use an enum-based engine configuration.
+- Completion ghost text is now preserved through manual keystrokes.
+- Window input actions now default to background execution; set `takeover: true` to opt into foreground activation, with clarified cross-platform coordinate and activation behavior.
+- `omp tiny-models download` can now download the word-completion model.
+- Updated `/play` help, read-tool summaries, platform-aware shortcut labels, and other UI hints for clearer interaction guidance.
+- Updated the empty-submit behavior to account for live-steered messages and surface pending live-steering status in the UI.
+- `ps --all` now includes exited global services, while the default view shows live global services.
+- Orchestrator task documentation now follows a Target/Change/Acceptance format.
+- Slash-command and hint usage tracking is now persistent and namespaced.
+
+### Fixed
+
+- Preserved MCP `structuredContent` in live tool-result details so evaluation callers can consume server data without reparsing model-facing JSON; spilled results continue to retain an artifact reference without duplicating the payload in session history.
+- Fixed Collab hosts becoming unable to reclaim a room after a brief network interruption; hosts now retry room recovery without losing guests or queued updates.
+- Fixed one-shot commands that stopped before completing, such as `omp config set` on a fresh Windows profile, incorrectly exiting successfully without output; they now report failure with diagnostic guidance.
+
 ## [18.3.2] - 2026-09-25
 
 ### Added
