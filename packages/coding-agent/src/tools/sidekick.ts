@@ -36,6 +36,7 @@ import { cfgFusionSidekickThinking } from "../fusion/settings";
 import { cfgTaskEnableLsp } from "../task/settings";
 import type { ToolSession } from "./index";
 import { cfgAsyncEnabled } from "./settings";
+import { holdBlockedAwait } from "./wait";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 /**
@@ -160,11 +161,13 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			// Async jobs are off: every handoff blocks inside this call.
 			const inline = run(signal ?? new AbortController().signal, forwardProgress);
 			this.#inlineHandoff = inline;
+			const releaseAwait = this.#holdHandoffAwait(() => ref?.id ?? findSidekickRef(leadId)?.id);
 			try {
 				const result = await inline;
 				return textResult(reportOf(result), { agentId: result.id, mode, pending: false });
 			} finally {
 				this.#inlineHandoff = undefined;
+				releaseAwait?.();
 			}
 		}
 
@@ -211,6 +214,24 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 
 	#leadId(): string {
 		return this.session.getAgentId?.() ?? MAIN_AGENT_ID;
+	}
+
+	/**
+	 * Publish that the lead's turn is blocked on its sidekick, reading no message,
+	 * until the returned release runs: a sidekick parked in a message-only `wait`
+	 * then returns instead of waiting on a lead that cannot answer. The id is read
+	 * lazily because a first handoff learns it only once the spawn registers.
+	 */
+	#holdHandoffAwait(sidekickId: () => string | undefined): (() => void) | undefined {
+		const registry = this.session.agentRegistry;
+		if (!registry) return undefined;
+		return holdBlockedAwait(registry, this.#leadId(), {
+			get agents() {
+				const id = sidekickId();
+				return id ? [id] : [];
+			},
+			inline: true,
+		});
 	}
 
 	/** Steer the update into the running handoff; the sidekick folds it in rather than restarting. */
@@ -326,10 +347,12 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		const onAbort = (): void => aborted.resolve("aborted");
 		signal?.addEventListener("abort", onAbort, { once: true });
 		manager.watchJobs([jobId]);
+		const releaseAwait = this.#holdHandoffAwait(() => job.agentId);
 		let outcome: "settled" | "timeout" | "aborted";
 		try {
 			outcome = await Promise.race([job.promise.then(() => "settled" as const), timeout.promise, aborted.promise]);
 		} finally {
+			releaseAwait?.();
 			manager.unwatchJobs([jobId]);
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", onAbort);

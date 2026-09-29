@@ -47,6 +47,9 @@
 ### Removed
 
 - Removed the web search provider picker from `omp setup`; set the `web` model role (or keep the free default chain) instead.
+### Fixed
+
+- Fixed `wait` with no owned background job handing the turn back every 5 seconds to 5 minutes while a running peer could still message it, which cost a full turn per return; it now blocks until a message arrives and returns at once only when every running peer is itself blocked waiting (on a message, on the caller's own result through `wait`, an inline `task` spawn, a blocking `sidekick` handoff or an eval `wait()`, or on another blocked agent), naming the peer blocked on the caller's result.
 
 ## [18.4.2] - 2026-09-28
 

@@ -2,10 +2,12 @@ import type { AsyncJob, AsyncJobManager } from "../async";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ToolSession } from "../tools";
 import { ToolAbortError } from "../tools/tool-errors";
+import { holdBlockedAwait } from "../tools/wait";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { withBridgeTimeoutPause } from "./bridge-timeout";
 import { getCompletionHandle, type CompletionHandleEntry } from "./completion-bridge";
 import type { JsStatusEvent } from "./js/shared/types";
+import { cfgEvalAutoBackgroundEnabled } from "./settings";
 
 /** Synthetic bridge name reserved for waiting on eval handles. */
 export const EVAL_WAIT_BRIDGE_NAME = "__wait__";
@@ -224,11 +226,27 @@ export async function runEvalWait(
 				for (const handle of resolved) emitLatestProgress(handle);
 			}, 1_000);
 			interval.unref?.();
+			const registry = options.session.agentRegistry;
+			const agentIds = resolved.flatMap(handle =>
+				"job" in handle && handle.job.agentId ? [handle.job.agentId] : [],
+			);
+			// With auto-background off, the eval call holds the turn until the cell
+			// ends, reading no message: publish this wait, so an awaited agent parked
+			// in a message-only `wait` returns instead of waiting on this turn.
+			const releaseAwait =
+				registry && agentIds.length > 0 && !cfgEvalAutoBackgroundEnabled.get(options.session.settings)
+					? holdBlockedAwait(registry, options.session.getAgentId?.() ?? MAIN_AGENT_ID, {
+							agents: agentIds,
+							inline: true,
+							independent: timeoutMs !== undefined,
+						})
+					: undefined;
 			let outcome: "settled" | "timeout" | "aborted";
 			try {
 				outcome = await waitForSettlement(resolved, timeoutMs, options.signal);
 			} finally {
 				clearInterval(interval);
+				releaseAwait?.();
 			}
 			for (const handle of resolved) emitLatestProgress(handle);
 			if (outcome === "aborted") {

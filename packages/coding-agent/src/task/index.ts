@@ -37,7 +37,7 @@ import taskSpecializationAdvisoryTemplate from "../prompts/tools/task-specializa
 import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { type: "text" };
 import { TASK_EFFORTS, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { truncateForPrompt } from "../tools/approval";
-import { hasWaitTool } from "../tools/wait";
+import { hasWaitTool, holdBlockedAwait } from "../tools/wait";
 import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
@@ -52,7 +52,7 @@ import {
 } from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
-import { AgentRegistry } from "../registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { forkMessages, type ForkSnapshot } from "./fork";
@@ -61,7 +61,12 @@ import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/tools/task";
 import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
-import { resolveEffectiveSubagentPolicy, runStructuredSubagent, StructuredSubagentError } from "./structured-subagent";
+import {
+	reserveStructuredSubagentId,
+	resolveEffectiveSubagentPolicy,
+	runStructuredSubagent,
+	StructuredSubagentError,
+} from "./structured-subagent";
 import { SpawnRun, type SpawnPermit } from "./spawn-run";
 import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
 
@@ -1652,7 +1657,22 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const assignment = (params.task ?? "").trim();
 		const context = this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined;
 		let latestProgress: AgentProgress | undefined;
+		let releaseInlineAwait: (() => void) | undefined;
 		try {
+			// `name` is the spawn handle: allocate the id from it here when this
+			// path did not pre-reserve one, so an inline spawn is published by id
+			// before its child starts. Do not treat it as a HUD description.
+			const id = preAllocatedId ?? (await reserveStructuredSubagentId(this.session, { label: params.name }));
+			const registry = this.session.agentRegistry;
+			if (!detached && registry) {
+				// This turn is parked on the inline child until it settles, reading
+				// no message meanwhile: publish that, so the child's message-only
+				// `wait` returns instead of blocking on an owner that cannot answer.
+				releaseInlineAwait = holdBlockedAwait(registry, this.session.getAgentId?.() ?? MAIN_AGENT_ID, {
+					agents: [id],
+					inline: true,
+				});
+			}
 			const execution = await runStructuredSubagent({
 				session: this.session,
 				invocationKind: "task",
@@ -1672,9 +1692,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							),
 						}
 					: {}),
-				// `name` is the spawn handle: keep it for id allocation when this
-				// path did not pre-reserve one. Do not treat it as a HUD description.
-				identity: { id: preAllocatedId, label: params.name },
+				identity: { id, label: params.name },
 				index: spawnIndex,
 				parentToolCallId: toolCallId,
 				detached,
@@ -1734,6 +1752,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					...(latestProgress ? { progress: [latestProgress] } : {}),
 				},
 			};
+		} finally {
+			releaseInlineAwait?.();
 		}
 	}
 

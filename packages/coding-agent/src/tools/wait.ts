@@ -14,7 +14,7 @@ import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
 import { buildJobResult, nothingToWaitForResult, snapshotJobs, undeliveredJobs } from "../async/job-control";
 import { hasLiveOwnedService, listServices, waitForOwnedServiceCompletion } from "../launch/services";
 import { drainPendingInbox, messageResult } from "../irc/messaging";
-import type { AgentRegistry } from "../registry/agent-registry";
+import type { AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { CoordinationDetails } from "@oh-my-pi/pi-tui/tools/wait";
 import { throwIfAborted } from "./tool-errors";
@@ -24,23 +24,8 @@ import { cfgLaunchEnabled } from "./settings";
 const waitSchema = type({});
 const WAIT_MAX_MS = 30 * 60_000;
 const PROGRESS_INTERVAL_MS = 500;
-/**
- * Window ladder (ms) for a wait only a peer message can end. A running peer
- * owes no message — a parent blocked awaiting this very agent stays running —
- * so such a wait hands the turn back on a short window instead of the job-wait
- * cap. Consecutive waits climb the rungs so a tight wait loop backs off.
- */
-const MESSAGE_WAIT_LADDER_MS = [5_000, 10_000, 30_000, 60_000, 300_000] as const;
-/** A gap this long since the last message-only wait means the agent did real work: restart at the floor. */
-const MESSAGE_WAIT_LADDER_RESET_MS = 60_000;
 /** Running peers named in a no-message result before collapsing the rest into a count. */
 const MESSAGE_WAIT_PEER_PREVIEW = 5;
-
-interface MessageWindow {
-	level: number;
-	openedAt: number;
-	deadline: number;
-}
 
 interface WaitMessaging {
 	registry: AgentRegistry;
@@ -53,57 +38,160 @@ function takeQueuedMessage(messaging: WaitMessaging | undefined): IrcMessage | u
 }
 
 /**
- * Jobs some agent's `wait` is blocked on right now, refcounted per shared job
- * manager. Delivery watches cannot answer "is the owner parked on this
- * result?": a workpool watches every member turn while its owner keeps working.
+ * An await an agent's turn is blocked in, as a message-only `wait` sees it when
+ * deciding whether anyone is left to message it.
  */
-const blockedWaits = new WeakMap<AsyncJobManager, Map<string, number>>();
+export interface BlockedAwait {
+	/**
+	 * Agents whose results the await is blocked on. A `wait` race ends on the
+	 * first of them or on a message — with none listed, on a message alone.
+	 */
+	agents: readonly string[];
+	/**
+	 * An inline await (a blocking `task` spawn, a `sidekick` handoff, an eval
+	 * `wait()`) ends only once every listed agent settles, and its agent reads no
+	 * message meanwhile.
+	 */
+	inline?: boolean;
+	/** It can end with no agent acting: a race's bash job or service leg, an inline timeout. */
+	independent?: boolean;
+}
 
-/** Mark `jobIds` as blocked on until the returned release runs. */
-function holdBlockedWait(manager: AsyncJobManager, jobIds: string[]): () => void {
-	const held = blockedWaits.get(manager) ?? new Map<string, number>();
-	blockedWaits.set(manager, held);
-	for (const id of jobIds) held.set(id, (held.get(id) ?? 0) + 1);
+interface RegistryAwaits {
+	/** Awaits each agent's turn is blocked in; parallel tool calls can hold several. */
+	byAgent: Map<string, BlockedAwait[]>;
+	/** Checks of message-only waits, re-run on every hold and release. */
+	listeners: Set<() => void>;
+}
+
+/**
+ * Awaits agents' turns are blocked in right now, per registry. Delivery watches
+ * cannot answer "is this agent parked on that result?": a workpool watches every
+ * member turn while its owner keeps working.
+ */
+const blockedAwaits = new WeakMap<AgentRegistry, RegistryAwaits>();
+
+function registryAwaits(registry: AgentRegistry): RegistryAwaits {
+	let awaits = blockedAwaits.get(registry);
+	if (!awaits) {
+		awaits = { byAgent: new Map(), listeners: new Set() };
+		blockedAwaits.set(registry, awaits);
+	}
+	return awaits;
+}
+
+/**
+ * Mark `agentId`'s turn as blocked in `block` until the returned release runs.
+ * Both edges re-run every message-only `wait` check on the registry.
+ */
+export function holdBlockedAwait(registry: AgentRegistry, agentId: string, block: BlockedAwait): () => void {
+	const awaits = registryAwaits(registry);
+	const held = awaits.byAgent.get(agentId);
+	if (held) held.push(block);
+	else awaits.byAgent.set(agentId, [block]);
+	for (const listener of awaits.listeners) listener();
 	return () => {
-		for (const id of jobIds) {
-			const count = (held.get(id) ?? 0) - 1;
-			if (count > 0) held.set(id, count);
-			else held.delete(id);
-		}
+		const current = awaits.byAgent.get(agentId);
+		const index = current?.indexOf(block) ?? -1;
+		if (!current || index === -1) return;
+		current.splice(index, 1);
+		if (current.length === 0) awaits.byAgent.delete(agentId);
+		for (const listener of awaits.listeners) listener();
+	};
+}
+
+/** The caller's peers with a live turn in flight, in roster order. */
+function runningPeers(messaging: WaitMessaging): AgentRef[] {
+	return messaging.registry.listVisibleTo(messaging.senderId).filter(ref => messaging.registry.isRunning(ref));
+}
+
+/**
+ * Whether some running peer can act without waiting on the caller or on another
+ * peer. A peer blocked in an await acts only once the await ends, and it cannot
+ * end while it needs the caller or a running agent: with no running peer left
+ * free, that agent is blocked too, so when no peer can act nobody is left to
+ * send the caller a message (#13513). A peer blocked in nothing, or in an await
+ * that can end alone or on a settling (idle, starting, finishing) agent, still
+ * can.
+ */
+function anyPeerCanAct(messaging: WaitMessaging, running: readonly AgentRef[]): boolean {
+	const byAgent = blockedAwaits.get(messaging.registry)?.byAgent;
+	const runningIds = new Set(running.map(ref => ref.id));
+	// Neither the caller nor running: its result lands without anyone acting.
+	const settlesAlone = (id: string): boolean => id !== messaging.senderId && !runningIds.has(id);
+	return running.some(ref =>
+		(byAgent?.get(ref.id) ?? []).every(
+			block =>
+				block.independent === true ||
+				(block.inline ? block.agents.every(settlesAlone) : block.agents.some(settlesAlone)),
+		),
+	);
+}
+
+/**
+ * Settles once the caller should stop waiting for a message: running peers
+ * remain, but none can act. Of the waiters caught in such a deadlock, those a
+ * blocked agent awaits settle first — their `yield` or message is what frees
+ * the rest, so every other waiter keeps waiting for it; with no waiter awaited,
+ * all of them settle. Re-checked on every registry and blocked-await change; an
+ * empty roster is the bus liveness check's to report, and that wake re-evaluates.
+ */
+function watchDeadlock(messaging: WaitMessaging): { settled: Promise<void>; dispose: () => void } {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const check = (): void => {
+		const running = runningPeers(messaging);
+		if (running.length === 0 || anyPeerCanAct(messaging, running)) return;
+		const byAgent = blockedAwaits.get(messaging.registry)?.byAgent;
+		const awaited = new Set([...(byAgent?.values() ?? [])].flat().flatMap(block => block.agents));
+		// A message-only wait is a race on no agent and no independent leg.
+		const awaitedWaiter = running.some(
+			ref =>
+				awaited.has(ref.id) &&
+				byAgent?.get(ref.id)?.some(block => !block.inline && !block.independent && block.agents.length === 0),
+		);
+		if (awaited.has(messaging.senderId) || !awaitedWaiter) resolve();
+	};
+	const { listeners } = registryAwaits(messaging.registry);
+	listeners.add(check);
+	const unsubscribeRegistry = messaging.registry.onChange(check);
+	check();
+	return {
+		settled: promise,
+		dispose: () => {
+			listeners.delete(check);
+			unsubscribeRegistry();
+		},
 	};
 }
 
 /**
- * An elapsed message window: name the running peers that kept it open and,
- * when the caller's own result job is blocked on by its owner's `wait`, say so —
- * that owner is parked on this agent, the cycle a bare liveness check cannot see.
+ * Nobody left can message the caller: name the running peers and, when one is
+ * blocked on the caller's own result, say so and whether it can read a message.
  */
-function noMessageResult(
-	messaging: WaitMessaging | undefined,
-	manager: AsyncJobManager | undefined,
-	window: MessageWindow,
-): AgentToolResult<CoordinationDetails> {
-	const running = messaging
-		? messaging.registry
-				.listVisibleTo(messaging.senderId)
-				.filter(ref => messaging.registry.isRunning(ref))
-				.map(ref => ref.id)
-		: [];
-	const blocked = manager ? blockedWaits.get(manager) : undefined;
-	const awaitedBy =
-		messaging && manager && blocked
-			? manager.getRunningJobs().find(job => job.agentId === messaging.senderId && blocked.has(job.id))?.ownerId
-			: undefined;
+function noMessageResult(messaging: WaitMessaging, startedAt: number): AgentToolResult<CoordinationDetails> {
+	const running = runningPeers(messaging).map(ref => ref.id);
+	const byAgent = blockedAwaits.get(messaging.registry)?.byAgent;
+	let awaitedBy: string | undefined;
+	let askable = false;
+	for (const id of running) {
+		const block = byAgent?.get(id)?.find(held => held.agents.includes(messaging.senderId));
+		if (!block) continue;
+		awaitedBy = id;
+		// A `wait` race wakes on a message; an inline await does not.
+		askable = block.inline !== true;
+		break;
+	}
 	const text = prompt.render(waitNoMessageTemplate, {
-		elapsed: formatDuration(Date.now() - window.openedAt),
+		elapsed: formatDuration(Date.now() - startedAt),
 		peers: running.slice(0, MESSAGE_WAIT_PEER_PREVIEW),
 		more: Math.max(0, running.length - MESSAGE_WAIT_PEER_PREVIEW),
 		awaitedBy,
+		askable,
 	});
 	return {
 		content: [{ type: "text", text }],
 		details: { op: "wait", jobs: [] },
-		// An elapsed message window carries nothing once consumed.
+		// A no-message result carries nothing once consumed.
 		useless: true,
 	};
 }
@@ -125,9 +213,6 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 	readonly loadMode = "essential";
 	readonly intent = "optional";
 
-	/** Rung and end time of the last message-only wait, for {@link MESSAGE_WAIT_LADDER_MS}. */
-	#lastMessageWait: { level: number; endedAt: number } | undefined;
-
 	constructor(private readonly session: ToolSession) {}
 
 	async execute(
@@ -145,57 +230,37 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 		const pending = takeQueuedMessage(messaging);
 		if (pending && messaging) return messageResult(messaging.senderId, pending);
 		if (cfgLaunchEnabled.get(this.session.settings)) await listServices(this.session, signal);
-		const deadline = Date.now() + WAIT_MAX_MS;
-		// Opened by the first message-only block and kept across re-evaluations,
-		// so a peer stopping mid-window cannot restart it.
-		let messageWindow: MessageWindow | undefined;
-		try {
-			for (;;) {
-				const queued = takeQueuedMessage(messaging);
-				if (queued && messaging) return messageResult(messaging.senderId, queued);
-				const jobs = manager?.getRunningJobs(ownerFilter) ?? [];
-				// An accepted completion whose delivery has not reached the transcript
-				// yet (queued, parked on the yield queue, or skipped while an earlier
-				// wait watched it) is exactly what this wait is for: return it now
-				// instead of reporting nothing to wait for.
-				const undelivered = manager ? undeliveredJobs(manager, senderId) : [];
-				if (manager && undelivered.length > 0) {
-					return buildJobResult(this.session, manager, "wait", [...undelivered, ...jobs], []);
-				}
-				const serviceRunning = hasLiveOwnedService(this.session);
-				const runningPeer =
-					messaging?.registry.listVisibleTo(messaging.senderId).some(ref => messaging.registry.isRunning(ref)) ??
-					false;
-				if (jobs.length === 0 && !runningPeer && !serviceRunning) {
-					return nothingToWaitForResult(this.session);
-				}
-				const window =
-					jobs.length === 0 && !serviceRunning ? (messageWindow ??= this.#openMessageWindow()) : undefined;
-				const result = await this.#blockUntilWake({
-					jobs,
-					manager,
-					messaging,
-					serviceRunning,
-					deadline: window ? Math.min(window.deadline, deadline) : deadline,
-					messageWindow: window,
-					signal,
-					onUpdate,
-				});
-				if (result) return result;
+		const startedAt = Date.now();
+		const deadline = startedAt + WAIT_MAX_MS;
+		for (;;) {
+			const queued = takeQueuedMessage(messaging);
+			if (queued && messaging) return messageResult(messaging.senderId, queued);
+			const jobs = manager?.getRunningJobs(ownerFilter) ?? [];
+			// An accepted completion whose delivery has not reached the transcript
+			// yet (queued, parked on the yield queue, or skipped while an earlier
+			// wait watched it) is exactly what this wait is for: return it now
+			// instead of reporting nothing to wait for.
+			const undelivered = manager ? undeliveredJobs(manager, senderId) : [];
+			if (manager && undelivered.length > 0) {
+				return buildJobResult(this.session, manager, "wait", [...undelivered, ...jobs], []);
 			}
-		} finally {
-			if (messageWindow) this.#lastMessageWait = { level: messageWindow.level, endedAt: Date.now() };
+			const serviceRunning = hasLiveOwnedService(this.session);
+			const runningPeer = messaging ? runningPeers(messaging).length > 0 : false;
+			if (jobs.length === 0 && !runningPeer && !serviceRunning) {
+				return nothingToWaitForResult(this.session);
+			}
+			const result = await this.#blockUntilWake({
+				jobs,
+				manager,
+				messaging,
+				serviceRunning,
+				startedAt,
+				deadline,
+				signal,
+				onUpdate,
+			});
+			if (result) return result;
 		}
-	}
-
-	#openMessageWindow(): MessageWindow {
-		const now = Date.now();
-		const last = this.#lastMessageWait;
-		const level =
-			!last || now - last.endedAt >= MESSAGE_WAIT_LADDER_RESET_MS
-				? 0
-				: Math.min(last.level + 1, MESSAGE_WAIT_LADDER_MS.length - 1);
-		return { level, openedAt: now, deadline: now + MESSAGE_WAIT_LADDER_MS[level] };
 	}
 
 	/**
@@ -208,13 +273,15 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 		manager: AsyncJobManager | undefined;
 		messaging: WaitMessaging | undefined;
 		serviceRunning: boolean;
+		/** When the wait began, for a no-message result's elapsed time. */
+		startedAt: number;
 		deadline: number;
-		/** Set exactly when only a peer message can end this block. */
-		messageWindow: MessageWindow | undefined;
 		signal: AbortSignal | undefined;
 		onUpdate: AgentToolUpdateCallback<CoordinationDetails> | undefined;
 	}): Promise<AgentToolResult<CoordinationDetails> | undefined> {
-		const { jobs, manager, messaging, serviceRunning, messageWindow, signal, onUpdate } = args;
+		const { jobs, manager, messaging, serviceRunning, signal, onUpdate } = args;
+		// Only a peer message can end this block.
+		const messageOnly = jobs.length === 0 && !serviceRunning;
 		const watchedIds = jobs.map(job => job.id);
 		manager?.watchJobs(watchedIds);
 		const serviceAbort = new AbortController();
@@ -229,7 +296,7 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 							{},
 							0,
 							busAbort.signal,
-							jobs.length === 0 && !serviceRunning ? { liveness: messaging } : undefined,
+							messageOnly ? { liveness: messaging } : undefined,
 						)
 						.then(
 							message => ({ message, error: null }),
@@ -255,19 +322,29 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 			});
 		const progressTimer = onUpdate && jobs.length > 0 ? setInterval(emitProgress, PROGRESS_INTERVAL_MS) : undefined;
 		if (jobs.length > 0) emitProgress();
-		const releaseBlockedWait = manager ? holdBlockedWait(manager, watchedIds) : undefined;
-		let wake: "job" | "message" | "service" | "timeout" | "abort";
+		// Published before the peer check below: agents that start waiting on each
+		// other in turn must each find the other already blocked.
+		const releaseAwait = messaging
+			? holdBlockedAwait(messaging.registry, messaging.senderId, {
+					agents: jobs.flatMap(job => (job.agentId ? [job.agentId] : [])),
+					independent: serviceRunning || jobs.some(job => !job.agentId),
+				})
+			: undefined;
+		const deadlock = messageOnly && messaging ? watchDeadlock(messaging) : undefined;
+		let wake: "job" | "message" | "service" | "deadlock" | "timeout" | "abort";
 		try {
 			wake = await Promise.race([
 				...jobs.map(job => job.promise.then(() => "job" as const)),
 				...(busLeg ? [busLeg.then(() => "message" as const)] : []),
 				...(serviceLeg ? [serviceLeg.then(() => "service" as const)] : []),
+				...(deadlock ? [deadlock.settled.then(() => "deadlock" as const)] : []),
 				timeout.then(() => "timeout" as const),
 				abort.promise.then(() => "abort" as const),
 			]);
 		} finally {
 			clearTimeout(timer);
-			releaseBlockedWait?.();
+			deadlock?.dispose();
+			releaseAwait?.();
 			clearInterval(progressTimer);
 			busAbort?.abort(busCancelled);
 			serviceAbort.abort();
@@ -298,7 +375,7 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 				throwIfAborted(signal);
 			}
 			if (manager && jobs.length > 0) return buildJobResult(this.session, manager, "wait", jobs, []);
-			if (wake === "timeout" && messageWindow) return noMessageResult(messaging, manager, messageWindow);
+			if (wake === "deadlock" && messaging) return noMessageResult(messaging, args.startedAt);
 			return {
 				content: [
 					{

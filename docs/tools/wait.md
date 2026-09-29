@@ -15,6 +15,7 @@
 - A pending steering/abort interrupt cuts the wait short. The agent should handle the incoming notice before calling `wait` again.
 - A single 30-minute safety cap returns a still-running snapshot; there is no polling ladder or per-call timeout.
 - If no owned job, live peer, or owned service can wake it, returns immediately with “Nothing to wait for” and a snapshot.
+- With no owned job or service, only a peer message can end the wait. It keeps blocking while any running peer could still send one. Once every running peer is itself blocked — in a message-only `wait`, or awaiting the caller or another blocked agent through `wait`, an inline `task` spawn, a blocking `sidekick` handoff, or an eval `wait()` with auto-background off — it returns at once, naming those peers and the one blocked on the caller's own result. When a blocked agent awaits one of the stuck waiters, only that waiter returns: its `yield` or message is what frees the rest.
 - Results and peer messages also auto-deliver without calling `wait`. Continue useful work instead of polling.
 
 ## Related surfaces
