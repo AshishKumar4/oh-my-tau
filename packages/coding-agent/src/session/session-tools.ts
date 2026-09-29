@@ -20,8 +20,8 @@ import { SIDEKICK_TOOL_NAME } from "../fusion/config";
 import { servedHarnessPrompt, type VendorTool } from "../harness/capture";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { cfgHarnessMode } from "../harness/settings";
-import { harnessFacade, presentedWireName, presentTool } from "../harness/facade";
-import { harnessFacadeSpecs } from "../harness/facades";
+import { type HarnessFacadeHost, harnessFacade, presentedWireName, presentTool } from "../harness/facade";
+import { type HarnessSurface, harnessSurface } from "../harness/facades";
 import { harnessToolBinding } from "../harness/manifest";
 import { type LocalProtocolOptions } from "../internal-urls";
 import { stripXdUrlPrefix, XD_URL_PREFIX } from "@oh-my-pi/pi-tui/tools/xd-url";
@@ -102,14 +102,6 @@ export interface SessionToolsHost {
 	/** The tool context this session's tools run with; facades that post-process a call read it. */
 	toolSession?(): ToolSession | undefined;
 }
-
-/**
- * omp tools a harness profile never presents: Claude Code has no wait tool
- * (an agent ends its turn and is woken by the next result or message).
- */
-const PROFILE_WITHHELD_TOOLS: Partial<Readonly<Record<HarnessProfile, readonly string[]>>> = {
-	"claude-code": ["wait"],
-};
 
 /** Registry delta applied by the SDK's settings-gated tool reconcile. */
 export interface SettingsGatedToolDelta {
@@ -982,6 +974,35 @@ export class SessionTools {
 		return servedHarnessPrompt(this.#host.model(), this.#harnessProfile())?.tools[wireName];
 	}
 
+	/** What a profile's facades read when deciding whether they mount. */
+	#facadeHost(): HarnessFacadeHost {
+		return {
+			settings: this.#host.settings,
+			session: this.#host.toolSession?.(),
+			vendorTool: (wireName: string) => this.#vendorTool(wireName),
+		};
+	}
+
+	/** `profile`'s surface over `enabledToolNames`; see {@link harnessSurface}. */
+	#surface(profile: HarnessProfile | undefined, enabledToolNames: readonly string[]): HarnessSurface {
+		return harnessSurface(profile, enabledToolNames, this.#facadeHost(), name => this.#toolRegistry.has(name));
+	}
+
+	/**
+	 * Tool names for omp's own prompt templates (`toolRefs`): the tools this
+	 * session presents right now, as {@link harnessSurface} derives them.
+	 */
+	toolRefs(): Readonly<Record<string, string>> {
+		return this.#surface(this.#harnessProfile(), this.getEnabledToolNames()).toolRefs;
+	}
+
+	/** Enabled tool names a prompt may treat as available: what the profile withholds with no stand-in dropped. */
+	getPromptToolNames(): string[] {
+		const enabled = this.getEnabledToolNames();
+		const { unavailable } = this.#surface(this.#harnessProfile(), enabled);
+		return unavailable.size === 0 ? enabled : enabled.filter(name => !unavailable.has(name));
+	}
+
 	/** Appends `profile`'s facades to an already-presented tool list, replacing the targets they stand in for. */
 	#presentTools(
 		tools: AgentTool[],
@@ -990,26 +1011,20 @@ export class SessionTools {
 	): AgentTool[] {
 		this.#mountedFacades.clear();
 		if (profile === undefined) return tools;
-		const replaced = new Set<string>(PROFILE_WITHHELD_TOOLS[profile]);
+		const host = this.#facadeHost();
+		const surface = harnessSurface(profile, enabledToolNames, host, name => this.#toolRegistry.has(name));
 		const facades: AgentTool[] = [];
-		const host = {
-			settings: this.#host.settings,
-			session: this.#host.toolSession?.(),
-			vendorTool: (wireName: string) => this.#vendorTool(wireName),
-		};
-		for (const spec of harnessFacadeSpecs(profile)) {
-			if (!enabledToolNames.includes(spec.target)) continue;
+		for (const spec of surface.facades) {
 			const target = this.#toolRegistry.get(spec.target);
-			if (!target || spec.mounts?.(host) === false) continue;
+			if (!target) continue;
 			const facade = harnessFacade(this.#wrapToolForAcpPermission(target), spec, host, () =>
 				this.#vendorTool(spec.wireName),
 			);
 			this.#mountedFacades.set(facade.name, facade);
 			facades.push(facade);
-			if (spec.replacesTarget) replaced.add(spec.target);
 		}
-		if (facades.length === 0 && replaced.size === 0) return tools;
-		return [...tools.filter(tool => !replaced.has(tool.name)), ...facades];
+		if (facades.length === 0 && surface.hidden.size === 0) return tools;
+		return [...tools.filter(tool => !surface.hidden.has(tool.name)), ...facades];
 	}
 
 	/**
@@ -1288,7 +1303,12 @@ export class SessionTools {
 		const previousToolPredicateNames = this.#toolPredicateNames;
 		this.#enabledToolNames = new Set([...validToolNames, ...mountNames]);
 		this.#setMountedNames(mountNames);
-		this.#toolPredicateNames = codeMode.active ? [...this.#enabledToolNames] : appliedNames;
+		// A tool the profile withholds with no facade standing in is not the
+		// model's to call: prompt gates and tool predicates must not see it.
+		const { unavailable } = this.#surface(profile, [...this.#enabledToolNames]);
+		const reachable = (names: readonly string[]): string[] =>
+			unavailable.size === 0 ? [...names] : names.filter(name => !unavailable.has(name));
+		this.#toolPredicateNames = reachable(codeMode.active ? [...this.#enabledToolNames] : appliedNames);
 		this.#setActiveToolNames?.(this.#toolPredicateNames);
 		// The eval tool advertises whatever stays direct, including a plan-mode
 		// transport `write`, so the applied partition lands before the rebuild
@@ -1311,7 +1331,7 @@ export class SessionTools {
 				// the Code Mode eval bridge. The rendered tool inventory is restricted
 				// to the direct names so the prompt never advertises bridge-only tools
 				// as provider-callable functions.
-				const promptToolNames = codeMode.active ? [...this.#enabledToolNames] : appliedNames;
+				const promptToolNames = reachable(codeMode.active ? [...this.#enabledToolNames] : appliedNames);
 				const promptTools = codeMode.active
 					? promptToolNames.flatMap(name => {
 							const tool = presentedRegistry.get(name);
@@ -2098,9 +2118,14 @@ export class SessionTools {
 		if (this.#host.isDisposed() || !this.#rebuildSystemPrompt || isCurrent?.() === false) return;
 		// Local alias: closures below cannot observe the field narrowing.
 		const rebuildSystemPrompt = this.#rebuildSystemPrompt;
-		const activeToolNames = this.getActiveToolNames();
+		// As in the apply path: a tool the profile withholds with no facade
+		// standing in reaches neither prompt gates nor tool predicates.
+		const { unavailable } = this.#surface(this.#harnessProfile(), this.getEnabledToolNames());
+		const reachable = (names: readonly string[]): string[] =>
+			unavailable.size === 0 ? [...names] : names.filter(name => !unavailable.has(name));
+		const activeToolNames = reachable(this.getActiveToolNames());
 		const promptToolNames =
-			this.#codeModeDirectWireSignature === undefined ? activeToolNames : this.getEnabledToolNames();
+			this.#codeModeDirectWireSignature === undefined ? activeToolNames : reachable(this.getEnabledToolNames());
 		// Under Code Mode the active names are exactly the direct keep-set.
 		const directToolNames = this.#codeModeDirectWireSignature === undefined ? undefined : activeToolNames;
 		this.#setActiveToolNames?.(this.#toolPredicateNames ?? activeToolNames);

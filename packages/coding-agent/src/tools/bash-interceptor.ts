@@ -5,8 +5,10 @@
  * this interceptor provides helpful error messages directing them to use
  * the specialized tools instead.
  */
+import { prompt } from "@oh-my-pi/pi-utils";
 import { extractFlatShellCommandSegments } from "./shell-tokenize";
 import { type BashInterceptorRule, DEFAULT_BASH_INTERCEPTOR_RULES } from "../exec/settings";
+import { harnessToolRefs } from "../harness/manifest";
 
 export interface InterceptionResult {
 	/** If true, the bash command should be blocked */
@@ -15,6 +17,37 @@ export interface InterceptionResult {
 	message?: string;
 	/** Suggested tool to use instead */
 	suggestedTool?: string;
+}
+
+/** What a rule message renders against; see {@link BashInterceptorRule}. */
+export interface InterceptorMessageData {
+	/** Names the session presents its tools under (`toolRefs`). */
+	toolRefs: Readonly<Record<string, string>>;
+	/** Bash takes omp's own schema: its native wording (service `name`, `proc://`) applies. */
+	nativeBash: boolean;
+	/** A harness Bash schema whose `run_in_background` is live: the managed alternative to name. */
+	backgroundField: boolean;
+}
+
+/** omp's own Bash under omp's own tool names: the wording every rule message had before templating. */
+const NATIVE_MESSAGE_DATA: InterceptorMessageData = {
+	toolRefs: harnessToolRefs(undefined),
+	nativeBash: true,
+	backgroundField: false,
+};
+
+/**
+ * A rule message rendered for the presented surface. A message without template
+ * syntax (every custom rule written before templating) passes through
+ * untouched, as does one that fails to render.
+ */
+function renderRuleMessage(message: string, data: InterceptorMessageData): string {
+	if (!message.includes("{{")) return message;
+	try {
+		return prompt.render(message, data);
+	} catch {
+		return message;
+	}
 }
 
 /**
@@ -121,6 +154,7 @@ export function checkBashInterception(
 	availableTools: string[],
 	rules: BashInterceptorRule[] = DEFAULT_BASH_INTERCEPTOR_RULES,
 	originalCommand = command,
+	messageData: InterceptorMessageData = NATIVE_MESSAGE_DATA,
 ): InterceptionResult {
 	const compiled = compileRules(rules);
 	const candidates = interceptionCandidates(command);
@@ -137,7 +171,7 @@ export function checkBashInterception(
 			if (regex.test(candidate)) {
 				return {
 					block: true,
-					message: `Blocked: ${rule.message}\n\nOriginal command: ${originalCommand}`,
+					message: `Blocked: ${renderRuleMessage(rule.message, messageData)}\n\nOriginal command: ${originalCommand}`,
 					suggestedTool: rule.tool,
 				};
 			}

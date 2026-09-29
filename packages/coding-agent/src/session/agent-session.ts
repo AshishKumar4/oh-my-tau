@@ -412,7 +412,6 @@ import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
-import { harnessToolRefs } from "../harness/manifest";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { SessionTools, type SessionToolsHost } from "./session-tools";
 import { resolveOpenAIWebsocketPreference } from "./settings-stream-fn";
@@ -1505,7 +1504,7 @@ export class AgentSession implements SettingsScope {
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			wakeForIrc: records => this.#wakeForIrc(records),
-			toolRefs: () => harnessToolRefs(effectiveHarnessProfile(this.settings, this.model)),
+			toolRefs: () => this.getToolRefs(),
 		};
 		this.#irc = new IrcBridge(ircHost);
 		const prewalkHost: PrewalkCoordinatorHost = {
@@ -5925,6 +5924,15 @@ export class AgentSession implements SettingsScope {
 		return this.#tools.getEnabledToolNames();
 	}
 
+	/**
+	 * Tool names for omp's own prompt templates (`toolRefs`): the tools this
+	 * session presents, keyed by native name. Native sessions get the literal
+	 * names; under Claude Code only what the wire carries (see `harnessToolRefs`).
+	 */
+	getToolRefs(): Readonly<Record<string, string>> {
+		return this.#tools.toolRefs();
+	}
+
 	/** Names of dynamic tools mounted under `xd://`. */
 	getMountedXdevToolNames(): string[] {
 		return this.#tools.getMountedXdevToolNames();
@@ -6884,7 +6892,10 @@ export class AgentSession implements SettingsScope {
 		for (const keyword of MAGIC_KEYWORDS) {
 			if (!this.#magicKeywordEnabled(keyword.id) || !containsMagicKeyword(text, keyword.word)) continue;
 			context ??= {
-				tools: this.getEnabledToolNames(),
+				// Only what the model can reach: a tool the harness profile
+				// withholds is no notice's to name.
+				tools: this.#tools.getPromptToolNames(),
+				toolRefs: this.getToolRefs(),
 				taskBatch: cfgTaskBatch.get(this.settings),
 				scoutAvailable: this.#isScoutAvailable(),
 				evalTools: cfgEvalToolsEnabled.get(this.settings),
@@ -9607,7 +9618,7 @@ export class AgentSession implements SettingsScope {
 						customType: "skillful-notice",
 						content: prompt.render(skillfulNoticePrompt, {
 							skills: renderedSkills,
-							toolRefs: harnessToolRefs(effectiveHarnessProfile(this.settings, this.model)),
+							toolRefs: this.getToolRefs(),
 						}),
 						display: false,
 					},

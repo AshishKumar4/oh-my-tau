@@ -29,7 +29,9 @@ import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { prewarmOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
 import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { servedHarnessPrompt } from "./harness/capture";
 import { effectiveHarnessProfile } from "./harness/effective-profile";
+import { type HarnessSurface, harnessSurface } from "./harness/facades";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
@@ -603,7 +605,10 @@ export interface CreateAgentSessionOptions {
 	systemPrompt?:
 		| string
 		| string[]
-		| ((defaultPrompt: string[], context?: { model: Model | undefined }) => string | string[]);
+		| ((
+				defaultPrompt: string[],
+				context?: { model: Model | undefined; toolRefs?: Readonly<Record<string, string>> },
+		  ) => string | string[]);
 	/** Raw Handlebars template replacing the bundled default system prompt rendering. */
 	systemPromptTemplate?: string;
 	/** Already-loaded custom prompt text rendered through the bundled custom system prompt template. */
@@ -2417,6 +2422,21 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// SessionTools owns the advertised snapshot; before it exists the base
 		// prompt is built from, and therefore advertises, the live set.
 		toolSession.getAdvertisedEvalPreludes = () => session?.getAdvertisedEvalPreludes() ?? getEvalPreludes();
+		// What the effective harness profile presents over a set of enabled
+		// tools: the computation SessionTools presents with, so the initial
+		// prompt, the tool predicates and `toolRefs` see the surface the wire
+		// carries before the session exists.
+		const harnessPromptSurface = (names: readonly string[]): HarnessSurface => {
+			const promptModel = toolSession.getActiveModel?.();
+			const profile = promptModel ? effectiveHarnessProfile(settings, promptModel) : undefined;
+			const host = {
+				settings,
+				session: toolSession,
+				vendorTool: (wireName: string) => servedHarnessPrompt(promptModel, profile ?? null)?.tools[wireName],
+			};
+			return harnessSurface(profile, names, host, name => toolRegistry.has(name));
+		};
+		toolSession.getToolRefs = () => session?.getToolRefs() ?? harnessPromptSurface([...activeToolNames]).toolRefs;
 
 		// Wire process-wide internal URL singletons owned by their real classes.
 		// Top-level sessions install the active snapshots; subagents inherit them.
@@ -3355,7 +3375,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const toolContextStore = new ToolContextStore(getSessionContext);
 		toolSession.getToolContext = () => toolContextStore.getContext();
 		const setSessionActiveToolNames = (names: Iterable<string>): void => {
-			const snapshot = Array.from(names);
+			// A tool the harness profile withholds with no facade standing in is
+			// not the model's to call; predicates and tool context never see it.
+			const requested = Array.from(names);
+			const { unavailable } = harnessPromptSurface(requested);
+			const snapshot = unavailable.size === 0 ? requested : requested.filter(name => !unavailable.has(name));
 			setActiveToolNames(snapshot);
 			toolContextStore.setToolNames(snapshot);
 		};
@@ -3749,10 +3773,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			compress: createSkillDescriptionCompressor(modelRegistry, settings),
 		});
 		const rebuildSystemPrompt = async (
-			toolNames: string[],
+			requestedToolNames: string[],
 			tools: Map<string, AgentTool>,
 			rebuildOptions?: { directToolNames?: readonly string[] },
 		): Promise<BuildSystemPromptResult> => {
+			// The prompt describes the surface the wire carries: a tool the harness
+			// profile withholds with no facade standing in is not listed or gated
+			// on, and `toolRefs` name what did mount.
+			const surface = harnessPromptSurface(requestedToolNames);
+			const toolNames =
+				surface.unavailable.size === 0
+					? requestedToolNames
+					: requestedToolNames.filter(name => !surface.unavailable.has(name));
 			const promptCwd = sessionManager.getCwd();
 			const activeRepoContext = hasSession
 				? await logger.time("resolveActiveRepoContext", resolveRepoContext, promptCwd)
@@ -3958,13 +3990,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(settings),
 				activeRepoContext,
 				...(promptModel && { harnessProfile: effectiveHarnessProfile(settings, promptModel) }),
+				harnessToolRefs: surface.toolRefs,
 			});
 			// `systemPrompt` may now also be a literal string or template, which the
 			// builder already resolved — only a function needs applying here.
 			if (typeof options.systemPrompt !== "function") {
 				return defaultPrompt;
 			}
-			const customPrompt = options.systemPrompt(defaultPrompt.systemPrompt, { model: promptModel });
+			const customPrompt = options.systemPrompt(defaultPrompt.systemPrompt, {
+				model: promptModel,
+				toolRefs: surface.toolRefs,
+			});
 			return {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};

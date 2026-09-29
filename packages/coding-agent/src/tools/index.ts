@@ -382,6 +382,12 @@ export interface ToolSession {
 	isToolActive?: (name: string) => boolean;
 	/** Update the active built-in tool predicate when a session changes tools mid-run. */
 	setActiveToolNames?: (names: Iterable<string>) => void;
+	/**
+	 * Tool names for omp's own prompt templates (`toolRefs`): the tools the
+	 * session presents, keyed by native name. Literal names natively; under a
+	 * harness profile only what the wire carries (see `harnessSurface`).
+	 */
+	getToolRefs?: () => Readonly<Record<string, string>>;
 	/** Canonical map containing every registered tool exactly once. */
 	toolRegistry?: Map<string, Tool>;
 	/** `xd://` presentation state backed by {@link toolRegistry}. */

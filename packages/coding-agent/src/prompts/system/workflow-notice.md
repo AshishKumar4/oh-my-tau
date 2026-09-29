@@ -17,7 +17,7 @@ State persists across `eval` calls. Every call provides:
 
 - `workpool(agent=None, *, name=None, context=None{{#if evalTools}}, tools=None{{/if}})`: pool of keep-alive workers bounded by live `task.maxConcurrency`. `.push(*items)` returns item ids; each item goes to the least context-loaded idle worker, a new worker while capacity remains, or a busy worker's round-robin queue. `eval.workpool.freshAgents=true` instead spawns a new agent per item. `.status()` reports counts/workers; `.peek()` returns a non-consuming batch snapshot; `.close()` drops queued work.
   - The pool name is its background job id and label. Push all items while it is active; its first full drain settles and closes that pool job. New phase/wave after drain → create a new named pool.
-  - Results auto-deliver. Completely blocked? Leave `eval` and call `wait`; NEVER poll or block the kernel with `pool.wait()`.
+  - Results auto-deliver. Completely blocked? Leave `eval` and {{#if toolRefs.wait}}call `{{toolRefs.wait}}`{{else}}end your turn: results arrive as notifications{{/if}}; NEVER poll or block the kernel with `pool.wait()`.
 - `agent(prompt, *, agent=None, label=None, schema=None, isolated=None, apply=None, merge=None{{#if evalTools}}, tools=None{{/if}})`: immediate `AgentHandle`; use for a small fixed dependency graph or when the parent needs validated `schema` data. `.wait()` returns text/data; `.handle` is `agent://<id>`. Unwaited results auto-deliver.
 - `completion(prompt, *, model="default", system=None, schema=None)`: immediate `CompletionHandle` for a tool-free one-shot call. Tiers: `"smol"`, `"default"`, `"slow"`.
 - `await judge(state, questions)`: typed `choice`/`bool`/`score` questions over one state → `{id: answer}` with probabilities. Cheaper than `completion()` for classification.
@@ -33,7 +33,7 @@ State persists across `eval` calls. Every call provides:
 2. Create ONE explicitly named pool per phase.
 3. Push every known item in one cell; later discoveries MAY be pushed while the pool job is still running.
 4. Continue useful local work. Results auto-deliver.
-5. Completely blocked? Leave `eval` and call `wait`; never poll or call `pool.wait()`.
+5. Completely blocked? Leave `eval` and {{#if toolRefs.wait}}call `{{toolRefs.wait}}`{{else}}end your turn: results arrive as notifications{{/if}}; never poll or call `pool.wait()`.
 6. Read every batch result; YOU verify and integrate.
 
 **Python:**

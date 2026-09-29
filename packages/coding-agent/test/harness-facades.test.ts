@@ -20,7 +20,7 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { VendorTool } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import { harnessFacade, presentTool } from "@oh-my-pi/pi-coding-agent/harness/facade";
-import { harnessFacadeSpecs } from "@oh-my-pi/pi-coding-agent/harness/facades";
+import { harnessFacadeSpecs, harnessSurface } from "@oh-my-pi/pi-coding-agent/harness/facades";
 import * as evalIndex from "@oh-my-pi/pi-coding-agent/eval";
 import * as completionBridge from "@oh-my-pi/pi-coding-agent/eval/completion-bridge";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
@@ -492,10 +492,14 @@ describe("claude-code ListAgents facade", () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: PEER, displayName: PEER, kind: "sub", session: null, status: "running" });
 		registry.register({ id: PARKED, displayName: PARKED, kind: "sub", session: null, status: "parked" });
+		const settings = Settings.isolated({ "launch.enabled": false, "harness.mode": "claude-code" });
+		// The session names its tools as its presented surface does (see harnessSurface).
+		const surface = harnessSurface("claude-code", ["read", "write"], { settings });
 		const session = {
 			...toolSession(),
-			settings: Settings.isolated({ "launch.enabled": false, "harness.mode": "claude-code" }),
+			settings,
 			getActiveModel: () => CLAUDE_CODE_MODEL,
+			getToolRefs: () => surface.toolRefs,
 		} as unknown as ToolSession;
 		const read = new ReadTool(session) as unknown as AgentTool;
 		const facade = facadeFor("claude-code", "ListAgents", read);

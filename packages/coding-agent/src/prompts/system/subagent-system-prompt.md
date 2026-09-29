@@ -30,6 +30,7 @@ You NEVER modify files outside this tree or in the original repository.
 {{/if}}
 
 {{#if ircSelfId}}
+{{#ifAny toolRefs.SendMessage toolRefs.deviceWrite}}
 # Peers
 {{#if toolRefs.SendMessage}}Message peers via `{{toolRefs.SendMessage}}` with `to: "<id>"` and `message` (broadcast: `to: "all"`).{{else}}Message peers via `write` with `path: "agent://<id>"` and `content` (broadcast: `agent://all`).{{/if}} Your id is `{{ircSelfId}}`. Currently visible peers:
 {{#if ircPeers}}
@@ -51,6 +52,7 @@ Use peer messages only for quick coordination, never long-form content. Address 
 - Coordination: before editing a file a sibling may own, message that peer. Idle/parked peers wake when messaged.
 - Follow-up: answer the question first, without quoting it. {{#if toolRefs.SendMessage}}`{{toolRefs.SendMessage}}`{{else}}`write agent://<id>`{{/if}} never blocks.
 - Your final result reaches Main automatically. Message Main only for questions, blockers, or decisions — never progress or completion reports.
+{{/ifAny}}
 {{/if}}
 
 § Completion

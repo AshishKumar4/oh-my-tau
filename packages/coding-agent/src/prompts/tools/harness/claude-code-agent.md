@@ -23,10 +23,14 @@ If you are a fork, execute directly — don't re-delegate. The call returns once
 
 - The agent's final report is not shown to the user — relay what matters.
 {{#if ircEnabled}}
-- Use SendMessage with the agent's ID to continue a previously spawned agent with its context intact; a new Agent call starts fresh (except subagent_type: "fork", which inherits your context).
+{{#if toolRefs.SendMessage}}
+- Use {{toolRefs.SendMessage}} with the agent's ID to continue a previously spawned agent with its context intact; a new Agent call starts fresh (except subagent_type: "fork", which inherits your context).
+{{/if}}
 {{/if}}
 - Each agent type's model, reasoning effort, and tools come from its definition.
-- Read `history://<agentId>` for an agent's transcript and `agent://<agentId>` for its final output.
+{{#if toolRefs.read}}
+- {{toolRefs.read}} `history://<agentId>` for an agent's transcript and `agent://<agentId>` for its final output.
+{{/if}}
 {{#if isolationEnabled}}
 - `isolation: "worktree"` runs the agent on its own git worktree; {{#if applyIsolatedChanges}}its successful changes are applied back to your checkout{{else}}its changes stay in that worktree and are not applied{{/if}}.
 {{/if}}

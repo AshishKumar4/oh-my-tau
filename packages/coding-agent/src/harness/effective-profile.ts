@@ -27,10 +27,13 @@ export function effectiveHarnessProfile(settings: ScopeLike, model: Model | unde
 	return mode;
 }
 
-/** {@link harnessToolRefs} for the profile a tool session presents under right now. */
+/**
+ * `toolRefs` for a tool session: the names of the tools it presents right now
+ * (see `harnessSurface`). A bare session with no presentation owner gets the
+ * literal omp names.
+ */
 export function sessionToolRefs(session: {
-	settings: ScopeLike;
-	getActiveModel?: () => Model | undefined;
+	getToolRefs?: () => Readonly<Record<string, string>>;
 }): Readonly<Record<string, string>> {
-	return harnessToolRefs(effectiveHarnessProfile(session.settings, session.getActiveModel?.()));
+	return session.getToolRefs?.() ?? harnessToolRefs(undefined);
 }

@@ -5,8 +5,9 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { nothingToWaitForResult } from "@oh-my-pi/pi-coding-agent/async/job-control";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { VendorTool } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import { sessionToolRefs } from "@oh-my-pi/pi-coding-agent/harness/effective-profile";
-import { harnessFacadeSpecs } from "@oh-my-pi/pi-coding-agent/harness/facades";
+import { harnessSurface } from "@oh-my-pi/pi-coding-agent/harness/facades";
 import { harnessToolRefs } from "@oh-my-pi/pi-coding-agent/harness/manifest";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -21,13 +22,51 @@ import skillfulNoticeTemplate from "../src/prompts/system/skillful-notice.md" wi
 import subagentAsyncPendingTemplate from "../src/prompts/system/subagent-async-pending.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../src/prompts/system/subagent-system-prompt.md" with { type: "text" };
 import subagentYieldReminderTemplate from "../src/prompts/system/subagent-yield-reminder.md" with { type: "text" };
+import claudeCodeAgentTemplate from "../src/prompts/tools/harness/claude-code-agent.md" with { type: "text" };
 import taskAsyncContractTemplate from "../src/prompts/tools/task-async-contract.md" with { type: "text" };
+import taskCoordinationAdvisoryTemplate from "../src/prompts/tools/task-coordination-advisory.md" with { type: "text" };
 import taskFollowUpTemplate from "../src/prompts/tools/task-follow-up.md" with { type: "text" };
 import { withHarnessCacheDir } from "./helpers/harness";
 
 const NATIVE = harnessToolRefs(undefined);
-const CLAUDE_CODE = harnessToolRefs("claude-code");
 const CLAUDE_CODE_MODEL = getBundledModel<"anthropic-messages">("anthropic", "claude-opus-5");
+
+/** Every omp tool a root Claude Code session enables by default that the facades care about. */
+const ROOT_TOOLS = ["read", "write", "edit", "bash", "task", "wait", "eval", "todo"];
+const TASK_OUTPUT: VendorTool = { description: "Retrieves output", inputSchema: {} };
+
+/**
+ * The claude-code surface over `tools`: `taskOutput` models a pre-2.1.284 capture
+ * that still declares TaskOutput; 2.1.284 captures do not.
+ */
+function claudeCodeSurface(
+	tools: readonly string[],
+	options: { taskOutput?: boolean; settings?: Settings; taskDepth?: number } = {},
+) {
+	return harnessSurface("claude-code", tools, {
+		settings: options.settings ?? Settings.isolated(),
+		...(options.taskDepth !== undefined && { session: { taskDepth: options.taskDepth } as unknown as ToolSession }),
+		vendorTool: name => (options.taskOutput && name === "TaskOutput" ? TASK_OUTPUT : undefined),
+	});
+}
+
+/** A root session serving a 2.1.284 capture: no TaskOutput, so nothing waits on the wire. */
+const CLAUDE_CODE = claudeCodeSurface(ROOT_TOOLS).toolRefs;
+/** A read-only subagent (scout, reviewer): no `write`, so no messaging or stop facade. */
+const READ_ONLY = claudeCodeSurface(["read", "bash"], { taskDepth: 1 }).toolRefs;
+/** A root session that cannot spawn: peer messaging is off, so neither SendMessage nor ListAgents mounts. */
+const NO_PEERS = claudeCodeSurface(ROOT_TOOLS, {
+	settings: Settings.isolated({ "task.maxRecursionDepth": 0 }),
+}).toolRefs;
+
+/** Facade names no prose uses: any mention names the tool. */
+const FACADE_ONLY_NAMES = ["SendMessage", "TaskStop", "ListAgents", "TaskOutput", "WebFetch"];
+
+/** Facade and tool names a surface must never mention when it did not mount them. */
+function unmountedNames(refs: Readonly<Record<string, string>>): string[] {
+	const names = ["SendMessage", "TaskStop", "ListAgents", "Skill", "TaskOutput", "WebFetch", "Write", "Edit"];
+	return names.filter(name => !Object.values(refs).includes(name));
+}
 const PARENT = "RefsParent";
 const CHILD = "RefsChild";
 
@@ -45,29 +84,69 @@ afterEach(() => {
 
 describe("harnessToolRefs", () => {
 	it("keeps omp's literal names outside claude-code", () => {
-		expect(NATIVE).toEqual({ task: "task", read: "read", write: "write", edit: "edit", bash: "bash", wait: "wait" });
+		expect(NATIVE).toEqual({
+			task: "task",
+			read: "read",
+			write: "write",
+			edit: "edit",
+			bash: "bash",
+			wait: "wait",
+			deviceWrite: "write",
+		});
 		expect(harnessToolRefs("codex")).toBe(NATIVE);
 		expect(harnessToolRefs("pi")).toBe(NATIVE);
+		expect(harnessSurface(undefined, ROOT_TOOLS, { settings: Settings.isolated() }).toolRefs).toBe(NATIVE);
 	});
 
-	it("names Claude Code's tools and withholds wait", () => {
-		expect(CLAUDE_CODE).toMatchObject({ task: "Agent", read: "Read", write: "Write", edit: "Edit", bash: "Bash" });
-		expect(CLAUDE_CODE.wait).toBeUndefined();
-		// Every facade key names a real claude-code facade.
-		const facades = new Set(harnessFacadeSpecs("claude-code").map(spec => spec.wireName));
-		for (const key of ["Agent", "SendMessage", "TaskStop", "ListAgents", "Skill"]) {
-			expect(CLAUDE_CODE[key]).toBe(key);
-			expect(facades.has(key)).toBe(true);
-		}
-	});
-
-	it("follows the session's effective profile", () => {
-		const session = (mode: string) => ({
-			settings: Settings.isolated({ "harness.mode": mode }),
-			getActiveModel: () => CLAUDE_CODE_MODEL,
+	it("names exactly what a 2.1.284 surface presents: no TaskOutput, so no wait", () => {
+		const surface = claudeCodeSurface(ROOT_TOOLS);
+		expect(surface.toolRefs).toMatchObject({
+			task: "Agent",
+			read: "Read",
+			write: "Write",
+			edit: "Edit",
+			bash: "Bash",
+			Agent: "Agent",
+			SendMessage: "SendMessage",
+			TaskStop: "TaskStop",
+			ListAgents: "ListAgents",
+			Skill: "Skill",
+			WebFetch: "WebFetch",
 		});
-		expect(sessionToolRefs(session("claude-code"))).toBe(CLAUDE_CODE);
-		expect(sessionToolRefs(session("native"))).toBe(NATIVE);
+		expect(surface.toolRefs.wait).toBeUndefined();
+		expect(surface.toolRefs.TaskOutput).toBeUndefined();
+		// Withheld with nothing standing in: prompts and predicates drop it.
+		expect([...surface.unavailable]).toEqual(["wait"]);
+		expect(surface.hidden.has("wait")).toBe(true);
+		expect(surface.facades.map(spec => spec.wireName)).not.toContain("TaskOutput");
+	});
+
+	it("names TaskOutput for wait where an older capture still declares it", () => {
+		const surface = claudeCodeSurface(ROOT_TOOLS, { taskOutput: true });
+		expect(surface.toolRefs.wait).toBe("TaskOutput");
+		expect(surface.toolRefs.TaskOutput).toBe("TaskOutput");
+		expect([...surface.unavailable]).toEqual([]);
+		expect(surface.hidden.has("wait")).toBe(true);
+	});
+
+	it("mounts SendMessage and ListAgents together, only with write and peer messaging", () => {
+		// A read-only subagent has peer messaging but no `write` to message with.
+		expect(READ_ONLY).toEqual({ read: "Read", bash: "Bash", Skill: "Skill", WebFetch: "WebFetch" });
+		// A root that cannot spawn has `write` but no peers: TaskStop stays, messaging goes.
+		expect(NO_PEERS.TaskStop).toBe("TaskStop");
+		expect(NO_PEERS.SendMessage).toBeUndefined();
+		expect(NO_PEERS.ListAgents).toBeUndefined();
+		// Neither mounts without the other: ListAgents lists whom SendMessage reaches.
+		const writeOnly = claudeCodeSurface(["write"], { taskDepth: 1 }).toolRefs;
+		expect(writeOnly.SendMessage).toBe("SendMessage");
+		expect(writeOnly.ListAgents).toBeUndefined();
+		const readOnlyChild = claudeCodeSurface(["read"], { taskDepth: 1 }).toolRefs;
+		expect(readOnlyChild.ListAgents).toBeUndefined();
+	});
+
+	it("reads the session's presented refs, falling back to omp's names", () => {
+		expect(sessionToolRefs({ getToolRefs: () => CLAUDE_CODE })).toBe(CLAUDE_CODE);
+		expect(sessionToolRefs({})).toBe(NATIVE);
 	});
 });
 
@@ -122,6 +201,48 @@ describe("multi-agent templates under claude-code", () => {
 		expect(prompt.render(skillfulNoticeTemplate, { skills, toolRefs: NATIVE })).toContain(
 			"you MUST read `skill://<name>` before proceeding.",
 		);
+	});
+
+	it("never name a facade or tool a narrower surface did not mount", () => {
+		for (const [surface, refs] of Object.entries({ READ_ONLY, NO_PEERS })) {
+			const rendered = {
+				contract: prompt.render(taskAsyncContractTemplate, { ...data, toolRefs: refs }),
+				followUp: prompt.render(taskFollowUpTemplate, { ...data, toolRefs: refs }),
+				incoming: prompt.render(ircIncomingTemplate, { ...data, toolRefs: refs }),
+				incomingIdle: prompt.render(ircIncomingTemplate, { ...data, relayOnStop: false, toolRefs: refs }),
+				pending: prompt.render(subagentAsyncPendingTemplate, { ...data, toolRefs: refs }),
+				reminder: prompt.render(subagentYieldReminderTemplate, { ...data, toolRefs: refs }),
+				system: prompt.render(subagentSystemPromptTemplate, { ...data, toolRefs: refs }),
+				coordination: prompt.render(taskCoordinationAdvisoryTemplate, { count: 2, toolRefs: refs }),
+				agent: prompt.render(claudeCodeAgentTemplate, {
+					agents: [],
+					defaultAgent: "task",
+					asyncEnabled: true,
+					ircEnabled: true,
+					toolRefs: refs,
+				}),
+			};
+			for (const [name, text] of Object.entries(rendered)) {
+				const named = unmountedNames(refs).filter(
+					tool => text.includes(`\`${tool}\``) || (FACADE_ONLY_NAMES.includes(tool) && text.includes(tool)),
+				);
+				expect({ surface, name, leaks: leaks(text), named }).toEqual({ surface, name, leaks: [], named: [] });
+				expect(text).not.toContain("undefined");
+			}
+		}
+		// A subagent that cannot message has no peer section at all.
+		const system = prompt.render(subagentSystemPromptTemplate, { ...data, toolRefs: READ_ONLY });
+		expect(system).not.toContain("# Peers");
+		// With SendMessage mounted the Agent description keeps its continuation line.
+		const agent = prompt.render(claudeCodeAgentTemplate, {
+			agents: [],
+			defaultAgent: "task",
+			asyncEnabled: true,
+			ircEnabled: true,
+			toolRefs: CLAUDE_CODE,
+		});
+		expect(agent).toContain("- Use SendMessage with the agent's ID to continue a previously spawned agent");
+		expect(agent).toContain("- Read `history://<agentId>` for an agent's transcript");
 	});
 
 	it("render the native text unchanged", () => {
@@ -191,25 +312,32 @@ describe("multi-agent templates under claude-code", () => {
 			status: "running",
 			parentId: PARENT,
 		});
-		const session = (mode: string) =>
+		const session = (refs: Readonly<Record<string, string>> | undefined) =>
 			({
 				cwd: process.cwd(),
 				hasUI: false,
-				settings: Settings.isolated({ "harness.mode": mode }),
+				settings: Settings.isolated(),
 				getActiveModel: () => CLAUDE_CODE_MODEL,
 				getAgentId: () => PARENT,
 				getSessionFile: () => null,
 				agentRegistry: AgentRegistry.global(),
+				...(refs && { getToolRefs: () => refs }),
 			}) as unknown as ToolSession;
-		const textOf = (mode: string) => {
-			const part = nothingToWaitForResult(session(mode)).content[0];
+		const textOf = (refs: Readonly<Record<string, string>> | undefined) => {
+			const part = nothingToWaitForResult(session(refs)).content[0];
 			return part?.type === "text" ? part.text : "";
 		};
-		const claudeCode = textOf("claude-code");
+		const claudeCode = textOf(CLAUDE_CODE);
 		expect(claudeCode).toContain(CHILD);
 		expect(leaks(claudeCode)).toEqual([]);
 		expect(claudeCode).toContain('message them via `SendMessage` (`to: "<id>"`)');
-		const native = textOf("native");
+		// Without write there is no message or stop tool to name, and no wait.
+		const readOnly = textOf(READ_ONLY);
+		expect(readOnly).toContain(CHILD);
+		expect(leaks(readOnly)).toEqual([]);
+		for (const tool of ["SendMessage", "TaskStop", "TaskOutput"]) expect(readOnly).not.toContain(tool);
+		expect(readOnly).toContain("These agents have no job entry; transcripts at `history://<id>`.");
+		const native = textOf(undefined);
 		expect(native).toContain("message them via `write agent://<id>`");
 	});
 });
@@ -234,8 +362,12 @@ describe("claude-code tool surface", () => {
 		};
 	}
 
-	async function presentedNames(mode: string): Promise<string[]> {
-		const tools = ["read", "write", "wait", "task", "eval", "todo"].map(stubTool);
+	async function presentedNames(
+		mode: string,
+		toolNames: readonly string[] = ["read", "write", "wait", "task", "eval", "todo"],
+	): Promise<{ presented: string[]; promptNames: string[]; refs: Readonly<Record<string, string>> }> {
+		const tools = toolNames.map(stubTool);
+		let promptNames: string[] = [];
 		const session = new AgentSession({
 			agent: new Agent({ initialState: { model: CLAUDE_CODE_MODEL, systemPrompt: [], tools } }),
 			sessionManager: SessionManager.inMemory(),
@@ -248,18 +380,25 @@ describe("claude-code tool surface", () => {
 			} as never,
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
 			builtInToolNames: tools.map(tool => tool.name),
-			rebuildSystemPrompt: async names => ({ systemPrompt: [`tools:${names.join(",")}`] }),
+			rebuildSystemPrompt: async names => {
+				promptNames = [...names];
+				return { systemPrompt: [`tools:${names.join(",")}`] };
+			},
 		});
 		sessions.push(session);
 		await session.setActiveToolsByName(tools.map(tool => tool.name));
-		return session.agent.state.tools.map(tool => tool.name);
+		return {
+			presented: session.agent.state.tools.map(tool => tool.name),
+			promptNames,
+			refs: session.getToolRefs(),
+		};
 	}
 
 	it("withholds wait only under claude-code, where no capture declares TaskOutput", async () => {
 		const claudeCode = await presentedNames("claude-code");
-		expect(claudeCode).not.toContain("wait");
-		expect(claudeCode).not.toContain("TaskOutput");
-		expect(claudeCode).toEqual(
+		expect(claudeCode.presented).not.toContain("wait");
+		expect(claudeCode.presented).not.toContain("TaskOutput");
+		expect(claudeCode.presented).toEqual(
 			expect.arrayContaining([
 				"Agent",
 				"SendMessage",
@@ -271,9 +410,27 @@ describe("claude-code tool surface", () => {
 				"todo",
 			]),
 		);
+		// Prompt gates never see the withheld tool, and the refs match the wire.
+		expect(claudeCode.promptNames).not.toContain("wait");
+		expect(claudeCode.promptNames).toContain("task");
+		expect(claudeCode.refs.wait).toBeUndefined();
+		expect(claudeCode.refs.task).toBe("Agent");
+		expect(claudeCode.refs.SendMessage).toBe("SendMessage");
 
 		const native = await presentedNames("native");
-		expect(native).toContain("wait");
-		expect(native).not.toContain("SendMessage");
+		expect(native.presented).toContain("wait");
+		expect(native.presented).not.toContain("SendMessage");
+		expect(native.promptNames).toContain("wait");
+		expect(native.refs).toBe(NATIVE);
+	});
+
+	it("mounts ListAgents only beside SendMessage", async () => {
+		const readOnly = await presentedNames("claude-code", ["read", "bash", "task"]);
+		expect(readOnly.presented).not.toContain("SendMessage");
+		expect(readOnly.presented).not.toContain("ListAgents");
+		expect(readOnly.presented).not.toContain("TaskStop");
+		expect(readOnly.refs.ListAgents).toBeUndefined();
+		// Stub tools keep their own names; the facades still mount over them.
+		expect(readOnly.presented).toEqual(expect.arrayContaining(["read", "bash", "Agent", "Skill"]));
 	});
 });

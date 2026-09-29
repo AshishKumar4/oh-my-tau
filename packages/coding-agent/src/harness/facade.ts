@@ -82,6 +82,8 @@ export interface HarnessFacadeSpec<TWire extends TSchema = TSchema, TParams = un
 	readonly intent?: (args: Partial<Static<TWire>>) => string | undefined;
 	/** Serves this spec's description and schema even when the capture declares the wire name. */
 	readonly ownSurface?: true;
+	/** Other omp tools that must be enabled, beside the target, for the facade to mount. */
+	readonly requires?: readonly string[];
 	toParams(args: Static<TWire>, host: HarnessFacadeHost): TParams;
 	/** Whether the facade mounts in this session; checked whenever tools are presented. */
 	mounts?(host: HarnessFacadeHost): boolean;

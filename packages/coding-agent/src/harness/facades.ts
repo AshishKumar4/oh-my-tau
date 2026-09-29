@@ -26,10 +26,15 @@ import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import { cfgTaskBatch, cfgTaskEnableEffort, cfgTaskIsolationEnabled } from "../task/settings";
 import { cfgFetchEnabled } from "../tools/settings";
 import type { HarnessFacadeHost, HarnessFacadeSpec } from "./facade";
-import { CODEX_COLLABORATION_NAMESPACE } from "./manifest";
+import { CODEX_COLLABORATION_NAMESPACE, harnessToolRefs } from "./manifest";
 
 function unsupported(field: string, reason: string): never {
 	throw new ToolError(`${field} is not supported: ${reason}. Retry without the field.`);
+}
+
+/** Peer messaging is on: always for a subagent, for the root while it can spawn one. */
+function peerMessaging(host: HarnessFacadeHost): boolean {
+	return isIrcEnabled(host.settings, host.session?.taskDepth ?? 0);
 }
 
 const claudeCodeSendMessageSchema = type({
@@ -241,7 +246,7 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 		ownSurface: true,
 		description: claudeCodeSendMessage,
 		parameters: claudeCodeSendMessageSchema,
-		mounts: host => isIrcEnabled(host.settings, host.session?.taskDepth ?? 0),
+		mounts: peerMessaging,
 		toParams: (args: typeof claudeCodeSendMessageSchema.infer) => {
 			const to = args.to.trim();
 			return { path: `agent://${to.toLowerCase() === "main" ? MAIN_AGENT_ID : to}`, content: args.message };
@@ -253,6 +258,9 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 		ownSurface: true,
 		description: claudeCodeListAgents,
 		parameters: claudeCodeListAgentsSchema,
+		// It lists whom SendMessage reaches, so it mounts exactly when SendMessage does.
+		requires: ["write"],
+		mounts: peerMessaging,
 		toParams: () => ({ path: "history://?live" }),
 	},
 	CLAUDE_CODE_TASK_OUTPUT,
@@ -450,10 +458,69 @@ export function harnessFacadeSpecs(profile: HarnessProfile): readonly HarnessFac
 }
 
 /**
- * The facade each profile waits on background work with (omp's `wait`).
- * Profiles without a wait facade (pi) fall back to `wait` itself.
+ * omp tools a harness profile never presents as themselves. Claude Code has no
+ * wait tool: its agents end the turn and are woken by the next result or
+ * message (TaskOutput stands in where the served client still declares it).
  */
-export const HARNESS_JOB_WAIT_FACADE: Partial<Readonly<Record<HarnessProfile, HarnessFacadeSpec>>> = {
-	"claude-code": CLAUDE_CODE_TASK_OUTPUT,
-	codex: CODEX_WAIT,
+const PROFILE_WITHHELD_TOOLS: Partial<Readonly<Record<HarnessProfile, readonly string[]>>> = {
+	"claude-code": ["wait"],
 };
+
+/** What a harness profile presents over a set of enabled omp tools. */
+export interface HarnessSurface {
+	/** Facades that mount, in presentation order. */
+	readonly facades: readonly HarnessFacadeSpec[];
+	/** Enabled tools kept off the wire as themselves: withheld by the profile or replaced by a mounted facade. */
+	readonly hidden: ReadonlySet<string>;
+	/**
+	 * Enabled tools nothing on the wire reaches: withheld by the profile with no
+	 * mounted facade standing in. Prompt gates and tool predicates treat them as
+	 * absent.
+	 */
+	readonly unavailable: ReadonlySet<string>;
+	/** Tool names for omp's own prompt templates; see {@link harnessToolRefs}. */
+	readonly toolRefs: Readonly<Record<string, string>>;
+}
+
+const NATIVE_SURFACE: HarnessSurface = {
+	facades: [],
+	hidden: new Set(),
+	unavailable: new Set(),
+	toolRefs: harnessToolRefs(undefined),
+};
+
+/**
+ * `profile`'s surface over `enabledToolNames`: the one computation presentation,
+ * prompt gates, tool predicates and `toolRefs` all read, so no prompt names a
+ * tool the wire does not carry. A facade mounts when its target (and every
+ * tool it `requires`) is enabled and registered and its `mounts` predicate
+ * accepts the session.
+ */
+export function harnessSurface(
+	profile: HarnessProfile | undefined,
+	enabledToolNames: readonly string[],
+	host: HarnessFacadeHost,
+	isRegistered: (name: string) => boolean = () => true,
+): HarnessSurface {
+	if (profile === undefined) return NATIVE_SURFACE;
+	const enabled = new Set(enabledToolNames);
+	const facades = harnessFacadeSpecs(profile).filter(
+		spec =>
+			enabled.has(spec.target) &&
+			isRegistered(spec.target) &&
+			(spec.requires ?? []).every(name => enabled.has(name)) &&
+			spec.mounts?.(host) !== false,
+	);
+	const replaced = new Set(facades.flatMap(spec => (spec.replacesTarget ? [spec.target] : [])));
+	const withheld = PROFILE_WITHHELD_TOOLS[profile] ?? [];
+	const unavailable = new Set(withheld.filter(name => !replaced.has(name)));
+	return {
+		facades,
+		hidden: new Set([...withheld, ...replaced]),
+		unavailable,
+		toolRefs: harnessToolRefs(profile, {
+			toolNames: enabledToolNames.filter(name => !unavailable.has(name)),
+			facades,
+		}),
+	};
+}

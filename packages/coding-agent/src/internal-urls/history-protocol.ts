@@ -460,7 +460,10 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		return match;
 	}
 
-	async #renderIndex(refs: AgentRef[], options: { includeDisk: boolean; readRef: string }): Promise<string> {
+	async #renderIndex(
+		refs: AgentRef[],
+		options: { includeDisk: boolean; readRef: string | undefined },
+	): Promise<string> {
 		const entries: IndexEntry[] = refs.map(ref => ({
 			id: ref.id,
 			status: ref.status,
@@ -487,7 +490,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		for (const entry of entries) {
 			lines.push(`| ${entry.id} | ${entry.status} | ${entry.kind} | ${entry.parent} | ${entry.lastActivity} |`);
 		}
-		lines.push("", `Read a transcript with \`${options.readRef} history://<id>\`.`);
+		if (options.readRef) lines.push("", `Read a transcript with \`${options.readRef} history://<id>\`.`);
 		return `${lines.join("\n")}\n`;
 	}
 

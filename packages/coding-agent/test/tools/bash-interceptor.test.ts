@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as os from "node:os";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -7,6 +8,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool, type BashToolInput } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { checkBashInterception } from "@oh-my-pi/pi-coding-agent/tools/bash-interceptor";
 import { DEFAULT_BASH_INTERCEPTOR_RULES } from "@oh-my-pi/pi-coding-agent/exec/settings";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 function createBashTool(rules: BashInterceptorRule[]): BashTool {
 	const session = {
@@ -255,6 +257,70 @@ describe("default bash service rules", () => {
 			expect(checkBashInterception(command, tools, DEFAULT_BASH_INTERCEPTOR_RULES).block).toBe(false);
 		},
 	);
+});
+
+describe("rule messages on the presented Bash", () => {
+	const WATCHER = "nodemon server.js";
+	const CLAUDE_CODE_REFS = { read: "Read", edit: "Edit", write: "Write", bash: "Bash" };
+
+	/** A session presenting Claude Code's Bash (no service `name`; `run_in_background` while async is on). */
+	function claudeCodeBash(asyncEnabled: boolean): BashTool {
+		const session = {
+			settings: Settings.isolated({
+				"harness.mode": "claude-code",
+				"bashInterceptor.enabled": true,
+				"bashInterceptor.patterns": DEFAULT_BASH_INTERCEPTOR_RULES,
+				"async.enabled": asyncEnabled,
+				"bash.autoBackground.enabled": false,
+			}),
+			cwd: os.tmpdir(),
+			getActiveModel: () => getBundledModel("anthropic", "claude-opus-5"),
+			getToolRefs: () => CLAUDE_CODE_REFS,
+		} as unknown as ToolSession;
+		return new BashTool(session);
+	}
+
+	const ctx = { toolNames: ["bash", "read", "edit", "write"] } as AgentToolContext;
+
+	it("keeps omp's own wording byte for byte on the native Bash", async () => {
+		const tool = createBashTool(DEFAULT_BASH_INTERCEPTOR_RULES);
+		await expect(tool.execute("c", { command: WATCHER }, undefined, undefined, ctx)).rejects.toThrow(
+			`Blocked: Use \`bash\` with \`name\` for services, watchers, and debuggers; inspect with \`read proc://<name>\`.\n\nOriginal command: ${WATCHER}`,
+		);
+		expect(checkBashInterception("cat file.txt", ["read"]).message).toBe(
+			"Blocked: Use the `read` tool instead of cat/head/tail. It provides better context and handles binary files.\n\nOriginal command: cat file.txt",
+		);
+	});
+
+	it("names Claude Code's run_in_background instead of a service name it cannot express", async () => {
+		const tool = claudeCodeBash(true);
+		const blocked = tool.execute("c", { command: WATCHER } as unknown as BashToolInput, undefined, undefined, ctx);
+		await expect(blocked).rejects.toThrow(
+			`Blocked: Use \`Bash\` with \`run_in_background: true\` for services, watchers, and debuggers.\n\nOriginal command: ${WATCHER}`,
+		);
+		// Following the advice passes the interceptor: the background run is the
+		// managed form (this bare session then has no job manager to start it).
+		const background = tool.execute(
+			"c",
+			{ command: WATCHER, run_in_background: true } as unknown as BashToolInput,
+			undefined,
+			undefined,
+			ctx,
+		);
+		await expect(background).rejects.toThrow("Async job manager unavailable");
+		// Redirect rules name the presented tools.
+		await expect(
+			tool.execute("c", { command: "cat file.txt" } as unknown as BashToolInput, undefined, undefined, ctx),
+		).rejects.toThrow("Blocked: Use the `Read` tool instead of cat/head/tail.");
+	});
+
+	it("names no field at all when Claude Code's Bash cannot run in the background", async () => {
+		const tool = claudeCodeBash(false);
+		const blocked = tool.execute("c", { command: WATCHER } as unknown as BashToolInput, undefined, undefined, ctx);
+		await expect(blocked).rejects.toThrow(
+			`Blocked: Use \`Bash\` for services, watchers, and debuggers.\n\nOriginal command: ${WATCHER}`,
+		);
+	});
 });
 
 describe("BashTool argument validation", () => {

@@ -10,7 +10,6 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { getModelMatchPreferences, resolveCliModel } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
-import { HARNESS_JOB_WAIT_FACADE } from "../harness/facades";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentDefinition } from "../task/types";
 import { cfgFusionEnabled, cfgFusionSidekickModel } from "./settings";
@@ -32,8 +31,14 @@ const LEAD_IDENTITY_BY_PROFILE: Readonly<Record<HarnessProfile, string>> = {
 /** Template data the lead prompt and the `sidekick` tool description render their slots from. */
 export interface FusionPromptData extends Record<string, unknown> {
 	sidekickTool: string;
-	/** The tool the lead waits for a background handoff with: the profile's job-wait facade, else `wait`. */
-	readTool: string;
+	/**
+	 * The tool the lead waits for a background handoff with, as presented:
+	 * `wait` natively, the mounted wait facade under a harness profile
+	 * (Claude Code's TaskOutput). Undefined when none is mounted (Claude Code
+	 * without TaskOutput): the lead ends its turn and the report arrives as a
+	 * notification.
+	 */
+	readTool: string | undefined;
 	leadIdentity: string;
 	/** GPT leads (the Codex profile) get two extra delegation bullets that Claude leads do not. */
 	gptLead: boolean;
@@ -45,13 +50,11 @@ export function buildFusionPromptData(options: {
 	toolRefs: Readonly<Record<string, string>>;
 }): FusionPromptData {
 	const { profile, toolRefs } = options;
-	const waitRef = toolRefs.wait ?? "wait";
 	return {
 		sidekickTool: toolRefs[SIDEKICK_TOOL_NAME] ?? SIDEKICK_TOOL_NAME,
-		readTool:
-			profile === undefined || HARNESS_JOB_WAIT_FACADE[profile] === undefined
-				? waitRef
-				: HARNESS_JOB_WAIT_FACADE[profile]!.wireName,
+		// Claude Code's refs carry only what the wire presents; the other
+		// surfaces always have `wait` (codex's own facade answers to that name).
+		readTool: profile === "claude-code" ? toolRefs.wait : (toolRefs.wait ?? "wait"),
 		leadIdentity: profile === undefined ? "assistant" : LEAD_IDENTITY_BY_PROFILE[profile],
 		gptLead: profile === "codex",
 	};

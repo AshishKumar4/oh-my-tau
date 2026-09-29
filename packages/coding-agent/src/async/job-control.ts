@@ -111,10 +111,28 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 	return out;
 }
 
+/**
+ * How the caller reaches an agent through the tools it presents (see
+ * `harnessToolRefs`): the stop and message facades by name, else omp's own
+ * `write` device URLs (`deviceWrite`, named natively), else nothing to name.
+ */
+function agentControls(toolRefs: Readonly<Record<string, string>>): {
+	stop?: (id: string) => string;
+	message?: string;
+} {
+	if (toolRefs.TaskStop || toolRefs.SendMessage) {
+		return {
+			...(toolRefs.TaskStop ? { stop: (id: string) => `\`${toolRefs.TaskStop}\` (\`task_id: "${id}"\`)` } : {}),
+			...(toolRefs.SendMessage ? { message: `\`${toolRefs.SendMessage}\` (\`to: "<id>"\`)` } : {}),
+		};
+	}
+	if (!toolRefs.deviceWrite) return {};
+	return { stop: id => `\`write proc://${id}/kill\``, message: "`write agent://<id>`" };
+}
+
 /** Model-facing lines for the running-agents section shared by `jobs` and empty-wait results. */
 function describeAgents(agents: AgentActivitySnapshot[], toolRefs: Readonly<Record<string, string>>): string[] {
-	const stop = (id: string): string =>
-		toolRefs.TaskStop ? `\`${toolRefs.TaskStop}\` (\`task_id: "${id}"\`)` : `\`write proc://${id}/kill\``;
+	const { stop, message } = agentControls(toolRefs);
 	const lines = [`## Running Agents (${agents.length}) — not job-backed\n`];
 	for (const agent of agents) {
 		const parent = agent.parentId ? ` (spawned by \`${agent.parentId}\`)` : "";
@@ -122,18 +140,20 @@ function describeAgents(agents: AgentActivitySnapshot[], toolRefs: Readonly<Reco
 		// An accepted final result with no turn in flight is the #11079 leak:
 		// the run is over but the ref never terminalized, so say so actionably
 		// instead of the generic stale-registration hint.
+		const clear = stop ? `; clear it with ${stop(agent.id)}` : "";
 		const stale = agent.live
 			? ""
 			: agent.acceptedAt !== undefined
-				? ` — final result accepted ${formatDuration(Math.max(0, Date.now() - agent.acceptedAt))} ago but still running; clear it with ${stop(agent.id)}`
+				? ` — final result accepted ${formatDuration(Math.max(0, Date.now() - agent.acceptedAt))} ago but still running${clear}`
 				: " — no turn in flight (stale registration?)";
 		lines.push(`- \`${agent.id}\`${parent} — up ${formatDuration(agent.ageMs)}${activity}${stale}`);
 	}
-	const message = toolRefs.SendMessage ? `\`${toolRefs.SendMessage}\` (\`to: "<id>"\`)` : "`write agent://<id>`";
-	lines.push("", `These agents have no job entry; message them via ${message}, transcripts at \`history://<id>\`.`);
+	const reach = message ? ` message them via ${message},` : "";
+	lines.push("", `These agents have no job entry;${reach} transcripts at \`history://<id>\`.`);
 	if (agents.some(agent => !agent.live)) {
 		const wait = toolRefs.wait ? ` and never satisfies \`${toolRefs.wait}\`` : "";
-		lines.push(`An agent with no turn in flight cannot answer a message${wait}; clear it with ${stop("<id>")}.`);
+		const clear = stop ? `; clear it with ${stop("<id>")}` : "";
+		lines.push(`An agent with no turn in flight cannot answer a message${wait}${clear}.`);
 	}
 	return lines;
 }

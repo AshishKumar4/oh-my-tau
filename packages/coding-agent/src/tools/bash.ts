@@ -21,6 +21,7 @@ import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import type { Settings } from "../config/settings";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
 import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
+import { sessionToolRefs } from "../harness/effective-profile";
 import { InternalUrlRouter } from "../internal-urls";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlFilesystem, UrlFsError } from "../internal-urls/url-filesystem";
@@ -1019,12 +1020,28 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// leading `cd ... &&` wrappers do not hide either shell-navigation rules
 		// or the dedicated-tool command that follows the directory change.
 		if (cfgBashInterceptorEnabled.get(this.session.settings)) {
+			// A harness Bash schema has no service `name`: there a background run is
+			// the managed form the `bash` rules steer toward, and it exempts the
+			// call as a named service does natively.
+			const nativeBash = this.parameters !== claudeCodeBashSchema;
+			const managed = name !== undefined || (!nativeBash && asyncRequested);
 			const rules = cfgBashInterceptorPatterns
 				.get(this.session.settings)
-				.filter(rule => !name || rule.tool !== "bash");
+				.filter(rule => !managed || rule.tool !== "bash");
+			const messageData = {
+				toolRefs: sessionToolRefs(this.session),
+				nativeBash,
+				backgroundField: !nativeBash && cfgAsyncEnabled.get(this.session.settings),
+			};
 			const commandsToCheck = rawCommand === command ? [command] : [rawCommand, command];
 			for (const commandToCheck of commandsToCheck) {
-				const interception = checkBashInterception(commandToCheck, ctx?.toolNames ?? [], rules, rawCommand);
+				const interception = checkBashInterception(
+					commandToCheck,
+					ctx?.toolNames ?? [],
+					rules,
+					rawCommand,
+					messageData,
+				);
 				if (interception.block) {
 					throw new ToolError(interception.message ?? "Command blocked");
 				}

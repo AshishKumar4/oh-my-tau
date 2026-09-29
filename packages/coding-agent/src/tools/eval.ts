@@ -232,6 +232,12 @@ export interface EvalToolDescriptionOptions {
 	eagerDelegation?: boolean;
 	/** Point blocked callers at the `wait` tool; false when the session lacks it (subagents). Default: true. */
 	waitTool?: boolean;
+	/**
+	 * Name the session presents omp's wait tool under (Claude Code's TaskOutput);
+	 * `null` when nothing on the wire waits (Claude Code without TaskOutput).
+	 * Default: `wait`.
+	 */
+	waitToolName?: string | null;
 	/** Enabled preludes; each becomes an `xd://eval/<name>` doc topic. */
 	preludes?: readonly Pick<EvalPreludeDefinition, "name" | "documentation">[];
 	/**
@@ -251,6 +257,7 @@ function evalTemplateContext(options: EvalToolDescriptionOptions) {
 		evalTools: options.evalTools ?? true,
 		eagerDelegation: options.eagerDelegation ?? true,
 		waitTool: options.waitTool ?? true,
+		waitToolName: options.waitToolName === null ? undefined : (options.waitToolName ?? "wait"),
 		autoBackgroundEnabled: options.autoBackgroundEnabled ?? false,
 		spawns: spawnPolicy.enabled,
 		spawnDefaultAgent: spawnPolicy.defaultAgent,
@@ -405,6 +412,7 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 		const session = this.session;
 		if (!session) return {};
 		const backends = resolveEvalBackends(session);
+		const toolRefs = sessionToolRefs(session);
 		const depthAllowsSpawning = canSpawnAtDepth(
 			cfgTaskMaxRecursionDepth.get(session.settings),
 			session.taskDepth ?? 0,
@@ -416,8 +424,9 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 			autoBackgroundEnabled: cfgEvalAutoBackgroundEnabled.get(session.settings),
 			evalTools: cfgEvalToolsEnabled.get(session.settings),
 			eagerDelegation: sessionDelegationBias(session) === "eager",
-			// Claude Code withholds `wait`; its prompts never name it.
-			waitTool: hasWaitTool(session) && sessionToolRefs(session).wait !== undefined,
+			// Named as presented; Claude Code withholds `wait` unless TaskOutput stands in.
+			waitTool: hasWaitTool(session) && toolRefs.wait !== undefined,
+			waitToolName: toolRefs.wait ?? null,
 			preludes: this.#advertisedPreludes(session),
 			inlineTopics: session.isToolActive?.("read") === false,
 			autoProvision: cfgEvalAutoProvision.get(session.settings),

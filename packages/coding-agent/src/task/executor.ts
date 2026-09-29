@@ -3128,10 +3128,9 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				// superseded it.
 				if (wakeJob && result) {
 					const parent = AgentRegistry.global().get(wakeJob.ownerId)?.session;
-					const parentProfile = parent ? effectiveHarnessProfile(parent.settings, parent.model) : undefined;
 					const text = formatTaskResultSummary(result, {
 						totalDurationMs: result.durationMs,
-						toolRefs: harnessToolRefs(parentProfile),
+						toolRefs: parent?.getToolRefs?.(),
 					});
 					const structured = result.structuredOutput;
 					if (result.aborted || result.exitCode !== 0 || result.error !== undefined) {
@@ -3439,7 +3438,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	let attemptUnsubscribe = monitor.attach(session);
 	try {
 		outcome = await driveSessionToYield(session, monitor, message, {
-			toolRefs: harnessToolRefs(effectiveHarnessProfile(session.settings, session.model)),
+			toolRefs: session.getToolRefs?.(),
 			onPromptBusy: async () => {
 				attemptUnsubscribe();
 				logger.debug("Subagent follow-up lost the prompt race to an IRC wake; backing off", { id });
@@ -4021,7 +4020,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						ircParkedCount: ircRoster?.parkedCount ?? 0,
 						ircOmittedCount: ircRoster?.omittedCount ?? 0,
 						ircSelfId: ircEnabled ? id : "",
-						toolRefs: harnessToolRefs(profile),
+						toolRefs: promptContext?.toolRefs ?? harnessToolRefs(undefined),
 					});
 					// Per-spawn text (context, worktree, IRC roster) goes after the
 					// trailing `<project-context>` block so spawns of the same agent
@@ -4345,7 +4344,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			readyAt = performance.now();
 			const outcome = await driveSessionToYield(session, monitor, task, {
 				solutionSpace: options.solutionSpace,
-				toolRefs: harnessToolRefs(effectiveHarnessProfile(subagentSettings, session.model)),
+				toolRefs: session.getToolRefs?.(),
 			});
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left

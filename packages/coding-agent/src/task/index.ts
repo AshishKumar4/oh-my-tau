@@ -162,6 +162,8 @@ interface TaskDescriptionOptions {
 	asyncEnabled: boolean;
 	ircEnabled: boolean;
 	parentSpawns: string;
+	/** Presented tool names (`toolRefs`), for a harness facade's own description. */
+	toolRefs: Readonly<Record<string, string>>;
 }
 
 /** Render a tool description template from a cached agent list and current settings. */
@@ -198,6 +200,7 @@ function renderDescription(template: string, options: TaskDescriptionOptions): s
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
 		hasModelMentions: options.sessionAgents.length > 0,
 		ircEnabled: options.ircEnabled,
+		toolRefs: options.toolRefs,
 	});
 }
 
@@ -744,6 +747,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
 			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
+			toolRefs: sessionToolRefs(this.session),
 		});
 	}
 	private constructor(

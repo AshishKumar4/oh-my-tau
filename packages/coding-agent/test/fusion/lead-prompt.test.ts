@@ -1,6 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { VendorTool } from "@oh-my-pi/pi-coding-agent/harness/capture";
+import { harnessSurface } from "@oh-my-pi/pi-coding-agent/harness/facades";
 import { buildSystemPrompt, type SystemPromptToolMetadata } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { TempDir } from "@oh-my-pi/pi-utils";
+
+const TASK_OUTPUT: VendorTool = { description: "Retrieves output", inputSchema: {} };
 
 const EMPTY_TREE = { rootPath: "", rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] };
 
@@ -22,15 +27,28 @@ describe("fusion lead prompt section", () => {
 		harnessProfile?: "claude-code" | "codex";
 		customPrompt?: string;
 		browserEnabled?: boolean;
+		/** Claude Code only: the served capture still declares TaskOutput (pre-2.1.284). */
+		taskOutput?: boolean;
 	}): Promise<string> {
-		const tools = new Map<string, SystemPromptToolMetadata>(options.toolNames.map(name => [name, meta(name)]));
+		// What the session hands the builder under Claude Code: the presented
+		// surface's refs, and the tool names minus what it withholds.
+		const surface =
+			options.harnessProfile === "claude-code"
+				? harnessSurface("claude-code", options.toolNames, {
+						settings: Settings.isolated(),
+						vendorTool: name => (options.taskOutput && name === "TaskOutput" ? TASK_OUTPUT : undefined),
+					})
+				: undefined;
+		const toolNames = options.toolNames.filter(name => !surface?.unavailable.has(name));
+		const tools = new Map<string, SystemPromptToolMetadata>(toolNames.map(name => [name, meta(name)]));
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir.path(),
 			contextFiles: [],
 			skills: [],
 			rules: [],
-			toolNames: options.toolNames,
+			toolNames,
 			tools,
+			...(surface && { harnessToolRefs: surface.toolRefs }),
 			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir.path() },
 			personality: "none",
 			evalPreludes: options.browserEnabled ? [{ name: "browser" }] : [],
@@ -54,11 +72,13 @@ describe("fusion lead prompt section", () => {
 	});
 
 	it("renders in the custom (harness) template with the profile's wait facade and identity", async () => {
+		// A capture that still declares TaskOutput: it stands in for `wait`.
 		const text = await build({
 			toolNames: ["read", "wait", "sidekick"],
 			harnessProfile: "claude-code",
 			customPrompt: "VENDOR PROMPT",
 			browserEnabled: true,
+			taskOutput: true,
 		});
 		expect(text).toContain("VENDOR PROMPT");
 		expect(text).toContain("wait for the report with `TaskOutput`");
@@ -73,5 +93,20 @@ describe("fusion lead prompt section", () => {
 
 		const customOff = await build({ toolNames: ["read", "wait"], customPrompt: "VENDOR PROMPT" });
 		expect(customOff).not.toContain("`sidekick` tool");
+	});
+
+	it("tells a Claude Code lead with no wait tool to end its turn for the report", async () => {
+		// A 2.1.284 capture declares no TaskOutput and the profile withholds `wait`.
+		const text = await build({
+			toolNames: ["read", "wait", "sidekick"],
+			harnessProfile: "claude-code",
+			customPrompt: "VENDOR PROMPT",
+		});
+		expect(text).toContain("`sidekick` tool");
+		expect(text).toContain("end your turn; the report arrives as a notification.");
+		expect(text).not.toContain("TaskOutput");
+		expect(text).not.toContain("`wait`");
+		expect(text).not.toContain("wait for the report with");
+		expect(text).not.toContain("undefined");
 	});
 });

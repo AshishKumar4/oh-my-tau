@@ -1,7 +1,7 @@
 <task-result id="{{id}}" agent="{{agentName}}" status="{{status}}" duration="{{duration}}">
 {{#if meta}}<meta lines="{{meta.lineCount}}" size="{{meta.charSize}}" />{{/if}}
 {{#if abortReason}}
-<abort-reason>{{abortReason}}{{#if resumable}} — the agent is still live with its full context; message it via {{#if toolRefs.SendMessage}}`{{toolRefs.SendMessage}}` (`to: "{{id}}"`){{else}}`write agent://{{id}}`{{/if}} to resume instead of redoing the work.{{/if}}</abort-reason>
+<abort-reason>{{abortReason}}{{#if resumable}}{{#if toolRefs.SendMessage}} — the agent is still live with its full context; message it via `{{toolRefs.SendMessage}}` (`to: "{{id}}"`) to resume instead of redoing the work.{{else}}{{#if toolRefs.deviceWrite}} — the agent is still live with its full context; message it via `write agent://{{id}}` to resume instead of redoing the work.{{/if}}{{/if}}{{/if}}</abort-reason>
 {{/if}}
 {{#if error}}
 <error>{{error}}</error>

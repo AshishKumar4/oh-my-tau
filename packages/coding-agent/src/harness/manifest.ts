@@ -77,7 +77,12 @@ export function harnessWireRenames(profile: HarnessProfile): Readonly<Record<str
 	return WIRE_RENAMES[profile];
 }
 
-/** Tools omp's own prompts name in their text, under their native names. */
+/**
+ * Tools omp's own prompts name in their text, under their native names.
+ * `deviceWrite` is the tool that takes omp's device URLs (`write agent://<id>`
+ * to message, `write proc://<id>/kill` to stop): templates phrase messaging and
+ * stopping that way only behind it, and a harness surface never carries it.
+ */
 const NATIVE_PROMPT_TOOL_REFS: Readonly<Record<string, string>> = {
 	task: "task",
 	read: "read",
@@ -85,28 +90,41 @@ const NATIVE_PROMPT_TOOL_REFS: Readonly<Record<string, string>> = {
 	edit: "edit",
 	bash: "bash",
 	wait: "wait",
+	deviceWrite: "write",
 };
 
-/**
- * The same references under Claude Code's surface: renamed tools by wire name,
- * no `wait` (the profile withholds it; an agent ends its turn and is woken by
- * the next result), and the facades templates phrase through — messaging,
- * stopping, listing, skills — by their own names, which a native session lacks.
- */
-const CLAUDE_CODE_PROMPT_TOOL_REFS: Readonly<Record<string, string>> = {
-	...WIRE_RENAMES["claude-code"],
-	Agent: "Agent",
-	SendMessage: "SendMessage",
-	TaskStop: "TaskStop",
-	ListAgents: "ListAgents",
-	Skill: "Skill",
-};
+/** The tools a harness profile presents, as {@link harnessToolRefs} reads them. */
+export interface PresentedToolSurface {
+	/** omp tools the model can reach, by native name. */
+	readonly toolNames: readonly string[];
+	/** Mounted facades: the wire name, the omp tool behind it, and whether it stands in for that tool. */
+	readonly facades: readonly { readonly wireName: string; readonly target: string; readonly replacesTarget?: true }[];
+}
 
 /**
  * Tool names for omp's own prompt templates (`toolRefs`), keyed by native tool
- * name. Every profile but `claude-code` keeps the literal names, so native
- * text renders byte for byte as before.
+ * name.
+ *
+ * Every profile but `claude-code` keeps the literal names unconditionally, so
+ * native text renders byte for byte as before. Under `claude-code` the map is
+ * exactly the presented `surface`: each reachable tool under its wire name,
+ * each mounted facade under its own name, and a tool a facade stands in for
+ * under the facade's (`wait` → `TaskOutput`). A key is absent when nothing on
+ * the wire answers to it, so a template naming a tool through `toolRefs` can
+ * leave the sentence out instead of naming a tool the model does not have.
+ * The surface never carries `deviceWrite`: its agents message and stop through
+ * the facades, not omp's device URLs.
  */
-export function harnessToolRefs(profile: HarnessProfile | undefined): Readonly<Record<string, string>> {
-	return profile === "claude-code" ? CLAUDE_CODE_PROMPT_TOOL_REFS : NATIVE_PROMPT_TOOL_REFS;
+export function harnessToolRefs(
+	profile: HarnessProfile | undefined,
+	surface?: PresentedToolSurface,
+): Readonly<Record<string, string>> {
+	if (profile !== "claude-code" || surface === undefined) return NATIVE_PROMPT_TOOL_REFS;
+	const refs: Record<string, string> = {};
+	for (const name of surface.toolNames) refs[name] = MANIFESTS[profile][name]?.wireName ?? name;
+	for (const facade of surface.facades) {
+		refs[facade.wireName] = facade.wireName;
+		if (facade.replacesTarget) refs[facade.target] = facade.wireName;
+	}
+	return refs;
 }

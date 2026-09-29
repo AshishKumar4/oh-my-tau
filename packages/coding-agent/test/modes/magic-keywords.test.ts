@@ -48,6 +48,51 @@ describe("orchestrate notice", () => {
 	});
 });
 
+describe("keyword notices under Claude Code", () => {
+	// A 2.1.284 surface: `task` is presented as Agent, `wait` is withheld with no
+	// TaskOutput in its place, so it is neither in the reachable tools nor the refs.
+	const toolRefs = { task: "Agent", read: "Read", write: "Write", edit: "Edit", bash: "Bash", eval: "eval" };
+	const tools = ["read", "task", "edit", "write", "bash", "todo", "eval"];
+
+	it("name the presented tools and never the withheld wait", () => {
+		const orchestrate = renderOrchestrateNotice({ tools, toolRefs });
+		expect(orchestrate).toContain("`Agent` subagents");
+		expect(orchestrate).toContain("launch all parallel `Agent` subagents in one message");
+		expect(orchestrate).toContain("git via `Bash`");
+		for (const omp of ["`wait`", "`edit`", "`write`", "`bash`", "undefined"]) {
+			expect(orchestrate).not.toContain(omp);
+		}
+		// `task` survives only as an agent type (a `subagent_type` value), never as the tool.
+		expect(orchestrate.replaceAll("`task`/`sonic`", "")).not.toContain("`task`");
+		const workflow = renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true, toolRefs });
+		expect(workflow).toContain("end your turn: results arrive as notifications");
+		expect(workflow).not.toContain("`wait`");
+		expect(workflow).not.toContain("undefined");
+	});
+
+	it("name TaskOutput where it stands in for wait", () => {
+		const withTaskOutput = { ...toolRefs, wait: "TaskOutput" };
+		const orchestrate = renderOrchestrateNotice({ tools: [...tools, "wait"], toolRefs: withTaskOutput });
+		expect(orchestrate).toContain("Blocked with nothing else to do? Use `TaskOutput`.");
+		const workflow = renderWorkflowNotice({
+			taskBatch: true,
+			scoutAvailable: true,
+			evalTools: true,
+			toolRefs: withTaskOutput,
+		});
+		expect(workflow).toContain("call `TaskOutput`");
+	});
+
+	it("keep the native text when no refs are given", () => {
+		const orchestrate = renderOrchestrateNotice({ tools: [...tools, "wait"] });
+		expect(orchestrate).toContain("Blocked with nothing else to do? Use `wait`.");
+		expect(orchestrate).toContain("`task` subagents");
+		expect(renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true })).toContain(
+			"Leave `eval` and call `wait`",
+		);
+	});
+});
+
 describe("workflow notice", () => {
 	it("defaults to workpools and hides eval-defined tools when disabled", () => {
 		const enabled = renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true });

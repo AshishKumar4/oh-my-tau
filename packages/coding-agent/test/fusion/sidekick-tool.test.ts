@@ -4,7 +4,10 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { findSidekickRef, listSidekickRefs } from "@oh-my-pi/pi-coding-agent/fusion/config";
+import type { VendorTool } from "@oh-my-pi/pi-coding-agent/harness/capture";
+import { harnessSurface } from "@oh-my-pi/pi-coding-agent/harness/facades";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { getSidekickAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
@@ -20,6 +23,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const SIDEKICK_ID = "Sidekick";
+const SIDEKICK_TOOL = "sidekick";
 
 /** A custom agent definition; `sidekick: true` opts its sessions into leading a sidekick of their own. */
 function expertAgent(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
@@ -292,6 +296,70 @@ describe("fusion sidekick tool", () => {
 			await manager.getJob(jobId)?.promise;
 			await manager.drainDeliveries({ timeoutMs: 1000 });
 			expect(deliveries).toEqual([{ id: jobId, text: "late report" }]);
+		});
+
+		it("under Claude Code names the wait path the surface presents, in the description and the background hint", async () => {
+			const taskOutput: VendorTool = { description: "Retrieves output", inputSchema: {} };
+			const settings = Settings.isolated({
+				"fusion.enabled": true,
+				"fusion.sidekickModel": "devin/swe-2",
+				"task.maxRuntimeMs": 0,
+				"harness.mode": "claude-code",
+			});
+			/** The lead's session; `declaresTaskOutput` models a pre-2.1.284 capture. */
+			const claudeCodeSession = (declaresTaskOutput: boolean): ToolSession => {
+				const surface = harnessSurface("claude-code", ["read", "write", "wait", "task", SIDEKICK_TOOL], {
+					settings,
+					vendorTool: name => (declaresTaskOutput && name === "TaskOutput" ? taskOutput : undefined),
+				});
+				return makeSession({
+					settings,
+					getActiveModel: () => getBundledModel("anthropic", "claude-opus-5"),
+					getToolRefs: () => surface.toolRefs,
+				});
+			};
+			/** A `block: false` handoff's hint, the job released afterwards. */
+			const backgroundHint = async (tool: SidekickTool): Promise<string> => {
+				const release = Promise.withResolvers<void>();
+				vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async () => {
+					registerSidekick("idle");
+					await release.promise;
+					return {
+						result: singleResult("late report"),
+						policy: {} as structured.EffectiveSubagentPolicy,
+						mergeSummary: "",
+						changesApplied: null,
+						artifactsDir: tempDir.path(),
+						temporaryArtifacts: true,
+					};
+				});
+				const result = await tool.execute("c1", { message: "Go", block: false });
+				release.resolve();
+				const jobId = result.details?.jobId;
+				if (jobId) await manager.getJob(jobId)?.promise;
+				for (const ref of listSidekickRefs()) AgentRegistry.global().unregister(ref.id);
+				return result.content[0]?.type === "text" ? result.content[0].text : "";
+			};
+
+			// 2.1.284: TaskOutput is not served and `wait` is withheld — nothing waits on the wire.
+			const bare = SidekickTool.createIf(claudeCodeSession(false));
+			if (!bare) throw new Error("sidekick tool should mount");
+			expect(bare.description).toContain("end your turn rather than polling; the report arrives as a notification.");
+			const bareHint = await backgroundHint(bare);
+			expect(bareHint).toContain(
+				"Its report arrives as a notification when it finishes; end your turn rather than polling.",
+			);
+			for (const text of [bare.description, bareHint]) {
+				expect(text).not.toContain("TaskOutput");
+				expect(text).not.toContain("`wait`");
+				expect(text).not.toContain("undefined");
+			}
+
+			// An older capture serves TaskOutput in `wait`'s place: both name it.
+			const served = SidekickTool.createIf(claudeCodeSession(true));
+			if (!served) throw new Error("sidekick tool should mount");
+			expect(served.description).toContain("wait for it with `TaskOutput`");
+			expect(await backgroundHint(served)).toContain("wait for it with `TaskOutput` rather than polling.");
 		});
 
 		it("steers a call that arrives mid-handoff into the running turn instead of spawning a second sidekick", async () => {

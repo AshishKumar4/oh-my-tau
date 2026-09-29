@@ -12,7 +12,7 @@
  */
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { effectiveHarnessProfile } from "../harness/effective-profile";
+import { effectiveHarnessProfile, sessionToolRefs } from "../harness/effective-profile";
 import { formatDuration, prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
 import {
@@ -117,16 +117,19 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		return prompt.render(sidekickDescription, this.#promptData());
 	}
 
-	/** Description slots under the session's current harness profile. */
+	/** Description slots under the session's current harness profile and the tools it presents. */
 	#promptData(): FusionPromptData {
 		const model = this.session.getActiveModel?.();
 		const profile = model ? effectiveHarnessProfile(this.session.settings, model) : undefined;
-		return buildFusionPromptData({ profile, toolRefs: {} });
+		return buildFusionPromptData({ profile, toolRefs: sessionToolRefs(this.session) });
 	}
 
-	/** For a handoff that outlives the call: the wait tool the description names, not polling. */
+	/** For a handoff that outlives the call: the description's wait tool, or ending the turn; never polling. */
 	#waitHint(): string {
-		return `Its report auto-delivers when it finishes; wait for it with \`${this.#promptData().readTool}\` rather than polling.`;
+		const { readTool } = this.#promptData();
+		return readTool
+			? `Its report auto-delivers when it finishes; wait for it with \`${readTool}\` rather than polling.`
+			: "Its report arrives as a notification when it finishes; end your turn rather than polling.";
 	}
 
 	async execute(

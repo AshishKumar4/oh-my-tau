@@ -1,4 +1,5 @@
 import { prompt } from "@oh-my-pi/pi-utils";
+import { harnessToolRefs } from "../harness/manifest";
 import jevifyNotice from "../prompts/system/jevify-notice.md" with { type: "text" };
 import orchestrateNotice from "../prompts/system/orchestrate-notice.md" with { type: "text" };
 import ultrathinkNotice from "../prompts/system/ultrathink-notice.md" with { type: "text" };
@@ -17,8 +18,10 @@ import workflowNotice from "../prompts/system/workflow-notice.md" with { type: "
 
 /** Session facts a keyword notice may render against. */
 export interface MagicKeywordContext {
-	/** Enabled tool names for the turn. */
+	/** Tool names the model can reach this turn (a harness profile's withheld tools excluded). */
 	tools: readonly string[];
+	/** Presented names of those tools (`toolRefs`); literal omp names when omitted. */
+	toolRefs?: Readonly<Record<string, string>>;
 	/** `task.batch`: whether `task` accepts a `tasks[]` array. */
 	taskBatch: boolean;
 	/** Whether the `scout` agent can be dispatched. */
@@ -51,9 +54,12 @@ export const ULTRATHINK_NOTICE: string = ultrathinkNotice.trim();
 /** Hidden notice for "jevify": bulk classification through the eval kernel's `judge()`. */
 export const JEVIFY_NOTICE: string = jevifyNotice.trim();
 
-/** Hidden notice for "orchestrate", naming only the tools the session actually exposes. */
-export function renderOrchestrateNotice({ tools }: Pick<MagicKeywordContext, "tools">): string {
-	return prompt.render(orchestrateNotice, { tools }).trim();
+/** Hidden notice for "orchestrate", naming only the tools the session actually exposes, as it presents them. */
+export function renderOrchestrateNotice({
+	tools,
+	toolRefs = harnessToolRefs(undefined),
+}: Pick<MagicKeywordContext, "tools" | "toolRefs">): string {
+	return prompt.render(orchestrateNotice, { tools, toolRefs }).trim();
 }
 
 /** Hidden notice for "workflowz", shaped by the active task/eval capabilities. */
@@ -61,8 +67,9 @@ export function renderWorkflowNotice({
 	taskBatch,
 	scoutAvailable,
 	evalTools,
-}: Pick<MagicKeywordContext, "taskBatch" | "scoutAvailable" | "evalTools">): string {
-	return prompt.render(workflowNotice, { taskBatch, scoutAvailable, evalTools }).trim();
+	toolRefs = harnessToolRefs(undefined),
+}: Pick<MagicKeywordContext, "taskBatch" | "scoutAvailable" | "evalTools" | "toolRefs">): string {
+	return prompt.render(workflowNotice, { taskBatch, scoutAvailable, evalTools, toolRefs }).trim();
 }
 
 export const MAGIC_KEYWORDS = [

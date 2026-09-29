@@ -593,6 +593,13 @@ export interface BuildSystemPromptOptions {
 	/** Whether active `write` is restricted to xd:// dispatch and the plan artifact sandbox. */
 	writeTransportOnly?: boolean;
 	harnessProfile?: HarnessProfile;
+	/**
+	 * `toolRefs` of the surface the harness profile presents (see
+	 * `harnessSurface`): wire names of the reachable tools and the mounted
+	 * facades. Under `claude-code` they override the tool-name refs, so the
+	 * footer names Skill, TaskOutput-for-`wait` and the like only while mounted.
+	 */
+	harnessToolRefs?: Readonly<Record<string, string>>;
 }
 
 /** Result of building provider-facing system prompt messages. */
@@ -679,6 +686,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		writeTransportOnly = false,
 		activeRepoContext: providedActiveRepoContext,
 		harnessProfile,
+		harnessToolRefs,
 	} = options;
 	const inlineToolDescriptors = providedInlineToolDescriptors ?? false;
 	const resolvedCwd = cwd ?? getProjectDir();
@@ -901,8 +909,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		if (!toolPromptNames.has(mounted.name)) toolPromptNames.set(mounted.name, `${XD_URL_PREFIX}${mounted.name}`);
 	}
 	const toolRefs: Record<string, string> = Object.fromEntries(toolPromptNames.entries());
-	// Claude Code loads skills through its Skill facade over `read`.
-	if (harnessProfile === "claude-code" && toolPromptNames.has("read")) toolRefs.Skill = "Skill";
+	// Under Claude Code the presented surface names the tools: renamed built-ins
+	// and the facades that mounted (Skill, SendMessage, TaskOutput for `wait`).
+	if (harnessProfile === "claude-code" && harnessToolRefs) Object.assign(toolRefs, harnessToolRefs);
 	// The sidekick tool mounts only for a Fusion lead, so its presence IS the
 	// Fusion signal: the lead section renders with the same presented names the
 	// rest of the prompt uses.
