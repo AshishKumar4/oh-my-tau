@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { HARNESS_CAPTURE_SCHEMA, loadHarnessPrompt } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import { lookupBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
@@ -33,6 +34,7 @@ async function runModelCommand(model: Model): Promise<string> {
 	const emitted: string[] = [];
 	await spec.handle({ name: "model", args: "", text: "/model" }, {
 		session: { model },
+		settings: Settings.isolated(),
 		output: (text: string) => {
 			emitted.push(text);
 		},
