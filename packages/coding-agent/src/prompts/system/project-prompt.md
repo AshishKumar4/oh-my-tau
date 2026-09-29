@@ -24,7 +24,11 @@ Before changes in these directories, MUST read:
 {{/if}}
 
 {{#ifAny contextFiles.length agentsMdSearch.files.length}}
+{{#when harnessProfile "==" "claude-code"}}
+Context files above auto-loaded. NEVER search for `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, or similar agent/context files: relevant files already in context; others noise.
+{{else}}
 Context files above auto-loaded. NEVER `grep`/`glob` for `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, or similar agent/context files: relevant files already in context; others noise.
+{{/when}}
 {{/ifAny}}
 
 {{#if includeWorkspaceTree}}

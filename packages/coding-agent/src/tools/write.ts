@@ -30,6 +30,8 @@ import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getLspBatchRequest } from "../lsp/batch";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 
+import claudeCodeWriteDescription from "../prompts/tools/harness/claude-code-write.md" with { type: "text" };
+import claudeCodeWriteDeviceOnlyDescription from "../prompts/tools/harness/claude-code-write-device-only.md" with { type: "text" };
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import writeDeviceOnlyDescription from "../prompts/tools/write-device-only.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
@@ -473,6 +475,11 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 	readonly label = "Write";
 	get description(): string {
 		const deviceOnly = this.session.deviceOnlyWrite === true && this.session.pendingFullWriteDescription !== true;
+		// With no vendor declaration to serve, Claude Code's `Write` still names its
+		// own `file_path` and `Read`, not omp's `path` and `read`.
+		if (this.parameters === claudeCodeWriteSchema) {
+			return prompt.render(deviceOnly ? claudeCodeWriteDeviceOnlyDescription : claudeCodeWriteDescription);
+		}
 		return prompt.render(deviceOnly ? writeDeviceOnlyDescription : writeDescription);
 	}
 	get parameters(): WriteInputSchema {

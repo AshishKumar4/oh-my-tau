@@ -55,6 +55,7 @@ import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { resolveEditMode } from "../utils/edit-mode";
 import { attemptEditAutoRepair, type EditAutoRepairOutcome } from "./auto-repair";
 import { type AppliedEditSnapshot, createEditBlackboxRecorder } from "./blackbox";
+import claudeCodeEditDescription from "../prompts/tools/harness/claude-code-edit.md" with { type: "text" };
 import hashlineCompactPrompt from "./hashline-compact.md" with { type: "text" };
 import { getLspBatchRequest } from "../lsp/batch";
 import { type EditToolDetails, type EditToolPerFileResult, type Operation } from "@oh-my-pi/pi-tui/tools/edit";
@@ -431,6 +432,10 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	get description(): string {
+		// With no vendor declaration to serve, Claude Code's `Edit` still describes
+		// its own fields; omp's replace prompt also claims a read-before-edit gate
+		// replace mode does not have.
+		if (this.parameters === claudeCodeEditSchema) return prompt.render(claudeCodeEditDescription);
 		const mode = this.mode;
 		const model = this.session.getActiveModel?.();
 		const rendered = resolveEditToolDescription(mode, model);

@@ -198,6 +198,7 @@ export function renderSummary(
 				unit.tailText,
 				shouldAddHashLines,
 				shouldAddLineNumbers,
+				displayMode.numbering,
 			);
 			modelParts.push(formatted.model);
 			displayParts.push(formatted.display);

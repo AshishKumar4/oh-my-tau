@@ -10,6 +10,7 @@ import { type ApprovalMode, resolveApproval } from "@oh-my-pi/pi-coding-agent/to
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { TOOL_TIMEOUTS } from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { toolWireSchema, validateToolArguments as validateArgs } from "@oh-my-pi/pi-ai";
 
@@ -141,14 +142,10 @@ describe("approval parity under a harness rename", () => {
 				properties: Record<string, { description?: string }>;
 			};
 		const schema = schemaOf(tool);
-		expect(Object.keys(schema.properties)).toEqual([
-			"command",
-			"timeout",
-			"description",
-			"run_in_background",
-			"dangerouslyDisableSandbox",
-		]);
-		expect(schema.properties.timeout?.description).toMatch(/milliseconds/);
+		expect(Object.keys(schema.properties)).toEqual(["command", "timeout", "description", "run_in_background"]);
+		expect(schema.properties.timeout?.description).toBe(
+			`Optional timeout in milliseconds (max ${TOOL_TIMEOUTS.bash.max * 1000})`,
+		);
 		expect(schemaOf(native).properties.timeout?.description).toMatch(/seconds/);
 		expect(tool.intent({ command: "echo hi", description: "Print hi" })).toBe("Print hi");
 		const result = await tool.execute("c", { command: "echo hi", timeout: 900_000 });
@@ -164,11 +161,11 @@ describe("approval parity under a harness rename", () => {
 		);
 	});
 
-	it("rejects Bash.dangerouslyDisableSandbox by name instead of dropping it", async () => {
+	it("runs a stray Bash.dangerouslyDisableSandbox call as is: omp has no sandbox to lift", async () => {
 		const tool = new BashTool(toolSession([], CLAUDE_CODE_MODEL));
-		await expect(tool.execute("c", { command: "echo hi", dangerouslyDisableSandbox: true })).rejects.toThrow(
-			/dangerouslyDisableSandbox/,
-		);
+		const stray = { command: "echo hi", dangerouslyDisableSandbox: true };
+		const result = await tool.execute("c", stray);
+		expect(result.isError).toBeFalsy();
 	});
 
 	it("presents Claude Code's Read fields under the profile and maps offset/limit onto a line selector", async () => {
@@ -180,7 +177,7 @@ describe("approval parity under a harness rename", () => {
 			const schema = toolWireSchema({ name: "read", description: "", parameters: tool.parameters }) as {
 				properties: Record<string, unknown>;
 			};
-			expect(Object.keys(schema.properties)).toEqual(["file_path", "offset", "limit", "pages"]);
+			expect(Object.keys(schema.properties)).toEqual(["file_path", "offset", "limit"]);
 			expect(() => validateArgs(tool, call({ path: target }))).toThrow();
 
 			const native = new ReadTool(toolSession([], undefined, dir));
@@ -204,7 +201,9 @@ describe("approval parity under a harness rename", () => {
 			expect(await text(tool, { file_path: target, limit: 1 })).toEqual(["line1"]);
 			expect(await text(tool, { file_path: target })).toEqual(await text(native, { path: `${target}:raw` }));
 
-			await expect(tool.execute("c", { file_path: target, pages: "1-2" })).rejects.toThrow(/Read\.pages/);
+			// PDFs page through `offset`/`limit`; a stray vendor `pages` reads the file as a bare call does.
+			const stray = { file_path: target, pages: "1-2" };
+			expect(await text(tool, stray)).toEqual(await text(native, { path: `${target}:raw` }));
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}

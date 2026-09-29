@@ -1685,7 +1685,8 @@ describe("AskTool under the claude-code harness", () => {
 			properties: { questions: { items: { properties: Record<string, unknown>; required: string[] } } };
 			required: string[];
 		};
-		expect(Object.keys(schema.properties)).toEqual(["questions", "answers", "annotations", "metadata"]);
+		// `answers`/`annotations`/`metadata` are host-filled in Claude Code; no omp host fills them.
+		expect(Object.keys(schema.properties)).toEqual(["questions"]);
 		expect(schema.required).toEqual(["questions"]);
 		expect(schema.properties.questions.items.required).toEqual(["question", "header", "options"]);
 		expect(schema.properties.questions.items.properties.id).toBeUndefined();

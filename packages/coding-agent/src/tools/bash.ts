@@ -25,6 +25,7 @@ import { InternalUrlRouter } from "../internal-urls";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlFilesystem, UrlFsError } from "../internal-urls/url-filesystem";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
+import claudeCodeBashDescription from "../prompts/tools/harness/claude-code-bash.md" with { type: "text" };
 import type {
 	ClientBridgeTerminalExitStatus,
 	ClientBridgeTerminalHandle,
@@ -384,13 +385,13 @@ type BashNativeSchema =
 
 // Claude Code's own `Bash` shape. A served capture presents the vendor's exact
 // declaration instead; this mirror is the schema while no capture is served, so
-// both agree on the field set and on `timeout` being milliseconds.
+// both agree on the field set and on `timeout` being milliseconds. Neither
+// carries the vendor's `dangerouslyDisableSandbox`: omp has no sandbox to lift.
 const claudeCodeBashSchema = type({
 	command: type("string").describe("The command to execute"),
-	"timeout?": type("number").describe("Optional timeout in milliseconds (max 600000)"),
+	"timeout?": type("number").describe(`Optional timeout in milliseconds (max ${TOOL_TIMEOUTS.bash.max * 1000})`),
 	"description?": type("string").describe("Clear, concise description of what this command does in 5-10 words"),
 	"run_in_background?": type("boolean").describe("Set to true to run this command in the background"),
-	"dangerouslyDisableSandbox?": type("boolean").describe("Set this to true to dangerously override sandbox mode"),
 });
 
 type BashToolSchema = BashNativeSchema | typeof claudeCodeBashSchema;
@@ -398,19 +399,12 @@ type BashToolSchema = BashNativeSchema | typeof claudeCodeBashSchema;
 const BASH_BRIDGES: HarnessBridges<BashToolInput, typeof claudeCodeBashSchema> = {
 	"claude-code": {
 		parameters: claudeCodeBashSchema,
-		toParams: args => {
-			if (args.dangerouslyDisableSandbox === true) {
-				throw new ToolError(
-					"Bash.dangerouslyDisableSandbox is not supported: approval is decided by the host, not the tool call. Retry without the field.",
-				);
-			}
-			return {
-				command: args.command,
-				// Vendor milliseconds to omp seconds; the clamp floor keeps a sub-second value alive.
-				...(args.timeout !== undefined ? { timeout: Math.ceil(args.timeout / 1000) } : {}),
-				...(args.run_in_background !== undefined ? { async: args.run_in_background } : {}),
-			};
-		},
+		toParams: args => ({
+			command: args.command,
+			// Vendor milliseconds to omp seconds; the clamp floor keeps a sub-second value alive.
+			...(args.timeout !== undefined ? { timeout: Math.ceil(args.timeout / 1000) } : {}),
+			...(args.run_in_background !== undefined ? { async: args.run_in_background } : {}),
+		}),
 	},
 };
 
@@ -634,6 +628,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly label = "Bash";
 	readonly loadMode = "essential";
 	get description(): string {
+		// With no vendor declaration to serve, Claude Code's `Bash` still describes
+		// its own fields: omp's text names `cwd`, `pty` and `async`, which that
+		// schema cannot carry.
+		if (this.parameters === claudeCodeBashSchema) {
+			return prompt.render(claudeCodeBashDescription, {
+				defaultTimeoutMs: TOOL_TIMEOUTS.bash.default * 1000,
+				maxTimeoutMs: TOOL_TIMEOUTS.bash.max * 1000,
+			});
+		}
 		const evalBackends = resolveEvalBackends(this.session);
 		const isToolActive = (name: string, fallback: boolean): boolean => this.session.isToolActive?.(name) ?? fallback;
 		return prompt.render(bashDescription, {

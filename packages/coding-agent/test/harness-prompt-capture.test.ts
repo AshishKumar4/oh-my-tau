@@ -33,16 +33,12 @@ const HARNESS_MEMORY_BLOCK = [
 	"",
 	"Use `Bash` for shell work.",
 ].join("\n");
-const HARNESS_MEMORY_REDACTED = [
+const HARNESS_MEMORY_DROPPED = [
 	"You are a coding CLI.",
 	"",
 	"# Working style",
 	"",
 	"Be terse.",
-	"",
-	"# Memory",
-	"",
-	"You have a persistent file-based memory at `[redacted-session-path]`. Write each fact there with the Write tool.",
 	"",
 	"# Tools",
 	"",
@@ -146,6 +142,19 @@ describe("harness prompt custody", () => {
 		expect((await build()).systemPrompt.join("\n")).toContain("<critical>");
 	});
 
+	it("names no omp search tool in the project footer under claude-code, and keeps the native wording", async () => {
+		writeCapture();
+
+		const vendor = (await build("claude-code")).systemPrompt.join("\n\n");
+		expect(vendor).toContain("Context files above auto-loaded. NEVER search for `AGENTS.md`");
+		expect(vendor).not.toContain("`grep`/`glob`");
+
+		resetHarnessPromptCache();
+		expect((await build()).systemPrompt.join("\n\n")).toContain(
+			"Context files above auto-loaded. NEVER `grep`/`glob` for `AGENTS.md`",
+		);
+	});
+
 	it("leads with the captured harness text verbatim and leaves the identity line to the wire layer", async () => {
 		writeCapture();
 
@@ -227,30 +236,28 @@ describe("harness prompt custody", () => {
 		expect(promptText).not.toContain("# CLAUDE.md instructions");
 	});
 
-	it("redacts the recording-session path in place while keeping the memory section byte-exact", async () => {
+	it("drops the vendor memory section, recording-session path and all", async () => {
 		writeCapture({ instructions: [RECORDED_BILLING_BLOCK, claudeCodeSystemInstruction, HARNESS_MEMORY_BLOCK] });
 
 		const { systemPrompt } = await build("claude-code");
 
-		expect(systemPrompt[0]).toBe(HARNESS_MEMORY_REDACTED);
-		expect(systemPrompt[0]).toContain("# Memory");
+		expect(systemPrompt[0]).toBe(HARNESS_MEMORY_DROPPED);
 		expect(systemPrompt.join("\n\n")).not.toContain("/tmp/ccrec-synthetic");
+		expect(systemPrompt.join("\n\n")).not.toContain("[redacted-session-path]");
 	});
 
-	it("keeps a vendor section that merely mentions a path, redacting only the token", async () => {
-		const toolsNote = "# Tools\n\nPrefer the file tools; shell logs land under /tmp/vendor-logs/ on failure.";
+	it("drops only the sentence that carried a recording-session path", async () => {
+		const toolsNote = "# Tools\n\nPrefer the file tools. Shell logs land under /tmp/vendor-logs/ on failure.";
 		writeCapture({ instructions: [RECORDED_BILLING_BLOCK, claudeCodeSystemInstruction, toolsNote] });
 
 		const { systemPrompt } = await build("claude-code");
 
-		expect(systemPrompt[0]).toBe(
-			"# Tools\n\nPrefer the file tools; shell logs land under [redacted-session-path] on failure.",
-		);
+		expect(systemPrompt[0]).toBe("# Tools\n\nPrefer the file tools.");
 	});
 
-	it("redacts session paths under roots the old content sniff missed", async () => {
+	it("drops session paths under roots the old content sniff missed", async () => {
 		const exotic = "# Memory\n\nState lives at /root/.config/s1 on this machine.";
-		const windows = "# Tools\n\nPer-machine state lives at C:\\Users\\bot\\memory on this machine.";
+		const windows = "# Tools\n\nKeep builds small.\n\nPer-machine state lives at C:\\Users\\bot\\memory on this machine.";
 		writeCapture({ instructions: [RECORDED_BILLING_BLOCK, claudeCodeSystemInstruction, exotic, windows] });
 
 		const { systemPrompt } = await build("claude-code");
@@ -258,8 +265,9 @@ describe("harness prompt custody", () => {
 
 		expect(promptText).not.toContain("/root/.config/s1");
 		expect(promptText).not.toContain("C:\\Users\\bot\\memory");
-		expect(promptText).toContain("# Memory");
-		expect(promptText).toContain("# Tools");
+		expect(promptText).not.toContain("[redacted-session-path]");
+		expect(promptText).not.toContain("# Memory");
+		expect(systemPrompt[0]).toBe("# Tools\n\nKeep builds small.");
 	});
 
 	it("leaves bare environment references the vendor wrote generically untouched", async () => {

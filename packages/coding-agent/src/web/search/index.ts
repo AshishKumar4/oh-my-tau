@@ -18,6 +18,7 @@ import type { CustomTool, CustomToolContext } from "../../extensibility/custom-t
 import { type HarnessBridges, harnessParameters, harnessParams } from "../../harness/bridge";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
+import claudeCodeWebSearchDescription from "../../prompts/tools/harness/claude-code-web-search.md" with { type: "text" };
 import { resolveConfiguredModelTarget } from "../../session/role-models";
 import { discoverAuthStorage } from "../../sdk";
 import type { ToolSession } from "../../tools";
@@ -399,7 +400,12 @@ export class WebSearchTool implements AgentTool<WebSearchInputSchema, SearchResu
 	readonly name = "web_search";
 	readonly approval = "read" as const;
 	readonly label = "Web Search";
-	readonly description: string;
+	/** Claude Code's `WebSearch` describes its own fields when no vendor declaration is served. */
+	get description(): string {
+		return this.parameters === claudeCodeWebSearchSchema
+			? prompt.render(claudeCodeWebSearchDescription)
+			: this.#nativeDescription;
+	}
 	get parameters(): WebSearchInputSchema {
 		return harnessParameters(this.#session, WEB_SEARCH_BRIDGES, webSearchSchema);
 	}
@@ -408,10 +414,11 @@ export class WebSearchTool implements AgentTool<WebSearchInputSchema, SearchResu
 	readonly summary = "Search the web for up-to-date information";
 
 	#session: ToolSession;
+	readonly #nativeDescription: string;
 
 	constructor(session: ToolSession) {
 		this.#session = session;
-		this.description = prompt.render(webSearchDescription);
+		this.#nativeDescription = prompt.render(webSearchDescription);
 	}
 
 	async execute(

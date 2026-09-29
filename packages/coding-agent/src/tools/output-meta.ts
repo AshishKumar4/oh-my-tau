@@ -584,6 +584,9 @@ async function spillLargeResultToArtifact(
 	// Build truncation meta
 	const outputLines = truncated.outputLines ?? truncated.totalLines;
 	const outputBytes = truncated.outputBytes ?? truncated.totalBytes;
+	// The spilled meta replaces the window's; keep the parameter its continuation hint names.
+	const nextOffsetParam = existingMeta?.truncation?.nextOffsetParam;
+	const paging = nextOffsetParam === undefined ? {} : { nextOffsetParam };
 	let truncationMeta: TruncationMeta;
 	if (truncated.truncatedBy === "middle") {
 		const elidedLines = truncated.elidedLines ?? Math.max(0, truncated.totalLines - outputLines);
@@ -612,6 +615,7 @@ async function spillLargeResultToArtifact(
 			elidedBytes,
 			artifactId,
 			nextOffset: existingMeta?.truncation?.nextOffset,
+			...paging,
 		};
 	} else {
 		const shownStart = truncated.totalLines - outputLines + 1;
@@ -626,6 +630,7 @@ async function spillLargeResultToArtifact(
 			shownRange: { start: shownStart, end: truncated.totalLines },
 			artifactId,
 			nextOffset: existingMeta?.truncation?.nextOffset,
+			...paging,
 		};
 	}
 

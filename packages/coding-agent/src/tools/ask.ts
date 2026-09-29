@@ -28,6 +28,7 @@ import { formatKeyHint, formatKeyHints } from "@oh-my-pi/pi-tui/app-keybindings"
 import { editorKey, editorKeys } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
+import claudeCodeAskDescription from "../prompts/tools/harness/claude-code-ask.md" with { type: "text" };
 import { vocalizer } from "../tts/vocalizer";
 
 import type { ToolSession } from ".";
@@ -102,9 +103,6 @@ const claudeCodeAskSchema = arkType({
 		.atLeastLength(1)
 		.atMostLength(4)
 		.describe("questions to ask (1-4)"),
-	"answers?": arkType("Record<string, string>").describe("host-filled; leave unset"),
-	"annotations?": arkType("Record<string, object>").describe("host-filled; leave unset"),
-	"metadata?": arkType({ "source?": "string" }).describe("host-filled; leave unset"),
 });
 type ClaudeCodeAskParams = typeof claudeCodeAskSchema.inferIn;
 type AskInputSchema = typeof askSchema | typeof claudeCodeAskSchema;
@@ -603,7 +601,13 @@ export class AskTool implements AgentTool<AskInputSchema, AskToolDetails> {
 	readonly approval = "read" as const;
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
-	readonly description: string;
+	readonly #nativeDescription: string;
+	/** Claude Code's `AskUserQuestion` describes its own fields when no vendor declaration is served. */
+	get description(): string {
+		return this.parameters === claudeCodeAskSchema
+			? prompt.render(claudeCodeAskDescription)
+			: this.#nativeDescription;
+	}
 	get parameters(): AskInputSchema {
 		return harnessParameters(this.session, ASK_BRIDGES, askSchema);
 	}
@@ -621,7 +625,7 @@ export class AskTool implements AgentTool<AskInputSchema, AskToolDetails> {
 	readonly loadMode = "discoverable";
 
 	constructor(private readonly session: ToolSession) {
-		this.description = prompt.render(askDescription);
+		this.#nativeDescription = prompt.render(askDescription);
 	}
 
 	static createIf(session: ToolSession): AskTool | null {

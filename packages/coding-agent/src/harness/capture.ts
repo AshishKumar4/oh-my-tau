@@ -14,6 +14,7 @@ import { getHarnessCacheDir, isEnoent, isRecord, logger } from "@oh-my-pi/pi-uti
 // (https://github.com/earendil-works/pi), Copyright (c) 2025 Mario Zechner.
 // See THIRD-PARTY-NOTICES.txt.
 import bundledPiPrompt from "../prompts/harness/pi.md" with { type: "text" };
+import { TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 
 export const HARNESS_CAPTURE_SCHEMA = 1;
 
@@ -85,6 +86,8 @@ type CaptureProjection =
 			readonly capturedAt: number;
 			readonly model?: string;
 			readonly tools: Readonly<Record<string, VendorTool>>;
+			/** Ids of the profile's surface edits whose anchor this recording does not carry. */
+			readonly unmatchedEdits: readonly string[];
 	  }
 	| { readonly ok: false; readonly reason: string };
 
@@ -144,6 +147,308 @@ function stripEncrypted(schema: Record<string, unknown>): Record<string, unknown
 	return { ...schema, properties: cleaned };
 }
 
+/**
+ * One verbatim edit to the surface a capture serves. A recording is the vendor
+ * client's text about the vendor client's features, and omp serves it as its
+ * own: a sentence about something omp lacks is removed — never replaced with a
+ * "not available" note — and one that misstates omp's behaviour is rewritten
+ * to state it. Anchors are recorded text, so the capture guard fails as soon
+ * as a recording stops carrying one, instead of a new capture quietly bringing
+ * the claim back.
+ */
+export type SurfaceEdit = {
+	/** Stable name the capture guard reports. */
+	readonly id: string;
+	/** `"prompt"` for the instructions; otherwise the wire name of a declaration. */
+	readonly target: string;
+} & (
+	| {
+			/** Recorded text, replaced by `replace` or removed. */
+			readonly find: string;
+			readonly replace?: string;
+	  }
+	| {
+			/** Recorded start of a line; the whole line is replaced by `replace` or removed. */
+			readonly line: string;
+			readonly replace?: string;
+	  }
+	| {
+			/** A top-level `# Heading` line, dropped together with its section. */
+			readonly section: string;
+	  }
+	| {
+			/** An input-schema property: its description rewritten, or the property dropped. */
+			readonly property: string;
+			readonly description?: string;
+	  }
+);
+
+const BASH_TIMEOUT_DEFAULT_MS = TOOL_TIMEOUTS.bash.default * 1000;
+const BASH_TIMEOUT_MAX_MS = TOOL_TIMEOUTS.bash.max * 1000;
+
+/**
+ * Claude Code's served surface measured against omp: the vendor instructions
+ * (`prompt`) and the declarations of the tools omp bridges under Claude Code's
+ * names.
+ */
+export const CLAUDE_CODE_SURFACE_EDITS: readonly SurfaceEdit[] = [
+	// omp never wraps pastes in id-tagged `<pasted_content>` blocks.
+	{ id: "prompt.pasted-content", target: "prompt", line: " - Text inside <pasted_content> tags " },
+	// There is no user-invocable skills section; omp's slash form is the client-side `/skill:<name>`.
+	{ id: "prompt.skill-slash-command", target: "prompt", line: " - When the user types `/<skill-name>`" },
+	// Claude Code's file memory: a directory on the recording machine (the only
+	// session path a recording carries) and a MEMORY.md index omp never loads.
+	{ id: "prompt.memory", target: "prompt", section: "# Memory" },
+	// Claims about the vendor client's other apps and its `/fast` toggle.
+	{ id: "prompt.product-surfaces", target: "prompt", line: " - Claude Code is available as " },
+	{ id: "prompt.fast-mode", target: "prompt", line: " - Fast mode for Claude Code " },
+	// Contradicts orchestrating subagents; omp has no workflows or deep-research.
+	{ id: "prompt.agent-restraint", target: "prompt", line: "Do not use the Agent tool, workflows, or deep-research " },
+	// `file_path` is handed to omp's read, which also opens the internal URLs
+	// that tool results (`artifact://`) and the prompt footer (`rule://`) name.
+	{
+		id: "read.internal-urls",
+		target: "Read",
+		find: "- `file_path` must be an absolute path.",
+		replace:
+			"- `file_path` must be an absolute path, or an internal URL such as `artifact://<id>` or `rule://<name>` when a tool result or this prompt names one.",
+	},
+	// A bare read of code returns omp's structural summary (the token win is
+	// kept); other reads stop at `read.defaultLimit` lines with a footer.
+	{
+		id: "read.default-window",
+		target: "Read",
+		line: "- Reads up to ",
+		replace:
+			"- Without `offset`/`limit`, a longer code file returns a structural summary: signatures stay, bodies are elided, and a footer gives the `offset`/`limit` that reads an elided range. Any other file returns its first lines, with a footer giving the `offset` to continue from when more remain.",
+	},
+	// PDFs convert to text; there is no page parameter.
+	{
+		id: "read.pdf-pages",
+		target: "Read",
+		find: 'Reads PDFs via the `pages` parameter (e.g. "1-5", max 20 pages/request; required for PDFs over 10 pages).',
+		replace: "Reads PDFs as extracted text, paged with `offset`/`limit`.",
+	},
+	{ id: "read.pages", target: "Read", property: "pages" },
+	// Notebooks render as cell sources only.
+	{
+		id: "read.notebook-outputs",
+		target: "Read",
+		find: "Reads Jupyter notebooks (.ipynb) as cells with outputs.",
+		replace: "Reads Jupyter notebooks (.ipynb) as their cells' source, without outputs.",
+	},
+	{
+		id: "read.special-paths",
+		target: "Read",
+		line: "- Reading a directory, ",
+		replace:
+			"- Reading a directory returns a listing of its entries. A missing file returns an error unless exactly one workspace file's path ends with the given path; that file is read instead, with a notice naming it. An empty file returns a notice rather than content.",
+	},
+	{
+		id: "bash.timeout",
+		target: "Bash",
+		line: "- `timeout` is in milliseconds",
+		replace: `- \`timeout\` is in milliseconds: default ${BASH_TIMEOUT_DEFAULT_MS}, max ${BASH_TIMEOUT_MAX_MS}.`,
+	},
+	{
+		id: "bash.timeout-schema",
+		target: "Bash",
+		property: "timeout",
+		description: `Optional timeout in milliseconds (max ${BASH_TIMEOUT_MAX_MS})`,
+	},
+	// omp does not intercept `sleep`, and Monitor is not served.
+	{
+		id: "bash.monitor",
+		target: "Bash",
+		find: " Foreground `sleep` is blocked; use Monitor with an until-loop to wait on a condition.",
+	},
+	// Nothing in omp injects an attribution reminder.
+	{
+		id: "bash.attribution",
+		target: "Bash",
+		line: "- End git commit messages and PR bodies with the attribution lines ",
+	},
+	// There is no sandbox to lift; approval is decided by the host.
+	{ id: "bash.sandbox", target: "Bash", property: "dangerouslyDisableSandbox" },
+	// Replace mode has no read-before-write gate.
+	{ id: "edit.read-first", target: "Edit", line: "- You must Read the file in this conversation before editing" },
+	{ id: "write.read-first", target: "Write", find: " Overwriting an existing file you haven't Read will fail." },
+	// Neither EnterPlanMode nor ExitPlanMode is served.
+	{ id: "ask.plan-mode", target: "AskUserQuestion", line: "Plan mode note: " },
+	// omp renders a preview under its option, not in a side-by-side pane.
+	{
+		id: "ask.preview-layout",
+		target: "AskUserQuestion",
+		find:
+			" When any option has a preview, the UI switches to a side-by-side layout with a vertical option list on the left and preview on the right.",
+	},
+	// Host-filled fields no omp host fills.
+	{ id: "ask.answers", target: "AskUserQuestion", property: "answers" },
+	{ id: "ask.annotations", target: "AskUserQuestion", property: "annotations" },
+	{ id: "ask.metadata", target: "AskUserQuestion", property: "metadata" },
+	// Older clients recorded the month as a literal, stale a month later; the
+	// date rides omp's first-turn reminder, as newer clients word it.
+	{
+		id: "websearch.current-month",
+		target: "WebSearch",
+		line: "- The current month is ",
+		replace:
+			"- The current month is (provided in the conversation below) — use this when searching for recent information.",
+	},
+];
+
+const SURFACE_EDITS: Partial<Readonly<Record<HarnessProfile, readonly SurfaceEdit[]>>> = {
+	"claude-code": CLAUDE_CODE_SURFACE_EDITS,
+};
+
+/**
+ * Rewrites `text` line by line. A `null` rewrite drops the line, and a dropped
+ * paragraph leaves one blank line between its neighbours and none at either end.
+ */
+function rewriteLines(text: string, rewrite: (line: string) => string | null): string {
+	const lines = text.split("\n");
+	const kept: string[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const next = rewrite(lines[i]!);
+		if (next !== null) {
+			kept.push(next);
+			continue;
+		}
+		const following = lines[i + 1];
+		if (kept.length === 0) {
+			if (following === "") i++;
+		} else if (kept[kept.length - 1] === "" && (following === undefined || following === "")) {
+			kept.pop();
+		}
+	}
+	return kept.join("\n");
+}
+
+/** `text` without its top-level `heading` section, or `undefined` when it has none. */
+function dropSection(text: string, heading: string): string | undefined {
+	const lines = text.split("\n");
+	let fenced = false;
+	let start = -1;
+	let end = lines.length;
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i]!;
+		if (line.startsWith("```")) {
+			fenced = !fenced;
+		} else if (!fenced && line.startsWith("# ")) {
+			if (start !== -1) {
+				end = i;
+				break;
+			}
+			if (line.trimEnd() === heading) start = i;
+		}
+	}
+	if (start === -1) return undefined;
+	// A closing section takes the blank lines before it along.
+	let from = start;
+	if (end === lines.length) while (from > 0 && lines[from - 1] === "") from--;
+	return [...lines.slice(0, from), ...lines.slice(end)].join("\n");
+}
+
+/** `text` with a text edit applied, or `undefined` when `text` lacks its anchor. */
+function editText(text: string, edit: SurfaceEdit): string | undefined {
+	if ("find" in edit) return text.includes(edit.find) ? text.split(edit.find).join(edit.replace ?? "") : undefined;
+	if ("line" in edit) {
+		if (!text.split("\n").some(line => line.startsWith(edit.line))) return undefined;
+		return rewriteLines(text, line => (line.startsWith(edit.line) ? (edit.replace ?? null) : line));
+	}
+	if ("section" in edit) return dropSection(text, edit.section);
+	return undefined;
+}
+
+function editSchema(
+	schema: TJsonSchema | undefined,
+	edit: { readonly property: string; readonly description?: string },
+): TJsonSchema | undefined {
+	const properties = schema?.properties;
+	if (schema === undefined || !isRecord(properties) || !(edit.property in properties)) return undefined;
+	if (edit.description !== undefined) {
+		const property = properties[edit.property];
+		return {
+			...schema,
+			properties: {
+				...properties,
+				[edit.property]: { ...(isRecord(property) ? property : {}), description: edit.description },
+			},
+		};
+	}
+	const { [edit.property]: _dropped, ...kept } = properties;
+	const required = Array.isArray(schema.required)
+		? { required: schema.required.filter(name => name !== edit.property) }
+		: {};
+	return { ...schema, properties: kept, ...required };
+}
+
+function editTool(tool: VendorTool, edit: SurfaceEdit): VendorTool | undefined {
+	if ("property" in edit) {
+		const inputSchema = editSchema(tool.inputSchema, edit);
+		return inputSchema === undefined ? undefined : { ...tool, inputSchema };
+	}
+	const description = editText(tool.description, edit);
+	return description === undefined ? undefined : { ...tool, description };
+}
+
+const LEADING_MARKER = /^\s*(?:(?:[-*+]|\d+[.)])\s+)?/;
+const SENTENCE_BREAK = /(?<=[.!?])\s+/;
+
+/**
+ * Drops every sentence that still carries a redacted recording-session path:
+ * the path belonged to the recording machine, so whatever the sentence says
+ * about it is not true of this session.
+ */
+function dropRedactedSentences(text: string): string {
+	if (!text.includes(REDACTED_SESSION_PATH)) return text;
+	return rewriteLines(text, line => {
+		if (!line.includes(REDACTED_SESSION_PATH)) return line;
+		const marker = LEADING_MARKER.exec(line)?.[0] ?? "";
+		const kept = line
+			.slice(marker.length)
+			.split(SENTENCE_BREAK)
+			.filter(sentence => !sentence.includes(REDACTED_SESSION_PATH));
+		return kept.length === 0 ? null : `${marker}${kept.join(" ")}`;
+	});
+}
+
+interface ServedSurface {
+	readonly text: string;
+	readonly tools: Readonly<Record<string, VendorTool>>;
+	readonly unmatched: readonly string[];
+}
+
+/**
+ * The surface `profile` serves from a capture: its edits applied once, when the
+ * capture loads. The result is a pure function of the recording, so every
+ * request and every process serves the same bytes.
+ */
+function editServedSurface(
+	profile: HarnessProfile,
+	text: string,
+	tools: Readonly<Record<string, VendorTool>>,
+): ServedSurface {
+	const edits = SURFACE_EDITS[profile];
+	if (edits === undefined) return { text, tools, unmatched: [] };
+	let prompt = text;
+	const served: Record<string, VendorTool> = { ...tools };
+	const unmatched: string[] = [];
+	for (const edit of edits) {
+		if (edit.target === "prompt") {
+			const next = editText(prompt, edit);
+			if (next === undefined) unmatched.push(edit.id);
+			else prompt = next;
+			continue;
+		}
+		const tool = served[edit.target];
+		const next = tool === undefined ? undefined : editTool(tool, edit);
+		if (next === undefined) unmatched.push(edit.id);
+		else served[edit.target] = next;
+	}
+	return { text: dropRedactedSentences(prompt), tools: served, unmatched };
+}
+
 export function projectHarnessCapture(profile: HarnessProfile, raw: unknown): CaptureProjection {
 	const capture = captureSchema(raw);
 	if (capture instanceof type.errors) return { ok: false, reason: capture.summary };
@@ -183,12 +488,15 @@ export function projectHarnessCapture(profile: HarnessProfile, raw: unknown): Ca
 		if (description.trim().length === 0) continue;
 		tools[name] = { description, ...(isRecord(input_schema) ? { inputSchema: stripEncrypted(input_schema) } : {}) };
 	}
+	const surface = editServedSurface(profile, blocks.join("\n\n"), tools);
+	if (surface.text.trim().length === 0) return { ok: false, reason: "instructions-empty" };
 	return {
 		ok: true,
-		text: blocks.join("\n\n"),
+		text: surface.text,
 		clientVersion: capture.clientVersion,
 		capturedAt: Number.isNaN(capturedAt) ? 0 : capturedAt,
-		tools,
+		tools: surface.tools,
+		unmatchedEdits: surface.unmatched,
 		...(capture.model === undefined ? {} : { model: capture.model }),
 	};
 }
@@ -327,6 +635,13 @@ async function readHarnessPrompt(profile: HarnessProfile, modelId?: string): Pro
 		if (!projection.ok) {
 			logger.debug("Harness capture rejected; ignoring it", { profile, file, reason: projection.reason });
 			continue;
+		}
+		if (projection.unmatchedEdits.length > 0) {
+			logger.debug("Harness capture lacks the anchors of some served-surface edits", {
+				profile,
+				file,
+				unmatched: projection.unmatchedEdits,
+			});
 		}
 		// A capture recorded on the serving model beats every other candidate,
 		// however recent: it is the only one whose vendor text already names the

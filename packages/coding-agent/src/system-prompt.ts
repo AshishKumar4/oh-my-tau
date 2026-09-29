@@ -1034,6 +1034,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		// A served vendor prompt carries its own operating directives; the footer
 		// then keeps environment facts only.
 		vendorPrompt: harnessPromptText !== undefined,
+		// The effective harness profile, so footer text can name only what that
+		// surface serves (`{{#when harnessProfile "==" "claude-code"}}`).
+		harnessProfile,
 	};
 	// A served vendor prompt renders the footer-only template too, so the harness
 	// case takes the same branch as a literal custom prompt.
