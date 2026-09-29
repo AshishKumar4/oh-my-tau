@@ -4,7 +4,20 @@
 
 ### Fixed
 
+- Fixed GPT models on Amazon Bedrock's OpenAI routes (bedrock-runtime and bedrock-mantle `/openai/...`) falling back to a local summary instead of OpenAI's native remote compaction; set `remoteCompaction.enabled: false` to opt out ([#13311](https://github.com/can1357/oh-my-pi/pull/13311) by [@mustafaabidali](https://github.com/mustafaabidali)).
+- Fixed native compaction on Amazon Bedrock's OpenAI routes skipping the provider's request setup, which sent Bedrock Mantle compaction to an unresolved `{region}` host and skipped configured headers and proxies; other providers' compaction requests are unchanged ([#13311](https://github.com/can1357/oh-my-pi/pull/13311) by [@mustafaabidali](https://github.com/mustafaabidali)).
+
+## [18.4.3] - 2026-09-28
+
+### Added
+
+- Added `transformAssistantMessagePreservesToolCalls`, letting stream speculation and direct speculative candidates run under a `transformAssistantMessage` that never rewrites streamed tool calls
+- Added `authorizeLaunch` to the speculative execution host and coordinator so tool stream sessions can start host-approved effectful work (e.g. subagents) before their call dispatches
+
+### Fixed
+
 - Fixed auto-compaction with the `remote` method failing on long Codex/OpenAI sessions with "Remote compaction input exceeds the context window" ([#13611](https://github.com/can1357/oh-my-pi/issues/13611))
+- Fixed passive tool-call context being repeated when several calls in one batch returned the same text; identical per-call context is now delivered once, at its first position ([#13633](https://github.com/can1357/oh-my-pi/pull/13633) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.4.2] - 2026-09-28
 
