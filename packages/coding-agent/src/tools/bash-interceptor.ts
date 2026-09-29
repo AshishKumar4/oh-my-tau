@@ -19,15 +19,18 @@ export interface InterceptionResult {
 	suggestedTool?: string;
 }
 
-/** What a rule message renders against; see {@link BashInterceptorRule}. */
-export interface InterceptorMessageData {
+/**
+ * What a rule message renders against; see {@link BashInterceptorRule}. A type
+ * alias, not an interface, so it satisfies the renderer's indexable context.
+ */
+export type InterceptorMessageData = {
 	/** Names the session presents its tools under (`toolRefs`). */
 	toolRefs: Readonly<Record<string, string>>;
 	/** Bash takes omp's own schema: its native wording (service `name`, `proc://`) applies. */
 	nativeBash: boolean;
 	/** A harness Bash schema whose `run_in_background` is live: the managed alternative to name. */
 	backgroundField: boolean;
-}
+};
 
 /** omp's own Bash under omp's own tool names: the wording every rule message had before templating. */
 const NATIVE_MESSAGE_DATA: InterceptorMessageData = {
