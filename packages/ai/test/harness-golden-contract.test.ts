@@ -13,7 +13,7 @@ import { CODEX_CLIENT_VERSION } from "@oh-my-pi/pi-catalog/wire/codex";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { withOfficialAnthropicEndpoint } from "./helpers";
 import claudeCodeGoldenJson from "./fixtures/harness/claude-code-2.1.284.golden.json" with { type: "json" };
-import codexGoldenJson from "./fixtures/harness/codex-0.155.1.golden.json" with { type: "json" };
+import codexGoldenJson from "./fixtures/harness/codex-0.159.0.golden.json" with { type: "json" };
 import {
 	anthropicDeclarations,
 	anthropicFraming,
