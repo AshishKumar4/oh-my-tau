@@ -297,11 +297,15 @@ function omittedRequestedLine(
 function formatOmittedRequestedLineNotice(
 	line: NonNullable<ReadLineWindow["byteLimitLine"]>,
 	maxBytes: number,
-	rawTarget: string,
+	selectorBase: string,
+	byOffset: boolean,
 ): string {
-	return `[Line ${line.index + 1} is ${formatBytes(
+	const lineNumber = line.index + 1;
+	// Claude Code's `Read` has no raw selector; a one-line window reads the line without context.
+	const target = byOffset ? `offset=${lineNumber} limit=1` : `${selectorBase}:raw:${lineNumber}-${lineNumber}`;
+	return `[Line ${lineNumber} is ${formatBytes(
 		line.byteLength,
-	)} and could not fit after preceding context in the ${formatBytes(maxBytes)} read budget. Use ${rawTarget} to read that line without context (byte-capped if it exceeds the budget), or widen the requested range to increase the budget.]`;
+	)} and could not fit after preceding context in the ${formatBytes(maxBytes)} read budget. Use ${target} to read that line without context (byte-capped if it exceeds the budget), or widen the requested range to increase the budget.]`;
 }
 
 /**
@@ -2452,11 +2456,11 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 						const nextOffset = startLine + userLimitedLines + 1;
 						outputText = formatBracketAwareText() ?? formatText(selectedContent, startLineDisplay);
 						if (omittedSelectedLine) {
-							const lineNumber = omittedSelectedLine.index + 1;
 							outputText += `\n\n${formatOmittedRequestedLineNotice(
 								omittedSelectedLine,
 								maxBytesForRead,
-								`${selectorBase}:raw:${lineNumber}-${lineNumber}`,
+								selectorBase,
+								usesClaudeCodeRead(this.session),
 							)}`;
 						} else {
 							outputText += `\n\n[More lines in file (${formatBytes(
@@ -2468,11 +2472,11 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 					} else if (truncation?.truncated) {
 						outputText = formatBracketAwareText() ?? formatText(truncation.content, startLineDisplay);
 						if (omittedSelectedLine) {
-							const lineNumber = omittedSelectedLine.index + 1;
 							outputText += `\n\n${formatOmittedRequestedLineNotice(
 								omittedSelectedLine,
 								maxBytesForRead,
-								`${selectorBase}:raw:${lineNumber}-${lineNumber}`,
+								selectorBase,
+								usesClaudeCodeRead(this.session),
 							)}`;
 						}
 						details = { truncation: toReadTruncationStats(truncation) };

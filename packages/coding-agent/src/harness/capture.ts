@@ -204,6 +204,8 @@ export const CLAUDE_CODE_SURFACE_EDITS: readonly SurfaceEdit[] = [
 	{ id: "prompt.fast-mode", target: "prompt", line: " - Fast mode for Claude Code " },
 	// Contradicts orchestrating subagents; omp has no workflows or deep-research.
 	{ id: "prompt.agent-restraint", target: "prompt", line: "Do not use the Agent tool, workflows, or deep-research " },
+	// Claude Code's token-budget counter, a recorded literal omp does not keep up to date.
+	{ id: "prompt.token-budget", target: "prompt", line: "<total_tokens>" },
 	// `file_path` is handed to omp's read, which also opens the internal URLs
 	// that tool results (`artifact://`) and the prompt footer (`rule://`) name.
 	{

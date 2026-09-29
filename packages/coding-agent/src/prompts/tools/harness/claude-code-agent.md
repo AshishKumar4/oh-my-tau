@@ -31,5 +31,5 @@ If you are a fork, execute directly — don't re-delegate. The call returns once
 - `isolation: "worktree"` runs the agent on its own git worktree; {{#if applyIsolatedChanges}}its successful changes are applied back to your checkout{{else}}its changes stay in that worktree and are not applied{{/if}}.
 {{/if}}
 {{#if batchEnabled}}
-- For several agents that share background, make one call with `tasks`: one agent per item (`description`, `prompt`, optional `subagent_type`). The top-level `prompt` is the shared brief every agent receives, so write the common context once instead of repeating it per item; the top-level `description` labels the batch. `subagent_type: "fork"` is not available inside `tasks`.
+- For several agents that share background, make one call with `tasks`: one agent per item (`description`, `prompt`, optional `subagent_type`). The top-level `prompt` is the shared brief every agent receives, so write the common context once instead of repeating it per item; the top-level `description` labels the batch. Items inside `tasks` cannot use `subagent_type: "fork"`.
 {{/if}}

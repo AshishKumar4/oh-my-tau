@@ -51,7 +51,6 @@ function projectData(options: {
 		activeRepoContext: "",
 		vendorPrompt: options.vendorPrompt,
 		appendPrompt: "",
-		...(options.harnessProfile === undefined ? {} : { harnessProfile: options.harnessProfile }),
 		claudeCodeVendorPrompt,
 	};
 }
