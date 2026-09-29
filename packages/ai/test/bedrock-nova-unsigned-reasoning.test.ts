@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { renderDemotedThinking } from "@oh-my-pi/pi-ai/dialect";
 import { streamBedrock } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
-import type { Context, Model } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 // Amazon Nova streams reasoningContent natively (with no signature — Nova never
@@ -122,5 +123,153 @@ describe("Bedrock Nova unsigned reasoning replay", () => {
 		for (const block of assistantMessage.content) {
 			expect(block).not.toHaveProperty("reasoningContent");
 		}
+	});
+});
+
+interface ConverseWireMessage {
+	role: string;
+	content: Array<Record<string, unknown>>;
+}
+
+function payloadMessages(payload: unknown): ConverseWireMessage[] {
+	if (!payload || typeof payload !== "object" || !("messages" in payload) || !Array.isArray(payload.messages)) {
+		throw new Error("expected a Converse payload with messages");
+	}
+	return payload.messages;
+}
+
+function assistantTurn(
+	content: AssistantMessage["content"],
+	source: Pick<AssistantMessage, "api" | "provider" | "model">,
+	stopReason: AssistantMessage["stopReason"],
+): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		...source,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason,
+		timestamp: 1,
+	};
+}
+
+// Anthropic's `reasoning_extraction` classifier refuses requests that re-send
+// prior reasoning to Claude as text, so Claude on Bedrock drops reasoning it
+// cannot replay as signed reasoningContent. Other Bedrock models keep the
+// dialect-wrapped text demotion exercised above.
+describe("Bedrock Claude prior reasoning replay", () => {
+	const claudeModel: Model<"bedrock-converse-stream"> = buildModel({
+		id: "us.anthropic.claude-opus-4-8-v1:0",
+		name: "Claude Opus 4.8",
+		api: "bedrock-converse-stream",
+		provider: "amazon-bedrock",
+		baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200000,
+		maxTokens: 8192,
+	});
+	const GPT_REASONING = "gpt-5.6-sol private chain: inspect the parser before patching";
+
+	function foreignReasoningContext(): Context {
+		return {
+			messages: [
+				{ role: "user", content: "Fix the parser", timestamp: 0 },
+				assistantTurn(
+					[
+						{ type: "thinking", thinking: GPT_REASONING, thinkingSignature: '{"type":"reasoning"}' },
+						{ type: "text", text: "Reading the parser first." },
+						{ type: "toolCall", id: "call_gpt", name: "read", arguments: { path: "parser.ts" } },
+					],
+					{ api: "openai-codex-responses", provider: "openai-codex", model: "gpt-5.6-sol" },
+					"toolUse",
+				),
+				{
+					role: "toolResult",
+					toolCallId: "call_gpt",
+					toolName: "read",
+					content: [{ type: "text", text: "parser body" }],
+					isError: false,
+					timestamp: 2,
+				},
+				{ role: "user", content: "Continue", timestamp: 3 },
+			],
+		};
+	}
+
+	test("drops cross-model reasoning for Claude but still demotes it for Nova", async () => {
+		const claude = payloadMessages(await captureReplayPayload(claudeModel, foreignReasoningContext()));
+
+		expect(JSON.stringify(claude)).not.toContain(GPT_REASONING);
+		expect(claude.map(message => message.role)).toEqual(["user", "assistant", "user"]);
+		expect(claude[1]?.content).toEqual([
+			{ text: "Reading the parser first." },
+			{ toolUse: { toolUseId: "call_gpt", name: "read", input: { path: "parser.ts" } } },
+		]);
+
+		const nova = payloadMessages(await captureReplayPayload(novaModel, foreignReasoningContext()));
+
+		expect(nova[1]?.content[0]).toEqual({ text: renderDemotedThinking(novaModel.id, GPT_REASONING) });
+	});
+
+	test("drops unsigned and reasoning-only turns while keeping signed replay and role alternation", async () => {
+		const signedReasoning = "claude own chain: the patch compiles";
+		const unsignedReasoning = "claude chain whose signature never arrived";
+		const reasoningOnly = "gpt-6-astra private chain: nothing else was said this turn";
+		const context: Context = {
+			messages: [
+				{ role: "user", content: "Fix the parser", timestamp: 0 },
+				assistantTurn(
+					[
+						{ type: "thinking", thinking: signedReasoning, thinkingSignature: "sig_claude" },
+						{ type: "thinking", thinking: unsignedReasoning },
+						{ type: "text", text: "Patched." },
+						{ type: "toolCall", id: "toolu_1", name: "read", arguments: { path: "parser.ts" } },
+					],
+					{ api: "bedrock-converse-stream", provider: "amazon-bedrock", model: claudeModel.id },
+					"toolUse",
+				),
+				{
+					role: "toolResult",
+					toolCallId: "toolu_1",
+					toolName: "read",
+					content: [{ type: "text", text: "parser body" }],
+					isError: false,
+					timestamp: 2,
+				},
+				assistantTurn(
+					[{ type: "thinking", thinking: reasoningOnly, thinkingSignature: '{"type":"reasoning"}' }],
+					{ api: "openai-codex-responses", provider: "openai-codex", model: "gpt-6-astra" },
+					"stop",
+				),
+				{ role: "user", content: "Continue", timestamp: 3 },
+			],
+		};
+
+		const messages = payloadMessages(await captureReplayPayload(claudeModel, context));
+
+		const wire = JSON.stringify(messages);
+		expect(wire).not.toContain(unsignedReasoning);
+		expect(wire).not.toContain(reasoningOnly);
+		// The reasoning-only turn vanishes without leaving two user turns
+		// adjacent: Converse rejects any conversation that does not alternate.
+		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "user"]);
+		expect(messages[1]?.content).toEqual([
+			{ reasoningContent: { reasoningText: { text: signedReasoning, signature: "sig_claude" } } },
+			{ text: "Patched." },
+			{ toolUse: { toolUseId: "toolu_1", name: "read", input: { path: "parser.ts" } } },
+		]);
+		expect(messages[2]?.content.slice(0, 2)).toMatchObject([
+			{ toolResult: { toolUseId: "toolu_1" } },
+			{ text: "Continue" },
+		]);
 	});
 });

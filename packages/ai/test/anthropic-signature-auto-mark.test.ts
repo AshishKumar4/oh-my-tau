@@ -14,9 +14,11 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 /**
  * Regression for #4297 — the anthropic-messages transport auto-heals the very
  * first `400 Invalid signature in thinking block` from an unmarked custom
- * signing proxy: demote every unsigned thinking block in the request, retry
- * once, and pin the (baseUrl, modelId) as signing in the session state so
- * subsequent turns skip the demotion round-trip.
+ * signing proxy: stop replaying unsigned thinking natively, retry once, and
+ * pin the (baseUrl, modelId) as signing in the session state so subsequent
+ * turns skip the failed round-trip. Claude targets drop the unsigned
+ * reasoning rather than demoting it to text: re-sent reasoning trips
+ * Anthropic's `reasoning_extraction` classifier.
  */
 
 const model: Model<"anthropic-messages"> = buildModel({
@@ -215,7 +217,7 @@ describe("#4297 anthropic-messages runtime signing auto-mark", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("demotes unsigned thinking, retries, and pins the session on the first signing 400", async () => {
+	it("drops unsigned thinking, retries, and pins the session on the first signing 400", async () => {
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		const capturedPayloads: unknown[] = [];
 		let attempt = 0;
@@ -252,9 +254,9 @@ describe("#4297 anthropic-messages runtime signing auto-mark", () => {
 		expect(firstThinking?.thinking).toBe("Read the file, then summarise.");
 
 		const retryBlocks = extractPriorAssistantBlocks(capturedPayloads[1]);
-		expect(retryBlocks.find(block => block.type === "thinking")).toBeUndefined();
-		const demotedText = retryBlocks.find(block => block.type === "text");
-		expect(demotedText?.text).toContain("Read the file, then summarise.");
+		expect(retryBlocks.map(block => block.type)).toEqual(["text"]);
+		expect(retryBlocks[0]?.text).toBe("The README covers the CLI.");
+		expect(JSON.stringify(capturedPayloads[1])).not.toContain("Read the file, then summarise.");
 
 		expect(readReplayUnsignedThinkingDisabled(providerSessionState)).toBe(true);
 		expect(result.disabledFeatures).toContain("unsigned-thinking-replay");
@@ -291,12 +293,13 @@ describe("#4297 anthropic-messages runtime signing auto-mark", () => {
 		expect(result.errorMessage).toBeUndefined();
 
 		const retryBlocks = extractPriorAssistantBlocks(capturedPayloads[1]);
-		expect(retryBlocks.find(block => block.type === "thinking")).toBeUndefined();
-		expect(retryBlocks.find(block => block.type === "text")?.text).toContain("Read the file, then summarise.");
+		expect(retryBlocks.map(block => block.type)).toEqual(["text"]);
+		expect(retryBlocks[0]?.text).toBe("The README covers the CLI.");
+		expect(JSON.stringify(capturedPayloads[1])).not.toContain("Read the file, then summarise.");
 		expect(readReplayUnsignedThinkingDisabled(providerSessionState)).toBe(true);
 	});
 
-	it("pre-demotes unsigned thinking on subsequent turns once the session is pinned", async () => {
+	it("pre-drops unsigned thinking on subsequent turns once the session is pinned", async () => {
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		const capturedPayloads: unknown[] = [];
 		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
@@ -326,8 +329,9 @@ describe("#4297 anthropic-messages runtime signing auto-mark", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(capturedPayloads.length).toBe(1);
 		const blocks = extractPriorAssistantBlocks(capturedPayloads[0]);
-		expect(blocks.find(block => block.type === "thinking")).toBeUndefined();
-		expect(blocks.find(block => block.type === "text")?.text).toContain("Read the file, then summarise.");
+		expect(blocks.map(block => block.type)).toEqual(["text"]);
+		expect(blocks[0]?.text).toBe("The README covers the CLI.");
+		expect(JSON.stringify(capturedPayloads[0])).not.toContain("Read the file, then summarise.");
 		expect(result.disabledFeatures).toContain("unsigned-thinking-replay");
 	});
 

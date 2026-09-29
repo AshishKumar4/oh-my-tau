@@ -11,24 +11,22 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
  * silently discards unsigned thought content (a replayed `thought:true` part is
  * neither recalled nor influences generation). `transformMessages` therefore
  * demotes the reasoning to a `text` block so it survives as conversation
- * context, usually wrapping it in the TARGET model's own canonical
- * thinking-block dialect (e.g. a ```thinking fence for Gemini). The
- * Anthropic/Claude dialect is the exception: every Claude model
- * (Opus / Sonnet / Haiku / Fable / Mythos, etc.) receives bare assistant prose,
- * because Anthropic's `reasoning_extraction` classifier flags `<thinking>` /
- * `antml:thinking` tags in prior turn history — refusing (Fable) or leaking
- * the wrapped chain-of-thought as visible reasoning on the others. Same-model
+ * context, wrapping it in the TARGET model's own canonical thinking-block
+ * dialect (e.g. a ```thinking fence for Gemini). Claude targets are the
+ * exception: Anthropic's `reasoning_extraction` classifier refuses requests
+ * that re-send prior reasoning — tagged or as bare prose — so every
+ * Anthropic-dialect target drops foreign reasoning instead. Same-model
  * continuations keep the native `thinking` block untouched.
  */
 const REASONING = "The user wants the Paris weather; I will call get_weather with city=Paris.";
 
-function makeModel<T extends Api>(api: T, provider: string, id: string): Model<T> {
+function makeModel<T extends Api>(api: T, provider: string, id: string, baseUrl = ""): Model<T> {
 	return buildModel({
 		id,
 		name: id,
 		api,
 		provider,
-		baseUrl: "",
+		baseUrl,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		maxTokens: 8_192,
@@ -130,13 +128,12 @@ describe("transformMessages cross-provider thinking demotion → canonical diale
 		expect(text).toContain(REASONING);
 	});
 
-	it("renders demoted foreign reasoning as bare assistant prose for every Anthropic-dialect Claude target", () => {
-		// The Anthropic reasoning_extraction classifier flags `<thinking>` and
-		// `antml:thinking` tags in prior turn history for the whole Claude family
-		// — Fable refuses outright, Opus/Sonnet/Haiku/Mythos leak the wrapped
-		// chain-of-thought as visible reasoning. Every Anthropic-dialect target
-		// therefore receives bare prose, not the dialect's canonical thinking
-		// tags.
+	it("drops foreign reasoning for every Anthropic-dialect Claude target instead of demoting it", () => {
+		// Re-sent reasoning trips Anthropic's `reasoning_extraction` classifier
+		// whether it is wrapped in `<thinking>` / `antml:thinking` tags or sent as
+		// bare prose, and a foreign thinking block cannot replay natively on
+		// Claude (only Claude-signed blocks verify). The block is dropped; the
+		// visible reply survives unchanged.
 		const targets = [
 			{ name: "Claude Opus", id: "claude-opus-4-8" },
 			{ name: "Claude Sonnet", id: "claude-sonnet-4-6" },
@@ -157,67 +154,28 @@ describe("transformMessages cross-provider thinking demotion → canonical diale
 				model,
 			);
 
-			expect(assistant.content.some(b => b.type === "thinking")).toBe(false);
-
-			const first = assistant.content[0];
-			expect(first?.type).toBe("text");
-			const text = first && first.type === "text" ? first.text : "";
-			expect(text).toBe(REASONING);
-			expect(text).toBe(renderDemotedThinking(target.id, REASONING));
-			expect(text).not.toContain("<thinking>");
-			expect(text).not.toContain("</thinking>");
-			expect(text).not.toContain("<think>");
-			expect(text).not.toContain("</think>");
-			expect(text).not.toContain("_Hmm.");
-
-			const reply = assistant.content[1];
-			expect(reply?.type).toBe("text");
-			expect(reply && reply.type === "text" ? reply.text : "").toBe("Checking the forecast.");
+			expect(assistant.content).toEqual([{ type: "text", text: "Checking the forecast." }]);
+			// Every encoder-side demotion site relies on this: nothing to emit.
+			expect(renderDemotedThinking(target.id, REASONING)).toBe("");
 		}
 	});
 
-	it("trims a demoted block that becomes final after following empty thinking blocks are dropped", () => {
-		const claude = makeModel("anthropic-messages", "anthropic", "claude-sonnet-4-6");
-		const turn: AssistantMessage = {
-			...geminiThinkingTurn(),
-			content: [
-				{ type: "thinking", thinking: `${REASONING}\n`, thinkingSignature: "google-sig" },
-				{ type: "thinking", thinking: " \n\t", thinkingSignature: "" },
-			],
-		};
+	it("drops foreign reasoning for Claude even on an endpoint that replays unsigned thinking natively", () => {
+		// A non-signing gateway resolves `replayUnsignedThinking`, under which
+		// Anthropic-compatible targets (Z.AI, DeepSeek, …) read foreign reasoning
+		// as native unsigned thinking. Claude verifies only its own signed blocks,
+		// so another model's reasoning is dropped there too.
+		const gateway = makeModel(
+			"anthropic-messages",
+			"claude-gateway",
+			"claude-opus-5-5",
+			"https://llm.example.com/anthropic",
+		);
+		expect(gateway.compat.replayUnsignedThinking).toBe(true);
 
-		const assistant = transformedAssistant([user("weather in Paris?"), turn], claude);
+		const assistant = transformedAssistant([user("weather in Paris?"), geminiThinkingTurn()], gateway);
 
-		expect(assistant.content).toHaveLength(1);
-		const first = assistant.content[0];
-		expect(first?.type).toBe("text");
-		const text = first && first.type === "text" ? first.text : "";
-		expect(text).toBe(REASONING);
-		expect(/\s$/.test(text)).toBe(false);
-	});
-
-	it("trimEnds trailing whitespace already present in bare Anthropic-dialect demoted thinking", () => {
-		const claude = makeModel("anthropic-messages", "anthropic", "claude-sonnet-4-6");
-		const reasoningWithTrailingWhitespace = "The plan is complete.\n \t";
-		const turn: AssistantMessage = {
-			...geminiThinkingTurn(),
-			content: [
-				{
-					type: "thinking",
-					thinking: reasoningWithTrailingWhitespace,
-					thinkingSignature: "google-sig",
-				},
-			],
-		};
-
-		const assistant = transformedAssistant([user("weather in Paris?"), turn], claude);
-
-		expect(assistant.content).toHaveLength(1);
-		const first = assistant.content[0];
-		expect(first?.type).toBe("text");
-		const text = first && first.type === "text" ? first.text : "";
-		expect(text).toBe("The plan is complete.");
-		expect(/\s$/.test(text)).toBe(false);
+		expect(assistant.content).toEqual([{ type: "text", text: "Checking the forecast." }]);
 	});
 
 	it("keeps the native thinking block for a same-provider/same-model continuation", () => {

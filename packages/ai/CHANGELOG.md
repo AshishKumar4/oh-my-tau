@@ -19,6 +19,7 @@
 ### Changed
 
 - Reduced per-token CPU and allocations while streaming: the leaked-thinking scanner used for OpenAI-compatible and custom endpoints no longer allocates per character, chat-completions and Bedrock look up a delta's content block in constant time, Google, Gemini CLI, Codex, and chat-completions streams skip raw SSE line capture unless an `onSseEvent` listener is attached, and event streams drain backlogs without `Array#shift` ([#13650](https://github.com/can1357/oh-my-pi/pull/13650) by [@H4vC](https://github.com/H4vC)).
+- Fixed Claude refusing long multi-model sessions with `Refusal (reasoning_extraction): This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs`. Prior reasoning Claude cannot replay as a native thinking block — other models' or providers' reasoning, unsigned or stale-signature blocks, and unsigned blocks after the signing-proxy auto-demote — was re-sent as plain assistant text; Claude targets on every provider (Anthropic, Bedrock, Vertex, gateways) now drop it instead, keeping visible text, tool calls, and signed thinking unchanged. Bedrock also folds adjacent user turns so a dropped reasoning-only turn keeps the conversation alternating.
 
 ## [18.4.2] - 2026-09-28
 

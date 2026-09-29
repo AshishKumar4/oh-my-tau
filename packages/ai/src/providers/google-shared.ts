@@ -242,9 +242,10 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 							thoughtSignature,
 						});
 					} else {
-						parts.push({
-							text: renderDemotedThinking(model.id, block.thinking),
-						});
+						// Claude targets (e.g. via Antigravity) drop it: `renderDemotedThinking`
+						// renders nothing for them.
+						const demoted = renderDemotedThinking(model.id, block.thinking);
+						if (demoted) parts.push({ text: demoted });
 					}
 				} else if (block.type === "toolCall") {
 					const facade = facadeToolCallReplay(block, declaredNames);

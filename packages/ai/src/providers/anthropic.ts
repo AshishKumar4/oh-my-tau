@@ -3344,7 +3344,7 @@ const streamAnthropicOnce = (
 						isInvalidThinkingSignatureError(streamFailureMessage)
 					) {
 						logger.warn(
-							"anthropic: signing proxy detected (thinking signature rejected), demoting unsigned thinking and retrying",
+							"anthropic: signing proxy detected (thinking signature rejected), disabling unsigned thinking replay and retrying",
 							{
 								provider: model.provider,
 								model: model.id,
@@ -4619,7 +4619,9 @@ function buildParams(
 	// A session-scoped auto-demote (learned from a live signing 400) clones the
 	// resolved compat with `replayUnsignedThinking: false` so every subsequent
 	// downstream read (convertAnthropicMessages, transformMessages) sees the
-	// demoted default without mutating the shared `model` reference.
+	// demoted default without mutating the shared `model` reference. Unsigned
+	// blocks then demote to text — or, for Claude targets, are dropped
+	// (`dropsUnreplayableThinking`).
 	const effectiveModel =
 		forceDemoteUnsignedThinking && model.compat.replayUnsignedThinking
 			? { ...model, compat: { ...model.compat, replayUnsignedThinking: false } }
@@ -5216,10 +5218,10 @@ export function convertAnthropicMessages(
 					if (hasSignedThinking) {
 						if (!block.thinkingSignature || block.thinkingSignature.trim().length === 0) {
 							if (block.thinking.trim().length === 0) continue;
-							blocks.push({
-								type: "text",
-								text: renderDemotedThinking(model.id, block.thinking),
-							});
+							// Demoted to text, except for Claude targets, which drop it:
+							// `renderDemotedThinking` renders nothing for them.
+							const demoted = renderDemotedThinking(model.id, block.thinking);
+							if (demoted) blocks.push({ type: "text", text: demoted });
 							continue;
 						}
 						blocks.push({
@@ -5238,10 +5240,9 @@ export function convertAnthropicMessages(
 								signature: "",
 							});
 						} else {
-							blocks.push({
-								type: "text",
-								text: renderDemotedThinking(model.id, block.thinking),
-							});
+							// Claude targets drop it, as above.
+							const demoted = renderDemotedThinking(model.id, block.thinking);
+							if (demoted) blocks.push({ type: "text", text: demoted });
 						}
 					} else {
 						blocks.push({

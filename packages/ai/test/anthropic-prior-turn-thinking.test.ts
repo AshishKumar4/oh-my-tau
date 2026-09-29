@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { renderDemotedThinking } from "@oh-my-pi/pi-ai/dialect";
-import { convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { type AnthropicMessageParam, convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type {
 	AssistantMessage,
 	Message,
@@ -102,11 +101,16 @@ interface WireToolUseBlock {
 	name: string;
 	input: Record<string, unknown>;
 }
+interface WireToolResultBlock {
+	type: "tool_result";
+	tool_use_id: string;
+}
 type WireBlock =
 	| WireThinkingBlock
 	| WireTextBlock
 	| WireRedactedBlock
 	| WireToolUseBlock
+	| WireToolResultBlock
 	| { type: string; [key: string]: unknown };
 
 describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
@@ -217,10 +221,11 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 		expect(redacted?.data).toBe("encrypted-blob");
 	});
 
-	it("strips foreign signatures and drops redacted_thinking when the target is official Anthropic", () => {
+	it("strips foreign signatures and drops reasoning and redacted_thinking on official Anthropic", () => {
 		// 3p → official Anthropic. The official endpoint rejects foreign
-		// signatures cryptographically, and `replayUnsignedThinking: false`
-		// demotes the unsigned visible thinking to text downstream, so the
+		// signatures cryptographically, so the stripped visible thinking cannot
+		// replay natively; Claude drops it rather than demoting it to text (the
+		// `reasoning_extraction` classifier refuses re-sent reasoning), and the
 		// matching redacted sibling must not remain as a lone native
 		// redacted_thinking block.
 		const target = makeAnthropicModel({
@@ -256,10 +261,8 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 		const params = convertAnthropicMessages(messages, target, false);
 		const assistants = params.filter(p => p.role === "assistant");
 		const priorBlocks = assistants[0].content as WireBlock[];
-		const text = priorBlocks.find(b => b.type === "text") as WireTextBlock | undefined;
-		expect(text?.text).toBe(renderDemotedThinking(target.id, "visible reasoning"));
-		expect(priorBlocks.find(b => b.type === "thinking")).toBeUndefined();
-		expect(priorBlocks.find(b => b.type === "redacted_thinking")).toBeUndefined();
+		expect(priorBlocks.map(b => b.type)).toEqual(["tool_use"]);
+		expect(JSON.stringify(priorBlocks)).not.toContain("visible reasoning");
 	});
 
 	it("preserves official Anthropic prior signatures across a same-deployment model switch", () => {
@@ -636,13 +639,14 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 		const thinking = priorBlocks.find(b => b.type === "thinking") as WireThinkingBlock | undefined;
 		// Signature-only replay is unsafe on a signing target with a stale
 		// (cross-model) source signature — that's the whole 400 failure class.
-		// The transform strips the signature (so `signingEndpoint` demotes the
-		// unsigned block to text) and no stale `sig_prior` reaches the wire.
+		// The transform strips the signature, and the now-unsigned reasoning is
+		// dropped rather than demoted to text: no stale `sig_prior` and no
+		// re-sent reasoning reach the wire.
 		expect(thinking).toBeUndefined();
-		const text = priorBlocks.find(b => b.type === "text") as WireTextBlock | undefined;
-		expect(text?.text).toContain("prior reasoning");
+		expect(priorBlocks.map(b => b.type)).toEqual(["tool_use"]);
 		const wireBlobs = JSON.stringify(priorBlocks);
 		expect(wireBlobs).not.toContain("sig_prior");
+		expect(wireBlobs).not.toContain("prior reasoning");
 	});
 
 	it("strips stale cross-model signatures on Google Vertex publishers/anthropic (#4297)", () => {
@@ -678,10 +682,10 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 		const priorBlocks = assistants[0].content as WireBlock[];
 		const thinking = priorBlocks.find(b => b.type === "thinking") as WireThinkingBlock | undefined;
 		expect(thinking).toBeUndefined();
-		const text = priorBlocks.find(b => b.type === "text") as WireTextBlock | undefined;
-		expect(text?.text).toContain("sonnet reasoning");
+		expect(priorBlocks.map(b => b.type)).toEqual(["tool_use"]);
 		const wireBlobs = JSON.stringify(priorBlocks);
 		expect(wireBlobs).not.toContain("sig_sonnet");
+		expect(wireBlobs).not.toContain("sonnet reasoning");
 	});
 });
 
@@ -731,10 +735,10 @@ describe("Latest-turn foreign thinking signatures (model switch mid tool-loop)",
 		// verify, and official Anthropic never replays unsigned thinking.
 		expect(blocks.find(b => b.type === "thinking")).toBeUndefined();
 		expect(JSON.stringify(blocks)).not.toContain(KIMI_SIG);
-		// The reasoning survives as demoted text ahead of the visible text.
+		// The reasoning is dropped, not demoted: only the visible text remains.
 		const texts = blocks.filter(b => b.type === "text") as WireTextBlock[];
-		expect(texts[0]?.text).toBe(renderDemotedThinking(target.id, reasoning));
-		expect(texts.some(t => t.text.includes("렌더링"))).toBe(true);
+		expect(texts.map(t => t.text)).toEqual(["한 군데 렌더링 닛: 빈 줄 하나 추가."]);
+		expect(JSON.stringify(blocks)).not.toContain(reasoning);
 		// The pending tool loop stays intact.
 		const toolUse = blocks.find(b => b.type === "tool_use") as WireToolUseBlock | undefined;
 		expect(toolUse?.id).toBe("toolu_send");
@@ -786,8 +790,8 @@ describe("Latest-turn foreign thinking signatures (model switch mid tool-loop)",
 		const blocks = assistants[0].content as WireBlock[];
 		expect(blocks.find(b => b.type === "thinking")).toBeUndefined();
 		expect(JSON.stringify(blocks)).not.toContain(KIMI_SIG);
-		const text = blocks.find(b => b.type === "text") as WireTextBlock | undefined;
-		expect(text?.text).toBe(renderDemotedThinking(target.id, reasoning));
+		expect(blocks.map(b => b.type)).toEqual(["tool_use"]);
+		expect(JSON.stringify(blocks)).not.toContain(reasoning);
 	});
 
 	it("keeps the latest ABANDONED same-model turn untouched (byte-for-byte rule)", () => {
@@ -859,5 +863,194 @@ describe("Latest-turn foreign thinking signatures (model switch mid tool-loop)",
 		expect(thinking?.thinking).toBe("fable reasoning");
 		expect(thinking?.signature ?? "").toBe("");
 		expect(JSON.stringify(blocks)).not.toContain("sig_fable");
+	});
+});
+
+function isToolResultBlock(block: WireBlock): block is WireToolResultBlock {
+	return block.type === "tool_result";
+}
+
+function wireBlocks(param: AnthropicMessageParam | undefined): WireBlock[] {
+	if (!param || typeof param.content === "string") return [];
+	return param.content as WireBlock[];
+}
+
+function toolResultIds(param: AnthropicMessageParam | undefined): string[] {
+	return wireBlocks(param).flatMap(block => (isToolResultBlock(block) ? [block.tool_use_id] : []));
+}
+
+describe("Claude targets drop prior reasoning they cannot replay natively (reasoning_extraction)", () => {
+	// Anthropic's `reasoning_extraction` classifier refuses requests that re-send
+	// prior reasoning to Claude as conversation content ("… restrictions on
+	// reverse engineering or duplicating model outputs"); long multi-model
+	// histories accumulate enough of it to be refused even as bare prose. Claude
+	// therefore receives prior reasoning only as a native thinking block it
+	// accepts. Everything else is dropped, while visible text and tool calls
+	// replay unchanged.
+	const GPT_REASONING = "gpt-5.6-sol private chain: inspect the parser before patching";
+	const MUSE_REASONING = "muse-spark private chain: the tokenizer drops trailing commas";
+	const CLAUDE_REASONING = "claude own chain: the patch compiles";
+	const LEAKED_REASONING = "private chain that must not reach Claude as text";
+
+	const officialClaude = () =>
+		makeAnthropicModel({
+			provider: "anthropic",
+			id: "claude-opus-5-5",
+			name: "Claude Opus 5.5",
+			baseUrl: "https://api.anthropic.com",
+		});
+	// A non-signing gateway resolves `replayUnsignedThinking: true`.
+	const gatewayClaude = () =>
+		makeAnthropicModel({
+			provider: "claude-gateway",
+			id: "claude-opus-5-5",
+			name: "Claude Opus 5.5 via gateway",
+		});
+
+	it("drops gpt and muse reasoning, keeping text, tool calls, and signed same-model thinking", () => {
+		for (const target of [officialClaude(), gatewayClaude()]) {
+			const messages: Message[] = [
+				makeUser("Fix the parser"),
+				makeAssistant(
+					[
+						{ type: "thinking", thinking: GPT_REASONING, thinkingSignature: '{"type":"reasoning"}' },
+						{ type: "text", text: "Reading the parser first." },
+						{ type: "toolCall", id: "call_gpt", name: "read", arguments: { path: "parser.ts" } },
+					],
+					{ api: "openai-codex-responses", provider: "openai-codex", model: "gpt-5.6-sol" },
+				),
+				toolResult("call_gpt", "parser body"),
+				makeAssistant(
+					[
+						{ type: "thinking", thinking: MUSE_REASONING },
+						{ type: "toolCall", id: "call_muse", name: "read", arguments: { path: "tokenizer.ts" } },
+					],
+					{ api: "openai-completions", provider: "meta", model: "muse-spark" },
+				),
+				toolResult("call_muse", "tokenizer body"),
+				makeAssistant(
+					[
+						{ type: "thinking", thinking: CLAUDE_REASONING, thinkingSignature: "sig_claude" },
+						{ type: "text", text: "Patched and verified." },
+					],
+					{ provider: target.provider, model: target.id, stopReason: "stop" },
+				),
+				makeUser("Ship it"),
+			];
+
+			const params = convertAnthropicMessages(messages, target, false);
+
+			const wire = JSON.stringify(params);
+			expect(wire).not.toContain(GPT_REASONING);
+			expect(wire).not.toContain(MUSE_REASONING);
+			const roles = params.map(p => p.role);
+			expect(roles).toEqual(["user", "assistant", "user", "assistant", "user", "assistant", "user"]);
+			expect(wireBlocks(params[1])).toEqual([
+				{ type: "text", text: "Reading the parser first." },
+				{ type: "tool_use", id: "call_gpt", name: "read", input: { path: "parser.ts" } },
+			]);
+			expect(toolResultIds(params[2])).toEqual(["call_gpt"]);
+			expect(wireBlocks(params[3])).toEqual([
+				{ type: "tool_use", id: "call_muse", name: "read", input: { path: "tokenizer.ts" } },
+			]);
+			expect(toolResultIds(params[4])).toEqual(["call_muse"]);
+			// Claude's own signed block still replays byte-for-byte.
+			expect(wireBlocks(params[5])).toEqual([
+				{ type: "thinking", thinking: CLAUDE_REASONING, signature: "sig_claude" },
+				{ type: "text", text: "Patched and verified." },
+			]);
+		}
+	});
+
+	const unreplayableCases: Array<{
+		name: string;
+		target: Model<"anthropic-messages">;
+		content: AssistantMessage["content"];
+		source: Partial<AssistantMessage>;
+		kept: WireBlock[];
+	}> = [
+		{
+			name: "unsigned reasoning from another Claude model on the same deployment",
+			target: officialClaude(),
+			content: [{ type: "thinking", thinking: LEAKED_REASONING }],
+			source: { provider: "anthropic", model: "claude-sonnet-4-6" },
+			kept: [],
+		},
+		{
+			name: "reasoning whose signature another deployment minted",
+			target: officialClaude(),
+			content: [{ type: "thinking", thinking: LEAKED_REASONING, thinkingSignature: "sig_vertex" }],
+			source: { provider: "google-vertex", model: "claude-opus-5-5" },
+			kept: [],
+		},
+		{
+			// The gateway replays unsigned thinking natively, but only the
+			// target's own: the stripped official block is not.
+			name: "official reasoning stripped of its signature for an unsigned-replay gateway",
+			target: gatewayClaude(),
+			content: [{ type: "thinking", thinking: LEAKED_REASONING, thinkingSignature: "sig_official" }],
+			source: { provider: "anthropic", model: "claude-opus-5-5" },
+			kept: [],
+		},
+		{
+			// An unsigned block cannot ride natively beside signed siblings.
+			name: "unsigned same-model reasoning beside a signed sibling",
+			target: gatewayClaude(),
+			content: [
+				{ type: "thinking", thinking: CLAUDE_REASONING, thinkingSignature: "sig_claude" },
+				{ type: "thinking", thinking: LEAKED_REASONING },
+			],
+			source: { provider: "claude-gateway", model: "claude-opus-5-5" },
+			kept: [{ type: "thinking", thinking: CLAUDE_REASONING, signature: "sig_claude" }],
+		},
+	];
+
+	for (const testCase of unreplayableCases) {
+		it(`drops ${testCase.name} instead of demoting it to text`, () => {
+			const messages: Message[] = [
+				makeUser("Summarize README"),
+				makeAssistant([...testCase.content, { type: "text", text: "Visible summary." }], {
+					...testCase.source,
+					stopReason: "stop",
+				}),
+				makeUser("Translate"),
+			];
+
+			const params = convertAnthropicMessages(messages, testCase.target, false);
+
+			expect(JSON.stringify(params)).not.toContain(LEAKED_REASONING);
+			expect(wireBlocks(params[1])).toEqual([...testCase.kept, { type: "text", text: "Visible summary." }]);
+		});
+	}
+
+	it("drops a reasoning-only turn without leaving an empty assistant message or breaking tool pairing", () => {
+		const reasoningOnly = "gpt-6-astra private chain: nothing else was said this turn";
+		const messages: Message[] = [
+			makeUser("Fix the parser"),
+			makeAssistant([{ type: "toolCall", id: "call_gpt", name: "read", arguments: { path: "parser.ts" } }], {
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				model: "gpt-5.6-sol",
+			}),
+			toolResult("call_gpt", "parser body"),
+			makeAssistant([{ type: "thinking", thinking: reasoningOnly, thinkingSignature: '{"type":"reasoning"}' }], {
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				model: "gpt-6-astra",
+				stopReason: "stop",
+			}),
+			makeUser("Continue"),
+		];
+
+		const params = convertAnthropicMessages(messages, officialClaude(), false);
+
+		expect(JSON.stringify(params)).not.toContain(reasoningOnly);
+		// The reasoning-only turn leaves no assistant param at all; Anthropic
+		// merges the adjacent user turns.
+		expect(params.map(p => p.role)).toEqual(["user", "assistant", "user", "user"]);
+		expect(wireBlocks(params[1])).toEqual([
+			{ type: "tool_use", id: "call_gpt", name: "read", input: { path: "parser.ts" } },
+		]);
+		expect(toolResultIds(params[2])).toEqual(["call_gpt"]);
 	});
 });

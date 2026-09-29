@@ -1062,6 +1062,16 @@ function convertMessages(
 	promptCachePolicy: BedrockPromptCachePolicy,
 ): WireMessage[] {
 	const result: WireMessage[] = [];
+	// Converse rejects consecutive same-role turns ("A conversation must
+	// alternate between user and assistant roles"). An assistant turn skipped
+	// for having nothing replayable — e.g. one whose only content was reasoning
+	// a Claude target drops (`dropsUnreplayableThinking`) — would leave two user
+	// turns adjacent, so a user turn that follows another folds into it.
+	const pushUserTurn = (content: UserContent[]): void => {
+		const previous = result.at(-1);
+		if (previous?.role === "user") previous.content.push(...content);
+		else result.push({ role: "user", content });
+	};
 	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
 
 	for (let i = 0; i < transformedMessages.length; i++) {
@@ -1073,7 +1083,7 @@ function convertMessages(
 				if (typeof m.content === "string") {
 					// Skip empty user messages
 					if (!m.content || m.content.trim() === "") continue;
-					result.push({ role: "user", content: [{ text: m.content.toWellFormed() }] });
+					pushUserTurn([{ text: m.content.toWellFormed() }]);
 				} else {
 					const contentBlocks: UserContent[] = [];
 					for (const c of m.content) {
@@ -1093,7 +1103,7 @@ function convertMessages(
 					}
 					// Skip message if all blocks filtered out
 					if (contentBlocks.length === 0) continue;
-					result.push({ role: "user", content: contentBlocks });
+					pushUserTurn(contentBlocks);
 				}
 				break;
 			case "assistant": {
@@ -1136,10 +1146,12 @@ function convertMessages(
 								// rejects it on replay with HTTP 400 "User messages cannot contain reasoning
 								// content. Please remove the reasoning content and try again.", which wedges the
 								// agent loop on every turn after the first. Demote to plain text instead — the
-								// content survives, just no longer typed as a reasoning block. This matches how
-								// every other provider (Anthropic, Google, OpenAI-completions) handles thinking
-								// blocks it can't safely replay.
-								contentBlocks.push({ text: renderDemotedThinking(model.id, c.thinking) });
+								// content survives, just no longer typed as a reasoning block — except on Claude,
+								// where re-sent reasoning trips Anthropic's `reasoning_extraction` classifier:
+								// `renderDemotedThinking` renders nothing there and the block is dropped. This
+								// matches every other provider's handling of thinking it can't safely replay.
+								const demoted = renderDemotedThinking(model.id, c.thinking);
+								if (demoted) contentBlocks.push({ text: demoted });
 							}
 							break;
 						default:
@@ -1167,7 +1179,7 @@ function convertMessages(
 				i = j - 1;
 
 				contentBlocks.push(...hoistedImages);
-				result.push({ role: "user", content: contentBlocks });
+				pushUserTurn(contentBlocks);
 				break;
 			}
 			default:
