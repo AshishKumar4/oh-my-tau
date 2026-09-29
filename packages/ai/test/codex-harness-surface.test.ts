@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
+import { streamSimple } from "@oh-my-pi/pi-ai";
 import {
 	buildCodexNamespaceTools,
 	buildTransformedCodexRequestBody,
@@ -375,6 +376,36 @@ describe("codex fork lineage", () => {
 		expect(snapshots[0]?.sessionId).toBe("root-session");
 		expect(turnMetadata.thread_id).toBe(snapshots[0]?.threadId);
 		expect(snapshots[0]?.input).toEqual(input);
+	});
+
+	it("carries the lineage and the snapshot observer through streamSimple, the path sessions use", async () => {
+		const source = createForkSource();
+		const snapshots: CodexRequestSnapshot[] = [];
+		let headers: Headers | undefined;
+		const fetchMock: FetchImpl = async (input, init) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url.endsWith("/responses")) headers = new Headers(init?.headers);
+			return dataSse(COMPLETED_EVENTS);
+		};
+		await streamSimple(
+			createCodexModel("gpt-6-astra"),
+			createForkContext([
+				{ role: "user", content: "Say hello", timestamp: 1 },
+				{ role: "user", content: "Summarize it for the parent", timestamp: 2 },
+			]),
+			{
+				apiKey: createCodexTestToken(),
+				fetch: fetchMock,
+				sessionId: "child-session",
+				codexFork: { source, messageCount: 1 },
+				onCodexRequestSnapshot: snapshot => snapshots.push(snapshot),
+			},
+		).result();
+
+		expect(headers?.get("session-id")).toBe("root-session");
+		expect(headers?.get("x-codex-parent-thread-id")).toBe("root-thread-1");
+		expect(snapshots).toHaveLength(1);
+		expect(snapshots[0]?.sessionId).toBe("root-session");
 	});
 
 	it("keeps shared root lineage without prefix replay on a different model", async () => {
