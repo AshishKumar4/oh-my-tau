@@ -260,7 +260,16 @@ describe("claude-code tool surface", () => {
 		expect(claudeCode).not.toContain("wait");
 		expect(claudeCode).not.toContain("TaskOutput");
 		expect(claudeCode).toEqual(
-			expect.arrayContaining(["Agent", "SendMessage", "TaskStop", "ListAgents", "WebFetch", "Skill", "eval", "todo"]),
+			expect.arrayContaining([
+				"Agent",
+				"SendMessage",
+				"TaskStop",
+				"ListAgents",
+				"WebFetch",
+				"Skill",
+				"eval",
+				"todo",
+			]),
 		);
 
 		const native = await presentedNames("native");

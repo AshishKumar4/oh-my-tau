@@ -141,10 +141,7 @@ function claudeCodeAgentParams(args: ClaudeCodeAgentArgs, host: HarnessFacadeHos
 /** The task tool surface the Agent facade reuses: its roster-backed description and batch speculation. */
 interface TaskToolSurface {
 	renderDescriptionAs?(template: string): string;
-	speculationFor?(projection: {
-		contextKey: string;
-		toParams: (args: unknown) => unknown;
-	}): ToolSpeculationPolicy;
+	speculationFor?(projection: { contextKey: string; toParams: (args: unknown) => unknown }): ToolSpeculationPolicy;
 }
 
 const WEB_FETCH_ANSWER_RULE = "Provide a concise response based only on the content above.";

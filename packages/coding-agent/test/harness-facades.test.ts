@@ -707,8 +707,9 @@ describe("claude-code Agent facade", () => {
 	it("serves isolation only while task isolation is enabled and never a model override", () => {
 		const schemaOf = (settings: Settings) =>
 			JSON.stringify(
-				(facadeFor("claude-code", "Agent", stubTool("task"), settings).parameters as { toJsonSchema(): unknown })
-					.toJsonSchema(),
+				(
+					facadeFor("claude-code", "Agent", stubTool("task"), settings).parameters as { toJsonSchema(): unknown }
+				).toJsonSchema(),
 			);
 		const plain = schemaOf(Settings.isolated({ "task.isolation.enabled": false, "task.batch": false }));
 		expect(plain).not.toContain('"isolation"');
