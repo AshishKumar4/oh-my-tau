@@ -29,7 +29,7 @@ import { formatLoginIdentity } from "../../cli/oauth-terminal";
 import { resolveAdvisorRoleSelection, resolveModelRoleValue } from "../../config/model-resolver";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { getRoleInfo } from "../../config/model-roles";
-import { settings } from "../../config/settings";
+import { type SettingProvenance, type Settings, settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import { createPluginSettingsHost } from "../../extensibility/plugins/settings-host";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -168,6 +168,34 @@ function loadProviderAuthUi(): ProviderAuthUiModules {
 			.LogoutAccountSelectorComponent,
 		OAuthSelectorComponent: require("@oh-my-pi/pi-tui/overlays/oauth-selector.js").OAuthSelectorComponent,
 	};
+}
+
+const SHADOWING_ROLE_SOURCE: Record<Exclude<SettingProvenance, "global" | "default">, string> = {
+	env: "an environment variable",
+	runtime: "a runtime override (CLI flag)",
+	overlay: "a --config overlay",
+	project: "this project's settings (.omp/config.yml)",
+};
+
+/**
+ * A role assignment written to one settings layer can stay invisible because a
+ * higher layer still sets the role (e.g. a project `.omp/config.yml` pin under
+ * global role storage). Returns the warning to show instead of a success
+ * status, or undefined when the assigned value is what now applies.
+ */
+export function shadowedModelRoleNotice(
+	roleSettings: Settings,
+	role: string,
+	assigned: string,
+	roleLabel: string,
+): string | undefined {
+	const effective = roleSettings.getModelRole(role);
+	if (effective === assigned) return undefined;
+	const provenance = roleSettings.getModelRoleProvenance(role);
+	if (provenance === "global" || provenance === "default") return undefined;
+	const hint =
+		provenance === "project" ? " Remove it there, or set modelRoleStorage: project to assign per project." : "";
+	return `${roleLabel} saved as ${assigned}, but ${SHADOWING_ROLE_SOURCE[provenance]} still sets it to ${effective ?? "none"} here.${hint}`;
 }
 
 export class SelectorController {
@@ -860,9 +888,10 @@ export class SelectorController {
 								this.ctx.settings.setModelRole(role, modelRoleValue);
 							}
 							const roleInfo = getRoleInfo(role, settings);
-							this.ctx.showStatus(
-								`${scopeLabel}${roleInfo?.tag ?? roleInfo?.name ?? role} model: ${selector ?? model.id}`,
-							);
+							const roleLabel = `${scopeLabel}${roleInfo?.tag ?? roleInfo?.name ?? role} model`;
+							const shadowed = shadowedModelRoleNotice(this.ctx.settings, role, modelRoleValue, roleLabel);
+							if (shadowed) this.ctx.showWarning(shadowed);
+							else this.ctx.showStatus(`${roleLabel}: ${selector ?? model.id}`);
 						}
 						return true;
 					} catch (error) {
