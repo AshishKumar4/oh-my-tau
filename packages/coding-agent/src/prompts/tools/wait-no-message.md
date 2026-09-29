@@ -1,2 +1,2 @@
-No message within {{elapsed}}, and none can come: every running peer{{#if peers.length}} ({{#each peers}}`{{this}}`{{#unless @last}}, {{/unless}}{{/each}}{{#if more}}, +{{more}} more{{/if}}){{/if}} is itself blocked waiting.
+No message within {{elapsed}}{{#if deadlocked}}, and none can come: every running peer{{#if peers.length}} ({{#each peers}}`{{this}}`{{#unless @last}}, {{/unless}}{{/each}}{{#if more}}, +{{more}} more{{/if}}){{/if}} is itself blocked waiting{{/if}}.
 {{#if awaitedBy}}`{{awaitedBy}}` is blocked waiting on your result: {{#if askable}}ask it via `agent://{{awaitedBy}}` for what you need, or `yield`{{else}}it reads no message until you `yield`{{/if}}.{{else}}Waiting again cannot help: message one via `agent://<id>`, or finish your turn.{{/if}}

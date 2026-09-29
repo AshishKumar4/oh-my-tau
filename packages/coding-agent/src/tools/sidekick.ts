@@ -347,7 +347,9 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		const onAbort = (): void => aborted.resolve("aborted");
 		signal?.addEventListener("abort", onAbort, { once: true });
 		manager.watchJobs([jobId]);
-		const releaseAwait = this.#holdHandoffAwait(() => job.agentId);
+		// A first handoff's job learns its agent id only after the spawn settles
+		// `#spawning`; the registry has the sidekick as soon as it registers.
+		const releaseAwait = this.#holdHandoffAwait(() => job.agentId ?? findSidekickRef(this.#leadId())?.id);
 		let outcome: "settled" | "timeout" | "aborted";
 		try {
 			outcome = await Promise.race([job.promise.then(() => "settled" as const), timeout.promise, aborted.promise]);

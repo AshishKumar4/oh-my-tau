@@ -14,6 +14,7 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { BUILTIN_TOOLS, createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { SidekickTool } from "@oh-my-pi/pi-coding-agent/tools/sidekick";
+import { blockedAwaitsOf, WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -340,6 +341,71 @@ describe("fusion sidekick tool", () => {
 			expect(followUp).not.toHaveBeenCalled();
 			release.resolve();
 			await manager.getJob(first.details?.jobId ?? "")?.promise;
+		});
+	});
+
+	describe("blocked awaits", () => {
+		const streaming = { isStreaming: true } as unknown as AgentSession;
+
+		/**
+		 * Run one first handoff whose sidekick, once registered, waits for a
+		 * message while the lead's turn is parked on it and an unrelated lane
+		 * streams. Returns the sidekick's wait text.
+		 */
+		async function sidekickWaitText(overrides: Partial<ToolSession>): Promise<string> {
+			const registry = AgentRegistry.global();
+			registry.register({ id: "Main", displayName: "Main", kind: "main", session: streaming, status: "running" });
+			registry.register({
+				id: "Lane",
+				displayName: "Lane",
+				kind: "sub",
+				parentId: "Main",
+				session: streaming,
+				status: "running",
+			});
+			try {
+				let waitText = "";
+				vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async () => {
+					// A first handoff learns the sidekick's id only once it registers.
+					registerSidekick("running", streaming);
+					const waitSession = {
+						cwd: tempDir.path(),
+						settings: Settings.isolated({ "launch.enabled": false }),
+						agentRegistry: registry,
+						getAgentId: () => SIDEKICK_ID,
+					} as unknown as ToolSession;
+					const waited = await new WaitTool(waitSession).execute("sidekick-wait", {});
+					waitText = waited.content[0]?.type === "text" ? waited.content[0].text : "";
+					return {
+						result: singleResult("report"),
+						policy: {} as structured.EffectiveSubagentPolicy,
+						mergeSummary: "",
+						changesApplied: null,
+						artifactsDir: tempDir.path(),
+						temporaryArtifacts: true,
+					};
+				});
+				const tool = SidekickTool.createIf(makeSession({ agentRegistry: registry, ...overrides }));
+				if (!tool) throw new Error("sidekick tool should mount");
+				const result = await tool.execute("c1", { message: "Implement X" });
+				expect(result.content[0]).toEqual({ type: "text", text: "report" });
+				// The lead's hold ends with the handoff.
+				expect(blockedAwaitsOf(registry, "Main")).toEqual([]);
+				return waitText;
+			} finally {
+				registry.unregister("Main");
+				registry.unregister("Lane");
+			}
+		}
+
+		it("holds the lead's turn on an inline handoff, so its waiting sidekick returns", async () => {
+			const text = await sidekickWaitText({ asyncJobManager: undefined });
+			expect(text).toContain("`Main` is blocked waiting on your result: it reads no message until you `yield`.");
+		});
+
+		it("holds the lead's turn while it blocks on the handoff job, learning the sidekick's id late", async () => {
+			const text = await sidekickWaitText({});
+			expect(text).toContain("`Main` is blocked waiting on your result: it reads no message until you `yield`.");
 		});
 	});
 });

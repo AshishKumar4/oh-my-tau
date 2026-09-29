@@ -2,23 +2,99 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import { TOOL_INTERRUPT_ABORT_REASON } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { runEvalWait } from "@oh-my-pi/pi-coding-agent/eval/handle-bridge";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
+import { blockedAwaitsOf, WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import type { TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 
-function session(manager?: AsyncJobManager, agentId = "Main"): ToolSession {
+function session(manager?: AsyncJobManager, agentId = "Main", settings: Record<string, unknown> = {}): ToolSession {
 	return {
 		cwd: process.cwd(),
-		settings: Settings.isolated({ "launch.enabled": false }),
+		settings: Settings.isolated({ "launch.enabled": false, ...settings }),
 		agentRegistry: AgentRegistry.global(),
 		asyncJobManager: manager,
 		getAgentId: () => agentId,
 	} as unknown as ToolSession;
+}
+
+/** A task job `Main` owns for agent `id`; cancelling it rejects the run, as a real spawn's abort does. */
+function ownedJob(manager: AsyncJobManager, id: string, ownerId = "Main"): PromiseWithResolvers<string> {
+	const run = Promise.withResolvers<string>();
+	manager.register(
+		"task",
+		id,
+		async ({ signal }) => {
+			signal.addEventListener("abort", () => run.reject(new Error(`${id} cancelled`)), { once: true });
+			return run.promise;
+		},
+		{ id, agentId: id, ownerId },
+	);
+	return run;
+}
+
+/**
+ * Run `Child` through the real inline `task` path. The mocked executor reports
+ * the child's first progress, as a live child does before any tool call, then
+ * parks it in a message-only `wait`; returns that wait's text.
+ */
+async function inlineChildWaitText(): Promise<string> {
+	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+		agents: [
+			{
+				name: "task",
+				description: "General-purpose task agent",
+				systemPrompt: "You are a task agent.",
+				source: "bundled",
+			},
+		],
+		projectAgentsDir: null,
+	});
+	let childText = "";
+	vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+		const id = options.id ?? "?";
+		const progress = {
+			index: 0,
+			id,
+			agent: options.agent.name,
+			agentSource: "bundled" as const,
+			task: "task prompt",
+			durationMs: 5,
+			tokens: 0,
+			requests: 1,
+		};
+		options.onProgress?.({ ...progress, status: "running", recentTools: [], recentOutput: [], toolCount: 0, cost: 0 });
+		registerRunning(id, "Main");
+		childText = firstText(await new WaitTool(session(undefined, id)).execute("child-wait", {}));
+		return {
+			...progress,
+			assignment: "Build the migration API.",
+			exitCode: 0,
+			output: "Migration API built.",
+			stderr: "",
+			truncated: false,
+		};
+	});
+	const tool = await TaskTool.create({
+		cwd: "/tmp",
+		hasUI: false,
+		settings: Settings.isolated({ "async.enabled": false, "task.batch": true }),
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+		getAgentId: () => "Main",
+		agentRegistry: AgentRegistry.global(),
+	} as unknown as ToolSession);
+	await tool.execute("inline-spawn", {
+		context: "Ship the migration API.",
+		tasks: [{ name: "Child", agent: "task", task: "Build the migration API." }],
+	} as TaskParams);
+	// The owner's turn is released once the inline child settles.
+	expect(blockedAwaitsOf(AgentRegistry.global(), "Main")).toEqual([]);
+	return childText;
 }
 
 /** Register an agent whose turn is in flight, so `isRunning` corroborates it. */
@@ -252,56 +328,156 @@ describe("wait", () => {
 	});
 
 	test("returns at once to a child its owner runs inline", async () => {
-		const registry = AgentRegistry.global();
 		registerRunning("Main");
-		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
-			agents: [
-				{
-					name: "task",
-					description: "General-purpose task agent",
-					systemPrompt: "You are a task agent.",
-					source: "bundled",
-				},
-			],
-			projectAgentsDir: null,
-		});
-		let childText = "";
-		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
-			const id = options.id ?? "?";
-			registerRunning(id, "Main");
-			childText = firstText(await new WaitTool(session(undefined, id)).execute("child-wait", {}));
-			return {
-				index: 0,
-				id,
-				agent: options.agent.name,
-				agentSource: "bundled",
-				task: "task prompt",
-				assignment: "Build the migration API.",
-				exitCode: 0,
-				output: "Migration API built.",
-				stderr: "",
-				truncated: false,
-				durationMs: 5,
-				tokens: 0,
-				requests: 1,
-			};
-		});
-		const tool = await TaskTool.create({
-			cwd: "/tmp",
-			hasUI: false,
-			settings: Settings.isolated({ "async.enabled": false, "task.batch": true }),
-			getSessionFile: () => null,
-			getSessionSpawns: () => "*",
-			getAgentId: () => "Main",
-			agentRegistry: registry,
-		} as unknown as ToolSession);
-		await tool.execute("inline-spawn", {
-			context: "Ship the migration API.",
-			tasks: [{ name: "Child", agent: "task", task: "Build the migration API." }],
-		} as TaskParams);
+		const childText = await inlineChildWaitText();
+		expect(childText).toStartWith("No message within");
 		expect(childText).toContain("`Main` is blocked waiting on your result");
 		// An owner parked in an inline spawn reads no message until the child settles.
 		expect(childText).not.toContain("agent://Main");
+	});
+
+	test("returns at once to a child its owner runs inline while an unrelated peer streams", async () => {
+		registerRunning("Main");
+		// A revived lane, blocked in nothing: it could message the child but owes it nothing.
+		registerRunning("Lane", "Main");
+		const childText = await inlineChildWaitText();
+		expect(childText).not.toContain("none can come");
+		expect(childText).toContain("`Main` is blocked waiting on your result: it reads no message until you `yield`.");
+	});
+
+	test("returns at once when its owner waits on its result alone while an unrelated peer streams", async () => {
+		vi.useFakeTimers();
+		registerRunning("Main");
+		registerRunning("Child", "Main");
+		registerRunning("Lane", "Main");
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const childRun = ownedJob(manager, "Child");
+		const parentWait = new WaitTool(session(manager, "Main")).execute("parent-wait", {});
+		const text = firstText(await new WaitTool(session(manager, "Child")).execute("child-wait", {}));
+		// Lane could still message Child, so no deadlock is claimed; only Main is named.
+		expect(text).not.toContain("none can come");
+		expect(text).toContain("`Main` is blocked waiting on your result: ask it via `agent://Main`");
+		childRun.resolve("migration API ready");
+		await parentWait;
+	});
+
+	test("keeps waiting while its owner also waits on a sibling that is still working", async () => {
+		vi.useFakeTimers();
+		registerRunning("Main");
+		registerRunning("Builder", "Main");
+		registerRunning("Reviewer", "Main");
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const builderRun = ownedJob(manager, "Builder");
+		const reviewerRun = ownedJob(manager, "Reviewer");
+		// Main wakes on either result; Builder waits for Reviewer's message.
+		const parentWait = new WaitTool(session(manager, "Main")).execute("parent-wait", {});
+		const builderWait = new WaitTool(session(manager, "Builder")).execute("builder-wait", {});
+		vi.advanceTimersByTime(600_000);
+		expect(await stillPending(builderWait)).toBe(true);
+		await IrcBus.global().send({ from: "Reviewer", to: "Builder", body: "schema ready" });
+		expect((await builderWait).details?.waited).toMatchObject({ from: "Reviewer", body: "schema ready" });
+		builderRun.resolve("built");
+		await parentWait;
+		reviewerRun.resolve("reviewed");
+	});
+
+	test("does not count a spawn queued for its permit as finishing on its own", async () => {
+		registerRunning("Main");
+		registerRunning("Child", "Main");
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const childRun = ownedJob(manager, "Child");
+		// With `task.maxConcurrency` 1, Queued waits for Child's permit: no run, no registry ref.
+		const queuedRun = Promise.withResolvers<string>();
+		manager.register("task", "Queued", async () => queuedRun.promise, {
+			id: "Queued",
+			agentId: "Queued",
+			ownerId: "Main",
+			queued: true,
+		});
+		const parentWait = new WaitTool(session(manager, "Main")).execute("parent-wait", {});
+		expect(firstText(await new WaitTool(session(manager, "Child")).execute("child-wait", {}))).toContain(
+			"agent://Main",
+		);
+		childRun.resolve("migration API ready");
+		await parentWait;
+		queuedRun.resolve("queued done");
+	});
+
+	test("an aborted wait releases its hold", async () => {
+		registerRunning("Main");
+		const registry = AgentRegistry.global();
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const childRun = ownedJob(manager, "Child");
+		const controller = new AbortController();
+		const parentWait = new WaitTool(session(manager, "Main")).execute("parent-wait", {}, controller.signal);
+		expect(blockedAwaitsOf(registry, "Main")).toMatchObject([{ agents: ["Child"], independent: false }]);
+		controller.abort();
+		await expect(parentWait).rejects.toThrow("Operation aborted");
+		expect(blockedAwaitsOf(registry, "Main")).toEqual([]);
+		childRun.resolve("migration API ready");
+	});
+
+	test("returns at once to an agent its owner awaits in an eval wait(), and releases the hold after", async () => {
+		registerRunning("Main");
+		registerRunning("Worker", "Main");
+		registerRunning("Lane", "Main");
+		const registry = AgentRegistry.global();
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const workerRun = ownedJob(manager, "Worker");
+		const evalSession = session(manager, "Main", { "eval.autoBackground.enabled": false });
+		const evalWait = runEvalWait({ items: [{ kind: "agent", id: "Worker" }] }, { session: evalSession });
+		expect(blockedAwaitsOf(registry, "Main")).toMatchObject([
+			{ agents: ["Worker"], inline: true, independent: false },
+		]);
+		const text = firstText(await new WaitTool(session(manager, "Worker")).execute("worker-wait", {}));
+		expect(text).toContain("`Main` is blocked waiting on your result: it reads no message until you `yield`.");
+		workerRun.resolve("done");
+		expect((await evalWait).items[0]).toMatchObject({ status: "completed", text: "done" });
+		expect(blockedAwaitsOf(registry, "Main")).toEqual([]);
+	});
+
+	test("an eval wait() with a timeout can end alone, and a timed-out or aborted one releases its hold", async () => {
+		vi.useFakeTimers();
+		registerRunning("Main");
+		registerRunning("Worker", "Main");
+		const registry = AgentRegistry.global();
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		ownedJob(manager, "Worker");
+		const evalSession = session(manager, "Main", { "eval.autoBackground.enabled": false });
+		const timed = runEvalWait({ items: [{ kind: "agent", id: "Worker" }], timeoutMs: 60_000 }, { session: evalSession });
+		expect(blockedAwaitsOf(registry, "Main")).toMatchObject([
+			{ agents: ["Worker"], inline: true, independent: true },
+		]);
+		// Main resumes on its timeout without Worker's result, so Worker keeps waiting for a message.
+		const workerWait = new WaitTool(session(manager, "Worker")).execute("worker-wait", {});
+		expect(await stillPending(workerWait)).toBe(true);
+		vi.advanceTimersByTime(60_000);
+		expect((await timed).items[0]).toMatchObject({ status: "running" });
+		expect(blockedAwaitsOf(registry, "Main")).toEqual([]);
+		expect(await stillPending(workerWait)).toBe(true);
+
+		const controller = new AbortController();
+		const aborted = runEvalWait(
+			{ items: [{ kind: "agent", id: "Worker" }] },
+			{ session: evalSession, signal: controller.signal },
+		);
+		// Without a timeout Main needs Worker's result to go on.
+		expect(firstText(await workerWait)).toContain("`Main` is blocked waiting on your result");
+		controller.abort();
+		await expect(aborted).rejects.toThrow();
+		expect(blockedAwaitsOf(registry, "Main")).toEqual([]);
+	});
+
+	test("publishes no hold for an eval wait() that auto-background can hand back", async () => {
+		registerRunning("Main");
+		registerRunning("Worker", "Main");
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const workerRun = ownedJob(manager, "Worker");
+		const evalSession = session(manager, "Main", { "eval.autoBackground.enabled": true });
+		const evalWait = runEvalWait({ items: [{ kind: "agent", id: "Worker" }] }, { session: evalSession });
+		expect(blockedAwaitsOf(AgentRegistry.global(), "Main")).toEqual([]);
+		workerRun.resolve("done");
+		await evalWait;
 	});
 
 	test("siblings that both wait only for a message each return at once", async () => {
@@ -327,22 +503,16 @@ describe("wait", () => {
 		registerRunning("Main");
 		registerRunning("Child", "Main");
 		registerRunning("Lane", "Main");
-		const manager = new AsyncJobManager({ onJobComplete: () => {} });
-		const childRun = Promise.withResolvers<string>();
-		manager.register("task", "Child", async () => childRun.promise, {
-			id: "Child",
-			agentId: "Child",
-			ownerId: "Main",
-		});
-		const parentWait = new WaitTool(session(manager, "Main")).execute("parent-wait", {});
-		const childWait = new WaitTool(session(manager, "Child")).execute("child-wait", {});
+		// Main is a root orchestrator waiting on its lanes' messages, not on a job.
+		const mainWait = new WaitTool(session(undefined, "Main")).execute("main-wait", {});
+		const childWait = new WaitTool(session(undefined, "Child")).execute("child-wait", {});
 		vi.advanceTimersByTime(600_000);
-		// Lane is still working and could message Child.
+		// Lane is still working and could message either of them.
 		expect(await stillPending(childWait)).toBe(true);
 		AgentRegistry.global().setStatus("Lane", "idle");
-		expect(firstText(await childWait)).toContain("agent://Main");
-		childRun.resolve("migration API ready");
-		await parentWait;
+		for (const result of await Promise.all([mainWait, childWait])) {
+			expect(firstText(result)).toStartWith("No message within 10m, and none can come");
+		}
 	});
 
 	test("returns at once to a grandchild whose owner and owner's owner both wait on results", async () => {

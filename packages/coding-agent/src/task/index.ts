@@ -61,13 +61,8 @@ import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/tools/task";
 import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
-import {
-	reserveStructuredSubagentId,
-	resolveEffectiveSubagentPolicy,
-	runStructuredSubagent,
-	StructuredSubagentError,
-} from "./structured-subagent";
-import { SpawnRun, type SpawnPermit } from "./spawn-run";
+import { resolveEffectiveSubagentPolicy, runStructuredSubagent, StructuredSubagentError } from "./structured-subagent";
+import { SpawnRun, type SpawnPermit, type SpawnRunOwner } from "./spawn-run";
 import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
 
 import { cfgAsyncEnabled } from "../tools/settings";
@@ -776,6 +771,39 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				),
 			{ agentId: spawn.agentId, detached: spawn.detached },
 		);
+	}
+
+	/**
+	 * Attach this turn to an inline run it is about to await. The turn stays
+	 * parked on the child until the returned release runs, reading no message
+	 * meanwhile: publish that, so the child's message-only `wait` returns instead
+	 * of blocking on an owner that cannot answer. Only a pre-claimed id is known
+	 * up front; otherwise the hold starts with the first progress naming the
+	 * child, which precedes any tool call the child makes.
+	 */
+	#attachInline(run: SpawnRun, owner: SpawnRunOwner): () => void {
+		const registry = this.session.agentRegistry;
+		let release: (() => void) | undefined;
+		let released = false;
+		const hold = (id: string | undefined): void => {
+			if (!registry || !id || release || released) return;
+			release = holdBlockedAwait(registry, this.session.getAgentId?.() ?? MAIN_AGENT_ID, {
+				agents: [id],
+				inline: true,
+			});
+		};
+		hold(run.identity.agentId);
+		run.attach({
+			...owner,
+			onUpdate: update => {
+				hold(update.details?.progress?.[0]?.id);
+				return owner.onUpdate?.(update);
+			},
+		});
+		return () => {
+			released = true;
+			release?.();
+		};
 	}
 
 	/**
@@ -1523,8 +1551,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					detached: false,
 					fork,
 				});
-			run.attach({ signal, onUpdate });
-			return await run.result;
+			const release = this.#attachInline(run, { signal, onUpdate });
+			try {
+				return await run.result;
+			} finally {
+				release();
+			}
 		}
 
 		const startTime = Date.now();
@@ -1600,7 +1632,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						agentId: spawn.preAllocatedId,
 						detached: false,
 					});
-				run.attach({
+				const release = this.#attachInline(run, {
 					signal: workerSignal,
 					onUpdate: onItemProgress
 						? update => {
@@ -1610,12 +1642,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						: undefined,
 				});
 				try {
-					await run.started;
-				} catch (error) {
-					if (workerSignal.aborted) return undefined;
-					throw error;
+					try {
+						await run.started;
+					} catch (error) {
+						if (workerSignal.aborted) return undefined;
+						throw error;
+					}
+					return await run.result;
+				} finally {
+					release();
 				}
-				return await run.result;
 			},
 			signal,
 		);
@@ -1657,22 +1693,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const assignment = (params.task ?? "").trim();
 		const context = this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined;
 		let latestProgress: AgentProgress | undefined;
-		let releaseInlineAwait: (() => void) | undefined;
 		try {
-			// `name` is the spawn handle: allocate the id from it here when this
-			// path did not pre-reserve one, so an inline spawn is published by id
-			// before its child starts. Do not treat it as a HUD description.
-			const id = preAllocatedId ?? (await reserveStructuredSubagentId(this.session, { label: params.name }));
-			const registry = this.session.agentRegistry;
-			if (!detached && registry) {
-				// This turn is parked on the inline child until it settles, reading
-				// no message meanwhile: publish that, so the child's message-only
-				// `wait` returns instead of blocking on an owner that cannot answer.
-				releaseInlineAwait = holdBlockedAwait(registry, this.session.getAgentId?.() ?? MAIN_AGENT_ID, {
-					agents: [id],
-					inline: true,
-				});
-			}
 			const execution = await runStructuredSubagent({
 				session: this.session,
 				invocationKind: "task",
@@ -1692,7 +1713,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							),
 						}
 					: {}),
-				identity: { id, label: params.name },
+				// `name` is the spawn handle: keep it for id allocation when this
+				// path did not pre-reserve one. Do not treat it as a HUD description.
+				identity: { id: preAllocatedId, label: params.name },
 				index: spawnIndex,
 				parentToolCallId: toolCallId,
 				detached,
@@ -1752,8 +1775,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					...(latestProgress ? { progress: [latestProgress] } : {}),
 				},
 			};
-		} finally {
-			releaseInlineAwait?.();
 		}
 	}
 

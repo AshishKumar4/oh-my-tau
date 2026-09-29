@@ -30,6 +30,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { BatchArgsScanner, type TaskLaunchSession } from "@oh-my-pi/pi-coding-agent/task/speculative-launch";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { blockedAwaitsOf, WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import type { SingleResult, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 
 const taskAgent: AgentDefinition = {
@@ -37,6 +38,14 @@ const taskAgent: AgentDefinition = {
 	description: "General-purpose task agent",
 	systemPrompt: "You are a task agent.",
 	source: "bundled",
+};
+
+const scoutAgent: AgentDefinition = {
+	name: "scout",
+	description: "Read-only scout",
+	systemPrompt: "You are a scout.",
+	source: "bundled",
+	blocking: true,
 };
 
 const sink: SpeculativeOperationSink = {
@@ -252,6 +261,71 @@ describe("task speculative launch", () => {
 
 		await spawn("Alpha").aborted.promise;
 		expect([...startedIds]).toEqual(["Alpha"]);
+	});
+
+	it("holds the turn on an inline speculative run only once dispatch adopts it", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [taskAgent, scoutAgent],
+			projectAgentsDir: null,
+		});
+		const registry = AgentRegistry.global();
+		const heldIds = () => blockedAwaitsOf(registry, "Main").flatMap(block => (block.inline ? block.agents : []));
+		const scoutArgs = {
+			context: "ctx",
+			tasks: [
+				{ name: "Alpha", agent: "scout", task: "Do A." },
+				{ name: "Beta", agent: "scout", task: "Do B." },
+			],
+		};
+		const scoutJson = JSON.stringify(scoutArgs);
+		const scoutAlphaClosed = scoutJson.slice(0, scoutJson.indexOf('{"name":"Beta"') + 10);
+
+		// A run discarded before adoption never held the turn, which was still streaming.
+		const discarded = await openSession({ agentRegistry: registry });
+		discarded.session.update(toolCall, scoutAlphaClosed);
+		await spawn("Alpha").started.promise;
+		expect(heldIds()).toEqual([]);
+		discarded.session.finalize({ toolCall, args: { ...scoutArgs, tasks: [scoutArgs.tasks[1]] } });
+		await spawn("Alpha").aborted.promise;
+		expect(heldIds()).toEqual([]);
+		spawns.clear();
+
+		// Adopted inline runs hold the turn by their pre-claimed ids until they
+		// settle: each child's message-only `wait` returns once its hold lands.
+		const adopted = await openSession({ agentRegistry: registry });
+		adopted.session.update(toolCall, scoutAlphaClosed);
+		await spawn("Alpha").started.promise;
+		adopted.session.finalize({ toolCall, args: scoutArgs });
+		await spawn("Beta").started.promise;
+		for (const id of ["Main", "Alpha", "Beta"]) {
+			registry.register({
+				id,
+				displayName: id,
+				kind: id === "Main" ? "main" : "sub",
+				parentId: id === "Main" ? undefined : "Main",
+				session: { isStreaming: true } as never,
+				status: "running",
+			});
+		}
+		const childWait = (id: string) =>
+			new WaitTool({
+				cwd: "/tmp",
+				settings: Settings.isolated({ "launch.enabled": false }),
+				agentRegistry: registry,
+				getAgentId: () => id,
+			} as unknown as ToolSession).execute(`${id}-wait`, {});
+		const waits = [childWait("Alpha"), childWait("Beta")];
+		const executing = adopted.tool.execute(toolCall.id, scoutArgs);
+		for (const result of await Promise.all(waits)) {
+			expect(result.content[0]).toMatchObject({
+				text: expect.stringContaining("`Main` is blocked waiting on your result"),
+			});
+		}
+		expect(heldIds().sort()).toEqual(["Alpha", "Beta"]);
+		spawn("Alpha").release.resolve();
+		spawn("Beta").release.resolve();
+		await executing;
+		expect(heldIds()).toEqual([]);
 	});
 
 	it("never starts a forking spawn early, so it forks the finished parent turn", async () => {
