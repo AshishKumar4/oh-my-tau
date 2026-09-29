@@ -1398,7 +1398,6 @@ export class SessionTools {
 			// check compares against the presented list, not the raw input:
 			// comparing against appliedTools would undo the facades above.
 			const presentedTools = this.#presentTools(appliedTools, [...this.#enabledToolNames], profile);
-			this.#host.agent.setTools(presentedTools);
 			const currentTools = this.#host.agent.state.tools;
 			if (
 				currentTools.length !== presentedTools.length ||
