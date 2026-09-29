@@ -291,13 +291,7 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 		const busLeg: Promise<{ message: IrcMessage | null; error: Error | null }> | undefined =
 			messaging && busAbort
 				? IrcBus.global()
-						.wait(
-							messaging.senderId,
-							{},
-							0,
-							busAbort.signal,
-							messageOnly ? { liveness: messaging } : undefined,
-						)
+						.wait(messaging.senderId, {}, 0, busAbort.signal, messageOnly ? { liveness: messaging } : undefined)
 						.then(
 							message => ({ message, error: null }),
 							error => ({
