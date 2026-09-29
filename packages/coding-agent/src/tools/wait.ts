@@ -112,62 +112,79 @@ function runningPeers(messaging: WaitMessaging): AgentRef[] {
 }
 
 /**
- * Whether some running peer can act without waiting on the caller or on another
- * peer. A peer blocked in an await acts only once the await ends, and it cannot
- * end while it needs the caller or a running agent: with no running peer left
- * free, that agent is blocked too, so when no peer can act nobody is left to
- * send the caller a message (#13513). A peer blocked in nothing, or in an await
- * that can end alone or on a settling (idle, starting, finishing) agent, still
- * can.
+ * Running peers that can act, now or once what they await lands. A peer blocked
+ * in nothing can, and so can one whose every await can end without the caller:
+ * on a leg that ends by itself, or on agents that are not running (their results
+ * land without anyone acting) or can act themselves. A message-only `wait` ends
+ * only on a message, so its peer never counts, and agents awaiting each other
+ * in a cycle never act. With none left, nobody can send the caller a message
+ * (#13513).
  */
-function anyPeerCanAct(messaging: WaitMessaging, running: readonly AgentRef[]): boolean {
+function peersThatCanAct(messaging: WaitMessaging, running: readonly AgentRef[]): Set<string> {
 	const byAgent = blockedAwaits.get(messaging.registry)?.byAgent;
 	const runningIds = new Set(running.map(ref => ref.id));
-	// Neither the caller nor running: its result lands without anyone acting.
-	const settlesAlone = (id: string): boolean => id !== messaging.senderId && !runningIds.has(id);
-	return running.some(ref =>
-		(byAgent?.get(ref.id) ?? []).every(
-			block =>
-				block.independent === true ||
-				(block.inline ? block.agents.every(settlesAlone) : block.agents.some(settlesAlone)),
-		),
-	);
+	const actors = new Set<string>();
+	// Its result can land without the caller: it is not running, or can act.
+	const lands = (id: string): boolean => id !== messaging.senderId && (!runningIds.has(id) || actors.has(id));
+	for (let grew = true; grew;) {
+		grew = false;
+		for (const ref of running) {
+			if (actors.has(ref.id)) continue;
+			const free = (byAgent?.get(ref.id) ?? []).every(
+				block =>
+					block.independent === true || (block.inline ? block.agents.every(lands) : block.agents.some(lands)),
+			);
+			if (!free) continue;
+			actors.add(ref.id);
+			grew = true;
+		}
+	}
+	return actors;
 }
 
 /**
- * The running peer whose blocked turn cannot resume until the caller acts: it
- * awaits the caller inline, reading nothing, or races on the caller's result
- * alone, with no leg that ends by itself. Either way it sends the caller
- * nothing, whatever else is running; a race could still wake on some other
- * peer's message, but nobody owes it one. A race that also awaits another agent
- * is left to the deadlock rule: that agent's result wakes it, and a worker may
- * be waiting on that agent's message.
+ * The running peer blocked on the caller's result with no other agent it awaits
+ * still able to act. It awaits the caller inline, reading nothing, or races on
+ * the caller's result with nothing else that can land (a message could still
+ * wake that race, but nobody owes it one). Such a peer sends the caller
+ * nothing, and nobody else owes the caller a message — whatever else is running
+ * — except the agents the peer awaits alongside the caller: a worker may wait
+ * on a sibling's message while their owner awaits both, inline (a sync `task`
+ * fan-out, a multi-handle eval `wait()`) or in a race. So a co-awaited agent
+ * that can act keeps the caller waiting, and one that settled or is itself
+ * stuck does not.
  */
-function peerAwaitingCaller(messaging: WaitMessaging, running: readonly AgentRef[]): AgentRef | undefined {
+function peerAwaitingCaller(
+	messaging: WaitMessaging,
+	running: readonly AgentRef[],
+	actors: ReadonlySet<string>,
+): AgentRef | undefined {
 	const byAgent = blockedAwaits.get(messaging.registry)?.byAgent;
 	const caller = messaging.senderId;
-	return running.find(ref =>
-		byAgent
-			?.get(ref.id)
-			?.some(
-				block =>
-					!block.independent &&
-					block.agents.includes(caller) &&
-					(block.inline === true || block.agents.every(id => id === caller)),
-			),
-	);
+	const runningIds = new Set(running.map(ref => ref.id));
+	const lands = (id: string): boolean => id !== caller && (!runningIds.has(id) || actors.has(id));
+	return running.find(ref => {
+		const blocks = byAgent?.get(ref.id) ?? [];
+		const stuckOnCaller = blocks.some(
+			block =>
+				!block.independent && block.agents.includes(caller) && (block.inline === true || !block.agents.some(lands)),
+		);
+		// The caller is not running, so this finds only co-awaited agents.
+		return stuckOnCaller && !blocks.some(block => block.agents.some(id => actors.has(id)));
+	});
 }
 
 /**
  * Settles with the no-message result once the caller should stop waiting for a
- * message: a running peer awaits the caller alone ({@link peerAwaitingCaller}),
- * or running peers remain but none can act. Of the waiters caught in such a
- * deadlock, those a blocked agent awaits settle first — their `yield` or message
- * is what frees the rest, so every other waiter keeps waiting for it; with no
- * waiter awaited, all of them settle. Re-checked on every registry and
- * blocked-await change; an empty roster is the bus liveness check's to report,
- * and that wake re-evaluates. The result is rendered when it settles, so a
- * release racing the wake-up cannot change its verdict.
+ * message: a running peer awaits the caller with no co-awaited agent able to act
+ * ({@link peerAwaitingCaller}), or running peers remain but none can act
+ * ({@link peersThatCanAct}). Of the waiters caught in such a deadlock, those a
+ * blocked agent awaits settle first — their `yield` or message is what frees
+ * the rest, so every other waiter keeps waiting for it; with no waiter awaited,
+ * all of them settle. Re-checked on every registry and blocked-await change; an
+ * empty roster is the bus liveness check's to report, and that wake
+ * re-evaluates. The result is rendered when it settles, so a release racing the
+ * wake-up cannot change its verdict.
  */
 function watchDeadlock(
 	messaging: WaitMessaging,
@@ -179,8 +196,9 @@ function watchDeadlock(
 		if (done) return;
 		const running = runningPeers(messaging);
 		if (running.length === 0) return;
-		const awaitingPeer = peerAwaitingCaller(messaging, running);
-		const deadlocked = !anyPeerCanAct(messaging, running);
+		const actors = peersThatCanAct(messaging, running);
+		const awaitingPeer = peerAwaitingCaller(messaging, running, actors);
+		const deadlocked = actors.size === 0;
 		if (!awaitingPeer) {
 			if (!deadlocked) return;
 			const byAgent = blockedAwaits.get(messaging.registry)?.byAgent;

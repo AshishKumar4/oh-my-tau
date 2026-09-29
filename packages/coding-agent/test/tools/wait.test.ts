@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
-import { TOOL_INTERRUPT_ABORT_REASON } from "@oh-my-pi/pi-agent-core";
+import { type AgentToolResult, TOOL_INTERRUPT_ABORT_REASON } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { runEvalWait } from "@oh-my-pi/pi-coding-agent/eval/handle-bridge";
@@ -11,6 +11,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { blockedAwaitsOf, WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import type { TaskParams } from "@oh-my-pi/pi-tui/tools/task";
+import type { CoordinationDetails } from "@oh-my-pi/pi-tui/tools/wait";
 
 function session(manager?: AsyncJobManager, agentId = "Main", settings: Record<string, unknown> = {}): ToolSession {
 	return {
@@ -38,11 +39,12 @@ function ownedJob(manager: AsyncJobManager, id: string, ownerId = "Main"): Promi
 }
 
 /**
- * Run `Child` through the real inline `task` path. The mocked executor reports
- * the child's first progress, as a live child does before any tool call, then
- * parks it in a message-only `wait`; returns that wait's text.
+ * Run `names` as one `task` batch through the real inline path (async off).
+ * The mocked executor reports each child's first progress, as a live child does
+ * before any tool call, registers it running, then runs `child` as its turn.
+ * Settles once the batch returns, checking the owner's turn is released.
  */
-async function inlineChildWaitText(): Promise<string> {
+async function runInlineTasks(names: string[], child: (id: string) => Promise<void>): Promise<void> {
 	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 		agents: [
 			{
@@ -54,7 +56,6 @@ async function inlineChildWaitText(): Promise<string> {
 		],
 		projectAgentsDir: null,
 	});
-	let childText = "";
 	vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 		const id = options.id ?? "?";
 		const progress = {
@@ -76,12 +77,12 @@ async function inlineChildWaitText(): Promise<string> {
 			cost: 0,
 		});
 		registerRunning(id, "Main");
-		childText = firstText(await new WaitTool(session(undefined, id)).execute("child-wait", {}));
+		await child(id);
 		return {
 			...progress,
-			assignment: "Build the migration API.",
+			assignment: `Build ${id}.`,
 			exitCode: 0,
-			output: "Migration API built.",
+			output: `${id} built.`,
 			stderr: "",
 			truncated: false,
 		};
@@ -97,10 +98,18 @@ async function inlineChildWaitText(): Promise<string> {
 	} as unknown as ToolSession);
 	await tool.execute("inline-spawn", {
 		context: "Ship the migration API.",
-		tasks: [{ name: "Child", agent: "task", task: "Build the migration API." }],
+		tasks: names.map(name => ({ name, agent: "task", task: `Build ${name}.` })),
 	} as TaskParams);
-	// The owner's turn is released once the inline child settles.
+	// The owner's turn is released once its inline children settle.
 	expect(blockedAwaitsOf(AgentRegistry.global(), "Main")).toEqual([]);
+}
+
+/** Run `Child` inline and park it in a message-only `wait`; returns that wait's text. */
+async function inlineChildWaitText(): Promise<string> {
+	let childText = "";
+	await runInlineTasks(["Child"], async id => {
+		childText = firstText(await new WaitTool(session(undefined, id)).execute("child-wait", {}));
+	});
 	return childText;
 }
 
@@ -386,6 +395,83 @@ describe("wait", () => {
 		builderRun.resolve("built");
 		await parentWait;
 		reviewerRun.resolve("reviewed");
+	});
+
+	test("keeps waiting while its owner runs it inline beside a sibling that is still working", async () => {
+		registerRunning("Main");
+		// Unrelated to the batch: once Right is done, it keeps nobody waiting.
+		registerRunning("Lane", "Main");
+		const rightStarted = Promise.withResolvers<void>();
+		const rightGo = Promise.withResolvers<void>();
+		const rightDone = Promise.withResolvers<void>();
+		const leftWaiting = Promise.withResolvers<{ waiting: Promise<AgentToolResult<CoordinationDetails>> }>();
+		let leftFirst: AgentToolResult<CoordinationDetails> | undefined;
+		let leftRewait = "";
+		// Main awaits both inline, one hold per child; Left waits for Right's message.
+		const batch = runInlineTasks(["Left", "Right"], async id => {
+			if (id === "Right") {
+				rightStarted.resolve();
+				await rightGo.promise;
+				await IrcBus.global().send({ from: "Right", to: "Left", body: "schema ready" });
+				// Right yields: its ref leaves `running` before its inline run settles.
+				AgentRegistry.global().setStatus("Right", "idle");
+				rightDone.resolve();
+				return;
+			}
+			await rightStarted.promise;
+			const waiting = new WaitTool(session(undefined, "Left")).execute("left-wait", {});
+			leftWaiting.resolve({ waiting });
+			leftFirst = await waiting;
+			await rightDone.promise;
+			leftRewait = firstText(await new WaitTool(session(undefined, "Left")).execute("left-rewait", {}));
+		});
+		const { waiting } = await leftWaiting.promise;
+		expect(await stillPending(waiting)).toBe(true);
+		rightGo.resolve();
+		await batch;
+		expect(leftFirst?.details?.waited).toMatchObject({ from: "Right", body: "schema ready" });
+		// With Right done, Main needs only Left, and Lane owes Left nothing.
+		expect(leftRewait).not.toContain("none can come");
+		expect(leftRewait).toContain("`Main` is blocked waiting on your result: it reads no message until you `yield`.");
+	});
+
+	test("keeps waiting while its owner's eval wait() also awaits a sibling that is still working", async () => {
+		vi.useFakeTimers();
+		registerRunning("Main");
+		registerRunning("Left", "Main");
+		registerRunning("Right", "Main");
+		// Unrelated to the handles: once Right is done, it keeps nobody waiting.
+		registerRunning("Lane", "Main");
+		const registry = AgentRegistry.global();
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const leftRun = ownedJob(manager, "Left");
+		const rightRun = ownedJob(manager, "Right");
+		const evalSession = session(manager, "Main", { "eval.autoBackground.enabled": false });
+		// One inline hold lists both handles; Left waits for Right's message.
+		const evalWait = runEvalWait(
+			{
+				items: [
+					{ kind: "agent", id: "Left" },
+					{ kind: "agent", id: "Right" },
+				],
+			},
+			{ session: evalSession },
+		);
+		expect(blockedAwaitsOf(registry, "Main")).toMatchObject([{ agents: ["Left", "Right"], inline: true }]);
+		const leftWait = new WaitTool(session(manager, "Left")).execute("left-wait", {});
+		vi.advanceTimersByTime(600_000);
+		expect(await stillPending(leftWait)).toBe(true);
+		await IrcBus.global().send({ from: "Right", to: "Left", body: "schema ready" });
+		expect((await leftWait).details?.waited).toMatchObject({ from: "Right", body: "schema ready" });
+		// Right yields and settles; the hold still lists it, but it can no longer act.
+		registry.setStatus("Right", "idle");
+		rightRun.resolve("right done");
+		const rewait = firstText(await new WaitTool(session(manager, "Left")).execute("left-rewait", {}));
+		expect(rewait).not.toContain("none can come");
+		expect(rewait).toContain("`Main` is blocked waiting on your result: it reads no message until you `yield`.");
+		leftRun.resolve("left done");
+		expect((await evalWait).items.map(item => item.status)).toEqual(["completed", "completed"]);
+		expect(blockedAwaitsOf(registry, "Main")).toEqual([]);
 	});
 
 	test("does not count a spawn queued for its permit as finishing on its own", async () => {
