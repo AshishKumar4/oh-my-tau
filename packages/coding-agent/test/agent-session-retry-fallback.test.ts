@@ -3570,6 +3570,10 @@ describe("AgentSession retry fallback", () => {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
 			"retry.fallbackRevertPolicy": "cooldown-expiry",
+			// Auto mode serves Fable 5 the claude-code surface (replace edit mode) and
+			// Opus 4.8 the native one; a fallback that changes the edit mode withholds
+			// the credit, so keep both models on one surface.
+			"harness.mode": "native",
 		});
 		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
 
