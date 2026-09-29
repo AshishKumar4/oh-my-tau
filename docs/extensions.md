@@ -129,7 +129,7 @@ Core methods:
 
 `ExtensionAPI` methods retain their extension binding when destructured or passed as callbacks.
 
-`getServiceTiers()` returns a detached snapshot of the session's live per-family tier map. `setServiceTier(family, tier)` changes one family for subsequent requests; pass `undefined` to clear that session override. OpenAI accepts `auto`, `default`, `flex`, `scale`, or `priority`; Anthropic accepts `priority`; Google accepts `flex` or `priority`. Changes made while a response is streaming do not alter that in-flight request.
+`getServiceTiers()` returns a detached snapshot of the session's live per-family tier map. `setServiceTier(family, tier)` changes one family for subsequent requests; pass `undefined` to clear that session override. OpenAI accepts `auto`, `default`, `flex`, `scale`, `priority`, or `ultrafast`; Anthropic accepts `priority`; Google accepts `flex` or `priority`. Changes made while a response is streaming do not alter that in-flight request.
 
 ### Provider registration
 
@@ -755,7 +755,7 @@ Unsupported/no-op in RPC implementation:
 
 ### Print/headless/subagent paths
 
-When no UI context is supplied to runner init, `ctx.hasUI` is `false` and methods are no-op/default-returning. `--mode rpc --no-ui` takes this path too, for RPC hosts that cannot answer dialogs.
+When no UI context is supplied to runner init, `ctx.hasUI` is `false` and methods are no-op/default-returning. Both `--mode rpc --no-ui` and `--mode rpc-ui --no-ui` take this path for extensions; `rpc-ui` tool dialogs remain enabled.
 
 ### ACP mode
 
@@ -968,7 +968,7 @@ Provide `renderCall` / `renderResult` on `registerTool` definitions for custom t
 Use the right surface:
 
 - **Extensions** (`src/extensibility/extensions/*`): unified system (events + tools + commands + renderers + provider registration).
-- **Hooks** (`src/extensibility/hooks/*`): separate legacy event API.
+- **Hooks** (`src/extensibility/hooks/*`): legacy `HookAPI` event API. Hook files load through the extension runner, so they run with extension semantics (see [hooks](./hooks.md)).
 - **Custom-tools** (`src/extensibility/custom-tools/*`): tool-focused modules; when loaded alongside extensions they are adapted and still pass through extension interception wrappers.
 
 If you need one package that owns policy, tools, command UX, and rendering together, use extensions.

@@ -6,9 +6,9 @@
 
 import { formatKeyHint } from "@oh-my-pi/pi-tui/key-hint-format";
 import { truncateToWidth } from "@oh-my-pi/pi-tui/utils";
-import { formatDuration, formatNumber, formatPercent } from "@oh-my-pi/pi-utils";
+import type { ModelStats } from "@oh-my-pi/omp-stats/shared-types";
+import { formatNumber, formatPercent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
-import { formatCost } from "@oh-my-pi/pi-tui/overlays/agent-hub-renderer";
 import { openStandaloneJudge } from "../judgment/standalone";
 import { harnessLabel, PromptCacheRollup, promptTokenTotal } from "../session/prompt-cache-stats";
 import { openPath } from "../utils/open";
@@ -66,10 +66,6 @@ export interface StatsCommandArgs {
 	summary: boolean;
 }
 
-function normalizePremiumRequests(n: number): number {
-	return Math.round((n + Number.EPSILON) * 100) / 100;
-}
-
 // =============================================================================
 // Command Handler
 // =============================================================================
@@ -81,6 +77,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 		formatStatsDashboardUrl,
 		getDashboardStats,
 		getTotalMessageCount,
+		printStatsSummary,
 		refreshRollups,
 		startServer,
 		syncAllSessions,
@@ -99,6 +96,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 			console.log(JSON.stringify(await getDashboardStats(), null, 2));
 		} else {
 			await printStatsSummary();
+			printHarnessCacheSummary((await getDashboardStats()).byModel);
 		}
 		return;
 	}
@@ -129,29 +127,8 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	await new Promise(() => {});
 }
 
-async function printStatsSummary(): Promise<void> {
-	const { getDashboardStats } = await import("@oh-my-pi/omp-stats");
-	const stats = await getDashboardStats();
-	const { overall, byModel, byFolder } = stats;
-
-	console.log(chalk.bold("\n=== AI Usage Statistics ===\n"));
-
-	console.log(chalk.bold("Overall:"));
-	console.log(`  Requests: ${formatNumber(overall.totalRequests)} (${formatNumber(overall.failedRequests)} errors)`);
-	console.log(`  Error Rate: ${formatPercent(overall.errorRate)}`);
-	console.log(`  Total Tokens: ${formatNumber(overall.totalInputTokens + overall.totalOutputTokens)}`);
-	console.log(`  Input Tokens: ${formatNumber(overall.totalInputTokens)}`);
-	console.log(`  Output Tokens: ${formatNumber(overall.totalOutputTokens)}`);
-	console.log(`  Cache Rate: ${formatPercent(overall.cacheRate)}`);
-	console.log(`  Cache Savings: ${formatPercent(overall.cacheSavings)}`);
-	console.log(`  Total Cost: ${formatCost(overall.totalCost)}`);
-	console.log(`  Premium Requests: ${formatNumber(normalizePremiumRequests(overall.totalPremiumRequests ?? 0))}`);
-	console.log(`  Avg Duration: ${overall.avgDuration !== null ? formatDuration(overall.avgDuration) : "-"}`);
-	console.log(`  Avg TTFT: ${overall.avgTtft !== null ? formatDuration(overall.avgTtft) : "-"}`);
-	if (overall.avgTokensPerSecond !== null) {
-		console.log(`  Avg Tokens/s: ${overall.avgTokensPerSecond.toFixed(1)}`);
-	}
-
+/** Prompt-cache hit rate per harness profile; the cross-package summary knows models, not profiles. */
+function printHarnessCacheSummary(byModel: readonly ModelStats[]): void {
 	const harness = new PromptCacheRollup();
 	for (const m of byModel) {
 		harness.add(harnessLabel(m.provider, m.model), {
@@ -161,31 +138,13 @@ async function printStatsSummary(): Promise<void> {
 			cacheWrite: m.totalCacheWriteTokens,
 		});
 	}
-	const harnessRows = harness.entries();
-	if (harnessRows.length > 0) {
-		console.log(chalk.bold("\nBy Harness Profile:"));
-		for (const [label, row] of harnessRows) {
-			console.log(
-				`  ${label}: ${formatPercent(row.hitPct / 100)} cache hit, ${formatNumber(row.requests)} reqs, ${formatNumber(row.cacheRead)} of ${formatNumber(promptTokenTotal(row))} prompt tokens`,
-			);
-		}
+	const rows = harness.entries();
+	if (rows.length === 0) return;
+	console.log(chalk.bold("By Harness Profile:"));
+	for (const [label, row] of rows) {
+		console.log(
+			`  ${label}: ${formatPercent(row.hitPct / 100)} cache hit, ${formatNumber(row.requests)} reqs, ${formatNumber(row.cacheRead)} of ${formatNumber(promptTokenTotal(row))} prompt tokens`,
+		);
 	}
-
-	if (byModel.length > 0) {
-		console.log(chalk.bold("\nBy Model:"));
-		for (const m of byModel.slice(0, 10)) {
-			console.log(
-				`  ${m.model}: ${formatNumber(m.totalRequests)} reqs, ${formatCost(m.totalCost)}, ${formatPercent(m.cacheRate)} cache rate, ${formatPercent(m.cacheSavings)} cache savings`,
-			);
-		}
-	}
-
-	if (byFolder.length > 0) {
-		console.log(chalk.bold("\nBy Folder:"));
-		for (const f of byFolder.slice(0, 10)) {
-			console.log(`  ${f.folder}: ${formatNumber(f.totalRequests)} reqs, ${formatCost(f.totalCost)}`);
-		}
-	}
-
 	console.log("");
 }
