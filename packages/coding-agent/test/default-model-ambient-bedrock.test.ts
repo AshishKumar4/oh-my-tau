@@ -21,23 +21,43 @@ import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage
 import { Snowflake } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
+// Every ambient AWS credential source Bedrock availability probes: env keys,
+// the bypass flag, shared profile files, web identity, container and
+// instance-role metadata. A host `~/.aws` profile must not make Bedrock available.
+const AWS_ENV_KEYS = [
+	"AWS_ACCESS_KEY_ID",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_BEARER_TOKEN_BEDROCK",
+	"AWS_BEDROCK_SKIP_AUTH",
+	"AWS_PROFILE",
+	"AWS_SDK_LOAD_CONFIG",
+	"AWS_SHARED_CREDENTIALS_FILE",
+	"AWS_CONFIG_FILE",
+	"AWS_WEB_IDENTITY_TOKEN_FILE",
+	"AWS_ROLE_ARN",
+	"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+	"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+	"AWS_EC2_METADATA_SERVICE_ENDPOINT",
+	"AWS_EC2_METADATA_DISABLED",
+] as const;
+
 describe("issue #9967 default model with ambient Bedrock credentials", () => {
 	let tempDir: string;
 	let authStorage: AuthStorage;
 	let registry: ModelRegistry;
-	let savedAccessKey: string | undefined;
-	let savedSecret: string | undefined;
-	let savedBearerToken: string | undefined;
+	const savedAwsEnv = new Map<string, string | undefined>();
 
 	beforeEach(async () => {
-		savedAccessKey = process.env.AWS_ACCESS_KEY_ID;
-		savedSecret = process.env.AWS_SECRET_ACCESS_KEY;
-		savedBearerToken = process.env.AWS_BEARER_TOKEN_BEDROCK;
-		delete process.env.AWS_ACCESS_KEY_ID;
-		delete process.env.AWS_SECRET_ACCESS_KEY;
-		delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+		savedAwsEnv.clear();
+		for (const key of AWS_ENV_KEYS) {
+			savedAwsEnv.set(key, process.env[key]);
+			delete process.env[key];
+		}
 		tempDir = path.join(os.tmpdir(), `pi-9967-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
+		process.env.AWS_SHARED_CREDENTIALS_FILE = path.join(tempDir, "aws-credentials");
+		process.env.AWS_CONFIG_FILE = path.join(tempDir, "aws-config");
+		process.env.AWS_EC2_METADATA_DISABLED = "true";
 		authStorage = createInMemoryAuthStorage();
 		// The user's only real login: an Anthropic credential.
 		await authStorage.credentials.set("anthropic", [{ type: "api_key", key: "sk-test-anthropic" }]);
@@ -46,12 +66,10 @@ describe("issue #9967 default model with ambient Bedrock credentials", () => {
 
 	afterEach(() => {
 		authStorage.close();
-		if (savedAccessKey === undefined) delete process.env.AWS_ACCESS_KEY_ID;
-		else process.env.AWS_ACCESS_KEY_ID = savedAccessKey;
-		if (savedSecret === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;
-		else process.env.AWS_SECRET_ACCESS_KEY = savedSecret;
-		if (savedBearerToken === undefined) delete process.env.AWS_BEARER_TOKEN_BEDROCK;
-		else process.env.AWS_BEARER_TOKEN_BEDROCK = savedBearerToken;
+		for (const [key, value] of savedAwsEnv) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	});
 	function getRelevantModels() {
