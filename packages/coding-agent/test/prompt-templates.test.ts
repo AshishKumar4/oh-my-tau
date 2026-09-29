@@ -13,6 +13,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { expandPromptTemplate, type PromptTemplate } from "@oh-my-pi/pi-coding-agent/config/prompt-templates";
 import { expandSlashCommand, type FileSlashCommand } from "@oh-my-pi/pi-coding-agent/extensibility/slash-commands";
+import { harnessToolRefs } from "@oh-my-pi/pi-coding-agent/harness/manifest";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { collectIrcPeerRoster } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { parseCommandArgs, substituteArgs } from "@oh-my-pi/pi-coding-agent/utils/command-args";
@@ -376,6 +377,9 @@ describe("subagent peer roster prompt", () => {
 			ircPeers: roster.peers,
 			ircParkedCount: roster.parkedCount,
 			ircOmittedCount: roster.omittedCount,
+			// Production always passes the session's tool refs (the executor falls
+			// back to the native map); the peer section names its messaging tool.
+			toolRefs: harnessToolRefs(undefined),
 		});
 		expect(rendered).toContain("LiveWorker");
 		expect(rendered).toContain("editing auth.ts");
