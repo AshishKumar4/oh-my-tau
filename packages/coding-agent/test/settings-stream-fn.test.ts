@@ -3,18 +3,24 @@
  * (`providers.openrouterVariant`, `providers.antigravityEndpoint`,
  * `providers.stream*TimeoutSeconds`, `providers.maxInFlightRequests`,
  * `model.loopGuard.*`, `textVerbosity` for Responses-family requests,
- * `harness.mode` as the `harnessProfile` wire override)
+ * `harness.mode` as the `harnessProfile` wire override, the served harness
+ * capture's `clientVersion` as `harnessClientVersion`)
  * options win — the same wiring the main agent and the advisor agent share so
  * OpenRouter sticky-routing / response caching behaves the same on advisor turns
  * (can1357/oh-my-pi#3639).
  */
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
 import type { Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { claudeCodeSystemInstruction } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { HARNESS_CAPTURE_SCHEMA, loadHarnessPrompt } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import { createSettingsAwareStreamFn } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
+import { withHarnessCacheDir } from "./helpers/harness";
 
 function captureBase(): { fn: StreamFn; calls: Array<{ options?: SimpleStreamOptions }> } {
 	const calls: Array<{ options?: SimpleStreamOptions }> = [];
@@ -317,5 +323,51 @@ describe("createSettingsAwareStreamFn", () => {
 
 			expect(calls[0]?.options?.fallbacks).toEqual([{ model: "claude-sonnet-5" }]);
 		});
+	});
+});
+
+describe("createSettingsAwareStreamFn served harness capture", () => {
+	const dirs = withHarnessCacheDir("omp-settings-stream-capture-");
+
+	it("threads the served capture's client version to the provider, and none without one", async () => {
+		const model = getBundledModel("anthropic", "claude-opus-5-5");
+		const forwardedVersion = (mode: "auto" | "claude-code" | "native", options: SimpleStreamOptions = {}) => {
+			const { fn: base, calls } = captureBase();
+			createSettingsAwareStreamFn(Settings.isolated({ "harness.mode": mode }), base)(model, stubContext, {
+				apiKey: "k",
+				...options,
+			});
+			return calls[0]?.options?.harnessClientVersion;
+		};
+		// Nothing served yet: the provider keeps the pinned wire version.
+		expect(forwardedVersion("claude-code")).toBeUndefined();
+
+		const profileDir = path.join(dirs.cache, "claude-code");
+		fs.mkdirSync(profileDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(profileDir, "2.1.284.b93-cli-claude-opus-5-5.json"),
+			JSON.stringify({
+				schema: HARNESS_CAPTURE_SCHEMA,
+				profile: "claude-code",
+				clientVersion: "2.1.284.b93",
+				entrypoint: "cli",
+				capturedAt: "2026-09-29T17:08:36.689Z",
+				model: "claude-opus-5-5",
+				instructions: [
+					"x-anthropic-billing-header: cc_version=2.1.284.b93; cc_entrypoint=cli;",
+					claudeCodeSystemInstruction,
+					"You are a coding CLI.",
+				],
+				tools: ["Bash", "Read"],
+			}),
+		);
+		expect(await loadHarnessPrompt("claude-code", model.id)).not.toBeNull();
+
+		expect(forwardedVersion("claude-code")).toBe("2.1.284.b93");
+		expect(forwardedVersion("auto")).toBe("2.1.284.b93");
+		// Native mode serves no capture, so its wire keeps the pinned version.
+		expect(forwardedVersion("native")).toBeUndefined();
+		// A caller-supplied version wins, like every other stream option.
+		expect(forwardedVersion("claude-code", { harnessClientVersion: "2.1.290.abc" })).toBe("2.1.290.abc");
 	});
 });

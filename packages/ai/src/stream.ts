@@ -1870,6 +1870,7 @@ function mapOptionsForApi<TApi extends Api>(
 		// `null` forces the native surface and differs from absent (catalog
 		// profile), so only an absent field may stay unset.
 		...(options?.harnessProfile !== undefined ? { harnessProfile: options.harnessProfile } : {}),
+		harnessClientVersion: options?.harnessClientVersion,
 		...simpleProviderOptions,
 	};
 

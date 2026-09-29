@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
-import { claudeCodeSystemInstruction } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
+import {
+	claudeCodeBillingHeaderPrefix,
+	claudeCodeCaptureVersion,
+	claudeCodeSystemInstruction,
+} from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import { buildTransformedCodexRequestBody } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type { Context, Tool } from "@oh-my-pi/pi-ai/types";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -8,7 +12,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { CODEX_CLIENT_VERSION } from "@oh-my-pi/pi-catalog/wire/codex";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { withOfficialAnthropicEndpoint } from "./helpers";
-import claudeCodeGoldenJson from "./fixtures/harness/claude-code-2.1.267.golden.json" with { type: "json" };
+import claudeCodeGoldenJson from "./fixtures/harness/claude-code-2.1.284.golden.json" with { type: "json" };
 import codexGoldenJson from "./fixtures/harness/codex-0.155.1.golden.json" with { type: "json" };
 import {
 	anthropicDeclarations,
@@ -44,6 +48,9 @@ const claudeVendorFraming: {
 	inventoryCarrier: string;
 	envelope: Record<string, string>;
 } = claudeCodeGoldenJson.vendorFraming;
+
+const claudeVendorFramingPerModel: Record<string, { deltas: Record<string, string> }> =
+	claudeCodeGoldenJson.vendorFramingPerModel;
 
 const codexGolden: HarnessGolden = codexGoldenJson;
 const claudeCodeGolden: HarnessGolden = claudeCodeGoldenJson;
@@ -286,7 +293,11 @@ describe("vendor captures validate the committed goldens (local only)", () => {
 				expect(Object.keys(framing.envelope).filter(key => framing.envelope[key] === "absent")).toEqual([
 					"tool_choice",
 				]);
-				expect(framing.envelope.max_tokens).toBe(claudeVendorFraming.envelope.max_tokens);
+				const model = typeof capture.body.model === "string" ? capture.body.model : "";
+				expect(framing.envelope.max_tokens).toBe(
+					claudeVendorFramingPerModel[model]?.deltas["envelope.max_tokens"] ??
+						claudeVendorFraming.envelope.max_tokens,
+				);
 				expect(inventory).toEqual(claudeCodeGolden.vendorInventory);
 			}
 		},
@@ -300,14 +311,25 @@ describe("vendor captures validate the committed goldens (local only)", () => {
 		for (const capture of promptCaptures) {
 			const golden = goldensByProfile[capture.profile];
 			if (!golden) continue;
-			expect(capture.clientVersion).toBe(golden.clientVersion);
+			// A Claude Code capture records `cc_version`, whose suffix fingerprints
+			// the recording's own first prompt; the release is the part before it.
+			const release =
+				capture.profile === "claude-code" ? claudeCodeCaptureVersion(capture.clientVersion) : capture.clientVersion;
+			expect(release).toBe(golden.clientVersion);
 			const conventions = new Set(capture.tools.map(name => namingConvention(name)));
 			expect(
 				[...conventions].filter(convention => !golden.vendorInventory.boundNaming.includes(convention)),
 			).toEqual([]);
-			expect(
-				capture.instructions.filter(block => CAPTURE_IDENTITIES.some(sentence => sentence === block.trim())),
-			).toEqual([]);
+			// The recorder keeps the wire-owned billing header and identity block
+			// ahead of the prompt (projectHarnessCapture strips them at load); an
+			// identity sentence after them would reach the served text.
+			const promptStart = capture.instructions.findIndex(
+				block =>
+					!block.trimStart().startsWith(claudeCodeBillingHeaderPrefix) &&
+					!CAPTURE_IDENTITIES.some(sentence => sentence === block.trim()),
+			);
+			const prompt = promptStart === -1 ? [] : capture.instructions.slice(promptStart);
+			expect(prompt.filter(block => CAPTURE_IDENTITIES.some(sentence => sentence === block.trim()))).toEqual([]);
 		}
 	});
 });

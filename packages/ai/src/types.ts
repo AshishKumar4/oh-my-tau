@@ -675,6 +675,14 @@ export interface StreamOptions {
 	 */
 	harnessProfile?: HarnessProfile | null;
 	/**
+	 * `clientVersion` of the harness capture whose prompt and tools the session
+	 * serves (e.g. `2.1.284.b93`), threaded by the session stream layer. Under
+	 * the claude-code profile the Anthropic transport claims that release in
+	 * its User-Agent and billing header instead of the pinned default, so the
+	 * wire names the client the served text came from. Ignored otherwise.
+	 */
+	harnessClientVersion?: string;
+	/**
 	 * Anthropic fallback credit redemption handle from a prior classifier refusal.
 	 * When present, the Anthropic provider replays the frozen request body and betas with
 	 * the new model and `fallback_credit_token` to redeem prompt cache credit.

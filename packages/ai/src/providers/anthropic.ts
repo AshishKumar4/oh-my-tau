@@ -126,6 +126,7 @@ import {
 	claudeToolPrefix,
 	getClaudeCodeUserAgent,
 	getClaudeCodeVersion,
+	SUBAGENT_VOLATILE_MARKER,
 } from "./claude-code-fingerprint";
 import {
 	buildCopilotDynamicHeaders,
@@ -197,6 +198,8 @@ export type AnthropicHeaderOptions = {
 	isCloudflareAiGateway?: boolean;
 	claudeCodeSessionId?: string;
 	claudeCodeBetas?: readonly string[];
+	/** Served claude-code capture's `clientVersion`; see {@link getClaudeCodeVersion}. */
+	servedClaudeCodeVersion?: string;
 	/** Allow explicit fingerprint headers to replace OAuth defaults on non-official endpoints. */
 	allowAnthropicHeaderOverrides?: boolean;
 };
@@ -397,7 +400,9 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 	}
 
 	if (oauthToken) {
-		const userAgent = isClaudeCodeClientUserAgent(incomingUserAgent) ? incomingUserAgent : getClaudeCodeUserAgent();
+		const userAgent = isClaudeCodeClientUserAgent(incomingUserAgent)
+			? incomingUserAgent
+			: getClaudeCodeUserAgent(options.servedClaudeCodeVersion);
 		const headers = {
 			...modelHeaders,
 			Accept: acceptHeader,
@@ -652,16 +657,32 @@ const overridableAnthropicHeaderKeys = new Set(
 	[...Object.keys(claudeCodeHeaders), "anthropic-beta", "User-Agent", "x-app"].map(key => key.toLowerCase()),
 );
 
-function createClaudeBillingHeader(firstUserMessageText: string): string {
+function createClaudeBillingHeader(firstUserMessageText: string, servedClaudeCodeVersion?: string): string {
 	// Fingerprint: SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]
 	// Matches CC's computeFingerprint in utils/fingerprint.ts.
 	// Uses chars from the first user message (not the system prompt).
 	const k = [4, 7, 20].map(i => firstUserMessageText[i] ?? "0").join("");
-	const version = getClaudeCodeVersion();
+	const version = getClaudeCodeVersion(servedClaudeCodeVersion);
 	const versionSuffix = Bun.SHA256.hash(`59cf53e54c78${k}${version}`, "hex").slice(0, 3);
 	// cch=00000: placeholder replaced with the real attestation hash by wrapFetchForCch
 	// before the request hits the wire (see below).
 	return `${claudeCodeBillingHeaderPrefix} cc_version=${version}.${versionSuffix}; cc_entrypoint=${claudeCodeEntrypoint}; ${CCH_PLACEHOLDER_STR};`;
+}
+
+/**
+ * The served capture's `clientVersion` when the request runs the claude-code
+ * profile. Only a request that carries the capture's prompt and tools may
+ * claim the capture's release; native requests and forced foreign profiles
+ * keep the process-wide version.
+ */
+function resolveServedClaudeCodeVersion(
+	model: Model<"anthropic-messages">,
+	override: HarnessProfile | null | undefined,
+	clientVersion: string | undefined,
+): string | undefined {
+	if (clientVersion === undefined) return undefined;
+	const profile = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
+	return profile === "claude-code" ? clientVersion : undefined;
 }
 
 // cch attestation: XXHash64(body_with_placeholder, seed) low-20-bits, 5 hex chars.
@@ -1153,6 +1174,11 @@ export type AnthropicClientOptionsArgs = {
 	fetch?: FetchImpl;
 	maxRetryDelayMs?: number;
 	sessionId?: string;
+	/**
+	 * Served claude-code capture's `clientVersion`. Carried unresolved so a
+	 * client rebuilt after a version rejection resolves the adopted version.
+	 */
+	servedClaudeCodeVersion?: string;
 	/** Working-identity cache key for this credential+host; undefined off the Copilot path. */
 	copilotCacheKey?: string;
 	/**
@@ -2133,6 +2159,13 @@ const streamAnthropicOnce = (
 					? (options?.anthropicPrefixMismatchBehavior ?? "drop_block")
 					: undefined;
 			const controlBetas = resolveAnthropicControlBetas(model, prefixMismatchBehavior);
+			// User-Agent and billing header claim the served capture's release; a
+			// version rejection is judged against it (see getClaudeCodeVersion).
+			const servedClaudeCodeVersion = resolveServedClaudeCodeVersion(
+				model,
+				options?.harnessProfile,
+				options?.harnessClientVersion,
+			);
 			const mergedCallerHeaders = mergeHeaders(model.headers, options?.headers);
 			const umansGatewayWebSearchHeader = getUmansWebSearchHeader(model, mergedCallerHeaders);
 			// Keep fallback payloads aligned with the top-level Vertex effort gate:
@@ -2304,6 +2337,7 @@ const streamAnthropicOnce = (
 						options?.sessionId ??
 						extractClaudeMetadataSessionId(options?.metadata?.user_id) ??
 						options?.promptCacheKey,
+					servedClaudeCodeVersion,
 					disableStrictTools,
 				};
 				const created = createClient(model, clientArgs);
@@ -3286,11 +3320,11 @@ const streamAnthropicOnce = (
 						isOAuthToken &&
 						clientArgs &&
 						firstTokenTime === undefined &&
-						adoptRequiredClaudeCodeVersion(streamFailure)
+						adoptRequiredClaudeCodeVersion(streamFailure, servedClaudeCodeVersion)
 					) {
 						logger.warn("anthropic: Claude Code version rejected as too old, retrying with required version", {
 							model: model.id,
-							version: getClaudeCodeVersion(),
+							version: getClaudeCodeVersion(servedClaudeCodeVersion),
 						});
 						client = createClient(model, { ...clientArgs, disableStrictTools }).client;
 						// The version only changes client headers; a redemption keeps its frozen body.
@@ -3592,6 +3626,8 @@ type SystemBlockOptions = {
 	extraInstructions?: string[];
 	/** Text of the first user message — used as fingerprint seed for the billing header. */
 	firstUserMessageText?: string;
+	/** Served claude-code capture's `clientVersion`, which the billing header's `cc_version` claims. */
+	servedClaudeCodeVersion?: string;
 	/** Cache lifetime shared by the OAuth system breakpoint and later message breakpoints. */
 	cacheControl?: AnthropicCacheControl;
 };
@@ -3600,14 +3636,20 @@ export function buildAnthropicSystemBlocks(
 	systemPrompt: readonly string[] | undefined,
 	options: SystemBlockOptions = {},
 ): AnthropicSystemBlock[] | undefined {
-	const { includeClaudeCodeInstruction = false, extraInstructions = [], firstUserMessageText, cacheControl } = options;
+	const {
+		includeClaudeCodeInstruction = false,
+		extraInstructions = [],
+		firstUserMessageText,
+		servedClaudeCodeVersion,
+		cacheControl,
+	} = options;
 	const sanitizedPrompts = normalizeSystemPrompts(systemPrompt);
 	const trimmedInstructions = extraInstructions.map(instruction => instruction.trim()).filter(Boolean);
 	const hasBillingHeader = sanitizedPrompts.some(prompt => prompt.startsWith(claudeCodeBillingHeaderPrefix));
 
 	if (includeClaudeCodeInstruction && !hasBillingHeader) {
 		const blocks: AnthropicSystemBlock[] = [
-			{ type: "text", text: createClaudeBillingHeader(firstUserMessageText ?? "") },
+			{ type: "text", text: createClaudeBillingHeader(firstUserMessageText ?? "", servedClaudeCodeVersion) },
 			{
 				type: "text",
 				text: claudeCodeSystemInstruction,
@@ -3655,6 +3697,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		isOAuth,
 		maxRetryDelayMs,
 		sessionId,
+		servedClaudeCodeVersion,
 		disableStrictTools: disableStrictToolsOverride,
 		copilotCacheKey,
 		copilotCacheSnapshot,
@@ -3769,6 +3812,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		isCloudflareAiGateway: model.provider === "cloudflare-ai-gateway",
 		allowAnthropicHeaderOverrides: model.compat.allowAnthropicHeaderOverrides,
 		claudeCodeSessionId: sessionId,
+		servedClaudeCodeVersion,
 		claudeCodeBetas: oauthToken
 			? buildClaudeCodeBetas({
 					agentRequest: hasTools || thinkingEnabled,
@@ -4138,13 +4182,61 @@ const VOLATILE_SYSTEM_SEGMENT_MARKERS = ["<memories>", "<project-context>"];
  * claude-code golden). Working-directory context therefore stays inside the
  * anchored head under the profile, which forgoes sharing that head across
  * directories; only per-turn recall, which the client never sends, sits behind
- * the breakpoint so a refresh re-bills just the suffix.
+ * the breakpoint so a refresh re-bills just the suffix. Per-spawn subagent text
+ * sits behind it too, located by {@link SUBAGENT_VOLATILE_MARKER} rather than a
+ * leading tag (see {@link isolateSubagentVolatileText}).
  */
 const CLAUDE_CODE_VOLATILE_SYSTEM_SEGMENT_MARKERS = ["<memories>"];
 
 function volatileSystemSuffixStart(systemBlocks: readonly AnthropicSystemBlock[], markers: readonly string[]): number {
 	const start = systemBlocks.findIndex(block => markers.some(marker => block.text.startsWith(marker)));
 	return start === -1 ? systemBlocks.length : start;
+}
+
+/** `text` without {@link SUBAGENT_VOLATILE_MARKER}, each taking one directly following newline with it. */
+function withoutSubagentMarker(text: string): string {
+	const [head, ...rest] = text.split(SUBAGENT_VOLATILE_MARKER);
+	return head + rest.map(piece => (piece.startsWith("\n") ? piece.slice(1) : piece)).join("");
+}
+
+/**
+ * Removes {@link SUBAGENT_VOLATILE_MARKER} from the system blocks and, with
+ * `split` (the claude-code profile), returns the index of the block that opens
+ * the per-spawn subagent text, else -1.
+ *
+ * The subagent prompt follows the vendor prompt, footer and `<project-context>`
+ * that every sibling spawned in one directory sends byte for byte; its
+ * per-spawn part (assignment context, worktree, peer roster) differs per
+ * sibling. Anchoring the head on the last block before that part lets the
+ * first sibling write the shared prefix and the rest read it. Anchored after
+ * it, each sibling writes an entry no other sibling's prefix reaches, and a
+ * read only matches where some request wrote, so every spawn re-writes the
+ * shared prefix. A marker inside a block splits it, so the text before the
+ * marker still joins the anchored head. Without `split` (native) the marker
+ * is only removed, so the wire matches a prompt rendered without it.
+ */
+function isolateSubagentVolatileText(systemBlocks: AnthropicSystemBlock[] | undefined, split: boolean): number {
+	if (!systemBlocks) return -1;
+	let start = -1;
+	for (let index = 0; index < systemBlocks.length; index++) {
+		const block = systemBlocks[index];
+		const at = block.text.indexOf(SUBAGENT_VOLATILE_MARKER);
+		if (at === -1) continue;
+		const pieces: AnthropicSystemBlock[] = [];
+		if (split && start === -1) {
+			const head = block.text.slice(0, at).trimEnd();
+			if (head.length > 0) pieces.push({ ...block, text: head });
+			start = index + pieces.length;
+			const tail = withoutSubagentMarker(block.text.slice(at));
+			if (tail.trim().length > 0) pieces.push({ ...block, text: tail });
+		} else {
+			const text = withoutSubagentMarker(block.text);
+			if (text.trim().length > 0) pieces.push({ ...block, text });
+		}
+		systemBlocks.splice(index, 1, ...pieces);
+		index += pieces.length - 1;
+	}
+	return start;
 }
 
 /**
@@ -4181,8 +4273,10 @@ function volatileSystemSuffixStart(systemBlocks: readonly AnthropicSystemBlock[]
  * The `claude-code` harness profile is the one exception on the system side:
  * the captured client anchors both its identity block and its last system
  * block (see the vendorFraming of the claude-code golden), so the profile keeps
- * the identity breakpoint and anchors the last block before any recall suffix.
- * It anchors no tool, so its head is still two breakpoints.
+ * the identity breakpoint and anchors the last block before any recall suffix
+ * or per-spawn subagent text (`subagentTextStart`, from
+ * {@link isolateSubagentVolatileText}). It anchors no tool, so its head is
+ * still two breakpoints.
  *
  * Runs on the fresh system blocks and wire tools built for this request, after
  * the declared tool list was derived from the transcript's request controls.
@@ -4192,6 +4286,7 @@ function applyHeadCaching(
 	tools: AnthropicWireTool[] | undefined,
 	cacheControl: AnthropicCacheControl | undefined,
 	harnessProfile: HarnessProfile | undefined,
+	subagentTextStart = -1,
 ): void {
 	if (!cacheControl) return;
 
@@ -4226,10 +4321,12 @@ function applyHeadCaching(
 		// `applyPromptCaching` (4 minus head breakpoints). All-volatile falls
 		// back to tail anchoring.
 		const claudeCode = harnessProfile === "claude-code";
-		const suffixStart = volatileSystemSuffixStart(
+		const markedStart = volatileSystemSuffixStart(
 			systemBlocks,
 			claudeCode ? CLAUDE_CODE_VOLATILE_SYSTEM_SEGMENT_MARKERS : VOLATILE_SYSTEM_SEGMENT_MARKERS,
 		);
+		const suffixStart =
+			claudeCode && subagentTextStart >= 0 ? Math.min(markedStart, subagentTextStart) : markedStart;
 		const anchorIndex = suffixStart === 0 ? systemBlocks.length - 1 : suffixStart - 1;
 		const anchor = systemBlocks[anchorIndex];
 		if (anchor && anchor.cache_control == null) {
@@ -4280,14 +4377,30 @@ function resolveAnthropicAdaptiveEffort(
 	return mapEffortToAnthropicAdaptiveEffort(model, requestedEffort);
 }
 
-function extractClaudeCodeFirstUserMessageText(messages: readonly Message[]): string {
+const LEADING_SYSTEM_REMINDER = /^\s*<system-reminder>[\s\S]*?<\/system-reminder>\s*/;
+
+/**
+ * Seed of the billing-header fingerprint. Claude Code hashes the user's own
+ * words: the `<system-reminder>` blocks it puts ahead of them in the first
+ * user message are not part of the seed (2.1.284 captures: `hello` → `.b93`).
+ * `skipReminders` (the claude-code profile) seeds omp's fingerprint the same
+ * way, so the date/cwd reminder omp prepends stops pinning every session to
+ * one suffix; other profiles keep hashing the message as sent.
+ */
+function extractClaudeCodeFirstUserMessageText(messages: readonly Message[], skipReminders = false): string {
 	for (const message of messages) {
 		if (message.role !== "user") continue;
 		const { content } = message;
-		if (typeof content === "string") return content;
-		if (!Array.isArray(content)) return "";
-		for (const block of content) {
-			if (block.type === "text") return block.text;
+		const texts =
+			typeof content === "string"
+				? [content]
+				: Array.isArray(content)
+					? content.flatMap(block => (block.type === "text" ? [block.text] : []))
+					: [];
+		if (!skipReminders) return texts[0] ?? "";
+		for (let text of texts) {
+			while (LEADING_SYSTEM_REMINDER.test(text)) text = text.replace(LEADING_SYSTEM_REMINDER, "");
+			if (text.length > 0) return text;
 		}
 		return "";
 	}
@@ -4627,17 +4740,24 @@ function buildParams(
 			? { ...model, compat: { ...model.compat, replayUnsignedThinking: false } }
 			: model;
 	const { headCacheControl, tailCacheControl } = getCacheControl(model, options?.cacheRetention, isOAuthToken);
+	// A null override forces the native profile (harness.mode native); only an
+	// absent one falls back to the model's catalog profile.
+	const harnessOverride = harnessProfile !== undefined ? harnessProfile : options?.harnessProfile;
+	const effectiveHarness =
+		harnessOverride === undefined ? resolveHarnessProfile(model) : (harnessOverride ?? undefined);
 
 	// Pre-compute system blocks so they occupy the right slot in the serialized body.
 	const shouldInjectClaudeCodeInstruction = isOAuthToken && model.compat.injectClaudeCodeInstruction !== false;
 	const firstUserMessageText = shouldInjectClaudeCodeInstruction
-		? extractClaudeCodeFirstUserMessageText(context.messages)
+		? extractClaudeCodeFirstUserMessageText(context.messages, effectiveHarness === "claude-code")
 		: "";
 	const systemBlocks = buildAnthropicSystemBlocks(context.systemPrompt, {
 		includeClaudeCodeInstruction: shouldInjectClaudeCodeInstruction,
 		firstUserMessageText,
+		servedClaudeCodeVersion: resolveServedClaudeCodeVersion(model, harnessOverride, options?.harnessClientVersion),
 		cacheControl: headCacheControl,
 	});
+	const subagentTextStart = isolateSubagentVolatileText(systemBlocks, effectiveHarness === "claude-code");
 
 	// Controls earlier requests recorded on their responses fix the declared
 	// tools, the top-level effort and every control message in between.
@@ -4763,11 +4883,6 @@ function buildParams(
 	// the `effort-2025-11-24` beta, which that adapter can only accept in the body
 	// (`anthropic_beta`), never as the `anthropic-beta` HTTP header this path sets
 	// — so the field is dropped alongside the beta to avoid a 400 (#5614).
-	// A null override forces the native profile (harness.mode native); only an
-	// absent one falls back to the model's catalog profile.
-	const harnessOverride = harnessProfile !== undefined ? harnessProfile : options?.harnessProfile;
-	const effectiveHarness =
-		harnessOverride === undefined ? resolveHarnessProfile(model) : (harnessOverride ?? undefined);
 	const compactionReplay: AnthropicCompactionReplay | undefined = compactionSupported
 		? { model: effectiveModel, legacy: !compactionRequest && !signedReplay }
 		: undefined;
@@ -4798,7 +4913,7 @@ function buildParams(
 	);
 	// Anchor the stable tools+system head so it stays cached across turns; the
 	// moving message tail is anchored separately in applyPromptCaching below.
-	applyHeadCaching(systemBlocks, tools, headCacheControl, effectiveHarness);
+	applyHeadCaching(systemBlocks, tools, headCacheControl, effectiveHarness, subagentTextStart);
 	const requestControls: AnthropicRequestControls | undefined =
 		toolPlan.record || effortPlan.record
 			? {

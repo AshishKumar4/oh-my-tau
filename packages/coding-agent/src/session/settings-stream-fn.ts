@@ -20,6 +20,7 @@ import { type Model, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi
 import { serverSideFallbackModels } from "@oh-my-pi/pi-catalog/compat/server-side-fallback";
 import type { Encoding } from "@oh-my-pi/pi-natives";
 import type { Settings } from "../config/settings";
+import { servedHarnessPrompt } from "../harness/capture";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { type AnthropicSlowModeLanes, anthropicSlowModeLanes } from "./anthropic-slow-mode";
 
@@ -147,6 +148,11 @@ export function createSettingsAwareStreamFn(
 			streamOptions !== undefined && "harnessProfile" in streamOptions
 				? (streamOptions.harnessProfile ?? null)
 				: (effectiveHarnessProfile(settings, model) ?? null);
+		// The capture serving this profile's prompt and tools names the client
+		// release the wire claims (Claude Code's User-Agent and billing header).
+		// Native sessions serve no capture, so their wire keeps the pinned version.
+		const harnessClientVersion =
+			streamOptions?.harnessClientVersion ?? servedHarnessPrompt(model, harnessOverride)?.clientVersion;
 		const merged: SimpleStreamOptions = {
 			...streamOptions,
 			maxTokens,
@@ -171,6 +177,7 @@ export function createSettingsAwareStreamFn(
 			...(fallbacks !== undefined ? { fallbacks } : {}),
 			...(slowModeHooks !== undefined ? { anthropicSlowMode: slowModeHooks } : {}),
 			harnessProfile: harnessOverride,
+			...(harnessClientVersion !== undefined ? { harnessClientVersion } : {}),
 		};
 		return base(model, context, merged);
 	};

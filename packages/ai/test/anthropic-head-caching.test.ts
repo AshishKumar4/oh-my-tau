@@ -22,7 +22,7 @@ import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { isRecord } from "@oh-my-pi/pi-utils";
-import claudeCodeGoldenJson from "./fixtures/harness/claude-code-2.1.267.golden.json" with { type: "json" };
+import claudeCodeGoldenJson from "./fixtures/harness/claude-code-2.1.284.golden.json" with { type: "json" };
 import { anthropicFraming } from "./helpers/harness-golden";
 
 const MODEL_SPEC: ModelSpec<"anthropic-messages"> = {

@@ -1,0 +1,134 @@
+{
+	"harness": "claude-code",
+	"clientVersion": "2.1.284",
+	"models": [
+		"claude-opus-5-5",
+		"claude-fable-5-1"
+	],
+	"source": {
+		"client": "Claude Code 2.1.284 (proprietary). Captured billing header: `cc_version=2.1.284.b93; cc_entrypoint=cli` (subagent requests append `cc_is_subagent=true`).",
+		"recorded": "POST /v1/messages?beta=true request bodies from the interactive `cli` entrypoint, recorded through a local proxy: first requests on claude-opus-5-5, claude-fable-5-1 and claude-sonnet-5-5 (32 flat tool declarations each), two-turn sessions, and subagent turns. The vendor projections are the claude-opus-5-5 main-agent request; the claude-fable-5-1 main-agent request projects identically apart from max_tokens (vendorFramingPerModel), and subagent requests keep the same block kinds and breakpoint slots at the default 5m TTL.",
+		"vendored": "STRUCTURE ONLY. Claude Code's system-prompt text (6.3k chars on Opus 5.5, 12.4k on Fable 5.1) and its tool descriptions are proprietary and are never committed. This fixture holds block kinds, ordering, cache-breakpoint placement, envelope field shapes, declaration/schema forms and naming conventions. Verbatim-text comparisons live in the local-only block of harness-golden-contract.test.ts and skip without OMP_HARNESS_CAPTURE_DIR / OMP_HARNESS_CACHE_DIR.",
+		"entrypointNote": "The capture is the `cli` entrypoint omp impersonates: billing header, the `claudeCodeSystemInstruction` identity sentence, then one static prompt block. 2.1.284 moved the per-session environment (working directory, platform, model line, skills list) out of the system array into a mid-conversation `system` message after the first user turn; the framing projection covers only the system array. Subagent requests carry the SDK identity sentence (`You are a Claude agent, built on Anthropic's Claude Agent SDK.`) and their agent definition as the prompt block, and send the assignment as the first user message, so they project to the same three kinds.",
+		"provenance": {
+			"systemLayout": "capture",
+			"cachedSystemSlots": "capture \u2014 breakpoints on the identity block and on the last system block, both `ephemeral` with a 1h TTL on main-agent requests (subagents: the same slots at the default 5m TTL)",
+			"inventoryCarrier": "capture \u2014 flat top-level `tools`",
+			"prefixedToolNames": "capture \u2014 declarations use the harness's own names, no transport prefix",
+			"envelope": "capture \u2014 max_tokens 128000 (64000 on Fable 5.1), adaptive thinking without a display field, context_management.edits, output_config.effort, no tool_choice",
+			"declarationForms": "capture \u2014 exactly `{description, input_schema, name}`",
+			"schemaForms": "capture \u2014 JSON Schema objects carrying `$schema` (draft 2020-12), `additionalProperties` and `properties`",
+			"boundNaming": "capture \u2014 every declared name is PascalCase"
+		}
+	},
+	"vendorFraming": {
+		"family": "anthropic-messages",
+		"systemLayout": [
+			"billing-header",
+			"identity",
+			"prompt"
+		],
+		"cachedSystemSlots": [
+			"identity:ephemeral/1h",
+			"prompt-last:ephemeral/1h"
+		],
+		"inventoryCarrier": "tools",
+		"namespaceStructure": null,
+		"envelope": {
+			"max_tokens": "128000",
+			"thinking": "object{type}",
+			"context_management": "object{edits}",
+			"output_config": "object{effort}",
+			"stream": "true",
+			"tool_choice": "absent"
+		},
+		"presentForbiddenKeys": [],
+		"prefixedToolNames": []
+	},
+	"vendorFramingPerModel": {
+		"claude-fable-5-1": {
+			"why": "2.1.284 requests 64000 output tokens on Fable 5.1 and 128000 on Opus 5.5 and Sonnet 5.5. omp requests the catalog ceiling (128000) on both profiled models, so this per-model vendor value is a documented divergence rather than an omp framing delta.",
+			"deltas": {
+				"envelope.max_tokens": "64000"
+			}
+		}
+	},
+	"vendorInventory": {
+		"declarationForms": [
+			"untyped|description,input_schema,name"
+		],
+		"boundNaming": [
+			"PascalCase"
+		],
+		"unboundNaming": [],
+		"schemaForms": [
+			"object|$schema,additionalProperties,properties",
+			"object|$schema,additionalProperties,properties,required"
+		],
+		"argumentDocStyle": "inline-property-descriptions"
+	},
+	"ompFraming": {
+		"family": "anthropic-messages",
+		"systemLayout": [
+			"billing-header",
+			"identity",
+			"prompt"
+		],
+		"cachedSystemSlots": [
+			"identity:ephemeral/1h",
+			"prompt-last:ephemeral/1h"
+		],
+		"inventoryCarrier": "tools",
+		"namespaceStructure": null,
+		"envelope": {
+			"max_tokens": "128000",
+			"thinking": "object{display,type}",
+			"context_management": "object{edits}",
+			"output_config": "object{effort}",
+			"stream": "true",
+			"tool_choice": "absent"
+		},
+		"presentForbiddenKeys": [],
+		"prefixedToolNames": []
+	},
+	"ompFramingPerModel": {
+		"claude-fable-5-1": {
+			"why": "Fable 5 resolves a prefix-mismatch behaviour in catalog compat, so its thinking block carries `block_binding`. Model-lineage policy, not a harness-profile difference \u2014 the other profiled model (Opus 5) must not grow the field.",
+			"deltas": {
+				"envelope.thinking": "object{block_binding,display,type}"
+			}
+		}
+	},
+	"ompInventory": {
+		"declarationForms": [
+			"untyped|description,eager_input_streaming,input_schema,name",
+			"untyped|description,eager_input_streaming,input_schema,name,strict"
+		],
+		"boundNaming": [
+			"PascalCase"
+		],
+		"unboundNaming": [
+			"lowercase",
+			"mcp-qualified"
+		],
+		"schemaForms": [
+			"object|additionalProperties,properties,required"
+		],
+		"argumentDocStyle": "inline-property-descriptions"
+	},
+	"documentedFramingDeltas": {
+		"envelope.thinking": "2.1.284's `cli` entrypoint sends bare `{\"type\": \"adaptive\"}` with the `redact-thinking-2026-02-12` beta, so the server's default (no readable thinking text) applies; its `sdk-cli` entrypoint sends `display: \"omitted\"`, which is where the 2.1.267 golden's display field came from. omp sets `display: \"summarized\"` (`omitted` when the session hides thinking summaries) so thinking deltas keep reaching omp's transcript and UI. A fingerprint difference on every thinking request; what the model is asked to do is unchanged."
+	},
+	"documentedInventoryDeltas": {
+		"declarationForms": "omp adds Anthropic's `eager_input_streaming` beta flag to every declaration (from catalog compat, not the profile) and `strict: true` to schema-strict tools; the captured client sends exactly `{description, input_schema, name}`. Behaviour-neutral for the backend, but a fingerprint difference on every request.",
+		"schemaForms": "the captured client emits `\"$schema\": \"https://json-schema.org/draft/2020-12/schema\"` on every `input_schema`; omp emits none. Same schema semantics, different bytes.",
+		"unboundNaming": "by design: omp keeps `grep`, `glob`, `todo`, `learn`, `recall` and MCP tools that the harness has no counterpart for, so their names legitimately stay in omp's convention (`lowercase`, `mcp-qualified`). The vendor projection passes every captured name as bound, so its unbound set is empty. Membership is the free half of the two-tier contract; `boundNaming` \u2014 the half that must match \u2014 carries no delta."
+	},
+	"notes": {
+		"fingerprintVersion": "omp claims the served capture's release on the wire. Under the claude-code profile the User-Agent (`claude-cli/<version> (external, cli)`) and the billing header's `cc_version` carry the version part of the served capture's `clientVersion` (`2.1.284` from `2.1.284.b93`; the three-hex suffix fingerprints each conversation's own first user text and is recomputed per request, seeded like the client with the user's words after any leading `<system-reminder>` blocks): `getClaudeCodeVersion(servedClientVersion)` in packages/ai/src/providers/claude-code-fingerprint.ts, fed by the session stream layer (`harnessClientVersion`). `PI_AI_CLAUDE_CODE_VERSION` pins the version outright, a `claude_code_version_too_old` rejection raises it to the server's minimum (never below a newer capture), and requests that serve no capture (native mode) keep the pinned default 2.1.280. 2.1.284 also sends `x-app: cli`, SDK 0.112.1 in X-Stainless-Package-Version and runtime v26.3.0, which omp already sends.",
+		"billingHeader": "2.1.284's billing block is `cc_version=<version>.<fingerprint>; cc_entrypoint=cli;`, with `cc_is_subagent=true;` appended on subagent requests; none of the recorded 2.1.284 requests carries a `cch=` field. Subagent requests also add an `x-claude-code-agent-id: <agent id>` header. omp appends the `cch=` attestation (wrapFetchForCch) and sends neither `cc_is_subagent` nor the agent-id header. None of these derives from the version; reported, not changed here.",
+		"betaList": "Captured on /v1/messages (earlier goldens inferred it from the usage endpoint). 2.1.284's main-agent thinking turn sends `claude-code-20250219`, `oauth-2025-04-20`, `interleaved-thinking-2025-05-14`, `redact-thinking-2026-02-12`, `thinking-token-count-2026-05-13`, `context-management-2025-06-27`, `prompt-caching-scope-2026-01-05`, `mid-conversation-system-2026-04-07`, `per-turn-control-2026-07-01`, `mid-conversation-tool-changes-2026-07-01`, `advisor-tool-2026-03-01`, `effort-2025-11-24` and `extended-cache-ttl-2025-04-11` (subagents drop the last; `fallback-credit-2026-06-01` appears on some requests). omp's OAuth agent list (`claudeCodeAgentBetaDefaults` plus the compat-gated control betas in packages/ai/src/providers/anthropic.ts) omits `redact-thinking`, `per-turn-control`, `advisor-tool` and `extended-cache-ttl`, and adds `mid-conversation-system-clear-at-2026-08-21` and `mid-conversation-output-config-2026-07-01` on models whose compat supports them, plus `fallback-credit-2026-06-01` on every agent request. Betas are feature flags, not inert fingerprint strings: each one changes what the server accepts. `ttl: \"1h\"` was accepted live on the OAuth agent path without `extended-cache-ttl-2025-04-11`. None of them derives from the version; reported, not fixed here.",
+		"cacheTailTtl": "2.1.284 now attests every breakpoint: the identity and last system blocks plus exactly one message breakpoint on the newest message the request shares with the conversation (a forked side request such as the prompt-suggestion turn anchors the message before its own prompt), all at 1h on main-agent OAuth requests and at the default 5m on subagents and API-key sessions; tools never carry one. omp matches the system slots and deliberately diverges on the messages: the tail is rewritten every turn and Anthropic charges 2x base input for a 1h write against 1.25x for 5m, so pinning it taxes every turn to insure against idle gaps measured at 0.8% of real inter-request gaps. Over 116 Fable 5.1 sessions (46,698 requests) head-1h/tail-5m cost $14,051 against $18,069 for uniform 1h. An explicit cacheRetention of long still pins both. omp spends the fourth breakpoint on a second message anchor: a decimation checkpoint every 15 user turns, else the message before a per-call mark, else the second-newest message, whose entry a later request still reaches when one turn appends more blocks than the ~20-block lookback covers.",
+		"subagentHead": "2.1.284 sends a subagent's assignment as its first user message, so its system array (identity, agent definition) is byte-identical across siblings of one agent type. omp renders the subagent prompt as a system block after `<project-context>`; its per-spawn part (context, worktree, peer roster) opens with `SUBAGENT_VOLATILE_MARKER` and the head breakpoint lands on the block before it, so siblings in one directory share the vendor prompt, footer and project context as one cached prefix. On such requests the anchored slot projects as `prompt` rather than `prompt-last`."
+	}
+}
