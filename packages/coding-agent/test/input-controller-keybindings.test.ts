@@ -703,18 +703,31 @@ describe("InputController keybinding setup", () => {
 describe("InputController image paste into an image-accepting prompt", () => {
 	let settingsState: SettingsTestState | undefined;
 	let tempDir: TempDir;
+	// A local terminal: over SSH the clipboard bitmap fallback is deliberately off.
+	const originalSshConnection = process.env.SSH_CONNECTION;
+	const originalSshTty = process.env.SSH_TTY;
+	const originalSshClient = process.env.SSH_CLIENT;
 
 	beforeAll(async () => {
 		await initTheme(false);
 	});
 
 	beforeEach(async () => {
+		delete process.env.SSH_CONNECTION;
+		delete process.env.SSH_TTY;
+		delete process.env.SSH_CLIENT;
 		settingsState = beginSettingsTest();
 		await Settings.init({ inMemory: true });
 		tempDir = await TempDir.create("@omp-prompt-image-");
 	});
 
 	afterEach(async () => {
+		if (originalSshConnection === undefined) delete process.env.SSH_CONNECTION;
+		else process.env.SSH_CONNECTION = originalSshConnection;
+		if (originalSshTty === undefined) delete process.env.SSH_TTY;
+		else process.env.SSH_TTY = originalSshTty;
+		if (originalSshClient === undefined) delete process.env.SSH_CLIENT;
+		else process.env.SSH_CLIENT = originalSshClient;
 		restoreSettingsTestState(settingsState);
 		settingsState = undefined;
 		await tempDir.remove();
