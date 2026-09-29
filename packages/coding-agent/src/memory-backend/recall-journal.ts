@@ -24,16 +24,20 @@ export const RECALL_JOURNAL_ENTRY_TYPE = "memory_recall";
 export interface RecallJournalHost {
 	getBranch(): SessionEntry[];
 	appendCustomEntry(customType: string, data?: unknown): string;
+	getCwd(): string;
 }
 
 /**
  * The block this session already injected, or undefined when it has not
  * recalled yet. Scoped to the backend that wrote it so switching backends
- * mid-session does not replay the other one's text, and to the segment after
- * the newest reset boundary: `/clear` clears the recall-once flag, so the next
- * turn must query again rather than replay the pre-clear block.
+ * mid-session does not replay the other one's text; to the cwd it was
+ * recalled in, because `/move` rebinds memory to the destination project and
+ * must not carry the source project's memories there; and to the segment
+ * after the newest reset boundary: `/clear` clears the recall-once flag, so
+ * the next turn must query again rather than replay the pre-clear block.
  */
 export function readJournaledRecall(host: RecallJournalHost, backend: string): string | undefined {
+	const cwd = host.getCwd();
 	let block: string | undefined;
 	for (const entry of host.getBranch()) {
 		if (entry.type === "reset_boundary") {
@@ -42,14 +46,14 @@ export function readJournaledRecall(host: RecallJournalHost, backend: string): s
 		}
 		if (entry.type !== "custom" || entry.customType !== RECALL_JOURNAL_ENTRY_TYPE) continue;
 		if (!isRecord(entry.data)) continue;
-		const { backend: entryBackend, block: journaled } = entry.data;
-		if (entryBackend !== backend) continue;
+		const { backend: entryBackend, cwd: entryCwd, block: journaled } = entry.data;
+		if (entryBackend !== backend || entryCwd !== cwd) continue;
 		if (typeof journaled === "string" && journaled.length > 0) block = journaled;
 	}
 	return block;
 }
 
-/** Records the block so later turns of this session reproduce it exactly. */
+/** Records the block so later turns of this session in this cwd reproduce it exactly. */
 export function journalRecall(host: RecallJournalHost, backend: string, block: string): void {
-	host.appendCustomEntry(RECALL_JOURNAL_ENTRY_TYPE, { backend, block });
+	host.appendCustomEntry(RECALL_JOURNAL_ENTRY_TYPE, { backend, cwd: host.getCwd(), block });
 }

@@ -333,7 +333,7 @@ describe("hindsightBackend first-turn injection", () => {
 		expect(session.getHindsightSessionState()?.lastRecallSnippet).toBe(block?.context);
 		// Committing journals the block so a resumed session replays it byte for byte.
 		expect(session.sessionManager.getBranch().filter(entry => entry.type === "custom")).toMatchObject([
-			{ customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "hindsight", block: block?.context } },
+			{ customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "hindsight", cwd: "/tmp", block: block?.context } },
 		]);
 	});
 
@@ -344,7 +344,11 @@ describe("hindsightBackend first-turn injection", () => {
 		});
 		const session = makeFakeSession({ sessionId: "s-resume" });
 		const journaled = "<memories>\nrecalled before the resume\n</memories>";
-		session.sessionManager.appendCustomEntry(RECALL_JOURNAL_ENTRY_TYPE, { backend: "hindsight", block: journaled });
+		session.sessionManager.appendCustomEntry(RECALL_JOURNAL_ENTRY_TYPE, {
+			backend: "hindsight",
+			cwd: session.sessionManager.getCwd(),
+			block: journaled,
+		});
 		await hindsightBackend.start({
 			session: session as never,
 			settings,

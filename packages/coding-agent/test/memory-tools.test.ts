@@ -1630,7 +1630,7 @@ describe("mnemopi recall injection across a resume", () => {
 			"<memories>\nFacts recalled from your long-term memory. Current time: 2026-09-17 21:27 UTC\n\n- prior fact\n</memories>";
 		const state = registerMnemopiState(undefined, {
 			entries: () => [
-				{ type: "custom", customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "mnemopi", block } },
+				{ type: "custom", customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "mnemopi", cwd: "/tmp", block } },
 			],
 		});
 		// A resumed process must not re-query: a fresh block would carry a new
@@ -1662,7 +1662,30 @@ describe("mnemopi recall injection across a resume", () => {
 		expect(persisted).toEqual([]);
 
 		expect(prepared?.commit?.()).toBe(true);
-		expect(persisted).toEqual([{ customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "mnemopi", block } }]);
+		expect(persisted).toEqual([
+			{ customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "mnemopi", cwd: "/tmp", block } },
+		]);
+	});
+
+	it("recalls again in a cwd the block was not journaled in", async () => {
+		// `/move` rebinds memory to the destination project; replaying the
+		// source project's block there would carry its memories across.
+		const state = registerMnemopiState(undefined, {
+			cwd: "/projects/destination",
+			entries: () => [
+				{
+					type: "custom",
+					customType: RECALL_JOURNAL_ENTRY_TYPE,
+					data: { backend: "mnemopi", cwd: "/projects/source", block: "<memories>\nsource\n</memories>" },
+				},
+			],
+		});
+		const fresh = "<memories>\ndestination\n</memories>";
+		vi.spyOn(state, "recallForContext").mockResolvedValue(fresh);
+
+		const prepared = await state.beforeAgentStartPrompt("question");
+
+		expect(prepared?.context).toBe(fresh);
 	});
 
 	it("recalls again after a reset boundary rather than replaying pre-clear text", async () => {
