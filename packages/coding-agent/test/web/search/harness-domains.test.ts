@@ -1,16 +1,23 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { toolWireSchema } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WebSearchTool, withDomainOperators } from "@oh-my-pi/pi-coding-agent/web/search";
 import * as modelResolver from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import * as modelRoles from "@oh-my-pi/pi-coding-agent/config/model-roles";
 import * as provider from "@oh-my-pi/pi-coding-agent/web/search/provider";
-import type { SearchParams } from "@oh-my-pi/pi-coding-agent/web/search/providers/base";
+import type { SearchParams, SearchProvider } from "@oh-my-pi/pi-coding-agent/web/search/providers/base";
+import { createInMemoryAuthStorage } from "../../helpers/agent-session-setup";
 
 const CLAUDE_CODE = getBundledModel("anthropic", "claude-opus-5");
-const PROFILED = { getActiveModel: () => CLAUDE_CODE } as unknown as ToolSession;
+// The bridge follows `harness.mode` from the session's settings (default auto);
+// the in-memory credential store keeps execute() off the developer's real one.
+const PROFILED = {
+	getActiveModel: () => CLAUDE_CODE,
+	settings: Settings.isolated(),
+	authStorage: createInMemoryAuthStorage(),
+} as unknown as ToolSession;
 const NATIVE = {} as ToolSession;
 
 function captureProvider(): { params: SearchParams | undefined } {
@@ -20,7 +27,7 @@ function captureProvider(): { params: SearchParams | undefined } {
 	// The pool is built from live settings before the chain resolves, so stub both.
 	vi.spyOn(modelRoles, "roleCandidatePool").mockReturnValue([CLAUDE_CODE]);
 	vi.spyOn(modelResolver, "resolveRoleChain").mockReturnValue([{ model: CLAUDE_CODE, explicit: false }]);
-	vi.spyOn(provider, "getSearchProvider").mockResolvedValue({
+	const fake: SearchProvider = {
 		id: "codex",
 		label: "codex",
 		isAvailable: () => true,
@@ -29,7 +36,11 @@ function captureProvider(): { params: SearchParams | undefined } {
 			captured.params = params;
 			return { provider: "codex", sources: [{ title: "r", url: "https://docs.rs/x" }] };
 		},
-	});
+	};
+	// A chat model with grounding (claude-opus-5 declares Anthropic's) resolves
+	// through the grounded lookup, so stub both or the chain reaches a live engine.
+	vi.spyOn(provider, "getSearchProvider").mockResolvedValue(fake);
+	vi.spyOn(provider, "getGroundedSearchProvider").mockResolvedValue(fake);
 	return captured;
 }
 
