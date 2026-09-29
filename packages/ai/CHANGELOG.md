@@ -15,6 +15,9 @@
 - `/usage` no longer shows an always-empty `gpt-4 requests` row for Cursor accounts on usage-based plans; the Cursor Models and Other Models meters remain ([#13726](https://github.com/can1357/oh-my-pi/pull/13726) by [@will-bogusz](https://github.com/will-bogusz)).
 - Cursor turns routed through an HTTP proxy now finish instead of hanging after the response completes ([#13724](https://github.com/can1357/oh-my-pi/pull/13724) by [@will-bogusz](https://github.com/will-bogusz)).
 - Fixed Claude refusing long multi-model sessions with `Refusal (reasoning_extraction): This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs`. Prior reasoning Claude cannot replay as a native thinking block — other models' or providers' reasoning, unsigned or stale-signature blocks, and unsigned blocks after the signing-proxy auto-demote — was re-sent as plain assistant text; Claude targets on every provider (Anthropic, Bedrock, Vertex, gateways) now drop it instead, keeping visible text, tool calls, and signed thinking unchanged. On Bedrock, Claude requests keep alternating when a dropped reasoning-only turn leaves user turns adjacent: the following user text folds into the preceding user turn, after its tool results; other Bedrock models are unchanged.
+### Changed
+
+- Changed to fall back to adaptive thinking when between_tools is used with xhigh effort
 
 ## [18.4.3] - 2026-09-28
 

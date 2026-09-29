@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { type AnthropicMessageParam, convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
+import {
+	type AnthropicMessageParam,
+	convertAnthropicMessages,
+	streamAnthropic,
+} from "@oh-my-pi/pi-ai/providers/anthropic";
 import type {
 	AssistantMessage,
 	Message,
@@ -1052,5 +1056,66 @@ describe("Claude targets drop prior reasoning they cannot replay natively (reaso
 			{ type: "tool_use", id: "call_gpt", name: "read", input: { path: "parser.ts" } },
 		]);
 		expect(toolResultIds(params[2])).toEqual(["call_gpt"]);
+	});
+
+	it("applies under Sonnet 5.5's between_tools thinking-off mode, replaying its signed in-loop thinking", async () => {
+		// `between_tools` is how Sonnet 5.5 turns thinking off, yet it still thinks
+		// between tool calls: that signed block must replay natively, while the
+		// reasoning Claude cannot replay stays out exactly as with thinking on.
+		const target = makeAnthropicModel({
+			provider: "anthropic",
+			id: "claude-sonnet-5-5",
+			name: "Claude Sonnet 5.5",
+			baseUrl: "https://api.anthropic.com",
+		});
+		const messages: Message[] = [
+			makeUser("Fix the parser"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: GPT_REASONING, thinkingSignature: '{"type":"reasoning"}' },
+					{ type: "toolCall", id: "call_gpt", name: "read", arguments: { path: "parser.ts" } },
+				],
+				{ api: "openai-codex-responses", provider: "openai-codex", model: "gpt-5.6-sol" },
+			),
+			toolResult("call_gpt", "parser body"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: CLAUDE_REASONING, thinkingSignature: "sig_sonnet" },
+					{ type: "thinking", thinking: LEAKED_REASONING },
+					{ type: "toolCall", id: "call_sonnet", name: "read", arguments: { path: "tokenizer.ts" } },
+				],
+				{ provider: target.provider, model: target.id },
+			),
+			toolResult("call_sonnet", "tokenizer body"),
+		];
+		let payload: { thinking?: unknown; context_management?: unknown; messages: AnthropicMessageParam[] } | undefined;
+		const controller = new AbortController();
+		controller.abort();
+		await streamAnthropic(
+			target,
+			{ systemPrompt: [], messages },
+			{
+				apiKey: "sk-ant-api-test",
+				signal: controller.signal,
+				thinkingEnabled: false,
+				onPayload: captured => {
+					payload = captured as typeof payload;
+				},
+			},
+		).result();
+
+		expect(payload?.thinking).toEqual({ type: "between_tools" });
+		expect(payload?.context_management).toBeUndefined();
+		const wire = JSON.stringify(payload?.messages);
+		expect(wire).not.toContain(GPT_REASONING);
+		expect(wire).not.toContain(LEAKED_REASONING);
+		expect(payload?.messages.map(p => p.role)).toEqual(["user", "assistant", "user", "assistant", "user"]);
+		expect(wireBlocks(payload?.messages[1])).toEqual([
+			{ type: "tool_use", id: "call_gpt", name: "read", input: { path: "parser.ts" } },
+		]);
+		expect(wireBlocks(payload?.messages[3])).toMatchObject([
+			{ type: "thinking", thinking: CLAUDE_REASONING, signature: "sig_sonnet" },
+			{ type: "tool_use", id: "call_sonnet", name: "read", input: { path: "tokenizer.ts" } },
+		]);
 	});
 });

@@ -1113,6 +1113,44 @@ describe("claude-code Skill facade", () => {
 		expect(withArgs.result.isError).toBe(true);
 		expect(withArgs.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("Skill.args") });
 	});
+
+	it("reads a namespaced collision alias and its bare winner by their listed names", async () => {
+		// A differing same-name skill keeps its variant under `<namespace>/<name>`
+		// (a plugin's name for plugin skills); `skill` carries that listed name verbatim.
+		const collisionDir = path.join(import.meta.dir, "fixtures", "skills-collision");
+		const skill = (name: string, root: string) => ({
+			name,
+			description: `${name} skill`,
+			filePath: path.join(collisionDir, root, "calendar", "SKILL.md"),
+			baseDir: path.join(collisionDir, root, "calendar"),
+			source: "custom:user",
+		});
+		const session = {
+			...toolSession(),
+			settings: Settings.isolated(),
+			skills: [skill("calendar", "first"), skill("second-plugin/calendar", "second")],
+			getActiveModel: () => CLAUDE_CODE_MODEL,
+		};
+		const read = new ReadTool(session as unknown as ToolSession) as unknown as AgentTool;
+		const facade = facadeFor("claude-code", "Skill", read);
+
+		const namespaced = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], {
+			name: "Skill",
+			arguments: { skill: "second-plugin/calendar" },
+		});
+		expect(namespaced.result.isError).toBe(false);
+		expect(namespaced.result.content[0]).toMatchObject({
+			type: "text",
+			text: expect.stringContaining("Calendar (Second)"),
+		});
+		expect(namespaced.assistant.content[0]).toMatchObject({ name: "read", wireName: "Skill" });
+
+		const bare = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], {
+			name: "Skill",
+			arguments: { skill: "calendar" },
+		});
+		expect(bare.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("Calendar (First)") });
+	});
 });
 
 describe("facade predicates stay total on unsupported vendor fields", () => {
