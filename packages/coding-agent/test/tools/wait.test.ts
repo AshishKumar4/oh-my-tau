@@ -67,7 +67,14 @@ async function inlineChildWaitText(): Promise<string> {
 			tokens: 0,
 			requests: 1,
 		};
-		options.onProgress?.({ ...progress, status: "running", recentTools: [], recentOutput: [], toolCount: 0, cost: 0 });
+		options.onProgress?.({
+			...progress,
+			status: "running",
+			recentTools: [],
+			recentOutput: [],
+			toolCount: 0,
+			cost: 0,
+		});
 		registerRunning(id, "Main");
 		childText = firstText(await new WaitTool(session(undefined, id)).execute("child-wait", {}));
 		return {
@@ -444,7 +451,10 @@ describe("wait", () => {
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		ownedJob(manager, "Worker");
 		const evalSession = session(manager, "Main", { "eval.autoBackground.enabled": false });
-		const timed = runEvalWait({ items: [{ kind: "agent", id: "Worker" }], timeoutMs: 60_000 }, { session: evalSession });
+		const timed = runEvalWait(
+			{ items: [{ kind: "agent", id: "Worker" }], timeoutMs: 60_000 },
+			{ session: evalSession },
+		);
 		expect(blockedAwaitsOf(registry, "Main")).toMatchObject([
 			{ agents: ["Worker"], inline: true, independent: true },
 		]);
