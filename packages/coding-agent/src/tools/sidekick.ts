@@ -8,7 +8,7 @@
  * and a handoff sent while one is already in flight is steered into the
  * running turn instead of queued. Every handoff turn is an async job, so a
  * non-blocking (or timed-out blocking) call's report self-delivers through the
- * ordinary background-job path and can be waited on with `hub`.
+ * ordinary background-job path and can be waited on with `wait`.
  */
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
@@ -17,6 +17,7 @@ import { formatDuration, prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
 import {
 	buildFusionPromptData,
+	type FusionPromptData,
 	findSidekickRef,
 	isFusionLead,
 	renderSidekickPrompt,
@@ -91,10 +92,6 @@ function describeProgress(progress: AgentProgress): string {
 	return `${SIDEKICK_LABEL}: ${activity} (${progress.toolCount} tool calls, ${formatDuration(progress.durationMs)})`;
 }
 
-function waitHint(jobId: string): string {
-	return `Its report auto-delivers when it finishes; wait for it with \`hub\` (op: "wait", ids: ["${jobId}"]) rather than polling.`;
-}
-
 export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickToolDetails> {
 	readonly name = SIDEKICK_TOOL_NAME;
 	readonly label = SIDEKICK_LABEL;
@@ -117,9 +114,19 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 	}
 
 	get description(): string {
+		return prompt.render(sidekickDescription, this.#promptData());
+	}
+
+	/** Description slots under the session's current harness profile. */
+	#promptData(): FusionPromptData {
 		const model = this.session.getActiveModel?.();
 		const profile = model ? effectiveHarnessProfile(this.session.settings, model) : undefined;
-		return prompt.render(sidekickDescription, buildFusionPromptData({ profile, toolRefs: {} }));
+		return buildFusionPromptData({ profile, toolRefs: {} });
+	}
+
+	/** For a handoff that outlives the call: the wait tool the description names, not polling. */
+	#waitHint(): string {
+		return `Its report auto-delivers when it finishes; wait for it with \`${this.#promptData().readTool}\` rather than polling.`;
 	}
 
 	async execute(
@@ -198,7 +205,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		}
 
 		if (!block) {
-			return textResult(`Handoff ${handoff} dispatched to the sidekick (job \`${jobId}\`). ${waitHint(jobId)}`, {
+			return textResult(`Handoff ${handoff} dispatched to the sidekick (job \`${jobId}\`). ${this.#waitHint()}`, {
 				agentId: ref?.id,
 				jobId,
 				mode,
@@ -371,7 +378,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			outcome === "aborted"
 				? "The wait was interrupted"
 				: `No report within ${formatDuration(SIDEKICK_MAX_BLOCK_SECONDS * 1000)}`;
-		return textResult(`${reason}; the sidekick is still working on handoff job \`${jobId}\`. ${waitHint(jobId)}`, {
+		return textResult(`${reason}; the sidekick is still working on handoff job \`${jobId}\`. ${this.#waitHint()}`, {
 			agentId: job.agentId,
 			jobId,
 			mode,

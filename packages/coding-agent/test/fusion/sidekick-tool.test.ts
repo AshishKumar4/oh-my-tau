@@ -284,6 +284,10 @@ describe("fusion sidekick tool", () => {
 			const jobId = result.details?.jobId;
 			if (!jobId) throw new Error("expected a job id");
 			expect(manager.getJob(jobId)?.status).toBe("running");
+			// The hint names the wait tool the session actually has.
+			const hint = result.content[0]?.type === "text" ? result.content[0].text : "";
+			expect(hint).toContain("wait for it with `wait`");
+			expect(hint).not.toContain("hub");
 			release.resolve();
 			await manager.getJob(jobId)?.promise;
 			await manager.drainDeliveries({ timeoutMs: 1000 });
