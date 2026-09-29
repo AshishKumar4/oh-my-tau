@@ -484,7 +484,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			}
 
 			const model = runtime.session.model;
-			const harness = servedHarnessPrompt(model, effectiveHarnessProfile(runtime.settings, model));
+			const harness = servedHarnessPrompt(model, effectiveHarnessProfile(runtime.settings, model) ?? null);
 			const lines = [model ? `Current model: ${model.provider}/${model.id}` : "No model is currently selected."];
 			if (harness !== undefined) {
 				lines.push(

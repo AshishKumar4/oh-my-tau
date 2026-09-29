@@ -561,6 +561,12 @@ export function loadHarnessPrompt(profile: HarnessProfile, modelId?: string): Pr
 	return tracked;
 }
 
+/**
+ * The loaded capture serving `model`. An omitted (`undefined`) `override`
+ * resolves the model's catalog profile; `null` means no profile. Session
+ * callers pass `effectiveHarnessProfile(...) ?? null`: `harness.mode: native`
+ * yields `undefined` there, which must not fall back to the catalog.
+ */
 export function servedHarnessPrompt(
 	model: Model | undefined,
 	override?: HarnessProfile | null,

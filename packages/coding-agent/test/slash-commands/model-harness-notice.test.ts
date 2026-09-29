@@ -28,13 +28,13 @@ const CAPTURE = {
 	ambient: [],
 };
 
-async function runModelCommand(model: Model): Promise<string> {
+async function runModelCommand(model: Model, settings = Settings.isolated()): Promise<string> {
 	const spec = lookupBuiltinSlashCommand("model");
 	if (!spec?.handle) throw new Error("expected a /model handler");
 	const emitted: string[] = [];
 	await spec.handle({ name: "model", args: "", text: "/model" }, {
 		session: { model },
-		settings: Settings.isolated(),
+		settings,
 		output: (text: string) => {
 			emitted.push(text);
 		},
@@ -68,5 +68,13 @@ describe("/model harness capture notice", () => {
 		const output = await runModelCommand(SONNET);
 
 		expect(output).toBe(`Current model: ${SONNET.provider}/${SONNET.id}`);
+	});
+
+	it("stays silent when harness.mode pins omp's native prompt", async () => {
+		await serveCapture();
+
+		const output = await runModelCommand(FABLE, Settings.isolated({ "harness.mode": "native" }));
+
+		expect(output).toBe(`Current model: ${FABLE.provider}/${FABLE.id}`);
 	});
 });

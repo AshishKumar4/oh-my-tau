@@ -53,7 +53,7 @@ export function sessionVendorPromptRef(session: {
 	model?: Model;
 	settings: ScopeLike;
 }): { readonly text: string } | undefined {
-	return servedHarnessPrompt(session.model, effectiveHarnessProfile(session.settings, session.model));
+	return servedHarnessPrompt(session.model, effectiveHarnessProfile(session.settings, session.model) ?? null);
 }
 
 /** Read host settings and optionally run the provider's inline-image planner. */

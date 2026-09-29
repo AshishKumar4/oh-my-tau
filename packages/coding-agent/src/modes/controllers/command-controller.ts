@@ -383,7 +383,7 @@ export class CommandController {
 				providerSessionState: this.ctx.session.providerSessionState,
 			});
 			info += renderProviderSection(providerDetails, theme);
-			const harness = servedHarnessPrompt(model, effectiveHarnessProfile(this.ctx.session.settings, model));
+			const harness = servedHarnessPrompt(model, effectiveHarnessProfile(this.ctx.session.settings, model) ?? null);
 			if (harness !== undefined) {
 				info += `${theme.fg("dim", "Harness Prompt:")} ${replaceTabs(sanitizeText(shortenPath(harness.path)))} ${theme.fg("dim", `(${replaceTabs(sanitizeText(harness.clientVersion))})`)}\n`;
 			}
