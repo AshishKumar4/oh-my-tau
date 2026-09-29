@@ -29,7 +29,7 @@ import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { prewarmOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
 import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
-import { servedHarnessPrompt } from "./harness/capture";
+import { loadHarnessPrompt, servedHarnessPrompt } from "./harness/capture";
 import { effectiveHarnessProfile } from "./harness/effective-profile";
 import { type HarnessSurface, harnessSurface } from "./harness/facades";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
@@ -225,8 +225,10 @@ import {
 	buildSystemPrompt as buildSystemPromptInternal,
 	cfgSystemPromptInputs,
 	composeAppendPrompt,
+	discoverSystemPromptOverride,
 	loadProjectContextFiles as loadContextFilesInternal,
 	projectSystemPromptToolMetadata,
+	SYSTEM_PROMPT_PREP_TIMEOUT_MS,
 } from "./system-prompt";
 import type { AgentDefinition } from "./task/types";
 import { AgentOutputManager } from "./task/output-manager";
@@ -2436,6 +2438,29 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			};
 			return harnessSurface(profile, names, host, name => toolRegistry.has(name));
 		};
+		/**
+		 * Loads the capture the prompt build will serve before the surface is read.
+		 * Whether TaskOutput mounts, and so whether `wait` is reachable, depends on
+		 * it: read before the build loads it, the first prompt and predicates would
+		 * drop `wait` while the tools presented afterwards offer TaskOutput, and the
+		 * next rebuild would rewrite the cached prompt. Memoized per profile and
+		 * model; skipped exactly when the build serves no capture (a caller-owned or
+		 * discovered SYSTEM.md prompt) and bounded like the build's own load.
+		 */
+		const loadServedHarnessPrompt = async (cwd: string): Promise<void> => {
+			const promptModel = toolSession.getActiveModel?.();
+			const profile = promptModel ? effectiveHarnessProfile(settings, promptModel) : undefined;
+			if (!promptModel || profile === undefined || servedHarnessPrompt(promptModel, profile)) return;
+			if (options.customSystemPrompt !== undefined || options.systemPromptTemplate !== undefined) return;
+			if ((await discoverSystemPromptOverride(cwd)) !== undefined) return;
+			const deadline = Promise.withResolvers<null>();
+			const timer = setTimeout(() => deadline.resolve(null), SYSTEM_PROMPT_PREP_TIMEOUT_MS);
+			try {
+				await Promise.race([loadHarnessPrompt(profile, promptModel.id).catch(() => null), deadline.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
+		};
 		toolSession.getToolRefs = () => session?.getToolRefs() ?? harnessPromptSurface([...activeToolNames]).toolRefs;
 
 		// Wire process-wide internal URL singletons owned by their real classes.
@@ -3777,15 +3802,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			tools: Map<string, AgentTool>,
 			rebuildOptions?: { directToolNames?: readonly string[] },
 		): Promise<BuildSystemPromptResult> => {
+			const promptCwd = sessionManager.getCwd();
 			// The prompt describes the surface the wire carries: a tool the harness
 			// profile withholds with no facade standing in is not listed or gated
-			// on, and `toolRefs` name what did mount.
+			// on, and `toolRefs` name what did mount — with the served capture
+			// loaded first, so this prompt is the one later rebuilds reproduce.
+			await loadServedHarnessPrompt(promptCwd);
 			const surface = harnessPromptSurface(requestedToolNames);
 			const toolNames =
 				surface.unavailable.size === 0
 					? requestedToolNames
 					: requestedToolNames.filter(name => !surface.unavailable.has(name));
-			const promptCwd = sessionManager.getCwd();
 			const activeRepoContext = hasSession
 				? await logger.time("resolveActiveRepoContext", resolveRepoContext, promptCwd)
 				: initialActiveRepoContext;
@@ -4149,6 +4176,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		}
 
+		// The initial predicates read the surface too: load its capture first.
+		await loadServedHarnessPrompt(sessionManager.getCwd());
 		setSessionActiveToolNames(initialToolNames);
 		const { systemPrompt } = await logger.time(
 			"buildSystemPrompt",

@@ -219,7 +219,7 @@ function renderActiveRepoContextPrompt(activeRepoContext: ActiveRepoContext | nu
 		.trim();
 }
 
-const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 5000;
+export const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 5000;
 /** Workstation facts the model needs to pick commands and paths: platform/release and CPU architecture. */
 function getEnvironmentInfo(): Array<{ label: string; value: string }> {
 	return [
