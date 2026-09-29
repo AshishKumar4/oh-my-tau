@@ -81,7 +81,10 @@ async function loadFixture(name: string): Promise<Fixture> {
 	return { name, raw, text: projection.text, tools: projection.tools, unmatchedEdits: projection.unmatchedEdits };
 }
 
-const FIXTURE_NAMES = fs.readdirSync(FIXTURE_DIR).filter(name => name.endsWith(".json")).sort();
+const FIXTURE_NAMES = fs
+	.readdirSync(FIXTURE_DIR)
+	.filter(name => name.endsWith(".json"))
+	.sort();
 const FIXTURES = await Promise.all(FIXTURE_NAMES.map(loadFixture));
 
 /** Everything a capture puts on the wire under omp: the instructions and the bridged declarations. */

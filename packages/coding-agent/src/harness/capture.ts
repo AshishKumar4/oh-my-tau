@@ -279,8 +279,7 @@ export const CLAUDE_CODE_SURFACE_EDITS: readonly SurfaceEdit[] = [
 	{
 		id: "ask.preview-layout",
 		target: "AskUserQuestion",
-		find:
-			" When any option has a preview, the UI switches to a side-by-side layout with a vertical option list on the left and preview on the right.",
+		find: " When any option has a preview, the UI switches to a side-by-side layout with a vertical option list on the left and preview on the right.",
 	},
 	// Host-filled fields no omp host fills.
 	{ id: "ask.answers", target: "AskUserQuestion", property: "answers" },

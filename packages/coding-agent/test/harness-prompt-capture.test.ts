@@ -257,7 +257,8 @@ describe("harness prompt custody", () => {
 
 	it("drops session paths under roots the old content sniff missed", async () => {
 		const exotic = "# Memory\n\nState lives at /root/.config/s1 on this machine.";
-		const windows = "# Tools\n\nKeep builds small.\n\nPer-machine state lives at C:\\Users\\bot\\memory on this machine.";
+		const windows =
+			"# Tools\n\nKeep builds small.\n\nPer-machine state lives at C:\\Users\\bot\\memory on this machine.";
 		writeCapture({ instructions: [RECORDED_BILLING_BLOCK, claudeCodeSystemInstruction, exotic, windows] });
 
 		const { systemPrompt } = await build("claude-code");

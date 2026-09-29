@@ -2735,9 +2735,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 			const start = offset ? Math.max(0, offset - 1) : 0;
 			if (start >= allLines.length) {
 				const suggestion =
-					allLines.length === 0
-						? "The listing is empty."
-						: formatBeyondEndHint(this.session, "", allLines.length);
+					allLines.length === 0 ? "The listing is empty." : formatBeyondEndHint(this.session, "", allLines.length);
 				return toolResult(details)
 					.text(`Line ${start + 1} is beyond end of listing (${allLines.length} lines total). ${suggestion}`)
 					.sourcePath(tree.rootPath)
