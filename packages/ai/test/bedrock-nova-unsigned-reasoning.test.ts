@@ -181,12 +181,6 @@ function toolResultWire(toolUseId: string, text: string): Record<string, unknown
 	return { toolResult: { toolUseId, content: [{ text }], status: "success" } };
 }
 
-/** Synthetic assistant turn that separates Claude's tool results from the user text after them. */
-const TOOL_RESULT_BRIDGE: ConverseWireMessage = {
-	role: "assistant",
-	content: [{ text: "I have processed the tool results." }],
-};
-
 // Anthropic's `reasoning_extraction` classifier refuses requests that re-send
 // prior reasoning to Claude as text, so Claude on Bedrock drops reasoning it
 // cannot replay as signed reasoningContent, and the turn structure still has to
@@ -239,15 +233,23 @@ describe("Bedrock Claude prior reasoning replay", () => {
 	}
 
 	test("drops cross-model reasoning for Claude but still demotes it for Nova", async () => {
-		const claude = payloadMessages(await captureReplayPayload(claudeModel, foreignReasoningContext()));
+		const claude = payloadMessages(
+			await captureReplayPayload(claudeModel, foreignReasoningContext(), { cacheRetention: "none" }),
+		);
 
 		expect(JSON.stringify(claude)).not.toContain(GPT_REASONING);
-		expect(claude.map(message => message.role)).toEqual(["user", "assistant", "user", "assistant", "user"]);
-		expect(claude[1]?.content).toEqual([
-			{ text: "Reading the parser first." },
-			{ toolUse: { toolUseId: "call_gpt", name: "read", input: { path: "parser.ts" } } },
+		expect(claude).toEqual([
+			{ role: "user", content: [{ text: "Fix the parser" }] },
+			{
+				role: "assistant",
+				content: [
+					{ text: "Reading the parser first." },
+					{ toolUse: { toolUseId: "call_gpt", name: "read", input: { path: "parser.ts" } } },
+				],
+			},
+			// The user text follows the tool results inside their turn.
+			{ role: "user", content: [toolResultWire("call_gpt", "parser body"), { text: "Continue" }] },
 		]);
-		expect(claude[3]).toEqual(TOOL_RESULT_BRIDGE);
 
 		const nova = payloadMessages(await captureReplayPayload(novaModel, foreignReasoningContext()));
 
@@ -287,8 +289,8 @@ describe("Bedrock Claude prior reasoning replay", () => {
 		expect(wire).not.toContain(unsignedReasoning);
 		expect(wire).not.toContain(reasoningOnly);
 		// The reasoning-only turn vanishes without leaving two user turns
-		// adjacent (Converse rejects any conversation that does not alternate)
-		// and without putting the user text beside the tool results.
+		// adjacent (Converse rejects any conversation that does not alternate):
+		// the user text joins the tool-result turn, after the tool results.
 		expect(messages).toEqual([
 			{ role: "user", content: [{ text: "Fix the parser" }] },
 			{
@@ -299,9 +301,7 @@ describe("Bedrock Claude prior reasoning replay", () => {
 					{ toolUse: { toolUseId: "toolu_1", name: "read", input: { path: "parser.ts" } } },
 				],
 			},
-			{ role: "user", content: [toolResultWire("toolu_1", "parser body")] },
-			TOOL_RESULT_BRIDGE,
-			{ role: "user", content: [{ text: "Continue" }] },
+			{ role: "user", content: [toolResultWire("toolu_1", "parser body"), { text: "Continue" }] },
 		]);
 	});
 
@@ -353,20 +353,16 @@ describe("Bedrock Claude prior reasoning replay", () => {
 			{ role: "user", content: [{ text: "Continue" }] },
 		]);
 
-		// Claude drops the reasoning-only turn and still alternates: adjacent text
-		// turns fold, while user text after tool results gets its own turn behind
-		// a bridging assistant turn instead of joining the toolResult turn.
+		// Claude drops the reasoning-only turn and still alternates strictly, with
+		// no synthetic assistant turn: adjacent text turns fold, and user text after
+		// tool results joins their turn behind the toolResult blocks, which stay first.
 		const claude = payloadMessages(await captureReplayPayload(claudeModel, context, { cacheRetention: "none" }));
 		expect(claude).toEqual([
 			{ role: "user", content: [{ text: "Fix the parser" }, { text: "Keep edits minimal." }] },
 			{ role: "assistant", content: [readCall("call_1", "parser.ts")] },
-			{ role: "user", content: [toolResultWire("call_1", "parser body")] },
-			TOOL_RESULT_BRIDGE,
-			{ role: "user", content: [{ text: "Also check the lexer." }] },
+			{ role: "user", content: [toolResultWire("call_1", "parser body"), { text: "Also check the lexer." }] },
 			{ role: "assistant", content: [readCall("call_2", "lexer.ts")] },
-			{ role: "user", content: [toolResultWire("call_2", "lexer body")] },
-			TOOL_RESULT_BRIDGE,
-			{ role: "user", content: [{ text: "Continue" }] },
+			{ role: "user", content: [toolResultWire("call_2", "lexer body"), { text: "Continue" }] },
 		]);
 		expect(JSON.stringify(claude)).not.toContain(reasoningOnly);
 	});

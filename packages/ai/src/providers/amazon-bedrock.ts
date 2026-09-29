@@ -1067,23 +1067,17 @@ function convertMessages(
 	// reasoning it cannot replay (`dropsUnreplayableThinking`), so an assistant
 	// turn whose only content was such reasoning is skipped and would leave two
 	// user turns adjacent. For Claude, a user or developer turn that follows
-	// another folds into it, but never into a toolResult turn: some Converse
-	// models reject text beside tool results ("Conversation blocks and tool
-	// result blocks cannot be provided in the same turn"), so a synthetic
-	// assistant turn bridges the gap instead, as openai-completions does for
-	// Mistral. A toolResult turn always follows its tool-use assistant turn, so
-	// it never folds. Other models keep one Converse turn per message.
+	// another user turn folds into it, after any toolResult blocks: tool results
+	// stay first, the order Anthropic requires when text accompanies them. A
+	// toolResult turn always follows its tool-use assistant turn, so it never
+	// folds. Llama and Mistral reject text beside tool results ("Conversation
+	// blocks and tool result blocks cannot be provided in the same turn"), so
+	// other models keep one Converse turn per message.
 	const dropsUnreplayable = dropsUnreplayableThinking(model.id);
 	const pushUserTurn = (content: UserContent[]): void => {
 		const previous = result.at(-1);
-		if (dropsUnreplayable && previous?.role === "user") {
-			if (!previous.content.some(block => "toolResult" in block)) {
-				previous.content.push(...content);
-				return;
-			}
-			result.push({ role: "assistant", content: [{ text: "I have processed the tool results." }] });
-		}
-		result.push({ role: "user", content });
+		if (dropsUnreplayable && previous?.role === "user") previous.content.push(...content);
+		else result.push({ role: "user", content });
 	};
 	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
 
