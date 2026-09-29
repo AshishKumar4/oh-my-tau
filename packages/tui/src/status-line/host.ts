@@ -70,8 +70,6 @@ export interface StatusLineSession {
 	 * lives in the agent session, which pi-tui must not import.
 	 */
 	promptCacheHealthText?: () => PromptCacheHealthText | undefined;
-	/** Fusion sidekick model id suffix ("provider/id"), set by hosts with Fusion; undefined otherwise. */
-	fusionSidekick?: string | undefined;
 	getAdvisorStatusOverview?(): { configured: boolean; advisors: readonly { status: string; yielded: boolean }[] };
 	getAdvisorCost?(): number;
 	isAdvisorUsingSubscription?(): boolean;
@@ -98,6 +96,8 @@ export interface StatusLineHost<TSession extends StatusLineSession = StatusLineS
 	getSessionSettingsIdentity(session: TSession): unknown;
 	getSessionSettingsRevision(session: TSession): number;
 	goalStatusInFooter(session: TSession): boolean;
+	/** Fusion sidekick selector ("provider/id") paired with `session`'s lead, or undefined while Fusion is off. */
+	fusionSidekick?(session: TSession): string | undefined;
 	activeAccount(session: TSession, provider: string): StatusAccountIdentity | undefined;
 	canFetchUsageReports(session: TSession): boolean;
 	fetchUsageReports(session: TSession, signal: AbortSignal): Promise<unknown>;

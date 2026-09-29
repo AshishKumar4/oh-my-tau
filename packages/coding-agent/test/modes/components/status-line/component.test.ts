@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { createGallerySession } from "../../../../src/cli/gallery-fixtures/preview-session";
 import { createGallerySegmentContext } from "../../../../src/cli/gallery-fixtures/segments";
 import { Settings } from "../../../../src/config/settings";
+import { cfgFusionEnabled, cfgFusionSidekickModel } from "../../../../src/fusion/settings";
 import { StatusLineComponent } from "@oh-my-pi/pi-tui/status-line/component";
 import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
 import { renderSegment } from "@oh-my-pi/pi-tui/status-line/segments";
@@ -246,17 +248,17 @@ describe("StatusLineComponent", () => {
 });
 
 describe("model segment fusion indicator", () => {
-	function fusionContext(values: { enabled: boolean; sidekickModel?: string }) {
-		const base = createGallerySegmentContext();
-		const settingValues: Record<string, unknown> = {
-			"fusion.enabled": values.enabled,
-			"fusion.sidekickModel": values.sidekickModel,
-		};
-		const session = {
-			...base.session,
-			settings: { get: (path: string) => settingValues[path] ?? false },
-		} as unknown as AgentSession;
-		return { ...base, session };
+	// The host resolves the pair from the session's own settings.
+	function fusionSession(values: { enabled: boolean; sidekickModel: string }): AgentSession {
+		const session = createGallerySession();
+		cfgFusionEnabled.set(session.settings, values.enabled);
+		cfgFusionSidekickModel.set(session.settings, values.sidekickModel);
+		return session;
+	}
+
+	function fusionContext(values: { enabled: boolean; sidekickModel: string }) {
+		const session = fusionSession(values);
+		return { ...createGallerySegmentContext(), session, fusionSidekick: statusLineHost.fusionSidekick?.(session) };
 	}
 
 	it("shows the lead paired with the sidekick id when fusion is enabled", () => {
@@ -275,8 +277,22 @@ describe("model segment fusion indicator", () => {
 		expect(disabled).toContain("Sonnet 4.5");
 		expect(disabled).not.toContain("swe-2");
 
-		const noSidekick = Bun.stripANSI(renderSegment("model", fusionContext({ enabled: true })).content);
+		const noSidekick = Bun.stripANSI(
+			renderSegment("model", fusionContext({ enabled: true, sidekickModel: "" })).content,
+		);
 		expect(noSidekick).toContain("Sonnet 4.5");
 		expect(noSidekick).not.toContain(theme.symbol("tab.fusion"));
+	});
+
+	it("follows the session's fusion settings in the live status line", () => {
+		const session = fusionSession({ enabled: true, sidekickModel: "devin/swe-2" });
+		const statusLine = statusLines.track(new StatusLineComponent(session, statusLineHost));
+		const pair = `Sonnet 4.5 ${theme.symbol("tab.fusion")} swe-2`;
+		expect(Bun.stripANSI(statusLine.getTopBorder(WIDE_ENOUGH_FOR_COST_SEGMENT).content)).toContain(pair);
+
+		cfgFusionEnabled.set(session.settings, false);
+		const off = Bun.stripANSI(statusLine.getTopBorder(WIDE_ENOUGH_FOR_COST_SEGMENT).content);
+		expect(off).toContain("Sonnet 4.5");
+		expect(off).not.toContain(theme.symbol("tab.fusion"));
 	});
 });

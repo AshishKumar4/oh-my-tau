@@ -772,12 +772,6 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			if (!messages) return undefined;
 			return promptCacheHealthTextOfMessages(messages);
 		};
-		// Fusion sidekick suffix comes from host settings (the session object
-		// carries no settings by design); absent unless Fusion is enabled.
-		const settings = this.host.getSettings() as { get(path: string): unknown } | undefined;
-		const enabled = settings?.get?.("fusion.enabled") === true;
-		const selector = settings?.get?.("fusion.sidekickModel");
-		source.fusionSidekick = enabled === true && typeof selector === "string" ? selector : undefined;
 	}
 
 	#gitEnabled(): boolean {
@@ -2406,6 +2400,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 					: null,
 			goalMode: this.#goalModeStatus,
 			goalStatusInFooter: this.#goalModeStatus ? this.host.goalStatusInFooter(this.session) : false,
+			fusionSidekick: this.host.fusionSidekick?.(this.session),
 			vibeMode: this.#vibeModeStatus,
 			vim: this.#vimStatus,
 			collab: this.#collabStatus,

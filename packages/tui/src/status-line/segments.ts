@@ -280,11 +280,11 @@ function modelDisplayName(ctx: SegmentContext): string {
 	}
 
 	// Fusion pairs the lead with a sidekick: "<lead> ⚡ <sidekick-id>".
-	// The host sets fusionSidekick (a "provider/model-id" selector; only
-	// the id is shown) when Fusion is enabled with a sidekick model.
-	// Absent on plain sessions and lightweight doubles, which render the
-	// plain lead.
-	const sidekickSelector = ctx.session.fusionSidekick;
+	// The host resolves fusionSidekick (a "provider/model-id" selector; only
+	// the id is shown) from the session's settings on every render while
+	// Fusion is enabled with a sidekick model. Absent otherwise, and for
+	// hosts without Fusion, which render the plain lead.
+	const sidekickSelector = ctx.fusionSidekick;
 	if (sidekickSelector !== undefined) {
 		const sidekickId = parseModelString(sidekickSelector)?.id ?? sidekickSelector;
 		modelName = `${modelName} ${theme.symbol("tab.fusion")} ${sidekickId}`;

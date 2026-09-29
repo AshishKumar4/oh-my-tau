@@ -21,6 +21,7 @@ import {
 	cfgStatusLineTransparent,
 	cfgTuiCodexResetFireworks,
 } from "./settings";
+import { cfgFusionEnabled, cfgFusionSidekickModel } from "../fusion/settings";
 import { cfgGoalStatusInFooter } from "../goals/settings";
 
 /**
@@ -52,6 +53,11 @@ export const statusLineHost: StatusLineHost<StatusLineHostSession> = {
 	getSessionSettingsIdentity: session => session.settings,
 	getSessionSettingsRevision: session => session.settings?.revision ?? 0,
 	goalStatusInFooter: session => cfgGoalStatusInFooter.get(session.settings ?? settings),
+	fusionSidekick: session => {
+		const scope = session.settings ?? settings;
+		const selector = cfgFusionSidekickModel.get(scope).trim();
+		return cfgFusionEnabled.get(scope) && selector ? selector : undefined;
+	},
 	activeAccount: (session, provider) =>
 		session.modelRegistry?.authStorage?.oauth.identity(provider, session.sessionId),
 	canFetchUsageReports: session => typeof session.fetchUsageReports === "function",

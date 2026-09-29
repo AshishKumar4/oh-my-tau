@@ -105,6 +105,8 @@ export interface SegmentContext {
 		condition?: LoopConditionConfig;
 	} | null;
 	goalStatusInFooter?: boolean;
+	/** Fusion sidekick selector ("provider/id") the model segment pairs with the lead; absent while Fusion is off. */
+	fusionSidekick?: string;
 	goalMode: {
 		enabled: boolean;
 		paused: boolean;
