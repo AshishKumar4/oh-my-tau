@@ -4325,8 +4325,7 @@ function applyHeadCaching(
 			systemBlocks,
 			claudeCode ? CLAUDE_CODE_VOLATILE_SYSTEM_SEGMENT_MARKERS : VOLATILE_SYSTEM_SEGMENT_MARKERS,
 		);
-		const suffixStart =
-			claudeCode && subagentTextStart >= 0 ? Math.min(markedStart, subagentTextStart) : markedStart;
+		const suffixStart = claudeCode && subagentTextStart >= 0 ? Math.min(markedStart, subagentTextStart) : markedStart;
 		const anchorIndex = suffixStart === 0 ? systemBlocks.length - 1 : suffixStart - 1;
 		const anchor = systemBlocks[anchorIndex];
 		if (anchor && anchor.cache_control == null) {

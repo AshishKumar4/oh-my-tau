@@ -140,7 +140,8 @@ describe("claude-code wire version", () => {
 	});
 
 	it("seeds the fingerprint with the user's words under the profile, the message as sent otherwise", async () => {
-		const reminder = "<system-reminder>\nToday: 2026-09-29; current working directory: '/work/a'.\n</system-reminder>";
+		const reminder =
+			"<system-reminder>\nToday: 2026-09-29; current working directory: '/work/a'.\n</system-reminder>";
 		const billed = async (content: UserMessage["content"], options: AnthropicOptions = {}) => {
 			const [request] = await send(
 				{ systemPrompt: [VENDOR_PROMPT], messages: [{ role: "user", content, timestamp: 1 }], tools: TOOLS },
@@ -332,13 +333,11 @@ describe("claude-code head breakpoint and per-spawn subagent text", () => {
 			messages: turn("Review part 7"),
 			tools: TOOLS,
 		});
-		expect(systemBlocks(body).map(block => block.text).slice(1)).toEqual([
-			claudeCodeSystemInstruction,
-			VENDOR_PROMPT,
-			FOOTER,
-			"Role: reviewer.",
-			perSpawnText(7),
-		]);
+		expect(
+			systemBlocks(body)
+				.map(block => block.text)
+				.slice(1),
+		).toEqual([claudeCodeSystemInstruction, VENDOR_PROMPT, FOOTER, "Role: reviewer.", perSpawnText(7)]);
 		expect(anchoredTexts(body)).toEqual([claudeCodeSystemInstruction, "Role: reviewer."]);
 	});
 
