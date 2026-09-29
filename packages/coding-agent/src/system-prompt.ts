@@ -900,7 +900,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	for (const mounted of xdevTools) {
 		if (!toolPromptNames.has(mounted.name)) toolPromptNames.set(mounted.name, `${XD_URL_PREFIX}${mounted.name}`);
 	}
-	const toolRefs = Object.fromEntries(toolPromptNames.entries());
+	const toolRefs: Record<string, string> = Object.fromEntries(toolPromptNames.entries());
+	// Claude Code loads skills through its Skill facade over `read`.
+	if (harnessProfile === "claude-code" && toolPromptNames.has("read")) toolRefs.Skill = "Skill";
 	// The sidekick tool mounts only for a Fusion lead, so its presence IS the
 	// Fusion signal: the lead section renders with the same presented names the
 	// rest of the prompt uses.

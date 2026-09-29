@@ -140,6 +140,18 @@ describe("BatchArgsScanner", () => {
 		expect(seen.indexOf(1)).toBe(raw.indexOf('"},{"name":"B"') + 1);
 		expect(seen.indexOf(2)).toBe(raw.length - 3);
 	});
+
+	it("reads the shared brief from a facade's key, never from an item's field of the same name", () => {
+		const raw =
+			'{"description":"Audit","prompt":"shared brief","tasks":[{"description":"A","prompt":"Do A."},{"description":"B","prompt":"Do B."}]}';
+		const scanner = new BatchArgsScanner("prompt");
+		scanner.feed(raw.slice(0, raw.indexOf('{"description":"B"')));
+		expect(scanner.context).toBe("shared brief");
+		expect(scanner.items).toEqual([{ description: "A", prompt: "Do A." }]);
+		scanner.feed(raw);
+		expect(scanner.context).toBe("shared brief");
+		expect(scanner.items).toHaveLength(2);
+	});
 });
 
 describe("task speculative launch", () => {
@@ -361,6 +373,76 @@ describe("task speculative launch", () => {
 		spawn(agentId).release.resolve();
 		await manager.getJob(agentId)!.promise;
 		expect(manager.getJob(agentId)!.status).toBe("completed");
+	});
+});
+
+describe("claude-code Agent speculative launch", () => {
+	const managers: AsyncJobManager[] = [];
+	const started: string[] = [];
+	const releases: Array<() => void> = [];
+
+	beforeEach(() => {
+		AgentRegistry.resetGlobalForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			const id = options.id ?? "?";
+			started.push(id);
+			const release = Promise.withResolvers<void>();
+			releases.push(release.resolve);
+			options.signal?.addEventListener("abort", () => release.resolve(), { once: true });
+			await release.promise;
+			return makeResult(id);
+		});
+	});
+
+	afterEach(async () => {
+		for (const release of releases.splice(0)) release();
+		started.length = 0;
+		vi.restoreAllMocks();
+		for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 1000 });
+		AgentLifecycleManager.resetGlobalForTests();
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	it("starts each streamed tasks item under the shared prompt and adopts it at dispatch", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		managers.push(manager);
+		const tool = await TaskTool.create(createSession(manager));
+		const agentSpec = harnessFacadeSpecs("claude-code").find(spec => spec.wireName === "Agent");
+		if (!agentSpec) throw new Error("expected the claude-code Agent facade");
+		const agent = harnessFacade(tool as unknown as AgentTool, agentSpec, { settings: Settings.isolated() });
+		const opened = await agent.speculation?.stream?.open({ coordinator: sink, parentToolCallId: toolCall.id });
+		if (!opened) throw new Error("expected an Agent launch session");
+		const session = opened as TaskLaunchSession;
+		const agentArgs = {
+			description: "Audit",
+			prompt: "ctx",
+			tasks: [
+				{ description: "A", prompt: "Do A." },
+				{ description: "B", prompt: "Do B." },
+			],
+		};
+		const agentJson = JSON.stringify(agentArgs);
+		const agentCall: AgentToolCall = { type: "toolCall", id: toolCall.id, name: "Agent", arguments: {} };
+
+		session.update(agentCall, agentJson.slice(0, agentJson.indexOf('{"description":"B"') + 10));
+		for (let attempt = 0; attempt < 500 && started.length === 0; attempt++) await Bun.sleep(2);
+		expect(started).toHaveLength(1);
+
+		// The final call is planned through the same projection.
+		expect(session.matchesFinalArgs(agentArgs)).toBe(true);
+		expect(session.matchesFinalArgs({ ...agentArgs, prompt: "other brief" })).toBe(false);
+		session.finalize({ toolCall: agentCall, args: agentArgs });
+		const result = await agent.execute(toolCall.id, agentArgs);
+
+		// Two spawns total: the early launch was adopted, not repeated.
+		expect(executorModule.runSubprocess).toHaveBeenCalledTimes(2);
+		const ids = (result.details as TaskToolDetails | undefined)?.progress?.map(progress => progress.id) ?? [];
+		expect(ids).toHaveLength(2);
+		expect(ids[0]).toBe(started[0]);
+		for (const release of releases.splice(0)) release();
+		for (const id of ids) await manager.getJob(id)?.promise;
 	});
 });
 

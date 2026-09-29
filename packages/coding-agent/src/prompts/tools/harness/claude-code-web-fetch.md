@@ -1,1 +1,4 @@
-Fetch a URL and return its content as reader-mode markdown (HTML is converted; JSON, text, and documents are returned as text). `prompt` is not run against the page in this build: the full page content comes back and you answer the prompt from it yourself. Use Read for local files.
+Fetches a URL, converts the page to markdown, and answers `prompt` against it using a small fast model.
+
+- Fails on authenticated/private URLs.
+- For local files, use Read.

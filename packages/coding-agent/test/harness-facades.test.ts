@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
@@ -21,8 +22,11 @@ import type { VendorTool } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import { harnessFacade, presentTool } from "@oh-my-pi/pi-coding-agent/harness/facade";
 import { harnessFacadeSpecs } from "@oh-my-pi/pi-coding-agent/harness/facades";
 import * as evalIndex from "@oh-my-pi/pi-coding-agent/eval";
+import * as completionBridge from "@oh-my-pi/pi-coding-agent/eval/completion-bridge";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { type AgentDefinition, TaskTool } from "@oh-my-pi/pi-coding-agent/task";
+import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
@@ -55,6 +59,7 @@ const CODEX_MODEL = buildModel({
 });
 const SENDER = "FacadeSender";
 const PEER = "FacadePeer";
+const PARKED = "FacadeParked";
 
 const managers: AsyncJobManager[] = [];
 const sessions: AgentSession[] = [];
@@ -78,10 +83,17 @@ function facadeFor(
 	wireName: string,
 	target: AgentTool,
 	settings: Settings = Settings.isolated(),
+	session?: ToolSession,
 ): AgentTool {
 	const spec = harnessFacadeSpecs(profile).find(entry => entry.wireName === wireName);
 	if (!spec) throw new Error(`no ${profile} facade named ${wireName}`);
-	return harnessFacade(target, spec, { settings });
+	return harnessFacade(target, spec, { settings, session });
+}
+
+function specFor(profile: HarnessProfile, wireName: string) {
+	const spec = harnessFacadeSpecs(profile).find(entry => entry.wireName === wireName);
+	if (!spec) throw new Error(`no ${profile} facade named ${wireName}`);
+	return spec;
 }
 
 function stubTool(name: string, extra: Partial<AgentTool> = {}): AgentTool {
@@ -273,6 +285,7 @@ async function reopenedFromDisk(messages: Message[]): Promise<Message[]> {
 afterEach(async () => {
 	AgentRegistry.global().unregister(PEER);
 	AgentRegistry.global().unregister(SENDER);
+	AgentRegistry.global().unregister(PARKED);
 	for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 200 });
 	for (const session of sessions.splice(0)) await session.dispose();
 	vi.restoreAllMocks();
@@ -283,8 +296,7 @@ describe("vendor descriptions under a profile", () => {
 		const served: { tool?: VendorTool } = {};
 		const read = stubTool("read", { examples: [{ caption: "omp example" }] });
 		const presented = presentTool(read, { wireName: "Read" }, () => served.tool);
-		const spec = harnessFacadeSpecs("claude-code").find(entry => entry.wireName === "SendMessage");
-		if (!spec) throw new Error("no SendMessage facade");
+		const spec = specFor("codex", "send_message");
 		const facade = harnessFacade(stubTool("write"), spec, { settings: Settings.isolated() }, () => served.tool);
 
 		// Tools are presented before the capture loads: omp's own surface until then.
@@ -304,6 +316,19 @@ describe("vendor descriptions under a profile", () => {
 		// The agent loop spreads own keys into the request copy; omp's examples
 		// would otherwise render into the vendor text.
 		expect({ ...presented }.examples).toBeUndefined();
+	});
+
+	it("keeps omp's own words for the claude-code agent facades even once the capture declares them", () => {
+		// The vendor text for these tools describes teams, peer sessions, and
+		// cloud features omp lacks, so the facades serve their own surface.
+		const served: VendorTool = { description: "vendor text: teammates and cloud sessions", inputSchema: {} };
+		for (const wireName of ["Agent", "SendMessage", "ListAgents", "TaskOutput", "TaskStop", "WebFetch", "Skill"]) {
+			const spec = specFor("claude-code", wireName);
+			const facade = harnessFacade(stubTool(spec.target), spec, { settings: Settings.isolated() }, () => served);
+			expect(facade.description).not.toBe(served.description);
+			expect(facade.parameters).not.toBe(served.inputSchema);
+			expect(facade.description).not.toMatch(/not available in this build|leave unset/i);
+		}
 	});
 });
 
@@ -362,18 +387,25 @@ describe("claude-code SendMessage facade", () => {
 		});
 	});
 
-	it("rejects notify_when_idle by name instead of dropping it", async () => {
-		const write = new WriteTool(toolSession()) as unknown as AgentTool;
-		const { result } = await runFacadeCall(
-			CLAUDE_CODE_MODEL,
-			[write, facadeFor("claude-code", "SendMessage", write)],
-			{
-				name: "SendMessage",
-				arguments: { to: PEER, message: "hi", notify_when_idle: true },
-			},
-		);
-		expect(result.isError).toBe(true);
-		expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("notify_when_idle") });
+	it("addresses agents by name and the main conversation as main", () => {
+		const facade = facadeFor("claude-code", "SendMessage", stubTool("write"));
+		expect(facade.toNativeArgs?.({ to: PEER, message: "hi" })).toEqual({ path: `agent://${PEER}`, content: "hi" });
+		// Claude Code's `main` (any case) is omp's main agent.
+		for (const to of ["main", "Main", " MAIN "]) {
+			expect(facade.toNativeArgs?.({ to, message: "hi" })).toEqual({
+				path: `agent://${MAIN_AGENT_ID}`,
+				content: "hi",
+			});
+		}
+		expect(facade.toNativeArgs?.({ to: "all", message: "hi" })).toEqual({ path: "agent://all", content: "hi" });
+	});
+
+	it("mounts only where peer messaging is enabled", () => {
+		const spec = specFor("claude-code", "SendMessage");
+		const settings = Settings.isolated({ "task.maxRecursionDepth": 0 });
+		expect(spec.mounts?.({ settings })).toBe(false);
+		expect(spec.mounts?.({ settings, session: { taskDepth: 1 } as unknown as ToolSession })).toBe(true);
+		expect(spec.mounts?.({ settings: Settings.isolated() })).toBe(true);
 	});
 
 	it("replays the omp identity with native arguments once the profile is gone", async () => {
@@ -456,53 +488,64 @@ describe("claude-code SendMessage facade", () => {
 });
 
 describe("claude-code ListAgents facade", () => {
-	it("lists the agent index through read history:// and rejects the unavailable filters by name", async () => {
+	it("lists only live agents through read history://?live", async () => {
 		const registry = AgentRegistry.global();
 		registry.register({ id: PEER, displayName: PEER, kind: "sub", session: null, status: "running" });
-		const read = new ReadTool(toolSession()) as unknown as AgentTool;
+		registry.register({ id: PARKED, displayName: PARKED, kind: "sub", session: null, status: "parked" });
+		const session = {
+			...toolSession(),
+			settings: Settings.isolated({ "launch.enabled": false, "harness.mode": "claude-code" }),
+			getActiveModel: () => CLAUDE_CODE_MODEL,
+		} as unknown as ToolSession;
+		const read = new ReadTool(session) as unknown as AgentTool;
 		const facade = facadeFor("claude-code", "ListAgents", read);
 
 		const listed = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], { name: "ListAgents", arguments: {} });
 		expect(listed.result.toolName).toBe("read");
 		expect(listed.result.isError).toBeFalsy();
-		expect(listed.result.content[0]).toMatchObject({
-			type: "text",
-			text: expect.stringContaining(`| ${PEER} | running | sub |`),
+		expect(listed.assistant.content[0]).toMatchObject({
+			name: "read",
+			wireName: "ListAgents",
+			nativeArguments: { path: "history://?live" },
 		});
-		expect(listed.assistant.content[0]).toMatchObject({ name: "read", wireName: "ListAgents" });
+		const text = listed.result.content[0]?.type === "text" ? listed.result.content[0].text : "";
+		expect(text).toContain(`| ${PEER} | running | sub |`);
+		// Parked agents and on-disk transcripts stay out of the live roster.
+		expect(text).not.toContain(PARKED);
+		expect(text).not.toContain("on disk");
+		expect(text).toContain("Read a transcript with `Read history://<id>`.");
 
-		const filtered = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], {
-			name: "ListAgents",
-			arguments: { q: "peer" },
+		// The bare index keeps every agent and the native read wording.
+		const everything = await runFacadeCall(NATIVE_ANTHROPIC_MODEL, [read], {
+			name: "read",
+			arguments: { path: "history://" },
 		});
-		expect(filtered.result.isError).toBe(true);
-		expect(filtered.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("ListAgents.q") });
+		const index = everything.result.content[0]?.type === "text" ? everything.result.content[0].text : "";
+		expect(index).toContain(`| ${PARKED} | parked | sub |`);
 	});
 });
 
 describe("claude-code TaskOutput facade", () => {
-	it("waits through the wait tool when blocking and names the snapshot primitive otherwise", async () => {
+	it("mounts only for a capture that declares TaskOutput", () => {
+		const spec = specFor("claude-code", "TaskOutput");
+		const settings = Settings.isolated();
+		// Claude Code 2.1.284 dropped TaskOutput: its agents wait by ending the turn.
+		expect(spec.mounts?.({ settings, vendorTool: () => undefined })).toBe(false);
+		expect(spec.mounts?.({ settings })).toBe(false);
+		const declared: VendorTool = { description: "Retrieves output", inputSchema: {} };
+		expect(spec.mounts?.({ settings, vendorTool: name => (name === "TaskOutput" ? declared : undefined) })).toBe(
+			true,
+		);
+		expect(spec.replacesTarget).toBe(true);
+	});
+
+	it("waits through the wait tool for the next settled job", async () => {
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 		managers.push(manager);
 		const wait = new WaitTool(toolSession({ manager })) as unknown as AgentTool;
 		const facade = facadeFor("claude-code", "TaskOutput", wait);
 		const gate = Promise.withResolvers<string>();
 		const jobId = manager.register("bash", "facade job", () => gate.promise, { ownerId: SENDER });
-
-		// No single target both blocks and snapshots: the non-blocking branch is
-		// rejected by name and points at proc://, the read-only snapshot.
-		const snapshot = await runFacadeCall(CLAUDE_CODE_MODEL, [wait, facade], {
-			name: "TaskOutput",
-			arguments: { task_id: jobId, block: false, timeout: 1000 },
-		});
-		expect(snapshot.result.isError).toBe(true);
-		expect(snapshot.result.content[0]).toMatchObject({
-			type: "text",
-			text: expect.stringContaining(
-				`TaskOutput.block false is not supported: this build has no non-blocking task output. Read proc://${jobId}`,
-			),
-		});
-		expect(manager.getJob(jobId)?.status).toBe("running");
 
 		gate.resolve("finished");
 		await manager.getJob(jobId)?.promise;
@@ -516,7 +559,7 @@ describe("claude-code TaskOutput facade", () => {
 			jobs: [expect.objectContaining({ id: jobId, status: "completed" })],
 		});
 		expect(waited.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("finished") });
-		expect(waited.assistant.content[0]).toMatchObject({ name: "wait", wireName: "TaskOutput" });
+		expect(waited.assistant.content[0]).toMatchObject({ name: "wait", wireName: "TaskOutput", nativeArguments: {} });
 	});
 });
 
@@ -634,6 +677,93 @@ describe("claude-code Agent facade", () => {
 		// itself an agent type, so it never reaches the spawn as `agent`.
 		expect(forked.result.isError).not.toBe(true);
 		expect(spawned).toEqual([{ task: "continue", fork: "all" }]);
+	});
+
+	it("maps the batch form onto task's shared context and items", () => {
+		const facade = facadeFor("claude-code", "Agent", stubTool("task"));
+		expect(
+			facade.toNativeArgs?.({
+				description: "Audit the repo",
+				prompt: "# Goal\nshared brief",
+				tasks: [
+					{ description: "Scan docs", prompt: "Scan the docs.", subagent_type: "scout" },
+					{ description: "Scan code", prompt: "Scan the code." },
+				],
+			}),
+		).toEqual({
+			context: "# Goal\nshared brief",
+			tasks: [{ task: "Scan the docs.", agent: "scout" }, { task: "Scan the code." }],
+		});
+		// Forking is a single-spawn feature: a fork item is refused, never dropped.
+		expect(() =>
+			facade.toNativeArgs?.({
+				description: "x",
+				prompt: "brief",
+				tasks: [{ description: "y", prompt: "z", subagent_type: "fork" }],
+			}),
+		).toThrow(/fork/);
+	});
+
+	it("serves isolation only while task isolation is enabled and never a model override", () => {
+		const schemaOf = (settings: Settings) =>
+			JSON.stringify(
+				(facadeFor("claude-code", "Agent", stubTool("task"), settings).parameters as { toJsonSchema(): unknown })
+					.toJsonSchema(),
+			);
+		const plain = schemaOf(Settings.isolated({ "task.isolation.enabled": false, "task.batch": false }));
+		expect(plain).not.toContain('"isolation"');
+		expect(plain).not.toContain('"tasks"');
+		expect(plain).not.toContain('"model"');
+		const full = schemaOf(Settings.isolated({ "task.isolation.enabled": true, "task.batch": true }));
+		expect(full).toContain('"isolation"');
+		expect(full).toContain('"worktree"');
+		expect(full).not.toContain('"remote"');
+		expect(full).toContain('"tasks"');
+		expect(full).not.toContain('"model"');
+
+		const off = facadeFor("claude-code", "Agent", stubTool("task"), Settings.isolated());
+		expect(() => off.toNativeArgs?.({ description: "x", prompt: "y", isolation: "worktree" })).toThrow(/isolation/);
+		const on = facadeFor(
+			"claude-code",
+			"Agent",
+			stubTool("task"),
+			Settings.isolated({ "task.isolation.enabled": true }),
+		);
+		expect(on.toNativeArgs?.({ description: "x", prompt: "y", isolation: "worktree" })).toEqual({
+			task: "y",
+			isolated: true,
+		});
+	});
+
+	it("describes the task tool's live agent roster in Claude Code's words", async () => {
+		const agents: AgentDefinition[] = [
+			{ name: "task", description: "General-purpose worker", systemPrompt: "task", source: "bundled" },
+			{ name: "scout", description: "Fast read-only research", systemPrompt: "scout", source: "bundled" },
+		];
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents, projectAgentsDir: null });
+		const settings = Settings.isolated({ "task.isolation.enabled": true });
+		const task = await TaskTool.create({
+			cwd: "/tmp/omp-claude-code-agent-description",
+			hasUI: false,
+			settings,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+		} as unknown as ToolSession);
+		const facade = facadeFor("claude-code", "Agent", task as unknown as AgentTool, settings);
+
+		expect(facade.description).toStartWith("Launch a new agent to handle complex, multi-step tasks.");
+		expect(facade.description).toContain("Available agent types:");
+		expect(facade.description).toContain("- `task`: General-purpose worker");
+		expect(facade.description).toContain("- `scout`");
+		expect(facade.description).toContain('`isolation: "worktree"`');
+		expect(facade.description).toContain("make one call with `tasks`");
+		// Stable across requests: the roster is a cached snapshot, not a rescan.
+		expect(facade.description).toBe(facade.description);
+		for (const omp of ["write agent://", "read proc://", "`wait`", "`yield`", "<irc>"]) {
+			expect(facade.description).not.toContain(omp);
+		}
+		// Batch speculation re-keys the task tool's stream planning onto `prompt`.
+		expect(facade.speculation?.stream).toBeDefined();
 	});
 });
 
@@ -1054,7 +1184,7 @@ describe("codex wait facade", () => {
 });
 
 describe("claude-code WebFetch facade", () => {
-	it("fetches the URL through read, persists as read, and returns the page rather than a prompt answer", async () => {
+	async function withPage<T>(run: (url: string) => Promise<T>): Promise<T> {
 		const server = Bun.serve({
 			port: 0,
 			fetch: () =>
@@ -1063,33 +1193,84 @@ describe("claude-code WebFetch facade", () => {
 				}),
 		});
 		try {
-			const session = { ...toolSession(), settings: Settings.isolated(), getActiveModel: () => CLAUDE_CODE_MODEL };
-			const read = new ReadTool(session as unknown as ToolSession) as unknown as AgentTool;
-			const facade = facadeFor("claude-code", "WebFetch", read);
+			return await run(`http://127.0.0.1:${server.port}/page`);
+		} finally {
+			server.stop(true);
+		}
+	}
+
+	function webSession(): ToolSession {
+		return {
+			...toolSession(),
+			settings: Settings.isolated(),
+			getActiveModel: () => CLAUDE_CODE_MODEL,
+		} as unknown as ToolSession;
+	}
+
+	it("fetches through read and answers the prompt with the smol model", async () => {
+		const complete = vi
+			.spyOn(completionBridge, "completeOnTier")
+			.mockResolvedValue("The page greets you from the server.");
+		await withPage(async url => {
+			const session = webSession();
+			const read = new ReadTool(session) as unknown as AgentTool;
+			const facade = facadeFor("claude-code", "WebFetch", read, Settings.isolated(), session);
 			const { assistant, result } = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], {
 				name: "WebFetch",
-				arguments: { url: `http://127.0.0.1:${server.port}/page`, prompt: "what does it say?" },
+				arguments: { url, prompt: "what does it say?" },
 			});
 			expect(result.toolName).toBe("read");
+			expect(result.isError).toBeFalsy();
+			expect(result.content).toEqual([{ type: "text", text: "The page greets you from the server." }]);
+			expect(assistant.content[0]).toMatchObject({ name: "read", wireName: "WebFetch" });
+			expect(complete).toHaveBeenCalledTimes(1);
+			const [question, tier] = complete.mock.calls[0] ?? [];
+			expect(tier).toBe("smol");
+			expect(question).toContain("hello from the server");
+			expect(question).toContain("what does it say?");
+		});
+	});
+
+	it("is served only while URL fetching is enabled", () => {
+		const spec = specFor("claude-code", "WebFetch");
+		expect(spec.mounts?.({ settings: Settings.isolated() })).toBe(true);
+		expect(spec.mounts?.({ settings: Settings.isolated({ "fetch.enabled": false }) })).toBe(false);
+	});
+
+	it("returns the page itself when no smol model resolves", async () => {
+		vi.spyOn(completionBridge, "completeOnTier").mockResolvedValue(undefined);
+		await withPage(async url => {
+			const session = webSession();
+			const read = new ReadTool(session) as unknown as AgentTool;
+			const facade = facadeFor("claude-code", "WebFetch", read, Settings.isolated(), session);
+			const { result } = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], {
+				name: "WebFetch",
+				arguments: { url, prompt: "what does it say?" },
+			});
 			expect(result.isError).toBeFalsy();
 			expect(result.details).toMatchObject({ kind: "url" });
 			expect(result.content[0]).toMatchObject({
 				type: "text",
 				text: expect.stringContaining("hello from the server"),
 			});
-			expect(assistant.content[0]).toMatchObject({ name: "read", wireName: "WebFetch" });
-		} finally {
-			server.stop(true);
-		}
+		});
 	});
 });
 
 describe("claude-code Skill facade", () => {
-	it("reads skill://<name> through read and rejects args by name", async () => {
+	it("loads skill://<name> through read and hands the skill its args", async () => {
+		using tempDir = TempDir.createSync("@omp-skill-facade-");
+		const skillFile = (name: string, body: string) => {
+			const baseDir = path.join(tempDir.path(), name);
+			const filePath = path.join(baseDir, "SKILL.md");
+			fs.mkdirSync(baseDir, { recursive: true });
+			fs.writeFileSync(filePath, `---\nname: ${name}\ndescription: ${name} skill\n---\n${body}\n`);
+			return { name, description: `${name} skill`, filePath, baseDir, source: "test" };
+		};
 		const session = {
 			...toolSession(),
 			settings: Settings.isolated(),
-			skills: [],
+			skills: [skillFile("deploy", "Deploy to $ARGUMENTS now."), skillFile("review", "Review the change.")],
 			getActiveModel: () => CLAUDE_CODE_MODEL,
 		};
 		const read = new ReadTool(session as unknown as ToolSession) as unknown as AgentTool;
@@ -1106,12 +1287,29 @@ describe("claude-code Skill facade", () => {
 		});
 		expect(missing.assistant.content[0]).toMatchObject({ name: "read", wireName: "Skill" });
 
-		const withArgs = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], {
+		const textOf = (result: ToolResultMessage) =>
+			result.content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n");
+		// `$ARGUMENTS` in the instructions takes the args in place...
+		const substituted = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], {
 			name: "Skill",
-			arguments: { skill: "deploy", args: "--prod" },
+			arguments: { skill: "deploy", args: "production" },
 		});
-		expect(withArgs.result.isError).toBe(true);
-		expect(withArgs.result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("Skill.args") });
+		expect(substituted.result.isError).toBeFalsy();
+		expect(textOf(substituted.result)).toContain("Deploy to production now.");
+		expect(textOf(substituted.result)).not.toContain("$ARGUMENTS");
+		// ...otherwise they follow the instructions.
+		const appended = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], {
+			name: "Skill",
+			arguments: { skill: "review", args: "--strict" },
+		});
+		expect(textOf(appended.result)).toContain("Review the change.");
+		expect(textOf(appended.result)).toEndWith("ARGUMENTS: --strict");
+		// No args: the skill loads exactly as a plain read.
+		const plain = await runFacadeCall(CLAUDE_CODE_MODEL, [read, facade], {
+			name: "Skill",
+			arguments: { skill: "review" },
+		});
+		expect(textOf(plain.result)).not.toContain("ARGUMENTS");
 	});
 
 	it("reads a namespaced collision alias and its bare winner by their listed names", async () => {
@@ -1165,8 +1363,8 @@ describe("facade predicates stay total on unsupported vendor fields", () => {
 	}
 
 	it("maps an unconvertible payload to the safest decision instead of throwing", () => {
-		const facade = facadeFor("claude-code", "SendMessage", policyTarget());
-		const hostile = { to: "Main", message: "hi", notify_when_idle: true };
+		const facade = facadeFor("claude-code", "TaskStop", policyTarget());
+		const hostile = {};
 		const approval = facade.approval;
 		expect(typeof approval === "function" ? approval(hostile) : approval).toEqual({
 			tier: "exec",
@@ -1181,8 +1379,8 @@ describe("facade predicates stay total on unsupported vendor fields", () => {
 	});
 
 	it("keeps the target tool's real policy for convertible payloads", () => {
-		const facade = facadeFor("claude-code", "SendMessage", policyTarget());
-		const convertible = { to: "Main", message: "hi" };
+		const facade = facadeFor("claude-code", "TaskStop", policyTarget());
+		const convertible = { task_id: "bg_1" };
 		const approval = facade.approval;
 		expect(typeof approval === "function" ? approval(convertible) : approval).toEqual({
 			tier: "read",

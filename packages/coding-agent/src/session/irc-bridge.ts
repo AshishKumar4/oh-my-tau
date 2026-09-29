@@ -1,6 +1,7 @@
 import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import { harnessToolRefs } from "../harness/manifest";
 import parentIrcSteerTemplate from "../prompts/steering/parent-irc.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -17,6 +18,8 @@ export interface IrcBridgeHost {
 	planModeEnabled(): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	wakeForIrc(records: AgentMessage[]): void;
+	/** Tool names under the session's harness profile, for the incoming-message text. */
+	toolRefs?(): Readonly<Record<string, string>>;
 }
 
 /** Owns incoming IRC queues and the session's non-interrupting aside queue. */
@@ -189,6 +192,7 @@ export class IrcBridge {
 				replyTo: msg.replyTo ?? "",
 				interrupting: streaming,
 				relayOnStop,
+				toolRefs: this.#host.toolRefs?.() ?? harnessToolRefs(undefined),
 			}),
 			display: true,
 			details: {

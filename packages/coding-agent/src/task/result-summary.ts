@@ -6,6 +6,7 @@
  * preview, `agent://` pointer) regardless of which path delivered it.
  */
 import { prompt } from "@oh-my-pi/pi-utils";
+import { harnessToolRefs } from "../harness/manifest";
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
 import { formatBytes, formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -40,7 +41,12 @@ function previewHead(output: string): string {
 /** Render the `<task-result>` envelope for a settled run. */
 export function formatTaskResultSummary(
 	result: SingleResult,
-	options: { totalDurationMs: number; mergeSummary?: string },
+	options: {
+		totalDurationMs: number;
+		mergeSummary?: string;
+		/** Tool names under the reader's harness profile; native names when omitted. */
+		toolRefs?: Readonly<Record<string, string>>;
+	},
 ): string {
 	const status = result.aborted
 		? "cancelled"
@@ -81,5 +87,6 @@ export function formatTaskResultSummary(
 				}
 			: undefined,
 		mergeSummary: options.mergeSummary ?? "",
+		toolRefs: options.toolRefs ?? harnessToolRefs(undefined),
 	});
 }

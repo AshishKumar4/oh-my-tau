@@ -76,3 +76,37 @@ const WIRE_RENAMES: Readonly<Record<HarnessProfile, Readonly<Record<string, stri
 export function harnessWireRenames(profile: HarnessProfile): Readonly<Record<string, string>> {
 	return WIRE_RENAMES[profile];
 }
+
+/** Tools omp's own prompts name in their text, under their native names. */
+const NATIVE_PROMPT_TOOL_REFS: Readonly<Record<string, string>> = {
+	task: "task",
+	read: "read",
+	write: "write",
+	edit: "edit",
+	bash: "bash",
+	wait: "wait",
+};
+
+/**
+ * The same references under Claude Code's surface: renamed tools by wire name,
+ * no `wait` (the profile withholds it; an agent ends its turn and is woken by
+ * the next result), and the facades templates phrase through — messaging,
+ * stopping, listing, skills — by their own names, which a native session lacks.
+ */
+const CLAUDE_CODE_PROMPT_TOOL_REFS: Readonly<Record<string, string>> = {
+	...WIRE_RENAMES["claude-code"],
+	Agent: "Agent",
+	SendMessage: "SendMessage",
+	TaskStop: "TaskStop",
+	ListAgents: "ListAgents",
+	Skill: "Skill",
+};
+
+/**
+ * Tool names for omp's own prompt templates (`toolRefs`), keyed by native tool
+ * name. Every profile but `claude-code` keeps the literal names, so native
+ * text renders byte for byte as before.
+ */
+export function harnessToolRefs(profile: HarnessProfile | undefined): Readonly<Record<string, string>> {
+	return profile === "claude-code" ? CLAUDE_CODE_PROMPT_TOOL_REFS : NATIVE_PROMPT_TOOL_REFS;
+}

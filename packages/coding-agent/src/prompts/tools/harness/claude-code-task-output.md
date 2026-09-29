@@ -1,1 +1,3 @@
-Wait for background work. With `block: true` this returns the first background task or agent result to settle, or an incoming message; the named task's result comes back once it finishes, so call again if another result arrives first. `block: false` is not available in this build: read `proc://<task_id>` for a snapshot instead. `timeout` is not applied.
+- Waits for background work: returns as soon as a background task (a shell command or an agent) finishes or another agent messages you, with that task's output and status
+- Takes a task_id parameter naming the task you are waiting on; if a different task finishes first, its result comes back instead — call again to keep waiting
+- Completion notifications deliver every result automatically; call this only when you are blocked until a result arrives

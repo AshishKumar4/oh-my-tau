@@ -29,10 +29,12 @@ import type { SpawnRun } from "./spawn-run";
 
 /**
  * Incremental scanner over streamed batch-task argument JSON. Extracts the
- * top-level `context` string once it closes and every `tasks[]` element whose
- * object has closed; never parses the unfinished tail.
+ * top-level shared-brief string (`context`, or the key a harness facade names
+ * it) once it closes and every `tasks[]` element whose object has closed;
+ * never parses the unfinished tail.
  */
 export class BatchArgsScanner {
+	readonly #contextKey: string;
 	#raw = "";
 	#pos = 0;
 	#depth = 0;
@@ -47,6 +49,10 @@ export class BatchArgsScanner {
 	#context: string | undefined;
 	#items: Record<string, unknown>[] = [];
 	#malformed = false;
+
+	constructor(contextKey = "context") {
+		this.#contextKey = contextKey;
+	}
 
 	/** Shared `context`, once its string has closed. */
 	get context(): string | undefined {
@@ -135,7 +141,7 @@ export class BatchArgsScanner {
 			return;
 		}
 		if (this.#expectKey) this.#key = typeof value === "string" ? value : undefined;
-		else if (this.#key === "context" && typeof value === "string") this.#context = value;
+		else if (this.#key === this.#contextKey && typeof value === "string") this.#context = value;
 	}
 
 	#closeItem(literal: string): void {
@@ -170,12 +176,24 @@ export interface TaskLauncher {
 	start(toolCallId: string, spawn: TaskParams, index: number, signal: AbortSignal): Promise<SpawnRun | undefined>;
 }
 
+/**
+ * A harness facade's batch shape over the task tool: `contextKey` names its
+ * shared-brief field and `toParams` maps its (possibly partial) args to task
+ * params before planning.
+ */
+export interface TaskLaunchProjection {
+	contextKey: string;
+	toParams: (args: unknown) => unknown;
+}
+
 export interface TaskLaunchSessionOptions {
 	sink: SpeculativeOperationSink;
 	tool: SpeculativeToolReference;
 	launcher: TaskLauncher;
 	/** Called once when the session stops owning launches (adopted or discarded). */
 	onClose: () => void;
+	/** Streamed args arrive in a facade's shape; see {@link TaskLaunchProjection}. */
+	projection?: TaskLaunchProjection;
 }
 
 /** One streamed `task` call's speculative launches; see the module docs. */
@@ -183,7 +201,7 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 	/** The task tool routes adoption through its own session map, not the tool context. */
 	readonly contextIndependent = true;
 	readonly #options: TaskLaunchSessionOptions;
-	readonly #scanner = new BatchArgsScanner();
+	readonly #scanner: BatchArgsScanner;
 	/** Canonical spawn params per planned index, set synchronously so reconciliation covers in-flight launches. */
 	readonly #planned = new Map<number, string>();
 	readonly #runs = new Map<number, SpawnRun>();
@@ -195,6 +213,20 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 
 	constructor(options: TaskLaunchSessionOptions) {
 		this.#options = options;
+		this.#scanner = new BatchArgsScanner(options.projection?.contextKey);
+	}
+
+	/** Per-spawn params planned from `args` in the streamed shape; undefined when invalid. */
+	#spawns(args: unknown): TaskParams[] | undefined {
+		const projection = this.#options.projection;
+		if (!projection) return this.#options.launcher.spawns(args);
+		let params: unknown;
+		try {
+			params = projection.toParams(args);
+		} catch {
+			return undefined;
+		}
+		return this.#options.launcher.spawns(params);
 	}
 
 	update(toolCall: AgentToolCall, partialJson?: string): void {
@@ -206,9 +238,10 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 		const context = scanner.context;
 		if (scanner.malformed || context === undefined) return;
 		const items = scanner.items;
+		const contextKey = this.#options.projection?.contextKey ?? "context";
 		for (let index = this.#planned.size; index < items.length; index++) {
-			const batch = { context, tasks: items.slice(0, index + 1) };
-			const spawn = this.#options.launcher.spawns(batch)?.[index];
+			const batch = { [contextKey]: context, tasks: items.slice(0, index + 1) };
+			const spawn = this.#spawns(batch)?.[index];
 			if (!spawn) {
 				this.#halted = true;
 				return;
@@ -220,7 +253,7 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 	/** The call finished streaming: abort on error or delta, else launch the remainder. */
 	finalize(context: ToolSpeculationAssessmentContext): void {
 		if (this.#closed) return;
-		const spawns = this.#options.launcher.spawns(context.args);
+		const spawns = this.#spawns(context.args);
 		if (!spawns) {
 			this.discard("finished task call is invalid");
 			return;
@@ -236,7 +269,7 @@ export class TaskLaunchSession implements ToolSpeculationStreamSession {
 	}
 
 	matchesFinalArgs(args: Readonly<Record<string, unknown>>): boolean {
-		const spawns = this.#options.launcher.spawns(args);
+		const spawns = this.#spawns(args);
 		return spawns !== undefined && this.#matches(spawns);
 	}
 

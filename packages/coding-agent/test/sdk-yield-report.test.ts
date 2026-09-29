@@ -4,6 +4,7 @@ import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { harnessToolRefs } from "@oh-my-pi/pi-coding-agent/harness/manifest";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -18,7 +19,12 @@ const stores: ModelRegistry[] = [];
 function reminder(budgetStop = false): AgentMessage {
 	return {
 		role: "developer",
-		content: prompt.render(submitReminderTemplate, { retryCount: 1, maxRetries: 3, budgetStop }),
+		content: prompt.render(submitReminderTemplate, {
+			retryCount: 1,
+			maxRetries: 3,
+			budgetStop,
+			toolRefs: harnessToolRefs(undefined),
+		}),
 		timestamp: Date.now(),
 	};
 }

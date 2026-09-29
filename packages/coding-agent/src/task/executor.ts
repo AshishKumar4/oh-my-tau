@@ -51,6 +51,8 @@ import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pendi
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
+import { harnessToolRefs } from "../harness/manifest";
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
@@ -217,6 +219,14 @@ function normalizeModelPatterns(value: string | string[] | undefined): string[] 
 }
 
 const SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX = "subagent:";
+
+/**
+ * Opening tag of a subagent's per-spawn system block under the `claude-code`
+ * profile on the Anthropic transport: head caching treats a block that starts
+ * with it as the volatile suffix, so sibling spawns share the anchored vendor
+ * prompt, footer, and project context.
+ */
+export const SUBAGENT_VOLATILE_MARKER = "<subagent-context>";
 
 interface SubagentRetryFallbackCandidate {
 	model: Model<Api>;
@@ -2345,6 +2355,7 @@ async function driveSessionToYield(
 						retryCount,
 						maxRetries: MAX_YIELD_RETRIES,
 						budgetStop,
+						toolRefs: harnessToolRefs(effectiveHarnessProfile(session.settings, session.model)),
 					});
 
 					const isFinalRetry = retryCount >= MAX_YIELD_RETRIES;
@@ -2442,6 +2453,7 @@ async function driveSessionToYield(
 						count: running.length,
 						multiple: running.length > 1,
 						jobs,
+						toolRefs: harnessToolRefs(effectiveHarnessProfile(session.settings, session.model)),
 					});
 					try {
 						await dispatchPrompt(notice, { attribution: "agent", synthetic: true }, "async-pending notice");
@@ -3120,7 +3132,12 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				// parent whatever it is: the yield result, or the failure that
 				// superseded it.
 				if (wakeJob && result) {
-					const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
+					const parent = AgentRegistry.global().get(wakeJob.ownerId)?.session;
+					const parentProfile = parent ? effectiveHarnessProfile(parent.settings, parent.model) : undefined;
+					const text = formatTaskResultSummary(result, {
+						totalDurationMs: result.durationMs,
+						toolRefs: harnessToolRefs(parentProfile),
+					});
 					const structured = result.structuredOutput;
 					if (result.aborted || result.exitCode !== 0 || result.error !== undefined) {
 						wakeJob.outcome.reject(new AsyncJobError(text, structured));
@@ -3981,10 +3998,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
 				preloadedPreparedExtensions: options.preloadedPreparedExtensions,
 				preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
-				systemPrompt: defaultPrompt => {
+				systemPrompt: (defaultPrompt, promptContext) => {
+					const promptModel = promptContext?.model;
 					const ircRoster = ircEnabled
 						? collectIrcPeerRoster(AgentRegistry.global(), id, ircRootSessionFile)
 						: undefined;
+					const profile = effectiveHarnessProfile(subagentSettings, promptModel);
 					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
 						agent: agent.systemPrompt,
 						context: options.context?.trim() ?? "",
@@ -4006,11 +4025,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						ircParkedCount: ircRoster?.parkedCount ?? 0,
 						ircOmittedCount: ircRoster?.omittedCount ?? 0,
 						ircSelfId: ircEnabled ? id : "",
+						toolRefs: harnessToolRefs(profile),
 					});
 					// Per-spawn text (context, worktree, IRC roster) goes after the
 					// trailing `<project-context>` block so spawns of the same agent
-					// share the static prompt prefix as a cache hit.
-					return [...defaultPrompt, subagentPrompt];
+					// share the static prompt prefix as a cache hit. Under Claude
+					// Code the transport anchors the cache on the last system block
+					// unless a block opens with a volatile marker, so there the
+					// per-spawn block is wrapped in one.
+					if (profile !== "claude-code" || promptModel?.api !== "anthropic-messages") {
+						return [...defaultPrompt, subagentPrompt];
+					}
+					return [...defaultPrompt, `${SUBAGENT_VOLATILE_MARKER}\n${subagentPrompt}\n</subagent-context>`];
 				},
 				sessionManager: sessionManagerForRun,
 				hasUI: false,

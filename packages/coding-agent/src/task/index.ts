@@ -38,6 +38,8 @@ import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { typ
 import { TASK_EFFORTS, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { hasWaitTool, holdBlockedAwait } from "../tools/wait";
+import { sessionToolRefs } from "../harness/effective-profile";
+import { harnessToolRefs } from "../harness/manifest";
 import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
@@ -63,7 +65,7 @@ import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/too
 import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
 import { resolveEffectiveSubagentPolicy, runStructuredSubagent, StructuredSubagentError } from "./structured-subagent";
 import { SpawnRun, type SpawnPermit, type SpawnRunOwner } from "./spawn-run";
-import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
+import { type TaskLauncher, type TaskLaunchProjection, TaskLaunchSession } from "./speculative-launch";
 
 import { cfgAsyncEnabled } from "../tools/settings";
 import {
@@ -162,8 +164,8 @@ interface TaskDescriptionOptions {
 	parentSpawns: string;
 }
 
-/** Render the tool description from a cached agent list and current settings. */
-function renderDescription(options: TaskDescriptionOptions): string {
+/** Render a tool description template from a cached agent list and current settings. */
+function renderDescription(template: string, options: TaskDescriptionOptions): string {
 	const spawnPolicy = resolveSpawnPolicy(options.parentSpawns);
 	const spawningDisabled = !spawnPolicy.enabled;
 	const agents = [...options.agents, ...options.sessionAgents];
@@ -182,7 +184,7 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		blocking: agent.blocking === true,
 	}));
 	const scoutAvailable = isScoutSpawnable(options.disabledAgents, options.parentSpawns);
-	return prompt.render(taskDescriptionTemplate, {
+	return prompt.render(template, {
 		agents: renderedAgents,
 		scoutAvailable,
 		spawningDisabled,
@@ -441,6 +443,7 @@ export function buildSpecializationAdvisory(
 	agentNames: string[],
 	depthCapacity: boolean,
 	scoutAvailable = true,
+	toolRefs = harnessToolRefs(undefined),
 ): string | undefined {
 	if (!depthCapacity) return undefined;
 	const generics = agentNames.filter(name => GENERIC_SPAWN_AGENTS.has(name));
@@ -450,6 +453,7 @@ export function buildSpecializationAdvisory(
 			count: generics.length,
 			agent: generics[0],
 			scoutAvailable,
+			toolRefs,
 		})
 		.trim();
 }
@@ -464,9 +468,10 @@ export function buildCoordinationAdvisory(
 	items: TaskItem[],
 	depthCapacity: boolean,
 	ircEnabled: boolean,
+	toolRefs = harnessToolRefs(undefined),
 ): string | undefined {
 	if (!depthCapacity || !ircEnabled || items.length < 2) return undefined;
-	return prompt.render(taskCoordinationAdvisoryTemplate, { count: items.length }).trim();
+	return prompt.render(taskCoordinationAdvisoryTemplate, { count: items.length, toolRefs }).trim();
 }
 
 /**
@@ -485,11 +490,15 @@ export function composeSpawnAdvisory(args: {
 	ircEnabled: boolean;
 	willRunAsync: boolean;
 	scoutAvailable?: boolean;
+	/** Tool names under the spawner's harness profile; native names when omitted. */
+	toolRefs?: Readonly<Record<string, string>>;
 }): string | undefined {
 	return (
 		[
-			buildSpecializationAdvisory(args.agents, args.depthCapacity, args.scoutAvailable),
-			args.willRunAsync ? buildCoordinationAdvisory(args.items, args.depthCapacity, args.ircEnabled) : undefined,
+			buildSpecializationAdvisory(args.agents, args.depthCapacity, args.scoutAvailable, args.toolRefs),
+			args.willRunAsync
+				? buildCoordinationAdvisory(args.items, args.depthCapacity, args.ircEnabled, args.toolRefs)
+				: undefined,
 		]
 			.filter(Boolean)
 			.join("\n\n") || undefined
@@ -661,25 +670,35 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * Batch calls start each subagent as soon as its `tasks[]` item streams in;
 	 * see `./speculative-launch` for the abort/adoption contract.
 	 */
-	readonly speculation: ToolSpeculationPolicy = {
-		stream: {
-			open: async context => {
-				if (!cfgTaskSpeculativeLaunch.get(this.session.settings) || !this.#isBatchEnabled()) return undefined;
-				if (!context.coordinator.authorizeLaunch) return undefined;
-				const id = context.parentToolCallId;
-				const session = new TaskLaunchSession({
-					sink: context.coordinator,
-					tool: this,
-					launcher: this.#launcher,
-					onClose: () => {
-						if (this.#launchSessions.get(id) === session) this.#launchSessions.delete(id);
-					},
-				});
-				this.#launchSessions.set(id, session);
-				return session;
+	readonly speculation: ToolSpeculationPolicy = this.speculationFor();
+
+	/**
+	 * The batch stream speculation for calls in another shape (a harness
+	 * facade's shared brief + `tasks`): `projection` maps each streamed prefix
+	 * to task params before planning, so the facade's items launch early too.
+	 */
+	speculationFor(projection?: TaskLaunchProjection): ToolSpeculationPolicy {
+		return {
+			stream: {
+				open: async context => {
+					if (!cfgTaskSpeculativeLaunch.get(this.session.settings) || !this.#isBatchEnabled()) return undefined;
+					if (!context.coordinator.authorizeLaunch) return undefined;
+					const id = context.parentToolCallId;
+					const session = new TaskLaunchSession({
+						sink: context.coordinator,
+						tool: this,
+						launcher: this.#launcher,
+						projection,
+						onClose: () => {
+							if (this.#launchSessions.get(id) === session) this.#launchSessions.delete(id);
+						},
+					});
+					this.#launchSessions.set(id, session);
+					return session;
+				},
 			},
-		},
-	};
+		};
+	}
 
 	get parameters(): TaskToolSchemaInstance {
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
@@ -699,10 +718,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 	/** Dynamic description that reflects current task settings. */
 	get description(): string {
+		return this.renderDescriptionAs(taskDescriptionTemplate);
+	}
+
+	/**
+	 * Renders `template` over the data behind {@link description} (the agent
+	 * roster and spawn settings), so a harness facade serves its own text with
+	 * the same live roster.
+	 */
+	renderDescriptionAs(template: string): string {
 		const disabledAgents = cfgTaskDisabledAgents.get(this.session.settings);
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationEnabled = cfgTaskIsolationEnabled.get(this.session.settings);
-		return renderDescription({
+		return renderDescription(template, {
 			agents:
 				discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
 				this.#discoveredAgents,
@@ -1017,6 +1045,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							cfgTaskDisabledAgents.get(this.session.settings),
 							this.session.getSessionSpawns?.() ?? "*",
 						),
+						toolRefs: sessionToolRefs(this.session),
 					});
 			const result = await this.#executeSyncFanout(
 				toolCallId,
@@ -1055,6 +1084,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						cfgTaskDisabledAgents.get(this.session.settings),
 						this.session.getSessionSpawns?.() ?? "*",
 					),
+					toolRefs: sessionToolRefs(this.session),
 				});
 		// Returns a fresh result (copied content array, copied text part) rather
 		// than mutating the caller's — task results are short-lived here, but an
@@ -1196,8 +1226,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			failedSchedules.length > 0
 				? ` Failed to schedule ${failedSchedules.length} spawn${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.join("; ")}.`
 				: "";
+		const toolRefs = sessionToolRefs(this.session);
 		const guidance = prompt
-			.render(taskAsyncContractTemplate, { ircEnabled, waitTool: hasWaitTool(this.session) })
+			.render(taskAsyncContractTemplate, {
+				ircEnabled,
+				waitTool: hasWaitTool(this.session) && toolRefs.wait !== undefined,
+				toolRefs,
+			})
 			.trim();
 		const renderSpawnFeedback = (mixed: boolean): string =>
 			prompt
@@ -1364,6 +1399,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				aborted,
 				isolated,
 				ircEnabled,
+				toolRefs: sessionToolRefs(this.session),
 				resumable: !isolated && (ref?.status === "idle" || ref?.status === "parked"),
 				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
 			})}`;
@@ -1785,7 +1821,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		totalDurationMs: number,
 		mergeSummary: string,
 	): AgentToolResult<TaskToolDetails> {
-		const summary = formatTaskResultSummary(result, { totalDurationMs, mergeSummary });
+		const summary = formatTaskResultSummary(result, {
+			totalDurationMs,
+			mergeSummary,
+			toolRefs: sessionToolRefs(this.session),
+		});
 
 		return {
 			content: [{ type: "text", text: summary }],

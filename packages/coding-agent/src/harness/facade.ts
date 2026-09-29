@@ -1,13 +1,18 @@
-import type { AgentTool, ToolApprovalDecision } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolResult, ToolApprovalDecision, ToolSpeculationPolicy } from "@oh-my-pi/pi-agent-core";
 import type { Static, TSchema, ToolNamespace } from "@oh-my-pi/pi-ai";
 import type { Settings } from "../config/settings";
 import { applyToolProxy } from "../extensibility/tool-proxy";
+import type { ToolSession } from "../tools";
 import { nativeParams } from "./bridge";
 import type { VendorTool } from "./capture";
 import type { HarnessToolBinding } from "./manifest";
 
 export interface HarnessFacadeHost {
 	readonly settings: Settings;
+	/** The session's tool context, for facades that post-process a forwarded call. */
+	readonly session?: ToolSession;
+	/** The served capture's declaration for a wire name, once the capture has loaded. */
+	readonly vendorTool?: (wireName: string) => VendorTool | undefined;
 }
 
 /** Wire name a registry tool presents under a manifest binding: the binding's rename, else the tool's own claim. */
@@ -75,7 +80,24 @@ export interface HarnessFacadeSpec<TWire extends TSchema = TSchema, TParams = un
 	readonly description: string;
 	readonly parameters: TWire;
 	readonly intent?: (args: Partial<Static<TWire>>) => string | undefined;
+	/** Serves this spec's description and schema even when the capture declares the wire name. */
+	readonly ownSurface?: true;
 	toParams(args: Static<TWire>, host: HarnessFacadeHost): TParams;
+	/** Whether the facade mounts in this session; checked whenever tools are presented. */
+	mounts?(host: HarnessFacadeHost): boolean;
+	/** Description derived from the target tool, e.g. the task tool's live agent roster. */
+	describe?(target: AgentTool): string | undefined;
+	/** Schema derived from session settings; must return the same schema for the same settings. */
+	schema?(host: HarnessFacadeHost): TSchema;
+	/** Post-processes the call; `forward` runs the target with `toParams(args)`. */
+	run?(call: {
+		args: Static<TWire>;
+		host: HarnessFacadeHost;
+		signal?: AbortSignal;
+		forward: () => Promise<AgentToolResult>;
+	}): Promise<AgentToolResult>;
+	/** The target's stream speculation for calls in this facade's shape. */
+	speculation?(target: AgentTool, toParams: (args: unknown) => unknown): ToolSpeculationPolicy | undefined;
 }
 
 function withPolicyKey(decision: ToolApprovalDecision | undefined, policyKey: string): ToolApprovalDecision {
@@ -108,20 +130,24 @@ export function harnessFacade(
 ): AgentTool {
 	const toParams = (args: unknown): unknown => nativeParams(spec.toParams(args as never, host) as object);
 	const approval = target.approval;
+	const served = (): VendorTool | undefined => (spec.ownSurface ? undefined : vendor());
+	const speculation = spec.speculation?.(target, toParams);
+	const run = spec.run;
 	return {
 		name: spec.wireName,
 		persistAs: target.name,
 		toNativeArgs: toParams,
 		label: target.label,
 		get description() {
-			return vendor()?.description ?? spec.description;
+			return served()?.description ?? spec.describe?.(target) ?? spec.description;
 		},
 		get parameters() {
-			return vendor()?.inputSchema ?? spec.parameters;
+			return served()?.inputSchema ?? spec.schema?.(host) ?? spec.parameters;
 		},
 		loadMode: "essential",
 		...(spec.namespace ? { namespace: spec.namespace } : {}),
 		...(spec.intent ? { intent: spec.intent as AgentTool["intent"] } : {}),
+		...(speculation ? { speculation } : {}),
 		approval: (args: unknown): ToolApprovalDecision => {
 			try {
 				return withPolicyKey(typeof approval === "function" ? approval(toParams(args)) : approval, target.name);
@@ -146,7 +172,9 @@ export function harnessFacade(
 		...(target.interruptible !== undefined
 			? { interruptible: mapPredicate(target.interruptible, toParams, false) as AgentTool["interruptible"] }
 			: {}),
-		execute: (toolCallId, args, signal, onUpdate, context) =>
-			target.execute(toolCallId, toParams(args) as never, signal, onUpdate, context),
+		execute: (toolCallId, args, signal, onUpdate, context) => {
+			const forward = () => target.execute(toolCallId, toParams(args) as never, signal, onUpdate, context);
+			return run ? run({ args: args as never, host, signal, forward }) : forward();
+		},
 	};
 }

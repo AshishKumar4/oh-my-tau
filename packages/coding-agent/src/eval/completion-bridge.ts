@@ -400,6 +400,22 @@ async function executeCompletion(
 	};
 }
 
+/**
+ * One stateless text completion on `tier`'s model chain (the `completion()`
+ * request path, fallbacks included), awaited directly instead of through a
+ * handle. Undefined when no model resolves for the tier.
+ */
+export async function completeOnTier(
+	prompt: string,
+	tier: "smol" | "default" | "slow",
+	session: ToolSession,
+	signal: AbortSignal,
+): Promise<string | undefined> {
+	const candidates = resolveTierCandidates(tier, session);
+	if (candidates.length === 0) return undefined;
+	return (await executeCompletion(prompt, tier, undefined, undefined, candidates, session, signal)).text;
+}
+
 /** Start a stateless completion and return its process-local handle immediately. */
 export async function runEvalCompletion(
 	args: unknown,

@@ -1,6 +1,8 @@
 import { type } from "@oh-my-pi/omptype";
-import type { ToolNamespace } from "@oh-my-pi/pi-ai";
+import type { AgentTool, AgentToolResult, ToolSpeculationPolicy } from "@oh-my-pi/pi-agent-core";
+import type { TSchema, ToolNamespace } from "@oh-my-pi/pi-ai";
 import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { prompt } from "@oh-my-pi/pi-utils";
 import claudeCodeAgent from "../prompts/tools/harness/claude-code-agent.md" with { type: "text" };
 import claudeCodeListAgents from "../prompts/tools/harness/claude-code-list-agents.md" with { type: "text" };
 import claudeCodeSendMessage from "../prompts/tools/harness/claude-code-send-message.md" with { type: "text" };
@@ -18,8 +20,12 @@ import codexWaitAgent from "../prompts/tools/harness/codex-wait-agent.md" with {
 import codexWait from "../prompts/tools/harness/codex-wait.md" with { type: "text" };
 import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { cfgTaskEnableEffort, cfgTaskIsolationEnabled } from "../task/settings";
-import type { HarnessFacadeSpec } from "./facade";
+import { completeOnTier } from "../eval/completion-bridge";
+import { isIrcEnabled } from "../irc/messaging";
+import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import { cfgTaskBatch, cfgTaskEnableEffort, cfgTaskIsolationEnabled } from "../task/settings";
+import { cfgFetchEnabled } from "../tools/settings";
+import type { HarnessFacadeHost, HarnessFacadeSpec } from "./facade";
 import { CODEX_COLLABORATION_NAMESPACE } from "./manifest";
 
 function unsupported(field: string, reason: string): never {
@@ -27,66 +33,144 @@ function unsupported(field: string, reason: string): never {
 }
 
 const claudeCodeSendMessageSchema = type({
-	to: type("string").describe("Recipient: an agent name from ListAgents or a background agent id"),
+	to: type("string").describe(
+		'Recipient: an agent name (from a spawn result or ListAgents), "main" for the main conversation, or "all"',
+	),
 	message: type("string").describe("Plain text message content"),
-	"summary?": type("string").describe("Transcript label; not transmitted"),
-	"notify_when_idle?": type("boolean").describe("Not available in this build; leave unset"),
 });
 
-const claudeCodeListAgentsSchema = type({
-	"channel?": type("string").describe("Not available in this build; leave unset"),
-	"q?": type("string").describe("Not available in this build; leave unset"),
-});
+const claudeCodeListAgentsSchema = type({});
 
 const claudeCodeTaskOutputSchema = type({
-	task_id: type("string").describe("The task ID to get output from"),
-	block: type("boolean").describe("Whether to wait for completion"),
-	timeout: type("number >= 0").describe("Not applied; the wait returns on the next background result"),
+	task_id: type("string").describe("The task you are waiting on"),
 });
 
 const claudeCodeTaskStopSchema = type({
-	"task_id?": type("string").describe("The ID of the background task or agent to stop"),
+	"task_id?": type("string").describe("The ID of the background task to stop, or a background agent's name"),
 	"shell_id?": type("string").describe("Deprecated: use task_id instead"),
-});
-
-const claudeCodeAgentSchema = type({
-	description: type("string").describe("A short (3-5 word) description of the task"),
-	prompt: type("string").describe("The task for the agent to perform"),
-	"subagent_type?": type("string").describe("The type of specialized agent to use for this task"),
-	"model?": type("'sonnet' | 'opus' | 'haiku' | 'fable'").describe(
-		"Not available; the agent definition owns its model",
-	),
-	"isolation?": type("'worktree' | 'remote'").describe("worktree runs the agent on an isolated git worktree"),
 });
 
 const claudeCodeWebFetchSchema = type({
 	url: type("string").describe("The URL to fetch content from"),
-	prompt: type("string").describe("Not applied in this build; the full page content is returned"),
+	prompt: type("string").describe("The prompt to run on the fetched content"),
 });
 
 const claudeCodeSkillSchema = type({
-	skill: type("string").describe("The skill name to load"),
-	"args?": type("string").describe("Not available in this build; leave unset"),
+	skill: type("string").describe("The skill name, exactly as the skills listing shows it"),
+	"args?": type("string").describe("Optional arguments for the skill"),
 });
 
-// Background-job control spans omp's `wait` (block for the next result),
-// `write proc://<id>/kill` (cancel) and `write agent://<id>` (message), with
-// `read proc://` / `read history://` for snapshots. A facade persists under one
-// identity, so a vendor call spanning two of those keeps its schema and rejects
-// the branch its target cannot serve, naming the primitive that can.
+const claudeCodeAgentItem = {
+	description: type("string").describe("A short (3-5 word) description of the task"),
+	prompt: type("string").describe("The task for the agent to perform"),
+	"subagent_type?": type("string").describe("The type of specialized agent to use for this task"),
+};
+
+interface ClaudeCodeAgentItem {
+	description: string;
+	prompt: string;
+	subagent_type?: string;
+}
+
+interface ClaudeCodeAgentArgs extends ClaudeCodeAgentItem {
+	isolation?: "worktree";
+	tasks?: ClaudeCodeAgentItem[];
+}
+
+const claudeCodeAgentSchemas = new Map<string, TSchema>();
+
+/**
+ * Claude Code's Agent schema with only what a session honors: no `model` (an
+ * agent's definition owns its model), `isolation` while task isolation is
+ * enabled, and the batch `tasks` form while `task.batch` is on. `tasks` comes
+ * last so a streamed call closes its shared `prompt` before the first item.
+ */
+function claudeCodeAgentSchema(isolation: boolean, batch: boolean): TSchema {
+	const key = `${isolation}:${batch}`;
+	let schema = claudeCodeAgentSchemas.get(key);
+	if (!schema) {
+		schema = type.raw({
+			...claudeCodeAgentItem,
+			...(isolation
+				? { "isolation?": type("'worktree'").describe('"worktree" runs the agent on its own git worktree') }
+				: {}),
+			...(batch
+				? {
+						"tasks?": type(claudeCodeAgentItem)
+							.array()
+							.describe("One agent per item; each receives the top-level `prompt` as a shared brief"),
+					}
+				: {}),
+		}) as unknown as TSchema;
+		claudeCodeAgentSchemas.set(key, schema);
+	}
+	return schema;
+}
+
+/**
+ * Agent call → task params. The flat form is one spawn; `tasks` becomes the
+ * task tool's batch `{ context, tasks[] }` with the top-level `prompt` as the
+ * shared context. Tolerates a partially streamed batch (speculative launch
+ * plans from each prefix).
+ */
+function claudeCodeAgentParams(args: ClaudeCodeAgentArgs, host: HarnessFacadeHost): Record<string, unknown> {
+	if (args.isolation === "worktree" && !cfgTaskIsolationEnabled.get(host.settings)) {
+		unsupported('Agent.isolation "worktree"', "task isolation is off in this session");
+	}
+	const isolated = args.isolation === "worktree" ? { isolated: true } : {};
+	if (args.tasks !== undefined) {
+		const tasks = args.tasks.map(item => {
+			if (item.subagent_type === "fork") {
+				throw new ToolError('subagent_type "fork" applies to a single Agent call, not to `tasks` items.');
+			}
+			return { task: item.prompt, ...(item.subagent_type !== undefined ? { agent: item.subagent_type } : {}) };
+		});
+		return { context: args.prompt, tasks, ...isolated };
+	}
+	// `subagent_type: "fork"` forks the conversation, not an agent type:
+	// the default task agent runs with the parent's history inherited.
+	const isFork = args.subagent_type === "fork";
+	return {
+		task: args.prompt,
+		...(args.subagent_type !== undefined && !isFork ? { agent: args.subagent_type } : {}),
+		...(isFork ? { fork: "all" as const } : {}),
+		...isolated,
+	};
+}
+
+/** The task tool surface the Agent facade reuses: its roster-backed description and batch speculation. */
+interface TaskToolSurface {
+	renderDescriptionAs?(template: string): string;
+	speculationFor?(projection: {
+		contextKey: string;
+		toParams: (args: unknown) => unknown;
+	}): ToolSpeculationPolicy;
+}
+
+const WEB_FETCH_ANSWER_RULE = "Provide a concise response based only on the content above.";
+
+/** Claude Code's WebFetch secondary prompt: the page, then the caller's prompt. */
+function webFetchPrompt(page: string, request: string): string {
+	return `Web page content:\n---\n${page}\n---\n\n${request}\n\n${WEB_FETCH_ANSWER_RULE}`;
+}
+
+function resultText(result: AgentToolResult): string {
+	return result.content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n");
+}
+
+// Background-job control maps onto omp's primitives: `wait` (block for the
+// next result), `write proc://<id>/kill` (cancel), `write agent://<id>`
+// (message), and `read history://` (roster).
 const CLAUDE_CODE_TASK_OUTPUT: HarnessFacadeSpec<typeof claudeCodeTaskOutputSchema> = {
 	target: "wait",
 	wireName: "TaskOutput",
+	replacesTarget: true,
+	ownSurface: true,
 	description: claudeCodeTaskOutput,
 	parameters: claudeCodeTaskOutputSchema,
-	toParams: (args: typeof claudeCodeTaskOutputSchema.infer) => {
-		if (!args.block) {
-			throw new ToolError(
-				`TaskOutput.block false is not supported: this build has no non-blocking task output. Read proc://${args.task_id} for a snapshot, or retry with block: true to wait.`,
-			);
-		}
-		return {};
-	},
+	// Claude Code 2.1.284 removed TaskOutput; serve it only to a capture that declares it.
+	mounts: host => host.vendorTool?.("TaskOutput") !== undefined,
+	toParams: () => ({}),
 };
 
 const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
@@ -94,55 +178,42 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 		target: "task",
 		wireName: "Agent",
 		replacesTarget: true,
-		description: claudeCodeAgent,
-		parameters: claudeCodeAgentSchema,
-		intent: (args: Partial<typeof claudeCodeAgentSchema.infer>) => args.description,
-		toParams: (args: typeof claudeCodeAgentSchema.infer, host) => {
-			// `model` is a documented optional override in both vendors' schemas; omp's
-			// agent definition owns the model, so the field is accepted and ignored
-			// rather than costing the model a rejected delegation.
-			if (args.isolation === "remote") unsupported('Agent.isolation "remote"', "omp has no remote execution");
-			if (args.isolation === "worktree" && !cfgTaskIsolationEnabled.get(host.settings)) {
-				unsupported('Agent.isolation "worktree"', "task.isolation.enabled is off in this session");
-			}
-			// `subagent_type: "fork"` forks the conversation, not an agent type:
-			// the default task agent runs with the parent's history inherited.
-			const isFork = args.subagent_type === "fork";
-			return {
-				task: args.prompt,
-				...(args.subagent_type !== undefined && !isFork ? { agent: args.subagent_type } : {}),
-				...(isFork ? { fork: "all" as const } : {}),
-				...(args.isolation === "worktree" ? { isolated: true } : {}),
-			};
-		},
+		ownSurface: true,
+		description: prompt.render(claudeCodeAgent, { agents: [], defaultAgent: "task", asyncEnabled: true }),
+		parameters: claudeCodeAgentSchema(false, false),
+		describe: target => (target as AgentTool & TaskToolSurface).renderDescriptionAs?.(claudeCodeAgent),
+		schema: host =>
+			claudeCodeAgentSchema(cfgTaskIsolationEnabled.get(host.settings), cfgTaskBatch.get(host.settings)),
+		intent: (args: Partial<ClaudeCodeAgentArgs>) => args.description,
+		toParams: (args: ClaudeCodeAgentArgs, host) => claudeCodeAgentParams(args, host),
+		speculation: (target, toParams) =>
+			(target as AgentTool & TaskToolSurface).speculationFor?.({ contextKey: "prompt", toParams }),
 	},
 	{
 		target: "write",
 		wireName: "SendMessage",
+		ownSurface: true,
 		description: claudeCodeSendMessage,
 		parameters: claudeCodeSendMessageSchema,
+		mounts: host => isIrcEnabled(host.settings, host.session?.taskDepth ?? 0),
 		toParams: (args: typeof claudeCodeSendMessageSchema.infer) => {
-			if (args.notify_when_idle === true) {
-				unsupported("SendMessage.notify_when_idle", "omp has no idle notice; use TaskOutput to wait on an agent");
-			}
-			return { path: `agent://${args.to}`, content: args.message };
+			const to = args.to.trim();
+			return { path: `agent://${to.toLowerCase() === "main" ? MAIN_AGENT_ID : to}`, content: args.message };
 		},
 	},
 	{
 		target: "read",
 		wireName: "ListAgents",
+		ownSurface: true,
 		description: claudeCodeListAgents,
 		parameters: claudeCodeListAgentsSchema,
-		toParams: (args: typeof claudeCodeListAgentsSchema.infer) => {
-			if (args.channel !== undefined) unsupported("ListAgents.channel", "omp has no agent channels");
-			if (args.q !== undefined) unsupported("ListAgents.q", "omp does not filter the roster");
-			return { path: "history://" };
-		},
+		toParams: () => ({ path: "history://?live" }),
 	},
 	CLAUDE_CODE_TASK_OUTPUT,
 	{
 		target: "write",
 		wireName: "TaskStop",
+		ownSurface: true,
 		description: claudeCodeTaskStop,
 		parameters: claudeCodeTaskStopSchema,
 		toParams: (args: typeof claudeCodeTaskStopSchema.infer) => {
@@ -154,18 +225,48 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 	{
 		target: "read",
 		wireName: "WebFetch",
+		ownSurface: true,
 		description: claudeCodeWebFetch,
 		parameters: claudeCodeWebFetchSchema,
+		mounts: host => cfgFetchEnabled.get(host.settings),
 		toParams: (args: typeof claudeCodeWebFetchSchema.infer) => ({ path: args.url }),
+		// The page comes through `read`; the session's smol model answers
+		// `prompt` over it. Without a smol model the page itself is the result.
+		run: async ({ args, host, signal, forward }) => {
+			const page = await forward();
+			if (page.isError || !host.session) return page;
+			let answer: string | undefined;
+			try {
+				answer = await completeOnTier(
+					webFetchPrompt(resultText(page), args.prompt),
+					"smol",
+					host.session,
+					signal ?? new AbortController().signal,
+				);
+			} catch {
+				if (signal?.aborted) throw signal.reason;
+			}
+			return answer ? { content: [{ type: "text", text: answer }] } : page;
+		},
 	},
 	{
 		target: "read",
 		wireName: "Skill",
+		ownSurface: true,
 		description: claudeCodeSkill,
 		parameters: claudeCodeSkillSchema,
-		toParams: (args: typeof claudeCodeSkillSchema.infer) => {
-			if (args.args !== undefined) unsupported("Skill.args", "skills take no arguments in omp");
-			return { path: `skill://${args.skill}` };
+		toParams: (args: typeof claudeCodeSkillSchema.infer) => ({ path: `skill://${args.skill}` }),
+		// Arguments reach the skill the way Claude Code passes them: replacing
+		// `$ARGUMENTS` in its instructions, else appended after them.
+		run: async ({ args, forward }) => {
+			const loaded = await forward();
+			const value = args.args?.trim();
+			if (loaded.isError || !value) return loaded;
+			const body = resultText(loaded);
+			const text = body.includes("$ARGUMENTS")
+				? body.replaceAll("$ARGUMENTS", value)
+				: `${body}\n\nARGUMENTS: ${value}`;
+			return { ...loaded, content: [{ type: "text", text }] };
 		},
 	},
 ];

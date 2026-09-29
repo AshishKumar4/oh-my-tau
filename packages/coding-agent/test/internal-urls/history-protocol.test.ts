@@ -178,6 +178,26 @@ describe("history:// protocol", () => {
 		expect(resource.contentType).toBe("text/markdown");
 		expect(resource.content).toContain("# Agents");
 		expect(resource.content).toContain("| HubAgent | idle | sub |");
+		expect(resource.content).toContain("Read a transcript with `read history://<id>`.");
+	});
+
+	it("history://?live lists only agents a message reaches without a revival", async () => {
+		const registry = AgentRegistry.global();
+		registry.register({ id: "LiveAgent", displayName: "task", kind: "sub", session: null, status: "running" });
+		registry.register({ id: "IdleAgent", displayName: "task", kind: "sub", session: null, status: "idle" });
+		registry.register({ id: "ParkedAgent", displayName: "task", kind: "sub", session: null, status: "parked" });
+		registry.register({ id: "StoppedAgent", displayName: "task", kind: "sub", session: null, status: "aborted" });
+
+		const live = await InternalUrlRouter.instance().resolve("history://?live");
+		expect(live.content).toContain("| LiveAgent | running | sub |");
+		expect(live.content).toContain("| IdleAgent | idle | sub |");
+		expect(live.content).not.toContain("ParkedAgent");
+		expect(live.content).not.toContain("StoppedAgent");
+		expect(live.content).not.toContain("on disk");
+
+		const all = await InternalUrlRouter.instance().resolve("history://");
+		expect(all.content).toContain("| ParkedAgent | parked | sub |");
+		expect(all.content).toContain("| StoppedAgent | aborted | sub |");
 	});
 
 	it("history://<id> renders a live ref's in-memory transcript", async () => {

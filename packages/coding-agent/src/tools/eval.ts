@@ -24,7 +24,7 @@ import { EvalShadowCellSession } from "../eval/speculation/cell-session";
 import { runWithEvalShadowCell } from "../eval/speculation/runtime-context";
 import type { EvalCellResult, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "@oh-my-pi/pi-tui/tools/eval";
 import { codexExecNestedDeclarations } from "../harness/codex-nested";
-import { effectiveHarnessProfile } from "../harness/effective-profile";
+import { effectiveHarnessProfile, sessionToolRefs } from "../harness/effective-profile";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import evalAgentsTopic from "../prompts/tools/eval-agents.md" with { type: "text" };
 import evalJudgeTopic from "../prompts/tools/eval-judge.md" with { type: "text" };
@@ -416,7 +416,8 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 			autoBackgroundEnabled: cfgEvalAutoBackgroundEnabled.get(session.settings),
 			evalTools: cfgEvalToolsEnabled.get(session.settings),
 			eagerDelegation: sessionDelegationBias(session) === "eager",
-			waitTool: hasWaitTool(session),
+			// Claude Code withholds `wait`; its prompts never name it.
+			waitTool: hasWaitTool(session) && sessionToolRefs(session).wait !== undefined,
 			preludes: this.#advertisedPreludes(session),
 			inlineTopics: session.isToolActive?.("read") === false,
 			autoProvision: cfgEvalAutoProvision.get(session.settings),

@@ -31,6 +31,7 @@ import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { invalidateToolSchemaMetadata } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import type { MemoryBackendStartOptions } from "../memory-backend/types";
 import type { AgentDefinition } from "../task/types";
+import type { ToolSession } from "../tools";
 import evalPreludeNoticePrompt from "../prompts/system/eval-prelude-notice.md" with { type: "text" };
 import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md" with { type: "text" };
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
@@ -98,7 +99,17 @@ export interface SessionToolsHost {
 	sessionAgents(): readonly AgentDefinition[];
 	/** Publishes the current Codex Code Mode tool exposure snapshot for turn metadata; undefined clears it. */
 	setCodeModeNamespacesInfo?(info: unknown): void;
+	/** The tool context this session's tools run with; facades that post-process a call read it. */
+	toolSession?(): ToolSession | undefined;
 }
+
+/**
+ * omp tools a harness profile never presents: Claude Code has no wait tool
+ * (an agent ends its turn and is woken by the next result or message).
+ */
+const PROFILE_WITHHELD_TOOLS: Partial<Readonly<Record<HarnessProfile, readonly string[]>>> = {
+	"claude-code": ["wait"],
+};
 
 /** Registry delta applied by the SDK's settings-gated tool reconcile. */
 export interface SettingsGatedToolDelta {
@@ -979,23 +990,25 @@ export class SessionTools {
 	): AgentTool[] {
 		this.#mountedFacades.clear();
 		if (profile === undefined) return tools;
-		const replaced = new Set<string>();
+		const replaced = new Set<string>(PROFILE_WITHHELD_TOOLS[profile]);
 		const facades: AgentTool[] = [];
+		const host = {
+			settings: this.#host.settings,
+			session: this.#host.toolSession?.(),
+			vendorTool: (wireName: string) => this.#vendorTool(wireName),
+		};
 		for (const spec of harnessFacadeSpecs(profile)) {
 			if (!enabledToolNames.includes(spec.target)) continue;
 			const target = this.#toolRegistry.get(spec.target);
-			if (!target) continue;
-			const facade = harnessFacade(
-				this.#wrapToolForAcpPermission(target),
-				spec,
-				{ settings: this.#host.settings },
-				() => this.#vendorTool(spec.wireName),
+			if (!target || spec.mounts?.(host) === false) continue;
+			const facade = harnessFacade(this.#wrapToolForAcpPermission(target), spec, host, () =>
+				this.#vendorTool(spec.wireName),
 			);
 			this.#mountedFacades.set(facade.name, facade);
 			facades.push(facade);
 			if (spec.replacesTarget) replaced.add(spec.target);
 		}
-		if (facades.length === 0) return tools;
+		if (facades.length === 0 && replaced.size === 0) return tools;
 		return [...tools.filter(tool => !replaced.has(tool.name)), ...facades];
 	}
 

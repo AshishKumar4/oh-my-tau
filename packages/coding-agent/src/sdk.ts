@@ -600,7 +600,10 @@ export interface CreateAgentSessionOptions {
 	planYolo?: PlanYolo;
 
 	/** Provider-facing system prompt override. Replaces the fully rendered default blocks. */
-	systemPrompt?: string | string[] | ((defaultPrompt: string[]) => string | string[]);
+	systemPrompt?:
+		| string
+		| string[]
+		| ((defaultPrompt: string[], context?: { model: Model | undefined }) => string | string[]);
 	/** Raw Handlebars template replacing the bundled default system prompt rendering. */
 	systemPromptTemplate?: string;
 	/** Already-loaded custom prompt text rendered through the bundled custom system prompt template. */
@@ -3961,7 +3964,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (typeof options.systemPrompt !== "function") {
 				return defaultPrompt;
 			}
-			const customPrompt = options.systemPrompt(defaultPrompt.systemPrompt);
+			const customPrompt = options.systemPrompt(defaultPrompt.systemPrompt, { model: promptModel });
 			return {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};

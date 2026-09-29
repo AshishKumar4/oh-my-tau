@@ -412,6 +412,7 @@ import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
+import { harnessToolRefs } from "../harness/manifest";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { SessionTools, type SessionToolsHost } from "./session-tools";
 import { resolveOpenAIWebsocketPreference } from "./settings-stream-fn";
@@ -1504,6 +1505,7 @@ export class AgentSession implements SettingsScope {
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			wakeForIrc: records => this.#wakeForIrc(records),
+			toolRefs: () => harnessToolRefs(effectiveHarnessProfile(this.settings, this.model)),
 		};
 		this.#irc = new IrcBridge(ircHost);
 		const prewalkHost: PrewalkCoordinatorHost = {
@@ -1856,6 +1858,7 @@ export class AgentSession implements SettingsScope {
 			localProtocolOptions: () => this.#localProtocolOptions(),
 			evalPreludes: () => this.getEvalPreludes(),
 			sessionAgents: () => this.getSessionAgents(),
+			toolSession: () => this.#evalToolSession,
 		};
 		this.#tools = new SessionTools(sessionToolsHost, {
 			autoApprove: config.autoApprove,
@@ -9602,7 +9605,10 @@ export class AgentSession implements SettingsScope {
 				await this.sendCustomMessage(
 					{
 						customType: "skillful-notice",
-						content: prompt.render(skillfulNoticePrompt, { skills: renderedSkills }),
+						content: prompt.render(skillfulNoticePrompt, {
+							skills: renderedSkills,
+							toolRefs: harnessToolRefs(effectiveHarnessProfile(this.settings, this.model)),
+						}),
 						display: false,
 					},
 					{ deliverAs: "nextTurn" },

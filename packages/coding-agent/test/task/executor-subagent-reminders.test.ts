@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, Effort } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -13,6 +14,7 @@ import {
 	finalizeSubprocessOutput,
 	runSubagentFollowUpTurn,
 	runSubprocess,
+	SUBAGENT_VOLATILE_MARKER,
 	SUBAGENT_WARNING_MISSING_YIELD,
 } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
@@ -242,6 +244,45 @@ describe("runSubprocess yield reminders", () => {
 		// background inside the assignment (or a local:// file), never a dump.
 		expect(systemPrompt?.[2]).not.toMatch(/CONTEXT\n=+/);
 		expect(userPrompt).not.toMatch(/CONTEXT\n=+/);
+	});
+
+	it("marks the per-spawn block volatile only for Claude Code on the Anthropic transport", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-volatile-marker",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-volatile-marker",
+			settings: Settings.isolated({ "harness.mode": "claude-code" }),
+		});
+
+		const systemPromptBuilder = createAgentSessionSpy.mock.calls[0]?.[0]?.systemPrompt;
+		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
+		const head = ["vendor prompt", "<project-context>\ncwd\n</project-context>"];
+		const claudeCode = getBundledModel("anthropic", "claude-opus-5");
+		const marked = systemPromptBuilder(head, { model: claudeCode });
+		// The cached head stays byte for byte; the per-spawn block opens with the
+		// marker the Anthropic transport anchors its cache in front of.
+		expect(marked?.slice(0, 2)).toEqual(head);
+		expect(marked?.[2]).toStartWith(`${SUBAGENT_VOLATILE_MARKER}\n`);
+		expect(marked?.[2]).toEndWith("\n</subagent-context>");
+		expect(marked?.[2]).toContain(baseAgent.systemPrompt);
+
+		const otherTransport = getBundledModel("openai", "gpt-5");
+		for (const model of [undefined, otherTransport]) {
+			const plain = systemPromptBuilder(head, { model });
+			expect(plain?.[2]).not.toContain(SUBAGENT_VOLATILE_MARKER);
+		}
 	});
 	it("resets yield state after an intervening wake wins the follow-up prompt race", async () => {
 		let prompts = 0;

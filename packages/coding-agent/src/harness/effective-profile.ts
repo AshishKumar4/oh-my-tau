@@ -1,6 +1,7 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import type { ScopeLike } from "../config/registry";
+import { harnessToolRefs } from "./manifest";
 import { cfgHarnessMode } from "./settings";
 
 /**
@@ -24,4 +25,12 @@ export function effectiveHarnessProfile(settings: ScopeLike, model: Model | unde
 		return resolveHarnessProfile(model);
 	}
 	return mode;
+}
+
+/** {@link harnessToolRefs} for the profile a tool session presents under right now. */
+export function sessionToolRefs(session: {
+	settings: ScopeLike;
+	getActiveModel?: () => Model | undefined;
+}): Readonly<Record<string, string>> {
+	return harnessToolRefs(effectiveHarnessProfile(session.settings, session.getActiveModel?.()));
 }

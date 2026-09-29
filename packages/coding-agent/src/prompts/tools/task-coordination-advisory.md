@@ -1,1 +1,1 @@
-Coordinate: {{count}} siblings are running together. If their work overlaps, have them message each other via `write agent://<id>` (`agent://all` broadcasts) before editing shared files. `read proc://` shows running jobs and agents.
+Coordinate: {{count}} siblings are running together. If their work overlaps, have them message each other via {{#if toolRefs.SendMessage}}`{{toolRefs.SendMessage}}` (`to: "all"` broadcasts){{else}}`write agent://<id>` (`agent://all` broadcasts){{/if}} before editing shared files. `{{toolRefs.read}} proc://` shows running jobs and agents.

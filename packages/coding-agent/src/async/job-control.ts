@@ -13,6 +13,7 @@ import { USER_INTERRUPT_LABEL } from "../session/messages";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 
+import { sessionToolRefs } from "../harness/effective-profile";
 import type { ToolSession } from "../tools";
 
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -111,7 +112,9 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 }
 
 /** Model-facing lines for the running-agents section shared by `jobs` and empty-wait results. */
-function describeAgents(agents: AgentActivitySnapshot[]): string[] {
+function describeAgents(agents: AgentActivitySnapshot[], toolRefs: Readonly<Record<string, string>>): string[] {
+	const stop = (id: string): string =>
+		toolRefs.TaskStop ? `\`${toolRefs.TaskStop}\` (\`task_id: "${id}"\`)` : `\`write proc://${id}/kill\``;
 	const lines = [`## Running Agents (${agents.length}) — not job-backed\n`];
 	for (const agent of agents) {
 		const parent = agent.parentId ? ` (spawned by \`${agent.parentId}\`)` : "";
@@ -122,18 +125,15 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 		const stale = agent.live
 			? ""
 			: agent.acceptedAt !== undefined
-				? ` — final result accepted ${formatDuration(Math.max(0, Date.now() - agent.acceptedAt))} ago but still running; clear it with \`write proc://${agent.id}/kill\``
+				? ` — final result accepted ${formatDuration(Math.max(0, Date.now() - agent.acceptedAt))} ago but still running; clear it with ${stop(agent.id)}`
 				: " — no turn in flight (stale registration?)";
 		lines.push(`- \`${agent.id}\`${parent} — up ${formatDuration(agent.ageMs)}${activity}${stale}`);
 	}
-	lines.push(
-		"",
-		"These agents have no job entry; message them via `write agent://<id>`, transcripts at `history://<id>`.",
-	);
+	const message = toolRefs.SendMessage ? `\`${toolRefs.SendMessage}\` (\`to: "<id>"\`)` : "`write agent://<id>`";
+	lines.push("", `These agents have no job entry; message them via ${message}, transcripts at \`history://<id>\`.`);
 	if (agents.some(agent => !agent.live)) {
-		lines.push(
-			"An agent with no turn in flight cannot answer a message and never satisfies `wait`; clear it with `write proc://<id>/kill`.",
-		);
+		const wait = toolRefs.wait ? ` and never satisfies \`${toolRefs.wait}\`` : "";
+		lines.push(`An agent with no turn in flight cannot answer a message${wait}; clear it with ${stop("<id>")}.`);
 	}
 	return lines;
 }
@@ -321,7 +321,7 @@ export function buildJobResult(
 
 	if (agents.length > 0) {
 		if (lines.length > 0) lines.push("");
-		lines.push(...describeAgents(agents));
+		lines.push(...describeAgents(agents, sessionToolRefs(session)));
 	}
 
 	// A tool result must never be empty text — the model cannot tell "no
@@ -353,7 +353,7 @@ export function nothingToWaitForResult(session: ToolSession): AgentToolResult<Co
 	const agents = runningAgentsOutsideJobs(session);
 	const lines: string[] = ["No running background jobs to wait for."];
 	if (agents.length > 0) {
-		lines.push("", ...describeAgents(agents));
+		lines.push("", ...describeAgents(agents, sessionToolRefs(session)));
 	}
 	return {
 		content: [{ type: "text", text: lines.join("\n") }],
