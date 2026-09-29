@@ -53,8 +53,13 @@ export const statusLineHost: StatusLineHost<StatusLineHostSession> = {
 	getSessionSettingsIdentity: session => session.settings,
 	getSessionSettingsRevision: session => session.settings?.revision ?? 0,
 	goalStatusInFooter: session => cfgGoalStatusInFooter.get(session.settings ?? settings),
+	// Fusion is per-session: only a session's own Settings can pair a lead with
+	// a sidekick. A session without them (a display-only replica, a fixture's
+	// `{ get }` stub) shows no pair; the global settings, which may be
+	// uninitialised while frames render, are never consulted.
 	fusionSidekick: session => {
-		const scope = session.settings ?? settings;
+		const scope = session.settings;
+		if (!(scope instanceof Settings)) return undefined;
 		const selector = cfgFusionSidekickModel.get(scope).trim();
 		return cfgFusionEnabled.get(scope) && selector ? selector : undefined;
 	},
