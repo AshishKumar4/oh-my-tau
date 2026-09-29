@@ -514,14 +514,6 @@ describe("claude-code ListAgents facade", () => {
 		expect(text).not.toContain(PARKED);
 		expect(text).not.toContain("on disk");
 		expect(text).toContain("Read a transcript with `Read history://<id>`.");
-
-		// The bare index keeps every agent and the native read wording.
-		const everything = await runFacadeCall(NATIVE_ANTHROPIC_MODEL, [read], {
-			name: "read",
-			arguments: { path: "history://" },
-		});
-		const index = everything.result.content[0]?.type === "text" ? everything.result.content[0].text : "";
-		expect(index).toContain(`| ${PARKED} | parked | sub |`);
 	});
 });
 

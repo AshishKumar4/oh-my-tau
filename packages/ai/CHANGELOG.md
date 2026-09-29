@@ -4,11 +4,11 @@
 
 ### Changed
 
-- Claude Code harness requests now claim the release of the served capture (for example `claude-cli/2.1.284`) in the User-Agent and billing header instead of the pinned default, and seed the billing fingerprint from the user's own words like Claude Code does; `PI_AI_CLAUDE_CODE_VERSION` still overrides it and native mode keeps the pinned default.
+- Claude Code harness requests now claim the release of the served capture (for example `claude-cli/2.1.284`) in the User-Agent and billing header instead of the pinned default, and seed the billing fingerprint from the user's own words like Claude Code does; `PI_AI_CLAUDE_CODE_VERSION` still overrides it and native mode keeps the pinned default. A minimum version adopted after the server rejects an older capture never lowers requests that serve no capture (native, side requests, OAuth refresh, usage) below the pinned default.
 
 ### Fixed
 
-- Fixed sibling subagents under the Claude Code harness re-writing the shared prompt cache on every spawn: per-spawn subagent text marked with `SUBAGENT_VOLATILE_MARKER` now sits after the cached head, so siblings share the vendor prompt, footer and project context.
+- Fixed sibling subagents under the Claude Code harness re-writing the shared prompt cache on every spawn: a system block that opens with `<subagent-context>` is now a claude-code volatile segment, so the head breakpoint lands before a subagent's per-spawn prompt and siblings share the cached vendor prompt, footer and project context.
 - Fixed DeepSeek `/responses` requests failing with `400 No tool output found` when a repaired orphan tool-result note landed between two outputs of the same tool round, and with `400 The reasoning_text in the thinking mode must be passed back` when replayed history lacked reasoning for an assistant turn ([#13083](https://github.com/can1357/oh-my-pi/issues/13083)).
 - Fixed `harness.mode: native` on models whose catalog profile is `claude-code` (Claude Opus 5, Fable 5.1) still getting the claude-code cache placement and vendor tool-name replay on Anthropic requests; a native override now takes the native path, with the system breakpoint before `<project-context>`/`<memories>` and the last tool anchored.
 - Fixed Claude on Amazon Bedrock's Anthropic Messages routes (`/anthropic` on bedrock-runtime and bedrock-mantle): runtime requests no longer fail with a request-metadata 400, and both routes use Anthropic's on-demand compaction ([#13311](https://github.com/can1357/oh-my-pi/pull/13311) by [@mustafaabidali](https://github.com/mustafaabidali)).

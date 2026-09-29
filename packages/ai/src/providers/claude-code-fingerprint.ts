@@ -39,24 +39,23 @@ export function claudeCodeCaptureVersion(clientVersion: string | undefined): str
 
 /**
  * Claude Code CLI version represented on the Anthropic wire (User-Agent, billing
- * header): `PI_AI_CLAUDE_CODE_VERSION` → version adopted from a server rejection
- * (see {@link adoptRequiredClaudeCodeVersion}) → {@link DEFAULT_CLAUDE_CODE_VERSION}.
+ * header): `PI_AI_CLAUDE_CODE_VERSION`, else the newer of the version adopted
+ * from a server rejection (see {@link adoptRequiredClaudeCodeVersion}) and
+ * {@link DEFAULT_CLAUDE_CODE_VERSION}.
  *
  * `servedClientVersion` is the `clientVersion` of the claude-code harness
  * capture whose prompt and tools the request carries. It takes the default's
  * place, so the header names the release the served text came from. The
- * adopted version is the minimum the server demanded: it still replaces an
- * older capture version but never downgrades a newer one. The env pin wins
- * over both.
+ * adopted version is a floor: it replaces an older capture version (or the
+ * default) but never downgrades a newer one. The env pin wins over all.
  */
 export function getClaudeCodeVersion(servedClientVersion?: string): string {
 	const pinned = process.env.PI_AI_CLAUDE_CODE_VERSION;
 	if (pinned) return pinned;
-	const served = claudeCodeCaptureVersion(servedClientVersion);
-	if (served === undefined) return adoptedClaudeCodeVersion || DEFAULT_CLAUDE_CODE_VERSION;
-	return adoptedClaudeCodeVersion && compareSemver(adoptedClaudeCodeVersion, served) > 0
+	const base = claudeCodeCaptureVersion(servedClientVersion) ?? DEFAULT_CLAUDE_CODE_VERSION;
+	return adoptedClaudeCodeVersion && compareSemver(adoptedClaudeCodeVersion, base) > 0
 		? adoptedClaudeCodeVersion
-		: served;
+		: base;
 }
 
 /** User-Agent emitted by Claude Code's CLI inference entrypoint. */
@@ -96,6 +95,11 @@ function compareSemver(a: string, b: string): number {
  * `servedClientVersion` is the one the rejected request resolved its version
  * with (see {@link getClaudeCodeVersion}), so the comparison is against the
  * version it actually sent.
+ *
+ * The adopted floor is process-wide, so it never drops below what requests
+ * serving no capture already send: a rejected older capture (2.1.269 against
+ * a 2.1.275 minimum) must not pull native, side-request, OAuth-refresh or
+ * usage User-Agents under the pinned default.
  */
 export function adoptRequiredClaudeCodeVersion(error: unknown, servedClientVersion?: string): boolean {
 	if (process.env.PI_AI_CLAUDE_CODE_VERSION) return false;
@@ -103,7 +107,8 @@ export function adoptRequiredClaudeCodeVersion(error: unknown, servedClientVersi
 	if (!message.includes(VERSION_TOO_OLD_CODE)) return false;
 	const required = REQUIRED_VERSION_PATTERN.exec(message)?.[1];
 	if (!required || compareSemver(required, getClaudeCodeVersion(servedClientVersion)) <= 0) return false;
-	adoptedClaudeCodeVersion = required;
+	const floor = getClaudeCodeVersion();
+	adoptedClaudeCodeVersion = compareSemver(required, floor) > 0 ? required : floor;
 	return true;
 }
 
@@ -118,12 +123,12 @@ export const claudeToolPrefix: string = "_";
 export const claudeCodeSystemInstruction = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /**
- * Opens the per-spawn part of a subagent's system prompt (assignment context,
- * worktree, peer roster): text that differs between siblings spawned from one
- * agent definition. Under the claude-code profile the Anthropic transport
- * anchors the head cache breakpoint on the text before it, so siblings share
- * the vendor prompt, footer and project context as one cached prefix. The
- * transport removes the marker, with one directly following newline, from the
- * wire in every profile; no other transport knows it.
+ * Tag wrapping a subagent's per-spawn system block (`<subagent-context>…
+ * </subagent-context>`): assignment context, worktree and peer roster, text
+ * that differs between siblings spawned from one agent definition. The coding
+ * agent emits it only under the claude-code profile on this transport, where
+ * the opening tag is a volatile system segment: the head cache breakpoint
+ * anchors on the block before it, so siblings share the vendor prompt, footer
+ * and project context as one cached prefix.
  */
-export const SUBAGENT_VOLATILE_MARKER = "<!-- omp:volatile-subagent -->";
+export const SUBAGENT_CONTEXT_TAG = "subagent-context";

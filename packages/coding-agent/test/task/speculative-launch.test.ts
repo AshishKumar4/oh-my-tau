@@ -433,14 +433,16 @@ describe("claude-code Agent speculative launch", () => {
 		// The final call is planned through the same projection.
 		expect(session.matchesFinalArgs(agentArgs)).toBe(true);
 		expect(session.matchesFinalArgs({ ...agentArgs, prompt: "other brief" })).toBe(false);
+		// The finished call launches the remaining item too.
 		session.finalize({ toolCall: agentCall, args: agentArgs });
+		for (let attempt = 0; attempt < 500 && started.length < 2; attempt++) await Bun.sleep(2);
+		expect(started).toHaveLength(2);
 		const result = await agent.execute(toolCall.id, agentArgs);
 
-		// Two spawns total: the early launch was adopted, not repeated.
+		// Two spawns total: dispatch adopted both early launches instead of repeating them.
 		expect(executorModule.runSubprocess).toHaveBeenCalledTimes(2);
 		const ids = (result.details as TaskToolDetails | undefined)?.progress?.map(progress => progress.id) ?? [];
-		expect(ids).toHaveLength(2);
-		expect(ids[0]).toBe(started[0]);
+		expect(ids).toEqual(started);
 		for (const release of releases.splice(0)) release();
 		for (const id of ids) await manager.getJob(id)?.promise;
 	});

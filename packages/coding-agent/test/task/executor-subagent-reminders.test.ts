@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, Effort } from "@oh-my-pi/pi-ai";
+import { SUBAGENT_CONTEXT_TAG } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
@@ -14,7 +15,6 @@ import {
 	finalizeSubprocessOutput,
 	runSubagentFollowUpTurn,
 	runSubprocess,
-	SUBAGENT_VOLATILE_MARKER,
 	SUBAGENT_WARNING_MISSING_YIELD,
 } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
@@ -274,14 +274,14 @@ describe("runSubprocess yield reminders", () => {
 		// The cached head stays byte for byte; the per-spawn block opens with the
 		// marker the Anthropic transport anchors its cache in front of.
 		expect(marked?.slice(0, 2)).toEqual(head);
-		expect(marked?.[2]).toStartWith(`${SUBAGENT_VOLATILE_MARKER}\n`);
-		expect(marked?.[2]).toEndWith("\n</subagent-context>");
+		expect(marked?.[2]).toStartWith(`<${SUBAGENT_CONTEXT_TAG}>\n`);
+		expect(marked?.[2]).toEndWith(`\n</${SUBAGENT_CONTEXT_TAG}>`);
 		expect(marked?.[2]).toContain(baseAgent.systemPrompt);
 
 		const otherTransport = getBundledModel("openai", "gpt-5");
 		for (const model of [undefined, otherTransport]) {
 			const plain = systemPromptBuilder(head, { model });
-			expect(plain?.[2]).not.toContain(SUBAGENT_VOLATILE_MARKER);
+			expect(plain?.[2]).not.toContain(`<${SUBAGENT_CONTEXT_TAG}>`);
 		}
 	});
 	it("resets yield state after an intervening wake wins the follow-up prompt race", async () => {

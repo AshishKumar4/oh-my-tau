@@ -126,7 +126,7 @@ import {
 	claudeToolPrefix,
 	getClaudeCodeUserAgent,
 	getClaudeCodeVersion,
-	SUBAGENT_VOLATILE_MARKER,
+	SUBAGENT_CONTEXT_TAG,
 } from "./claude-code-fingerprint";
 import {
 	buildCopilotDynamicHeaders,
@@ -4177,61 +4177,15 @@ const VOLATILE_SYSTEM_SEGMENT_MARKERS = ["<memories>", "<project-context>"];
  * claude-code golden). Working-directory context therefore stays inside the
  * anchored head under the profile, which forgoes sharing that head across
  * directories; only per-turn recall, which the client never sends, sits behind
- * the breakpoint so a refresh re-bills just the suffix. Per-spawn subagent text
- * sits behind it too, located by {@link SUBAGENT_VOLATILE_MARKER} rather than a
- * leading tag (see {@link isolateSubagentVolatileText}).
+ * the breakpoint so a refresh re-bills just the suffix. A subagent's per-spawn
+ * block (`<subagent-context>`, see {@link SUBAGENT_CONTEXT_TAG}) sits behind it
+ * too, so siblings share the vendor prompt, footer and project context.
  */
-const CLAUDE_CODE_VOLATILE_SYSTEM_SEGMENT_MARKERS = ["<memories>"];
+const CLAUDE_CODE_VOLATILE_SYSTEM_SEGMENT_MARKERS = ["<memories>", `<${SUBAGENT_CONTEXT_TAG}>`];
 
 function volatileSystemSuffixStart(systemBlocks: readonly AnthropicSystemBlock[], markers: readonly string[]): number {
 	const start = systemBlocks.findIndex(block => markers.some(marker => block.text.startsWith(marker)));
 	return start === -1 ? systemBlocks.length : start;
-}
-
-/** `text` without {@link SUBAGENT_VOLATILE_MARKER}, each taking one directly following newline with it. */
-function withoutSubagentMarker(text: string): string {
-	const [head, ...rest] = text.split(SUBAGENT_VOLATILE_MARKER);
-	return head + rest.map(piece => (piece.startsWith("\n") ? piece.slice(1) : piece)).join("");
-}
-
-/**
- * Removes {@link SUBAGENT_VOLATILE_MARKER} from the system blocks and, with
- * `split` (the claude-code profile), returns the index of the block that opens
- * the per-spawn subagent text, else -1.
- *
- * The subagent prompt follows the vendor prompt, footer and `<project-context>`
- * that every sibling spawned in one directory sends byte for byte; its
- * per-spawn part (assignment context, worktree, peer roster) differs per
- * sibling. Anchoring the head on the last block before that part lets the
- * first sibling write the shared prefix and the rest read it. Anchored after
- * it, each sibling writes an entry no other sibling's prefix reaches, and a
- * read only matches where some request wrote, so every spawn re-writes the
- * shared prefix. A marker inside a block splits it, so the text before the
- * marker still joins the anchored head. Without `split` (native) the marker
- * is only removed, so the wire matches a prompt rendered without it.
- */
-function isolateSubagentVolatileText(systemBlocks: AnthropicSystemBlock[] | undefined, split: boolean): number {
-	if (!systemBlocks) return -1;
-	let start = -1;
-	for (let index = 0; index < systemBlocks.length; index++) {
-		const block = systemBlocks[index];
-		const at = block.text.indexOf(SUBAGENT_VOLATILE_MARKER);
-		if (at === -1) continue;
-		const pieces: AnthropicSystemBlock[] = [];
-		if (split && start === -1) {
-			const head = block.text.slice(0, at).trimEnd();
-			if (head.length > 0) pieces.push({ ...block, text: head });
-			start = index + pieces.length;
-			const tail = withoutSubagentMarker(block.text.slice(at));
-			if (tail.trim().length > 0) pieces.push({ ...block, text: tail });
-		} else {
-			const text = withoutSubagentMarker(block.text);
-			if (text.trim().length > 0) pieces.push({ ...block, text });
-		}
-		systemBlocks.splice(index, 1, ...pieces);
-		index += pieces.length - 1;
-	}
-	return start;
 }
 
 /**
@@ -4269,9 +4223,8 @@ function isolateSubagentVolatileText(systemBlocks: AnthropicSystemBlock[] | unde
  * the captured client anchors both its identity block and its last system
  * block (see the vendorFraming of the claude-code golden), so the profile keeps
  * the identity breakpoint and anchors the last block before any recall suffix
- * or per-spawn subagent text (`subagentTextStart`, from
- * {@link isolateSubagentVolatileText}). It anchors no tool, so its head is
- * still two breakpoints.
+ * or per-spawn subagent block. It anchors no tool, so its head is still two
+ * breakpoints.
  *
  * Runs on the fresh system blocks and wire tools built for this request, after
  * the declared tool list was derived from the transcript's request controls.
@@ -4281,7 +4234,6 @@ function applyHeadCaching(
 	tools: AnthropicWireTool[] | undefined,
 	cacheControl: AnthropicCacheControl | undefined,
 	harnessProfile: HarnessProfile | undefined,
-	subagentTextStart = -1,
 ): void {
 	if (!cacheControl) return;
 
@@ -4316,11 +4268,10 @@ function applyHeadCaching(
 		// `applyPromptCaching` (4 minus head breakpoints). All-volatile falls
 		// back to tail anchoring.
 		const claudeCode = harnessProfile === "claude-code";
-		const markedStart = volatileSystemSuffixStart(
+		const suffixStart = volatileSystemSuffixStart(
 			systemBlocks,
 			claudeCode ? CLAUDE_CODE_VOLATILE_SYSTEM_SEGMENT_MARKERS : VOLATILE_SYSTEM_SEGMENT_MARKERS,
 		);
-		const suffixStart = claudeCode && subagentTextStart >= 0 ? Math.min(markedStart, subagentTextStart) : markedStart;
 		const anchorIndex = suffixStart === 0 ? systemBlocks.length - 1 : suffixStart - 1;
 		const anchor = systemBlocks[anchorIndex];
 		if (anchor && anchor.cache_control == null) {
@@ -4786,7 +4737,6 @@ function buildParams(
 		servedClaudeCodeVersion: resolveServedClaudeCodeVersion(model, harnessOverride, options?.harnessClientVersion),
 		cacheControl: headCacheControl,
 	});
-	const subagentTextStart = isolateSubagentVolatileText(systemBlocks, effectiveHarness === "claude-code");
 
 	// Controls earlier requests recorded on their responses fix the declared
 	// tools, the top-level effort and every control message in between.
@@ -4952,7 +4902,7 @@ function buildParams(
 	);
 	// Anchor the stable tools+system head so it stays cached across turns; the
 	// moving message tail is anchored separately in applyPromptCaching below.
-	applyHeadCaching(systemBlocks, tools, headCacheControl, effectiveHarness, subagentTextStart);
+	applyHeadCaching(systemBlocks, tools, headCacheControl, effectiveHarness);
 	const requestControls: AnthropicRequestControls | undefined =
 		toolPlan.record || effortPlan.record
 			? {

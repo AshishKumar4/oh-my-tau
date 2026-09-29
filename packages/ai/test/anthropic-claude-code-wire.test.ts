@@ -7,10 +7,10 @@
  *   `clientVersion`; `PI_AI_CLAUDE_CODE_VERSION` still wins, requests that
  *   serve no capture keep the pinned default, and a server-demanded minimum
  *   raises an older capture version without ever lowering a newer one.
- * - `SUBAGENT_VOLATILE_MARKER` moves the claude-code head breakpoint in front
- *   of the per-spawn text so sibling subagents share the vendor prompt, footer
- *   and project context byte for byte. Native requests only lose the marker:
- *   their bytes and breakpoints match a prompt rendered without it.
+ * - A `<subagent-context>` block (`SUBAGENT_CONTEXT_TAG`) is a claude-code
+ *   volatile segment: the head breakpoint lands in front of it, so sibling
+ *   subagents share the vendor prompt, footer and project context byte for
+ *   byte. Native requests keep their own markers and bytes.
  *
  * No network: a recording `fetch` answers every request with a canned turn.
  */
@@ -23,9 +23,10 @@ import {
 	claudeCodeCaptureVersion,
 	claudeCodeSystemInstruction,
 	DEFAULT_CLAUDE_CODE_VERSION,
+	getClaudeCodeUserAgent,
 	getClaudeCodeVersion,
 	resetAdoptedClaudeCodeVersion,
-	SUBAGENT_VOLATILE_MARKER,
+	SUBAGENT_CONTEXT_TAG,
 } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import type { Context, FetchImpl, Model, Tool, UserMessage } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -59,6 +60,9 @@ const FOOTER = "# Environment\nSkills: none. Rules: none.";
 const PROJECT_CONTEXT = "<project-context>\n<workstation>\n- cwd: /work/a\n</workstation>\n</project-context>";
 const MEMORIES = "<memories>\nrecall\n</memories>";
 const perSpawnText = (spawn: number) => `§ Context\nImplement part ${spawn}.\n\n# Peers\n- \`Sibling${spawn}\``;
+/** A subagent's per-spawn system block as the coding agent renders it under the claude-code profile. */
+const subagentContext = (spawn: number) =>
+	`<${SUBAGENT_CONTEXT_TAG}>\n${perSpawnText(spawn)}\n</${SUBAGENT_CONTEXT_TAG}>`;
 
 interface WireRequest {
 	userAgent: string | null;
@@ -260,6 +264,34 @@ describe("claude-code wire version", () => {
 		expect(billedVersion(requests[1].body)).toStartWith("100.0.0.");
 	});
 
+	it("keeps requests serving no capture at the default when an older capture is rejected", async () => {
+		// Realistic releases: a served 2.1.269 capture, a 2.1.275 server minimum,
+		// and the pinned default (2.1.280) above both.
+		const olderCapture = "2.1.269.517";
+		const minimum = "2.1.275";
+		expect(Bun.semver.order(minimum, DEFAULT_CLAUDE_CODE_VERSION)).toBe(-1);
+		const rejection = new Error(`claude_code_version_too_old: version ${minimum} or newer is required`);
+		expect(getClaudeCodeVersion(olderCapture)).toBe("2.1.269");
+
+		expect(adoptRequiredClaudeCodeVersion(rejection, olderCapture)).toBe(true);
+		// The rejected capture retries at or above the minimum...
+		expect(Bun.semver.order(getClaudeCodeVersion(olderCapture), minimum)).toBeGreaterThanOrEqual(0);
+		// ...while native, side, OAuth-refresh and usage requests never drop below the default.
+		expect(getClaudeCodeVersion()).toBe(DEFAULT_CLAUDE_CODE_VERSION);
+		expect(getClaudeCodeUserAgent()).toBe(`claude-cli/${DEFAULT_CLAUDE_CODE_VERSION} (external, cli)`);
+		// A newer capture keeps claiming its own release.
+		expect(getClaudeCodeVersion(CAPTURE_CLIENT_VERSION)).toBe("2.1.284");
+		// The same demand again is already met: no retry loop.
+		expect(adoptRequiredClaudeCodeVersion(rejection, olderCapture)).toBe(false);
+
+		const [native] = await send(
+			{ systemPrompt: [VENDOR_PROMPT], messages: turn(RECORDED_PROMPT), tools: TOOLS },
+			{ harnessProfile: null },
+		);
+		expect(native.userAgent).toBe(`claude-cli/${DEFAULT_CLAUDE_CODE_VERSION} (external, cli)`);
+		expect(billedVersion(native.body)?.split(".").slice(0, 3).join(".")).toBe(DEFAULT_CLAUDE_CODE_VERSION);
+	});
+
 	it("treats an adopted minimum as a floor under the capture and the env pin as final", async () => {
 		const rejection = (required: string) =>
 			new Error(`claude_code_version_too_old: version ${required} or newer is required`);
@@ -281,35 +313,29 @@ describe("claude-code wire version", () => {
 	});
 });
 
-describe("claude-code head breakpoint and per-spawn subagent text", () => {
+describe("claude-code head breakpoint and per-spawn subagent context", () => {
 	const sibling = (spawn: number) =>
 		send({
-			systemPrompt: [
-				VENDOR_PROMPT,
-				FOOTER,
-				PROJECT_CONTEXT,
-				`${SUBAGENT_VOLATILE_MARKER}\n${perSpawnText(spawn)}`,
-				MEMORIES,
-			],
+			systemPrompt: [VENDOR_PROMPT, FOOTER, PROJECT_CONTEXT, subagentContext(spawn), MEMORIES],
 			messages: turn(`Implement part ${spawn}`),
 			tools: TOOLS,
 		});
 
-	it("anchors the head before the per-spawn text and keeps the identity slot", async () => {
+	it("anchors the head before the <subagent-context> block and keeps the identity slot", async () => {
 		const [{ body }] = await sibling(1);
 		const system = systemBlocks(body);
+		// The block reaches the wire as rendered: the tag is markup, not a stripped marker.
 		expect(system.map(block => block.text).slice(1)).toEqual([
 			claudeCodeSystemInstruction,
 			VENDOR_PROMPT,
 			FOOTER,
 			PROJECT_CONTEXT,
-			perSpawnText(1),
+			subagentContext(1),
 			MEMORIES,
 		]);
 		expect(anchoredTexts(body)).toEqual([claudeCodeSystemInstruction, PROJECT_CONTEXT]);
 		expect(system[4]?.cache_control).toEqual(HEAD_TTL);
 		expect(system[5]?.cache_control).toBeUndefined();
-		expect(JSON.stringify(body)).not.toContain(SUBAGENT_VOLATILE_MARKER);
 		expect(body.tools?.some(tool => tool.cache_control != null)).toBe(false);
 	});
 
@@ -324,45 +350,43 @@ describe("claude-code head breakpoint and per-spawn subagent text", () => {
 		// Block 0 is the billing header, whose attestation hashes the whole body.
 		expect(JSON.stringify(secondSystem.slice(1, anchor + 1))).toBe(JSON.stringify(firstSystem.slice(1, anchor + 1)));
 		expect(JSON.stringify(second.tools)).toBe(JSON.stringify(first.tools));
-		expect(secondSystem[anchor + 1]?.text).not.toBe(firstSystem[anchor + 1]?.text);
+		// The per-spawn block sits right after the anchor and is each sibling's own.
+		expect(firstSystem[anchor + 1]?.text).toBe(subagentContext(1));
+		expect(secondSystem[anchor + 1]?.text).toBe(subagentContext(2));
 	});
 
-	it("splits a block at an inline marker so the text before it stays anchored", async () => {
-		const [{ body }] = await send({
-			systemPrompt: [VENDOR_PROMPT, FOOTER, `Role: reviewer.\n\n${SUBAGENT_VOLATILE_MARKER}\n${perSpawnText(7)}`],
-			messages: turn("Review part 7"),
-			tools: TOOLS,
-		});
-		expect(
-			systemBlocks(body)
-				.map(block => block.text)
-				.slice(1),
-		).toEqual([claudeCodeSystemInstruction, VENDOR_PROMPT, FOOTER, "Role: reviewer.", perSpawnText(7)]);
-		expect(anchoredTexts(body)).toEqual([claudeCodeSystemInstruction, "Role: reviewer."]);
-	});
-
-	it("leaves native requests byte-identical to a prompt rendered without the marker", async () => {
+	it("leaves native requests on their own markers and bytes", async () => {
 		for (const auth of [
 			{ apiKey: "sk-ant-oat-test", isOAuth: true },
 			{ apiKey: "sk-ant-api-test", isOAuth: false },
 		]) {
 			const options: AnthropicOptions = { harnessProfile: null, ...auth };
-			const context = (perSpawn: string): Context => ({
-				systemPrompt: [VENDOR_PROMPT, FOOTER, PROJECT_CONTEXT, perSpawn, MEMORIES],
-				messages: turn("Implement part 1"),
-				tools: TOOLS,
-			});
-			const [{ body: marked }] = await send(context(`${SUBAGENT_VOLATILE_MARKER}\n${perSpawnText(1)}`), options);
-			const [{ body: plain }] = await send(context(perSpawnText(1)), options);
-			// With OAuth, block 0 is the billing header, whose attestation hashes the
-			// whole body (including a per-request metadata id).
+			const [{ body }] = await send(
+				{
+					systemPrompt: [VENDOR_PROMPT, FOOTER, PROJECT_CONTEXT, perSpawnText(1), MEMORIES],
+					messages: turn("Implement part 1"),
+					tools: TOOLS,
+				},
+				options,
+			);
 			const skip = auth.isOAuth ? 1 : 0;
-			expect(JSON.stringify(systemBlocks(marked).slice(skip))).toBe(JSON.stringify(systemBlocks(plain).slice(skip)));
-			expect(JSON.stringify(marked.tools)).toBe(JSON.stringify(plain.tools));
-			expect(JSON.stringify(marked.messages)).toBe(JSON.stringify(plain.messages));
-			// Native anchors the block before `<project-context>` plus the last tool.
-			expect(anchoredTexts(marked)).toEqual([FOOTER]);
-			expect(marked.tools?.map(tool => tool.cache_control != null)).toEqual([true]);
+			// The coding agent never wraps native per-spawn text; it reaches the
+			// wire unchanged, and native anchors the block before
+			// `<project-context>` plus the last tool.
+			expect(
+				systemBlocks(body)
+					.slice(skip)
+					.map(block => block.text),
+			).toEqual([
+				...(auth.isOAuth ? [claudeCodeSystemInstruction] : []),
+				VENDOR_PROMPT,
+				FOOTER,
+				PROJECT_CONTEXT,
+				perSpawnText(1),
+				MEMORIES,
+			]);
+			expect(anchoredTexts(body)).toEqual([FOOTER]);
+			expect(body.tools?.map(tool => tool.cache_control != null)).toEqual([true]);
 		}
 	});
 });

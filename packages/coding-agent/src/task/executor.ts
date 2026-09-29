@@ -9,6 +9,7 @@ import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
+import { SUBAGENT_CONTEXT_TAG } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type AsyncJobRunResult } from "../async";
 import type { Rule } from "../capability/rule";
@@ -219,14 +220,6 @@ function normalizeModelPatterns(value: string | string[] | undefined): string[] 
 }
 
 const SUBAGENT_RETRY_FALLBACK_ROLE_PREFIX = "subagent:";
-
-/**
- * Opening tag of a subagent's per-spawn system block under the `claude-code`
- * profile on the Anthropic transport: head caching treats a block that starts
- * with it as the volatile suffix, so sibling spawns share the anchored vendor
- * prompt, footer, and project context.
- */
-export const SUBAGENT_VOLATILE_MARKER = "<subagent-context>";
 
 interface SubagentRetryFallbackCandidate {
 	model: Model<Api>;
@@ -2215,6 +2208,8 @@ async function driveSessionToYield(
 	options: {
 		/** Open-endedness description forwarded to the session's `auto` thinking classifier. */
 		solutionSpace?: string;
+		/** Tool names under the child's harness profile for its reminders; native names when omitted. */
+		toolRefs?: Readonly<Record<string, string>>;
 		/**
 		 * Invoked when the initial prompt loses a prompt race (AgentBusyError) before
 		 * retrying. Lets the caller restore a safe contract and detach its monitor
@@ -2355,7 +2350,7 @@ async function driveSessionToYield(
 						retryCount,
 						maxRetries: MAX_YIELD_RETRIES,
 						budgetStop,
-						toolRefs: harnessToolRefs(effectiveHarnessProfile(session.settings, session.model)),
+						toolRefs: options.toolRefs ?? harnessToolRefs(undefined),
 					});
 
 					const isFinalRetry = retryCount >= MAX_YIELD_RETRIES;
@@ -2453,7 +2448,7 @@ async function driveSessionToYield(
 						count: running.length,
 						multiple: running.length > 1,
 						jobs,
-						toolRefs: harnessToolRefs(effectiveHarnessProfile(session.settings, session.model)),
+						toolRefs: options.toolRefs ?? harnessToolRefs(undefined),
 					});
 					try {
 						await dispatchPrompt(notice, { attribution: "agent", synthetic: true }, "async-pending notice");
@@ -3444,6 +3439,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	let attemptUnsubscribe = monitor.attach(session);
 	try {
 		outcome = await driveSessionToYield(session, monitor, message, {
+			toolRefs: harnessToolRefs(effectiveHarnessProfile(session.settings, session.model)),
 			onPromptBusy: async () => {
 				attemptUnsubscribe();
 				logger.debug("Subagent follow-up lost the prompt race to an IRC wake; backing off", { id });
@@ -4031,12 +4027,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					// trailing `<project-context>` block so spawns of the same agent
 					// share the static prompt prefix as a cache hit. Under Claude
 					// Code the transport anchors the cache on the last system block
-					// unless a block opens with a volatile marker, so there the
-					// per-spawn block is wrapped in one.
+					// before a volatile segment, so there the per-spawn block is one.
 					if (profile !== "claude-code" || promptModel?.api !== "anthropic-messages") {
 						return [...defaultPrompt, subagentPrompt];
 					}
-					return [...defaultPrompt, `${SUBAGENT_VOLATILE_MARKER}\n${subagentPrompt}\n</subagent-context>`];
+					const tag = SUBAGENT_CONTEXT_TAG;
+					return [...defaultPrompt, `<${tag}>\n${subagentPrompt}\n</${tag}>`];
 				},
 				sessionManager: sessionManagerForRun,
 				hasUI: false,
@@ -4347,7 +4343,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 
 			readyAt = performance.now();
-			const outcome = await driveSessionToYield(session, monitor, task, { solutionSpace: options.solutionSpace });
+			const outcome = await driveSessionToYield(session, monitor, task, {
+				solutionSpace: options.solutionSpace,
+				toolRefs: harnessToolRefs(effectiveHarnessProfile(subagentSettings, session.model)),
+			});
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left
 			// `running` before the (possibly slow) cleanup below.

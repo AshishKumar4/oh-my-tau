@@ -170,6 +170,55 @@ const CLAUDE_CODE_TASK_OUTPUT: HarnessFacadeSpec<typeof claudeCodeTaskOutputSche
 	toParams: () => ({}),
 };
 
+const CLAUDE_CODE_WEB_FETCH: HarnessFacadeSpec<typeof claudeCodeWebFetchSchema> = {
+	target: "read",
+	wireName: "WebFetch",
+	ownSurface: true,
+	description: claudeCodeWebFetch,
+	parameters: claudeCodeWebFetchSchema,
+	mounts: host => cfgFetchEnabled.get(host.settings),
+	toParams: args => ({ path: args.url }),
+	// The page comes through `read`; the session's smol model answers
+	// `prompt` over it. Without a smol model the page itself is the result.
+	run: async ({ args, host, signal, forward }) => {
+		const page = await forward();
+		if (page.isError || !host.session) return page;
+		let answer: string | undefined;
+		try {
+			answer = await completeOnTier(
+				webFetchPrompt(resultText(page), args.prompt),
+				"smol",
+				host.session,
+				signal ?? new AbortController().signal,
+			);
+		} catch {
+			if (signal?.aborted) throw signal.reason;
+		}
+		return answer ? { content: [{ type: "text", text: answer }] } : page;
+	},
+};
+
+const CLAUDE_CODE_SKILL: HarnessFacadeSpec<typeof claudeCodeSkillSchema> = {
+	target: "read",
+	wireName: "Skill",
+	ownSurface: true,
+	description: claudeCodeSkill,
+	parameters: claudeCodeSkillSchema,
+	toParams: args => ({ path: `skill://${args.skill}` }),
+	// Arguments reach the skill the way Claude Code passes them: replacing
+	// `$ARGUMENTS` in its instructions, else appended after them.
+	run: async ({ args, forward }) => {
+		const loaded = await forward();
+		const value = args.args?.trim();
+		if (loaded.isError || !value) return loaded;
+		const body = resultText(loaded);
+		const text = body.includes("$ARGUMENTS")
+			? body.replaceAll("$ARGUMENTS", value)
+			: `${body}\n\nARGUMENTS: ${value}`;
+		return { ...loaded, content: [{ type: "text", text }] };
+	},
+};
+
 const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 	{
 		target: "task",
@@ -219,53 +268,8 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 			return { path: `proc://${id}/kill` };
 		},
 	},
-	{
-		target: "read",
-		wireName: "WebFetch",
-		ownSurface: true,
-		description: claudeCodeWebFetch,
-		parameters: claudeCodeWebFetchSchema,
-		mounts: host => cfgFetchEnabled.get(host.settings),
-		toParams: (args: typeof claudeCodeWebFetchSchema.infer) => ({ path: args.url }),
-		// The page comes through `read`; the session's smol model answers
-		// `prompt` over it. Without a smol model the page itself is the result.
-		run: async ({ args, host, signal, forward }) => {
-			const page = await forward();
-			if (page.isError || !host.session) return page;
-			let answer: string | undefined;
-			try {
-				answer = await completeOnTier(
-					webFetchPrompt(resultText(page), args.prompt),
-					"smol",
-					host.session,
-					signal ?? new AbortController().signal,
-				);
-			} catch {
-				if (signal?.aborted) throw signal.reason;
-			}
-			return answer ? { content: [{ type: "text", text: answer }] } : page;
-		},
-	},
-	{
-		target: "read",
-		wireName: "Skill",
-		ownSurface: true,
-		description: claudeCodeSkill,
-		parameters: claudeCodeSkillSchema,
-		toParams: (args: typeof claudeCodeSkillSchema.infer) => ({ path: `skill://${args.skill}` }),
-		// Arguments reach the skill the way Claude Code passes them: replacing
-		// `$ARGUMENTS` in its instructions, else appended after them.
-		run: async ({ args, forward }) => {
-			const loaded = await forward();
-			const value = args.args?.trim();
-			if (loaded.isError || !value) return loaded;
-			const body = resultText(loaded);
-			const text = body.includes("$ARGUMENTS")
-				? body.replaceAll("$ARGUMENTS", value)
-				: `${body}\n\nARGUMENTS: ${value}`;
-			return { ...loaded, content: [{ type: "text", text }] };
-		},
-	},
+	CLAUDE_CODE_WEB_FETCH,
+	CLAUDE_CODE_SKILL,
 ];
 
 const CODEX_COLLABORATION: ToolNamespace = {
