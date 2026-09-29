@@ -62,8 +62,9 @@ describe("keyword notices under Claude Code", () => {
 		for (const omp of ["`wait`", "`edit`", "`write`", "`bash`", "undefined"]) {
 			expect(orchestrate).not.toContain(omp);
 		}
-		// `task` survives only as an agent type (a `subagent_type` value), never as the tool.
-		expect(orchestrate.replaceAll("`task`/`sonic`", "")).not.toContain("`task`");
+		expect(orchestrate).toContain("10. Right-size offload: `Agent`/`sonic` only for substantial");
+		expect(orchestrate).toContain("- `Agent`/`sonic` Target/Change/Acceptance scaffolding");
+		expect(orchestrate).not.toContain("`task`");
 		const workflow = renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true, toolRefs });
 		expect(workflow).toContain("end your turn: results arrive as notifications");
 		expect(workflow).not.toContain("`wait`");
@@ -87,6 +88,8 @@ describe("keyword notices under Claude Code", () => {
 		const orchestrate = renderOrchestrateNotice({ tools: [...tools, "wait"] });
 		expect(orchestrate).toContain("Blocked with nothing else to do? Use `wait`.");
 		expect(orchestrate).toContain("`task` subagents");
+		expect(orchestrate).toContain("10. Right-size offload: `task`/`sonic` only for substantial");
+		expect(orchestrate).toContain("- `task`/`sonic` Target/Change/Acceptance scaffolding");
 		expect(renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true })).toContain(
 			"Leave `eval` and call `wait`",
 		);
