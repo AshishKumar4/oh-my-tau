@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderDemotedThinking } from "@oh-my-pi/pi-ai/dialect";
-import { streamBedrock } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
-import type { AssistantMessage, Context, Model } from "@oh-my-pi/pi-ai/types";
+import { type BedrockOptions, streamBedrock } from "@oh-my-pi/pi-ai/providers/amazon-bedrock";
+import type { AssistantMessage, Context, Model, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 // Amazon Nova streams reasoningContent natively (with no signature — Nova never
@@ -63,7 +63,11 @@ function contextWithUnsignedThinking(modelId: string): Context {
 	};
 }
 
-async function captureReplayPayload(model: Model<"bedrock-converse-stream">, context: Context): Promise<unknown> {
+async function captureReplayPayload(
+	model: Model<"bedrock-converse-stream">,
+	context: Context,
+	options: Partial<BedrockOptions> = {},
+): Promise<unknown> {
 	const controller = new AbortController();
 	controller.abort();
 	const { promise, resolve } = Promise.withResolvers<unknown>();
@@ -73,6 +77,7 @@ async function captureReplayPayload(model: Model<"bedrock-converse-stream">, con
 		signal: controller.signal,
 		maxTokens: 16,
 		onPayload: payload => resolve(payload),
+		...options,
 	});
 
 	return promise;
@@ -160,10 +165,33 @@ function assistantTurn(
 	};
 }
 
+function toolResultTurn(toolCallId: string, text: string): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName: "read",
+		content: [{ type: "text", text }],
+		isError: false,
+		timestamp: 2,
+	};
+}
+
+/** The Converse block a successful text tool result replays as. */
+function toolResultWire(toolUseId: string, text: string): Record<string, unknown> {
+	return { toolResult: { toolUseId, content: [{ text }], status: "success" } };
+}
+
+/** Synthetic assistant turn that separates Claude's tool results from the user text after them. */
+const TOOL_RESULT_BRIDGE: ConverseWireMessage = {
+	role: "assistant",
+	content: [{ text: "I have processed the tool results." }],
+};
+
 // Anthropic's `reasoning_extraction` classifier refuses requests that re-send
 // prior reasoning to Claude as text, so Claude on Bedrock drops reasoning it
-// cannot replay as signed reasoningContent. Other Bedrock models keep the
-// dialect-wrapped text demotion exercised above.
+// cannot replay as signed reasoningContent, and the turn structure still has to
+// alternate. Other Bedrock models keep the dialect-wrapped text demotion
+// exercised above and one Converse turn per message.
 describe("Bedrock Claude prior reasoning replay", () => {
 	const claudeModel: Model<"bedrock-converse-stream"> = buildModel({
 		id: "us.anthropic.claude-opus-4-8-v1:0",
@@ -175,6 +203,18 @@ describe("Bedrock Claude prior reasoning replay", () => {
 		input: ["text", "image"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 200000,
+		maxTokens: 8192,
+	});
+	const llamaModel: Model<"bedrock-converse-stream"> = buildModel({
+		id: "us.meta.llama3-3-70b-instruct-v1:0",
+		name: "Llama 3.3 70B Instruct",
+		api: "bedrock-converse-stream",
+		provider: "amazon-bedrock",
+		baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128000,
 		maxTokens: 8192,
 	});
 	const GPT_REASONING = "gpt-5.6-sol private chain: inspect the parser before patching";
@@ -192,14 +232,7 @@ describe("Bedrock Claude prior reasoning replay", () => {
 					{ api: "openai-codex-responses", provider: "openai-codex", model: "gpt-5.6-sol" },
 					"toolUse",
 				),
-				{
-					role: "toolResult",
-					toolCallId: "call_gpt",
-					toolName: "read",
-					content: [{ type: "text", text: "parser body" }],
-					isError: false,
-					timestamp: 2,
-				},
+				toolResultTurn("call_gpt", "parser body"),
 				{ role: "user", content: "Continue", timestamp: 3 },
 			],
 		};
@@ -209,11 +242,12 @@ describe("Bedrock Claude prior reasoning replay", () => {
 		const claude = payloadMessages(await captureReplayPayload(claudeModel, foreignReasoningContext()));
 
 		expect(JSON.stringify(claude)).not.toContain(GPT_REASONING);
-		expect(claude.map(message => message.role)).toEqual(["user", "assistant", "user"]);
+		expect(claude.map(message => message.role)).toEqual(["user", "assistant", "user", "assistant", "user"]);
 		expect(claude[1]?.content).toEqual([
 			{ text: "Reading the parser first." },
 			{ toolUse: { toolUseId: "call_gpt", name: "read", input: { path: "parser.ts" } } },
 		]);
+		expect(claude[3]).toEqual(TOOL_RESULT_BRIDGE);
 
 		const nova = payloadMessages(await captureReplayPayload(novaModel, foreignReasoningContext()));
 
@@ -237,14 +271,7 @@ describe("Bedrock Claude prior reasoning replay", () => {
 					{ api: "bedrock-converse-stream", provider: "amazon-bedrock", model: claudeModel.id },
 					"toolUse",
 				),
-				{
-					role: "toolResult",
-					toolCallId: "toolu_1",
-					toolName: "read",
-					content: [{ type: "text", text: "parser body" }],
-					isError: false,
-					timestamp: 2,
-				},
+				toolResultTurn("toolu_1", "parser body"),
 				assistantTurn(
 					[{ type: "thinking", thinking: reasoningOnly, thinkingSignature: '{"type":"reasoning"}' }],
 					{ api: "openai-codex-responses", provider: "openai-codex", model: "gpt-6-astra" },
@@ -254,22 +281,93 @@ describe("Bedrock Claude prior reasoning replay", () => {
 			],
 		};
 
-		const messages = payloadMessages(await captureReplayPayload(claudeModel, context));
+		const messages = payloadMessages(await captureReplayPayload(claudeModel, context, { cacheRetention: "none" }));
 
 		const wire = JSON.stringify(messages);
 		expect(wire).not.toContain(unsignedReasoning);
 		expect(wire).not.toContain(reasoningOnly);
 		// The reasoning-only turn vanishes without leaving two user turns
-		// adjacent: Converse rejects any conversation that does not alternate.
-		expect(messages.map(message => message.role)).toEqual(["user", "assistant", "user"]);
-		expect(messages[1]?.content).toEqual([
-			{ reasoningContent: { reasoningText: { text: signedReasoning, signature: "sig_claude" } } },
-			{ text: "Patched." },
-			{ toolUse: { toolUseId: "toolu_1", name: "read", input: { path: "parser.ts" } } },
+		// adjacent (Converse rejects any conversation that does not alternate)
+		// and without putting the user text beside the tool results.
+		expect(messages).toEqual([
+			{ role: "user", content: [{ text: "Fix the parser" }] },
+			{
+				role: "assistant",
+				content: [
+					{ reasoningContent: { reasoningText: { text: signedReasoning, signature: "sig_claude" } } },
+					{ text: "Patched." },
+					{ toolUse: { toolUseId: "toolu_1", name: "read", input: { path: "parser.ts" } } },
+				],
+			},
+			{ role: "user", content: [toolResultWire("toolu_1", "parser body")] },
+			TOOL_RESULT_BRIDGE,
+			{ role: "user", content: [{ text: "Continue" }] },
 		]);
-		expect(messages[2]?.content.slice(0, 2)).toMatchObject([
-			{ toolResult: { toolUseId: "toolu_1" } },
-			{ text: "Continue" },
+	});
+
+	test("keeps one turn per message for other models and alternates Claude turns around tool results", async () => {
+		const reasoningOnly = "gpt-6-astra private chain: nothing else was said this turn";
+		const gpt = { api: "openai-codex-responses", provider: "openai-codex", model: "gpt-5.6-sol" } as const;
+		const context: Context = {
+			messages: [
+				{ role: "user", content: "Fix the parser", timestamp: 0 },
+				{ role: "developer", content: "Keep edits minimal.", timestamp: 0 },
+				assistantTurn(
+					[{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "parser.ts" } }],
+					gpt,
+					"toolUse",
+				),
+				toolResultTurn("call_1", "parser body"),
+				// Steering sent while the tool ran: user text right after the tool results.
+				{ role: "user", content: "Also check the lexer.", timestamp: 2 },
+				assistantTurn(
+					[{ type: "toolCall", id: "call_2", name: "read", arguments: { path: "lexer.ts" } }],
+					gpt,
+					"toolUse",
+				),
+				toolResultTurn("call_2", "lexer body"),
+				assistantTurn(
+					[{ type: "thinking", thinking: reasoningOnly, thinkingSignature: '{"type":"reasoning"}' }],
+					{ api: "openai-codex-responses", provider: "openai-codex", model: "gpt-6-astra" },
+					"stop",
+				),
+				{ role: "user", content: "Continue", timestamp: 3 },
+			],
+		};
+		const readCall = (toolUseId: string, path: string) => ({ toolUse: { toolUseId, name: "read", input: { path } } });
+
+		// Other models keep one Converse turn per message, exactly as before Claude
+		// reasoning was dropped: text never joins a toolResult turn (Llama 3.x and
+		// Mistral reject "Conversation blocks and tool result blocks ... in the
+		// same turn"), and the reasoning-only turn stays demoted text.
+		const llama = payloadMessages(await captureReplayPayload(llamaModel, context, { cacheRetention: "none" }));
+		expect(llama).toEqual([
+			{ role: "user", content: [{ text: "Fix the parser" }] },
+			{ role: "user", content: [{ text: "Keep edits minimal." }] },
+			{ role: "assistant", content: [readCall("call_1", "parser.ts")] },
+			{ role: "user", content: [toolResultWire("call_1", "parser body")] },
+			{ role: "user", content: [{ text: "Also check the lexer." }] },
+			{ role: "assistant", content: [readCall("call_2", "lexer.ts")] },
+			{ role: "user", content: [toolResultWire("call_2", "lexer body")] },
+			{ role: "assistant", content: [{ text: renderDemotedThinking(llamaModel.id, reasoningOnly) }] },
+			{ role: "user", content: [{ text: "Continue" }] },
 		]);
+
+		// Claude drops the reasoning-only turn and still alternates: adjacent text
+		// turns fold, while user text after tool results gets its own turn behind
+		// a bridging assistant turn instead of joining the toolResult turn.
+		const claude = payloadMessages(await captureReplayPayload(claudeModel, context, { cacheRetention: "none" }));
+		expect(claude).toEqual([
+			{ role: "user", content: [{ text: "Fix the parser" }, { text: "Keep edits minimal." }] },
+			{ role: "assistant", content: [readCall("call_1", "parser.ts")] },
+			{ role: "user", content: [toolResultWire("call_1", "parser body")] },
+			TOOL_RESULT_BRIDGE,
+			{ role: "user", content: [{ text: "Also check the lexer." }] },
+			{ role: "assistant", content: [readCall("call_2", "lexer.ts")] },
+			{ role: "user", content: [toolResultWire("call_2", "lexer body")] },
+			TOOL_RESULT_BRIDGE,
+			{ role: "user", content: [{ text: "Continue" }] },
+		]);
+		expect(JSON.stringify(claude)).not.toContain(reasoningOnly);
 	});
 });

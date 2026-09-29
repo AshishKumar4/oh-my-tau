@@ -14,6 +14,7 @@
 - Fixed Claude on Amazon Bedrock's Anthropic Messages routes (`/anthropic` on bedrock-runtime and bedrock-mantle): runtime requests no longer fail with a request-metadata 400, and both routes use Anthropic's on-demand compaction ([#13311](https://github.com/can1357/oh-my-pi/pull/13311) by [@mustafaabidali](https://github.com/mustafaabidali)).
 - `/usage` no longer shows an always-empty `gpt-4 requests` row for Cursor accounts on usage-based plans; the Cursor Models and Other Models meters remain ([#13726](https://github.com/can1357/oh-my-pi/pull/13726) by [@will-bogusz](https://github.com/will-bogusz)).
 - Cursor turns routed through an HTTP proxy now finish instead of hanging after the response completes ([#13724](https://github.com/can1357/oh-my-pi/pull/13724) by [@will-bogusz](https://github.com/will-bogusz)).
+- Fixed Claude refusing long multi-model sessions with `Refusal (reasoning_extraction): This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs`. Prior reasoning Claude cannot replay as a native thinking block — other models' or providers' reasoning, unsigned or stale-signature blocks, and unsigned blocks after the signing-proxy auto-demote — was re-sent as plain assistant text; Claude targets on every provider (Anthropic, Bedrock, Vertex, gateways) now drop it instead, keeping visible text, tool calls, and signed thinking unchanged. On Bedrock, Claude requests keep alternating when a dropped reasoning-only turn leaves user turns adjacent: user text folds into a preceding text turn, and a short synthetic assistant turn separates it from tool results; other Bedrock models are unchanged.
 
 ## [18.4.3] - 2026-09-28
 
@@ -24,7 +25,6 @@
 ### Changed
 
 - Reduced per-token CPU and allocations while streaming: the leaked-thinking scanner used for OpenAI-compatible and custom endpoints no longer allocates per character, chat-completions and Bedrock look up a delta's content block in constant time, Google, Gemini CLI, Codex, and chat-completions streams skip raw SSE line capture unless an `onSseEvent` listener is attached, and event streams drain backlogs without `Array#shift` ([#13650](https://github.com/can1357/oh-my-pi/pull/13650) by [@H4vC](https://github.com/H4vC)).
-- Fixed Claude refusing long multi-model sessions with `Refusal (reasoning_extraction): This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs`. Prior reasoning Claude cannot replay as a native thinking block — other models' or providers' reasoning, unsigned or stale-signature blocks, and unsigned blocks after the signing-proxy auto-demote — was re-sent as plain assistant text; Claude targets on every provider (Anthropic, Bedrock, Vertex, gateways) now drop it instead, keeping visible text, tool calls, and signed thinking unchanged. Bedrock also folds adjacent user turns so a dropped reasoning-only turn keeps the conversation alternating.
 
 ## [18.4.2] - 2026-09-28
 
