@@ -4,6 +4,23 @@ import type { SessionEntry } from "./session-entries";
 
 export const TOOL_EXECUTION_START_CUSTOM_TYPE = "tool_execution_start";
 export const SESSION_EXIT_CUSTOM_TYPE = "session_exit";
+export const SESSION_OPEN_CUSTOM_TYPE = "session_open";
+
+/**
+ * Marker a live session writes when it takes over a session file that already
+ * has history. A crash writes no `session_exit`, so this is what separates one
+ * process's entries from the next.
+ */
+export interface SessionOpenData {
+	pid: number;
+	/** `performance.timeOrigin` of the writing process; with `pid`, identifies it across reboots. */
+	processStartedAt: number;
+	recordedAt: string;
+}
+
+export function createSessionOpenData(): SessionOpenData {
+	return { pid: process.pid, processStartedAt: performance.timeOrigin, recordedAt: new Date().toISOString() };
+}
 
 /**
  * Compact projection of tool-call arguments persisted with the start marker.

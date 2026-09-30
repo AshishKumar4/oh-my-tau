@@ -12,14 +12,20 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
-import type { AsyncJobManager } from "../async";
+import { AsyncJobError, type AsyncJobManager } from "../async";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { getBundledAgent } from "../task/agents";
 import { discoverAgents, getAgent } from "../task/discovery";
 import { runSubagentFollowUpTurn } from "../task/executor";
 import type { AgentDefinition } from "../task/types";
-import { SESSION_EXIT_CUSTOM_TYPE, summarizeToolArguments, TOOL_EXECUTION_START_CUSTOM_TYPE } from "./exit-diagnostics";
+import { ASYNC_RESULT_MESSAGE_TYPE } from "./async-job-delivery";
+import {
+	SESSION_EXIT_CUSTOM_TYPE,
+	SESSION_OPEN_CUSTOM_TYPE,
+	summarizeToolArguments,
+	TOOL_EXECUTION_START_CUSTOM_TYPE,
+} from "./exit-diagnostics";
 import type { SessionEntry } from "./session-entries";
 import { SessionManager } from "./session-manager";
 
@@ -74,18 +80,33 @@ function toolCallsOf(message: AgentMessage): ToolCallBlock[] {
 	return message.content.filter((block): block is ToolCallBlock => block.type === "toolCall");
 }
 
-/** Terminal records a crash or quit leaves behind (e.g. the resume-time "exited before completing" stub). */
-function isAbortStub(message: AgentMessage): boolean {
-	return (
-		message.role === "assistant" &&
-		(message.stopReason === "aborted" || message.stopReason === "error") &&
-		toolCallsOf(message).length === 0
-	);
+function isStoppedTurn(message: AgentMessage): boolean {
+	return message.role === "assistant" && (message.stopReason === "aborted" || message.stopReason === "error");
 }
 
+/** Terminal records a crash or quit leaves behind (e.g. the resume-time "exited before completing" stub). */
+function isAbortStub(message: AgentMessage): boolean {
+	return isStoppedTurn(message) && toolCallsOf(message).length === 0;
+}
+
+/**
+ * Whether `entry` shows a process working, as opposed to one unwinding: a quit
+ * writes `session_exit` first and only then aborts, so the aborted turn and
+ * tool results it settles land after its own exit marker.
+ */
 function isActivity(entry: SessionEntry): boolean {
-	if (entry.type === "message") return !isAbortStub(entry.message);
+	if (entry.type === "message") return entry.message.role !== "toolResult" && !isStoppedTurn(entry.message);
 	return entry.type === "custom_message" || isCustom(entry, TOOL_EXECUTION_START_CUSTOM_TYPE);
+}
+
+function isOpenedByThisProcess(entry: SessionEntry): boolean {
+	return (
+		entry.type === "custom" &&
+		entry.customType === SESSION_OPEN_CUSTOM_TYPE &&
+		isRecord(entry.data) &&
+		entry.data.pid === process.pid &&
+		entry.data.processStartedAt === performance.timeOrigin
+	);
 }
 
 function truncate(text: string): string {
@@ -102,17 +123,19 @@ function describeCall(name: string, args: unknown): string {
 }
 
 /**
- * Slice of `branch` written by the process that preceded this one: entries
- * before `processStartMs`, cut at `session_exit` markers. With activity after
- * the last marker that process crashed; otherwise it is the one that ended at
- * the last marker (a quit while work was running).
+ * Slice of `branch` written by the process that preceded this one. It ends
+ * where this process opened the file (the whole branch for a parked
+ * subagent's transcript) and starts at the previous process's `session_open`
+ * marker. Files older than those markers fall back to `session_exit` markers:
+ * with activity after the last one that process crashed; otherwise it is the
+ * one that ended there, together with the records it wrote while unwinding.
  */
-function previousProcessSlice(
-	branch: readonly SessionEntry[],
-	processStartMs: number,
-): { start: number; end: number } | undefined {
-	let end = 0;
-	while (end < branch.length && Date.parse(branch[end]!.timestamp) < processStartMs) end++;
+function previousProcessSlice(branch: readonly SessionEntry[]): { start: number; end: number } | undefined {
+	let end = branch.findIndex(isOpenedByThisProcess);
+	if (end < 0) end = branch.length;
+	for (let i = end - 1; i >= 0; i--) {
+		if (isCustom(branch[i]!, SESSION_OPEN_CUSTOM_TYPE)) return { start: i + 1, end };
+	}
 	let lastExit = -1;
 	for (let i = 0; i < end; i++) if (isCustom(branch[i]!, SESSION_EXIT_CUSTOM_TYPE)) lastExit = i;
 	for (let i = lastExit + 1; i < end; i++) {
@@ -121,12 +144,12 @@ function previousProcessSlice(
 	if (lastExit < 0) return undefined;
 	let previousExit = -1;
 	for (let i = 0; i < lastExit; i++) if (isCustom(branch[i]!, SESSION_EXIT_CUSTOM_TYPE)) previousExit = i;
-	return { start: previousExit + 1, end: lastExit + 1 };
+	return { start: previousExit + 1, end };
 }
 
 function readRestartedAgents(entry: SessionEntry): InterruptedJob[] {
-	if (entry.type !== "custom" || !isRecord(entry.data) || !Array.isArray(entry.data.restarted)) return [];
-	return entry.data.restarted
+	if (entry.type !== "custom" || !isRecord(entry.data) || !Array.isArray(entry.data.agents)) return [];
+	return entry.data.agents
 		.filter(isRecord)
 		.flatMap(item =>
 			typeof item.jobId === "string" && typeof item.label === "string"
@@ -135,12 +158,9 @@ function readRestartedAgents(entry: SessionEntry): InterruptedJob[] {
 		);
 }
 
-/**
- * Find the work the previous process left interrupted on `branch`.
- * `processStartMs` separates this process's entries from earlier ones.
- */
-export function findInterruptedWork(branch: readonly SessionEntry[], processStartMs: number): InterruptedWorkScan {
-	const slice = previousProcessSlice(branch, processStartMs);
+/** Find the work the previous process left interrupted on `branch`. */
+export function findInterruptedWork(branch: readonly SessionEntry[]): InterruptedWorkScan {
+	const slice = previousProcessSlice(branch);
 	if (!slice) return { handled: false, toolCalls: [], toolCallsRepairable: false, jobs: [], agents: [] };
 	for (let i = slice.end; i < branch.length; i++) {
 		if (isCustom(branch[i]!, RECOVER_CUSTOM_TYPE)) return { handled: true };
@@ -170,7 +190,11 @@ export function findInterruptedWork(branch: readonly SessionEntry[], processStar
 			for (const agent of readRestartedAgents(entry)) start(agent);
 			continue;
 		}
-		if (entry.type === "custom_message" && entry.customType === "async-result" && isRecord(entry.details)) {
+		if (
+			entry.type === "custom_message" &&
+			entry.customType === ASYNC_RESULT_MESSAGE_TYPE &&
+			isRecord(entry.details)
+		) {
 			const jobs = entry.details.jobs;
 			if (Array.isArray(jobs))
 				for (const job of jobs) if (isRecord(job) && typeof job.jobId === "string") finish(job.jobId);
@@ -218,8 +242,10 @@ export function findInterruptedWork(branch: readonly SessionEntry[], processStar
 		}
 	}
 
+	// Only results after the turn answer it: providers can reuse tool-call ids across turns.
 	const answered = new Set<string>();
-	for (const entry of branch) {
+	for (let i = (turn?.index ?? branch.length) + 1; i < branch.length; i++) {
+		const entry = branch[i]!;
 		if (entry.type === "message" && entry.message.role === "toolResult") answered.add(entry.message.toolCallId);
 	}
 	const toolCalls = (turn?.calls ?? [])
@@ -277,10 +303,13 @@ function jobLine(job: InterruptedJob): string {
 }
 
 /** Repair a parked subagent's own transcript and describe what else it lost, for its resume prompt. */
-async function prepareSubagent(sessionFile: string, processStartMs: number): Promise<string> {
-	const manager = await SessionManager.open(sessionFile);
+async function prepareSubagent(sessionFile: string): Promise<string> {
+	const manager = await SessionManager.open(sessionFile, undefined, undefined, {
+		suppressBreadcrumb: true,
+		throwIfMissing: true,
+	});
 	try {
-		const scan = findInterruptedWork(manager.getBranch(), processStartMs);
+		const scan = findInterruptedWork(manager.getBranch());
 		if (scan.handled) return SUBAGENT_RESUME_MESSAGE;
 		if (scan.toolCallsRepairable) appendInterruptedToolResults(manager, scan.toolCalls);
 		const lost = [
@@ -295,11 +324,13 @@ async function prepareSubagent(sessionFile: string, processStartMs: number): Pro
 	}
 }
 
-async function resolveAgentDefinition(sessionFile: string, cwd: string): Promise<AgentDefinition | undefined> {
-	const name = (await SessionManager.peekSessionInit(sessionFile))?.init?.agent;
+async function resolveAgentDefinition(
+	name: string | undefined,
+	discovered: () => Promise<AgentDefinition[]>,
+): Promise<AgentDefinition | undefined> {
 	if (name) {
-		const discovered = getAgent((await discoverAgents(cwd)).agents, name) ?? getBundledAgent(name);
-		if (discovered) return discovered;
+		const agent = getAgent(await discovered(), name) ?? getBundledAgent(name);
+		if (agent) return agent;
 	}
 	return getBundledAgent("task");
 }
@@ -338,12 +369,9 @@ function count(n: number, noun: string): string {
  * Recover the previous process's interrupted work on `host`'s session. The
  * caller starts the main agent's turn with {@link RecoverOutcome.notice}.
  */
-export async function resumeInterruptedWork(
-	host: RecoverHost,
-	processStartMs: number = performance.timeOrigin,
-): Promise<RecoverOutcome> {
+export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverOutcome> {
 	const sessionManager = host.sessionManager;
-	const scan = findInterruptedWork(sessionManager.getBranch(), processStartMs);
+	const scan = findInterruptedWork(sessionManager.getBranch());
 	if (scan.handled) return { status: "handled" };
 	if (scan.toolCalls.length === 0 && scan.jobs.length === 0 && scan.agents.length === 0) {
 		return { status: "nothing" };
@@ -353,6 +381,13 @@ export async function resumeInterruptedWork(
 		appendInterruptedToolResults(sessionManager, scan.toolCalls);
 		host.agent.replaceMessages(host.buildDisplaySessionContext().messages);
 	}
+	// Recorded before the first await: a second /recover while this one is still
+	// restarting subagents, or after it throws, must not restart them again.
+	sessionManager.appendCustomEntry(RECOVER_CUSTOM_TYPE, {
+		toolCalls: scan.toolCalls.map(call => call.toolCallId),
+		jobs: scan.jobs.map(job => job.jobId),
+		agents: scan.agents,
+	});
 
 	const restarted: InterruptedJob[] = [];
 	const notResumed: string[] = [];
@@ -362,23 +397,34 @@ export async function resumeInterruptedWork(
 		await ensurePersistedRoster(registry, rootSessionFile);
 		const manager = host.asyncJobManager;
 		const artifactsDir = rootSessionFile?.slice(0, -".jsonl".length);
+		let discovery: Promise<AgentDefinition[]> | undefined;
+		const discovered = (): Promise<AgentDefinition[]> => {
+			discovery ??= discoverAgents(sessionManager.getCwd()).then(result => result.agents);
+			return discovery;
+		};
 		for (const interrupted of scan.agents) {
-			const sessionFile = registry.get(interrupted.jobId)?.sessionFile;
-			if (!sessionFile) {
+			const ref = registry.get(interrupted.jobId);
+			if (!ref?.sessionFile) {
 				notResumed.push(`${jobName(interrupted)}: its transcript was not found.`);
+				continue;
+			}
+			if (ref.session) {
+				notResumed.push(`${jobName(interrupted)}: it is already running in this session.`);
 				continue;
 			}
 			if (!manager) {
 				notResumed.push(`${jobName(interrupted)}: background jobs are disabled.`);
 				continue;
 			}
-			const message = await prepareSubagent(sessionFile, processStartMs);
-			const agent = await resolveAgentDefinition(sessionFile, sessionManager.getCwd());
-			if (!agent) {
-				notResumed.push(`${jobName(interrupted)}: its agent definition was not found.`);
-				continue;
-			}
+			const sessionFile = ref.sessionFile;
 			try {
+				const init = (await SessionManager.peekSessionInit(sessionFile))?.init;
+				const agent = await resolveAgentDefinition(init?.agent, discovered);
+				if (!agent) {
+					notResumed.push(`${jobName(interrupted)}: its agent definition was not found.`);
+					continue;
+				}
+				const message = await prepareSubagent(sessionFile);
 				manager.register(
 					"task",
 					interrupted.jobId,
@@ -388,16 +434,20 @@ export async function resumeInterruptedWork(
 							agent,
 							message,
 							description: interrupted.label,
+							outputSchema: init?.outputSchema,
+							outputSchemaMode: init?.outputSchemaMode,
 							signal,
 							artifactsDir,
 						});
-						if (result.aborted) throw new Error(`Resumed ${interrupted.jobId} was cancelled.`);
-						if (result.exitCode !== 0 || result.error) {
-							throw new Error(
-								`Resumed ${interrupted.jobId} failed: ${result.error ?? result.stderr ?? "unknown error"}`,
-							);
+						const text = result.output.trim() || `(${interrupted.jobId} finished without a report)`;
+						const structured = result.structuredOutput;
+						if (result.aborted || result.exitCode !== 0 || result.error) {
+							const reason = result.aborted
+								? "was cancelled"
+								: `failed: ${result.error ?? result.stderr ?? "unknown error"}`;
+							throw new AsyncJobError(`Resumed ${interrupted.jobId} ${reason}\n\n${text}`, structured);
 						}
-						return result.output.trim() || `(${interrupted.jobId} finished without a report)`;
+						return structured ? { text, structured } : text;
 					},
 					{ id: interrupted.jobId, agentId: interrupted.jobId, ownerId: host.getAgentId() },
 				);
@@ -407,12 +457,6 @@ export async function resumeInterruptedWork(
 			}
 		}
 	}
-
-	sessionManager.appendCustomEntry(RECOVER_CUSTOM_TYPE, {
-		toolCalls: scan.toolCalls.map(call => call.toolCallId),
-		jobs: scan.jobs.map(job => job.jobId),
-		restarted,
-	});
 
 	const sections: string[] = ["A system glitch stopped OMP. Resumed after the interruption:"];
 	if (scan.toolCalls.length > 0) {

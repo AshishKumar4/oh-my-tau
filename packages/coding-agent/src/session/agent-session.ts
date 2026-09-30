@@ -331,7 +331,9 @@ import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
 import {
 	collectPendingToolCalls,
 	createInterruptedTurnAbortMessage,
+	createSessionOpenData,
 	SESSION_EXIT_CUSTOM_TYPE,
+	SESSION_OPEN_CUSTOM_TYPE,
 	type SessionExitData,
 	summarizeToolArguments,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
@@ -2262,6 +2264,7 @@ export class AgentSession implements SettingsScope {
 		this.#watchWorkspaceAndPowerSettings();
 		this.#watchSessionSettings();
 		this.#watchModelAvailabilitySettings();
+		this.#recordSessionOpen();
 	}
 
 	/** Registers teardown to run when this session is disposed (e.g. handle listeners bound to it). */
@@ -2917,6 +2920,16 @@ export class AgentSession implements SettingsScope {
 		if (args) data.args = args;
 		if (event.intent) data.intent = event.intent;
 		this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
+	}
+
+	/** Mark where this process took over a session file with history; `/recover` splits processes at these. */
+	#recordSessionOpen(): void {
+		if (
+			!this.sessionManager.getEntries().some(entry => entry.type === "message" && entry.message.role === "assistant")
+		) {
+			return;
+		}
+		this.sessionManager.appendCustomEntry(SESSION_OPEN_CUSTOM_TYPE, createSessionOpenData());
 	}
 
 	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {
@@ -10829,6 +10842,7 @@ export class AgentSession implements SettingsScope {
 				this.#advisors.restoreCost(costs, providersBySlug);
 			}
 			this.#bash.finishSessionTransition(bashTransition, true);
+			if (switchingToDifferentSession) this.#recordSessionOpen();
 			// Keep the old reservations during rollback; the target is committed now,
 			// so the snapshotted old queues can no longer be restored.
 			this.#releaseTtsrReservations(previousSteeringMessages);
