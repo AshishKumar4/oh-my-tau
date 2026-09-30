@@ -578,6 +578,12 @@ export class AgentLifecycleManager {
 		clearTimeout(adopted.timer);
 		const timer = setTimeout(() => {
 			adopted.timer = undefined;
+			// A session waiting on its own background jobs is mid-run, not idle:
+			// parking would dispose it and cancel them. Look again after a TTL.
+			if (adopted.ref.session?.hasPendingAsyncWork()) {
+				this.#armTimer(id, adopted);
+				return;
+			}
 			void this.park(id);
 		}, adopted.idleTtlMs);
 		timer.unref?.();

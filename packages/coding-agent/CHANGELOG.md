@@ -16,6 +16,7 @@
 ### Fixed
 
 - Cache-warming refreshes cancelled or superseded after the provider accepted them now count toward session usage and cost instead of being dropped ([#13717](https://github.com/can1357/oh-my-pi/pull/13717))
+- A subagent woken by a message now delivers its result to its parent when it finishes in a later turn, for example after its own background command completes; that result used to be lost. It stays in the running-subagents list until it finishes, and an idle subagent is no longer parked while its own background jobs are still running
 
 ## [18.4.4] - 2026-09-29
 
