@@ -410,6 +410,7 @@ export class WorkPool {
 							subagentEventBus: this.session.subagentEventBus,
 							artifactsDir: this.session.getSessionFile()?.slice(0, -6),
 							maxRuntimeMs: cfgTaskMaxRuntimeMs.get(this.session.settings),
+							resultOwnerId: this.ownerId,
 						});
 					}
 				} catch (error) {

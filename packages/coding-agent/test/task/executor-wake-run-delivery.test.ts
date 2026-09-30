@@ -29,6 +29,8 @@ import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const LANE = "ProbeLane";
 const REVIEWER = "Reviewer";
+/** An agent other than `Main` that spawned the lane. */
+const LEAD = "Lead";
 
 const laneAgent: AgentDefinition = {
 	name: "task",
@@ -54,6 +56,10 @@ interface LaneOptions {
 	idleTtlMs?: number;
 	/** Running-job cap of the job manager the lane and its parent share, read at every registration. */
 	maxRunningJobs?: () => number;
+	/** The agent that spawned the lane; `Main` by default. */
+	parentId?: string;
+	/** Runs write no `<id>.md` artifact. */
+	noArtifacts?: boolean;
 }
 
 interface Lane {
@@ -159,11 +165,12 @@ function createLane(responses: MockHandler[], laneOptions: LaneOptions = {}): La
 	const registry = AgentRegistry.global();
 	registry.register({ id: MAIN_AGENT_ID, displayName: MAIN_AGENT_ID, kind: "main", session: null, status: "running" });
 	registry.register({ id: REVIEWER, displayName: REVIEWER, kind: "sub", session: null, status: "running" });
+	registry.register({ id: LEAD, displayName: LEAD, kind: "sub", session: null, status: "running" });
 	const ref = registry.register({
 		id: LANE,
 		displayName: LANE,
 		kind: "sub",
-		parentId: MAIN_AGENT_ID,
+		parentId: laneOptions.parentId ?? MAIN_AGENT_ID,
 		session,
 		status: "idle",
 	});
@@ -184,7 +191,7 @@ function createLane(responses: MockHandler[], laneOptions: LaneOptions = {}): La
 		id: LANE,
 		agent: laneAgent,
 		eventBus,
-		artifactsDir: tempDir.path(),
+		artifactsDir: laneOptions.noArtifacts ? undefined : tempDir.path(),
 		maxRuntimeMs: laneOptions.maxRuntimeMs,
 	});
 
@@ -701,7 +708,12 @@ describe("IRC wake run delivery", () => {
 		const relaysTo = captureRelays();
 
 		// The caller's job (here the test) carries the follow-up's result to the parent.
-		const followUp = runSubagentFollowUpTurn({ id: LANE, agent: laneAgent, message: "Run the probe, then report." });
+		const followUp = runSubagentFollowUpTurn({
+			id: LANE,
+			agent: laneAgent,
+			message: "Run the probe, then report.",
+			resultOwnerId: MAIN_AGENT_ID,
+		});
 		await lane.jobStarted;
 		await lane.session.waitForIdle();
 		await drainEventLoop();
@@ -792,6 +804,83 @@ describe("IRC wake run delivery", () => {
 		expect(toParent[0]).toContain("answered directly");
 		expect(relaysTo(REVIEWER)).toHaveLength(1);
 		expect(parentJobs(lane)).not.toContain(LANE);
+		filler.resolve("filler done");
+	});
+	it("does not relay a follow-up run's result to its job's owner when another agent spawned the lane", async () => {
+		const statusAnswered = Promise.withResolvers<void>();
+		const lane = createLane(
+			[
+				toolCall("background", { label: "probe" }),
+				{ content: ["Waiting for the probe."] },
+				() => {
+					statusAnswered.resolve();
+					return { content: ["The probe is still running."] };
+				},
+				toolCall("yield", { data: { report: "handoff: probe passed" } }),
+			],
+			{ parentId: LEAD },
+		);
+		const relaysTo = captureRelays();
+
+		// `Main` runs the follow-up in its own job (a `/recover` restart of a
+		// lane it had messaged): that job, not a relay, carries the result to it.
+		const followUp = runSubagentFollowUpTurn({
+			id: LANE,
+			agent: laneAgent,
+			message: "Run the probe, then report.",
+			resultOwnerId: MAIN_AGENT_ID,
+		});
+		await lane.jobStarted;
+		await lane.session.waitForIdle();
+		await drainEventLoop();
+		await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Status?" });
+		await statusAnswered.promise;
+		await lane.session.waitForIdle();
+
+		lane.finishJob("3 of 3 passed");
+		const result = await followUp;
+		expect(result.output).toContain("handoff: probe passed");
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
+	});
+
+	it("tells the lane's own parent a follow-up result that another agent's job carries", async () => {
+		const lane = createLane([toolCall("yield", { data: { report: "recovered: probe passed" } })], {
+			parentId: LEAD,
+		});
+		const relaysTo = captureRelays();
+
+		const result = await runSubagentFollowUpTurn({
+			id: LANE,
+			agent: laneAgent,
+			message: "A system glitch stopped OMP and interrupted your run.",
+			resultOwnerId: MAIN_AGENT_ID,
+		});
+		await lane.session.waitForIrcReplies();
+
+		expect(result.output).toContain("recovered: probe passed");
+		const toLead = relaysTo(LEAD);
+		expect(toLead).toHaveLength(1);
+		expect(toLead[0]).toContain("recovered: probe passed");
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
+	});
+
+	it("hands the parent the yield summary when no job can carry it and no artifact was written", async () => {
+		const lane = createLane([toolCall("yield", { data: { report: "answered without an artifact" } })], {
+			maxRunningJobs: () => 1,
+			noArtifacts: true,
+		});
+		const filler = Promise.withResolvers<string>();
+		lane.manager.register("bash", "filler", () => filler.promise, { ownerId: MAIN_AGENT_ID });
+		const relaysTo = captureRelays();
+
+		await IrcBus.global().send({ from: REVIEWER, to: LANE, body: "What did you find?" });
+		await lane.runEnded;
+		await lane.session.waitForIrcReplies();
+
+		const toParent = relaysTo(MAIN_AGENT_ID);
+		expect(toParent).toHaveLength(1);
+		expect(toParent[0]).toContain("answered without an artifact");
+		expect(toParent[0]).not.toContain("produced no output");
 		filler.resolve("filler done");
 	});
 });

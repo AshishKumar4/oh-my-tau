@@ -335,6 +335,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			eventBus: this.session.eventBus,
 			subagentEventBus: this.session.subagentEventBus,
 			artifactsDir: this.session.getSessionFile()?.slice(0, -6),
+			resultOwnerId: this.#leadId(),
 		});
 	}
 
