@@ -287,8 +287,8 @@ cat <<EOF
 Done. $("$OMP" --version) installed, $FOUND capture(s) in $CACHE_DIR
 
 Models post-trained on Claude Code (Opus 5, Fable 5.1) and Codex (GPT-6 Astra,
-GPT-5.6 Sol) now receive that client's system prompt, tool names, and prompt-cache
-framing. Every other model is untouched.
+GPT-6.1 Sol, GPT-6 Sol, GPT-6 Luna, GPT-5.6 Sol) now receive that client's system
+prompt, tool names, and prompt-cache framing. Every other model is untouched.
 
 Re-run this script after upgrading Claude Code or Codex to refresh the captures;
 they are keyed by client version, and an older capture keeps serving until then.

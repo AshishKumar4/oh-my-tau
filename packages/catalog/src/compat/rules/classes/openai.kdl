@@ -49,12 +49,13 @@ class "openai" {
 	// imposed by the Codex route, so the same lineage on another host keeps
 	// omp's native surface.
 	//
-	// Exact ids on purpose: the advertised surface varies per SKU (Astra adds a
-	// `clock` namespace and `request_user_input_async`; Sol has neither), so a
-	// revision range would impersonate SKUs whose surface nobody has captured.
-	// Widen one id at a time as each is verified against a real client request.
+	// Exact ids on purpose: the advertised surface varies per SKU (the GPT-6
+	// SKUs add a `clock` namespace and `request_user_input_async`; GPT-5.6 Sol
+	// has neither), so a revision range would impersonate SKUs whose surface
+	// nobody has captured. Widen one id at a time as each is verified against a
+	// real client request.
 	on-api "openai-codex-responses" {
-		models "gpt-6-astra" "gpt-5.6-sol" {
+		models "gpt-6-astra" "gpt-6.1-sol" "gpt-6-sol" "gpt-6-luna" "gpt-5.6-sol" {
 			harness-profile "codex"
 		}
 	}

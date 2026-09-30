@@ -1395,7 +1395,7 @@ describe("Responses Lite remote compaction", () => {
 	// parallel_tool_calls, so independent tools can run in one turn. A profiled
 	// turn sends codex-cli's envelope instead: the base prompt as the leading
 	// developer message, tool_choice "auto" and parallel_tool_calls false
-	// (ai/test/fixtures/harness/codex-0.159.0.golden.json, vendorFraming.envelope).
+	// (ai/test/fixtures/harness/codex-0.159.2.golden.json, vendorFraming.envelope).
 	test.each([
 		[
 			"native surface",

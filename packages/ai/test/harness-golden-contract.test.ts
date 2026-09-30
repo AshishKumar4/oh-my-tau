@@ -9,11 +9,11 @@ import { buildTransformedCodexRequestBody } from "@oh-my-pi/pi-ai/providers/open
 import type { Context, Tool } from "@oh-my-pi/pi-ai/types";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { CODEX_CLIENT_VERSION } from "@oh-my-pi/pi-catalog/wire/codex";
+import { CODEX_BASE_URL, CODEX_CLIENT_VERSION } from "@oh-my-pi/pi-catalog/wire/codex";
 import { isRecord } from "@oh-my-pi/pi-utils";
-import { withOfficialAnthropicEndpoint } from "./helpers";
+import { createCodexModel, withOfficialAnthropicEndpoint } from "./helpers";
 import claudeCodeGoldenJson from "./fixtures/harness/claude-code-2.1.284.golden.json" with { type: "json" };
-import codexGoldenJson from "./fixtures/harness/codex-0.159.0.golden.json" with { type: "json" };
+import codexGoldenJson from "./fixtures/harness/codex-0.159.2.golden.json" with { type: "json" };
 import {
 	anthropicDeclarations,
 	anthropicFraming,
@@ -138,9 +138,11 @@ async function claudeCodeRequest(modelId: string): Promise<Record<string, unknow
 	return payload;
 }
 
+// Built as Codex discovery builds it: sessions receive Codex models from the live
+// `/models` listing, which carries SKUs the bundled catalog lacks (gpt-6.1-sol).
 function codexRequest(modelId: string): Promise<Record<string, unknown>> {
 	return buildTransformedCodexRequestBody(
-		getBundledModel<"openai-codex-responses">("openai-codex", modelId),
+		createCodexModel(modelId, { baseUrl: CODEX_BASE_URL }),
 		harnessContext(CODEX_TOOLS),
 		{ reasoning: Effort.High, textVerbosity: "low", include: ["reasoning.encrypted_content"] },
 	);
