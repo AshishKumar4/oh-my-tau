@@ -22,7 +22,7 @@ import { throwIfAborted } from "./tool-errors";
 import { cfgLaunchEnabled } from "./settings";
 
 const waitSchema = type({});
-const WAIT_MAX_MS = 30 * 60_000;
+const WAIT_MAX_MS = 2 * 60 * 60_000;
 const PROGRESS_INTERVAL_MS = 500;
 /** Running peers named in a no-message result before collapsing the rest into a count. */
 const MESSAGE_WAIT_PEER_PREVIEW = 5;

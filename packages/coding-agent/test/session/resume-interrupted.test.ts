@@ -19,7 +19,7 @@ import {
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import * as executor from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import type { SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "../helpers/agent-session-setup";
 
@@ -101,6 +101,12 @@ function revived(manager: SessionManager, to: string): void {
 	);
 }
 
+/** A successful `yield` call and the result the yield tool records for it. */
+function yielded(manager: SessionManager, id: string, args: { data?: unknown; type?: string | string[] }): void {
+	manager.appendMessage(toolTurn({ id, name: "yield", args }));
+	manager.appendMessage(toolResult(id, "yield", { status: "success", ...args }));
+}
+
 /** Lets entry timestamps (ms resolution) tell writes apart. */
 function tick(): Promise<void> {
 	return Bun.sleep(5);
@@ -170,12 +176,28 @@ describe("/recover", () => {
 		return file;
 	}
 
-	function deliveries(jobs: AsyncJobManager): Array<{ id: string; text: string }> {
-		const delivered: Array<{ id: string; text: string }> = [];
-		jobs.registerDeliverySink("Main", (id, text) => {
-			delivered.push({ id, text });
+	function deliveries(
+		jobs: AsyncJobManager,
+	): Array<{ id: string; text: string; status?: string; structured?: StructuredSubagentOutput }> {
+		const delivered: Array<{ id: string; text: string; status?: string; structured?: StructuredSubagentOutput }> = [];
+		jobs.registerDeliverySink("Main", (id, text, job) => {
+			delivered.push({ id, text, status: job?.status, structured: job?.structured });
 		});
 		return delivered;
+	}
+
+	/** Runs `/recover` with restarts mocked; returns its outcome, the restarted ids, and what reached `Main`. */
+	async function recover(jobs = new AsyncJobManager({ retentionMs: 0 })) {
+		const delivered = deliveries(jobs);
+		const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockResolvedValue(singleResult("report"));
+		const outcome = await resumeInterruptedWork(host(jobs));
+		await jobs.waitForAll();
+		await jobs.drainDeliveries({ timeoutMs: 1000 });
+		if (outcome.status !== "resumed") throw new Error(`expected resumed, got ${outcome.status}`);
+		const restartedIds = followUp.mock.calls.map(([options]) => options.id);
+		followUp.mockRestore();
+		await jobs.dispose();
+		return { outcome, restartedIds, delivered };
 	}
 
 	it("gives a crash-interrupted tool call a glitch result and keeps it in context", async () => {
@@ -626,8 +648,7 @@ describe("/recover", () => {
 		ircFrom(manager, "Lane", "Waiting for the probe.", { wakeRelay: true });
 		await tick();
 		lane.appendCustomMessageEntry("async-result", "3 of 3 passed", true, { jobs: [{ jobId: "bg_1", type: "bash" }] });
-		lane.appendMessage(toolTurn({ id: "y", name: "yield", args: { data: { report: "probe passed: 3 of 3" } } }));
-		lane.appendMessage(toolResult("y", "yield"));
+		yielded(lane, "y", { data: { report: "probe passed: 3 of 3" } });
 		const laneFile = await parked("Lane", lane);
 		manager.appendMessage(createAssistantMessage("waiting on Lane"));
 		openedBy(manager, "this");
@@ -818,5 +839,182 @@ describe("/recover", () => {
 		const scan = findInterruptedWork(manager.getBranch());
 
 		expect(!scan.handled && [...scan.agents, ...scan.jobs]).toEqual([]);
+	});
+	it("restarts a subagent the crash cut off between its tool results and its next response", async () => {
+		const lane = laneSession();
+		revived(manager, "Lane");
+		ircFrom(lane, "Main", "Fix the build.");
+		// Every call is answered, but the loop was about to sample again on these results.
+		lane.appendMessage(toolTurn({ id: "read", name: "read", args: { path: "build.ts" } }));
+		lane.appendMessage(toolResult("read", "read"));
+		await parked("Lane", lane);
+		manager.appendMessage(createAssistantMessage("waiting on Lane"));
+		openedBy(manager, "this");
+
+		const { outcome, restartedIds } = await recover();
+
+		expect(restartedIds).toEqual(["Lane"]);
+		expect(outcome.restarted.map(agent => agent.jobId)).toEqual(["Lane"]);
+	});
+
+	it("restarts a subagent whose last turn paused rather than ended", async () => {
+		const lane = laneSession();
+		revived(manager, "Lane");
+		ircFrom(lane, "Main", "Fix the build.");
+		lane.appendMessage({
+			...createAssistantMessage("Checking the build config next."),
+			stopDetails: { type: "pause_turn" },
+		});
+		await parked("Lane", lane);
+		manager.appendMessage(createAssistantMessage("waiting on Lane"));
+		openedBy(manager, "this");
+
+		const { outcome, restartedIds, delivered } = await recover();
+
+		expect(restartedIds).toEqual(["Lane"]);
+		expect(outcome.recovered).toEqual([]);
+		expect(delivered.map(item => item.id)).toEqual(["Lane"]);
+		expect(delivered[0]?.text).toBe("report");
+	});
+
+	it("delivers a recovered report again when the previous recovery's delivery never reached the journal", async () => {
+		const lost = laneSession();
+		const landed = laneSession();
+		for (const [id, lane] of [
+			["Lost", lost],
+			["Landed", landed],
+		] as const) {
+			revived(manager, id);
+			ircFrom(lane, "Main", "Report your findings.");
+			yielded(lane, `${id}_y`, { data: { report: `${id} findings` } });
+			await parked(id, lane);
+		}
+		await tick();
+		// The previous process ran /recover, then crashed: only Landed's result made it into the journal.
+		openedBy(manager, 101);
+		const first = await recover();
+		expect(first.outcome.recovered.map(agent => agent.jobId)).toEqual(["Lost", "Landed"]);
+		manager.appendCustomMessageEntry("async-result", "Landed findings", true, {
+			jobs: [{ jobId: "Landed", type: "task" }],
+		});
+		manager.appendMessage(createAssistantMessage("reading the recovered results"));
+		openedBy(manager, "this");
+
+		const { outcome, restartedIds, delivered } = await recover();
+
+		expect(restartedIds).toEqual([]);
+		expect(outcome.recovered.map(agent => agent.jobId)).toEqual(["Lost"]);
+		expect(delivered.map(item => item.id)).toEqual(["Lost"]);
+		expect(delivered[0]?.text).toContain("Lost findings");
+	});
+
+	it("recovers a sectioned yield's assembled result and its structured output", async () => {
+		const lane = laneSession();
+		lane.appendSessionInit({
+			systemPrompt: "reviewer prompt",
+			task: "review",
+			tools: ["read", "yield"],
+			agent: "reviewer",
+			outputSchema: {
+				properties: { findings: { type: "array", items: { type: "string" } }, verdict: { type: "string" } },
+			},
+		});
+		revived(manager, "Lane");
+		ircFrom(lane, "Main", "Review the fix.");
+		yielded(lane, "s1", { type: ["findings"], data: "P1: the cache key ignores the locale" });
+		yielded(lane, "s2", { type: ["verdict"], data: "incorrect" });
+		// The data-less finalize keeps the sections as the result.
+		yielded(lane, "done", { type: "result" });
+		await parked("Lane", lane);
+		manager.appendMessage(createAssistantMessage("waiting on the review"));
+		openedBy(manager, "this");
+
+		const { outcome, delivered } = await recover();
+
+		expect(outcome.recovered.map(agent => agent.jobId)).toEqual(["Lane"]);
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]?.text).toContain("P1: the cache key ignores the locale");
+		expect(delivered[0]?.text).toContain('"verdict": "incorrect"');
+		expect(delivered[0]?.text).not.toContain('"type": "result"');
+		expect(delivered[0]?.structured).toMatchObject({
+			status: "valid",
+			data: { findings: ["P1: the cache key ignores the locale"], verdict: "incorrect" },
+		});
+	});
+
+	it("keeps the original start of subagents a /recover cut off before it recorded an outcome", async () => {
+		const lane = laneSession();
+		const legacy = laneSession();
+		const laneStart = Date.now();
+		revived(manager, "Lane");
+		revived(manager, "Legacy");
+		for (const [id, session] of [
+			["Lane", lane],
+			["Legacy", legacy],
+		] as const) {
+			ircFrom(session, "Main", "Report your findings.");
+			yielded(session, `${id}_y`, { data: { report: `${id} findings` } });
+			await parked(id, session);
+		}
+		await tick();
+		// The previous process's /recover crashed before its outcome; an older binary recorded no start for Legacy.
+		openedBy(manager, 101);
+		manager.appendCustomEntry(RECOVER_CUSTOM_TYPE, {
+			toolCalls: [],
+			jobs: [],
+			agents: [
+				{ jobId: "Lane", type: "task", label: "Lane", startedAt: laneStart },
+				{ jobId: "Legacy", type: "task", label: "Legacy" },
+			],
+		});
+		manager.appendMessage(createAssistantMessage("recovering"));
+		openedBy(manager, "this");
+
+		const { outcome, restartedIds, delivered } = await recover();
+
+		expect(restartedIds).toEqual([]);
+		expect(outcome.recovered.map(agent => agent.jobId)).toEqual(["Lane", "Legacy"]);
+		expect(delivered.map(item => item.text)).toEqual([
+			expect.stringContaining("Lane findings"),
+			expect.stringContaining("Legacy findings"),
+		]);
+	});
+
+	it("does not count work a fork child inherited from its parent as its own", async () => {
+		manager.appendMessage(toolTurn({ id: "spawn", name: "task", args: { tasks: [] } }));
+		manager.appendMessage(
+			toolResult("spawn", "task", {
+				async: { state: "running", jobId: "Fork", type: "task" },
+				progress: [{ id: "Fork", status: "running" }],
+			}),
+		);
+		const child = laneSession();
+		// The fork copies the parent's history, running background job and live spawn included.
+		child.appendMessage(toolTurn({ id: "serve", name: "bash", args: { command: "bun run serve" } }), {
+			inherited: true,
+		});
+		child.appendMessage(toolResult("serve", "bash", { async: { state: "running", jobId: "bg_1", type: "bash" } }), {
+			inherited: true,
+		});
+		child.appendMessage(toolTurn({ id: "spawn", name: "task", args: { tasks: [] } }), { inherited: true });
+		child.appendMessage(
+			toolResult("spawn", "task", {
+				async: { state: "running", jobId: "Fork", type: "task" },
+				progress: [{ id: "Fork", status: "running" }],
+			}),
+			{ inherited: true },
+		);
+		child.appendSessionInit({ systemPrompt: "fork prompt", task: "check the docs", tools: ["read"], agent: "task" });
+		child.appendMessage({ role: "user", content: "Check the docs.", timestamp: Date.now() });
+		yielded(child, "y", { data: { report: "the docs are fine" } });
+		await parked("Fork", child);
+		manager.appendMessage(createAssistantMessage("waiting on Fork"));
+		openedBy(manager, "this");
+
+		const { outcome, restartedIds, delivered } = await recover();
+
+		expect(restartedIds).toEqual([]);
+		expect(outcome.recovered.map(agent => agent.jobId)).toEqual(["Fork"]);
+		expect(delivered[0]?.text).toContain("the docs are fine");
 	});
 });

@@ -630,6 +630,9 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 		if (shadowCell && (source.filename || source.packages?.length || source.environment)) {
 			await shadowCell.discard("file-backed or environment-changing eval requires authoritative execution");
 		}
+		const autoBgManager = session.asyncJobManager;
+		const autoBackgroundEligible =
+			cfgEvalAutoBackgroundEnabled.get(session.settings) && autoBgManager !== undefined && !autoBgManager.atCapacity;
 		const cells: ResolvedEvalCell[] = [
 			{
 				index: 0,
@@ -639,7 +642,7 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 				environmentChange: source.environment !== undefined,
 				environment:
 					source.environment ?? (this.#environmentModes[cellLanguage] === "project" ? "project" : undefined),
-				timeoutMs: cellTimeoutMs,
+				timeoutMs: params.timeout === undefined && autoBackgroundEligible ? 0 : cellTimeoutMs,
 				reset: params.reset ?? false,
 				resolved,
 			},
@@ -689,10 +692,9 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 			return session.trackEvalExecution?.(execution, sessionAbortController) ?? execution;
 		};
 
-		const autoBgManager = session.asyncJobManager;
 		// At the running-job cap, fall through to direct foreground execution
 		// instead of failing every eval call until a slot frees up.
-		if (!cfgEvalAutoBackgroundEnabled.get(session.settings) || !autoBgManager || autoBgManager.atCapacity) {
+		if (!autoBackgroundEligible || !autoBgManager) {
 			return await run(signal, emitToolUpdate);
 		}
 

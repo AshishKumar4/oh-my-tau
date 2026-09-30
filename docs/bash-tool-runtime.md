@@ -27,7 +27,7 @@ Set `bash.enabled: false` in settings to remove the model-facing `bash` tool fro
 - validates optional `env` names against shell-variable syntax,
 - extracts a leading single-line `cd <path> && ...` into `cwd` when `cwd` was not supplied, unless the path needs shell expansion,
 - rejects `async: true` when `async.enabled` is false,
-- defaults `timeout` to 300 seconds; `0` explicitly disables the command deadline.
+- defaults foreground-only `timeout` to 300 seconds; explicit background starts and eligible auto-background runs have no default deadline; `0` explicitly disables the command deadline.
 
 There are no structured `head` or `tail` parameters. Command text is never rewritten for internal URLs. The embedded shell and its in-process coreutils resolve `scheme://` paths through an injected async filesystem (`InternalUrlFilesystem`) at the moment of each operation, so URLs built from variables, redirections, globs, `cd`, and a URL `cwd` all work. File-backed schemes operate on their backing files; rendered resources are read-only; external programs never see virtual paths and cannot start in a virtual working directory. `xargs`, `find -exec`/`-execdir`, and `ifne` run their commands through the shell's own dispatch in a subshell, so `… | xargs cat` reaches the in-process `cat` and its URL arguments. The configured direnv/devenv preflight can then merge project environment changes, with explicit `env` values taking precedence.
 
@@ -81,7 +81,7 @@ Default rule patterns (defined in code) target common misuses:
 - missing path -> `ToolError("Working directory does not exist: ...")`
 - non-directory -> `ToolError("Working directory is not a directory: ...")`
 
-The default timeout is 300 seconds. `timeout: 0` disables the deadline. Other values are clamped to `[1, 3600]` seconds and by a positive `tools.maxTimeout` ceiling; a clamp notice and both requested/resolved values are recorded when they differ.
+Foreground-only calls default to 300 seconds. Explicit background starts and eligible auto-background runs have no deadline when the caller omits `timeout`; this is decided before execution so no default timer survives promotion to the background. `timeout: 0` also disables the deadline. Explicit nonzero values apply in every mode and are clamped to `[1, 3600]` seconds and by a positive `tools.maxTimeout` ceiling; a clamp notice and both requested/resolved values are recorded when they differ.
 
 ## 4) Artifact allocation
 

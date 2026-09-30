@@ -1137,14 +1137,31 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			};
 		}
 
-		// A timeout of 0 is an explicit long-running-command contract: the user
-		// must still cancel the call or job, but OMP does not impose a deadline.
-		const requestedTimeoutSec = rawTimeout ?? 300;
-		const timeoutDisabled = requestedTimeoutSec === 0;
+		// The client-bridge terminal provides a live terminal card in the editor;
+		// when available it wins over auto-backgrounding.
+		const clientBridge = asyncRequested ? undefined : this.session.getClientBridge?.();
+		const bridgeTerminalAvailable = Boolean(
+			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && virtualCwd === undefined,
+		);
+		const autoBgManager = this.session.asyncJobManager;
+		const autoBackgroundEligible =
+			!asyncRequested &&
+			cfgBashAutoBackgroundEnabled.get(this.session.settings) &&
+			!pty &&
+			!bridgeTerminalAvailable &&
+			autoBgManager !== undefined &&
+			!autoBgManager.atCapacity;
+
+		// A managed run may background after starting; do not hand its executor
+		// a default deadline that would survive that promotion. Explicit 0 also
+		// disables the deadline, while caller-supplied nonzero limits still apply.
+		const requestedTimeoutSec =
+			rawTimeout ?? (asyncRequested || autoBackgroundEligible ? undefined : TOOL_TIMEOUTS.bash.default);
+		const timeoutDisabled = requestedTimeoutSec === undefined || requestedTimeoutSec === 0;
 		const maxTimeout = cfgToolsMaxTimeout.get(this.session.settings);
 		const timeoutSec = timeoutDisabled ? undefined : clampTimeout("bash", requestedTimeoutSec, maxTimeout);
 		const timeoutMs = timeoutSec === undefined ? undefined : timeoutSec * 1000;
-		if (timeoutSec !== undefined) {
+		if (requestedTimeoutSec !== undefined && timeoutSec !== undefined) {
 			const timeoutClampNotice = formatTimeoutClampNotice(requestedTimeoutSec, timeoutSec, maxTimeout);
 			if (timeoutClampNotice) pendingNotices.push(timeoutClampNotice);
 		}
@@ -1170,24 +1187,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			});
 		}
 
-		// The client-bridge terminal provides a live terminal card in the editor;
-		// when available it wins over auto-backgrounding (both are opt-in, and
-		// auto-background would otherwise silently disable the terminal route).
-		const clientBridge = this.session.getClientBridge?.();
-		const bridgeTerminalAvailable = Boolean(
-			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && virtualCwd === undefined,
-		);
-
-		const autoBgManager = this.session.asyncJobManager;
 		// At the running-job cap, fall through to direct foreground execution
 		// instead of failing every bash call until a slot frees up.
-		if (
-			cfgBashAutoBackgroundEnabled.get(this.session.settings) &&
-			!pty &&
-			!bridgeTerminalAvailable &&
-			autoBgManager &&
-			!autoBgManager.atCapacity
-		) {
+		if (autoBackgroundEligible && autoBgManager) {
 			const autoBackgroundWaitMs = resolveAutoBackgroundWaitMs(
 				Math.floor(cfgBashAutoBackgroundThresholdMs.get(this.session.settings)),
 				timeoutMs,

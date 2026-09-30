@@ -250,7 +250,7 @@ export const CLAUDE_CODE_SURFACE_EDITS: readonly SurfaceEdit[] = [
 		id: "bash.timeout",
 		target: "Bash",
 		line: "- `timeout` is in milliseconds",
-		replace: `- \`timeout\` is in milliseconds: default ${BASH_TIMEOUT_DEFAULT_MS}, max ${BASH_TIMEOUT_MAX_MS}.`,
+		replace: `- \`timeout\` is in milliseconds: default ${BASH_TIMEOUT_DEFAULT_MS}, max ${BASH_TIMEOUT_MAX_MS}. Foreground-only calls use this default; background commands without an explicit timeout have no deadline.`,
 	},
 	{
 		id: "bash.timeout-schema",
