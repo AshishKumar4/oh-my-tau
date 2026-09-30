@@ -9,6 +9,7 @@ import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-b
 import type { AgentSession, FreshSessionResult, HandoffResult } from "../session/agent-session";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
 import { buildReplanTitleContext, USER_INTERRUPT_LABEL } from "../session/messages";
+import { RECOVER_IDLE_TEXT, RECOVER_CUSTOM_TYPE, resumeInterruptedWork } from "../session/resume-interrupted";
 import { resolveResumableSession } from "../session/session-listing";
 import { toggleSessionPin } from "../session/session-pins";
 import {
@@ -528,6 +529,49 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				runtime.ctx.showStatus("Nothing to retry");
 			}
 			clearSubmittedText(runtime);
+		},
+	},
+	{
+		name: "recover",
+		icon: "restart",
+		description: "Recover work a crash or quit interrupted: tool calls, background jobs, and subagents",
+		handle: async (_command, runtime) => {
+			if (runtime.session.isStreaming) {
+				return usage("Wait for the current response to finish or abort it before resuming.", runtime);
+			}
+			const outcome = await resumeInterruptedWork(runtime.session);
+			if (outcome.status !== "resumed") return usage(RECOVER_IDLE_TEXT[outcome.status], runtime);
+			await runtime.output(outcome.summary);
+			// Dispatched without awaiting, like `/retry`: hosts whose prompt turn owns
+			// the event subscription keep it open across the turn below.
+			void runtime.session
+				.sendCustomMessage(
+					{ customType: RECOVER_CUSTOM_TYPE, content: outcome.notice, display: true, attribution: "user" },
+					{ triggerTurn: true },
+				)
+				.catch(error => logger.warn("/recover could not start the resumed turn", { error: errorMessage(error) }));
+			await runtime.keepTurnOpenUntilIdle?.();
+			return commandConsumed({ agentInvoked: true });
+		},
+		handleTui: async (_command, runtime) => {
+			clearSubmittedText(runtime);
+			const session = runtime.ctx.session;
+			if (session.isStreaming) {
+				runtime.ctx.showWarning("Wait for the current response to finish or abort it before resuming.");
+				return;
+			}
+			const outcome = await resumeInterruptedWork(session);
+			if (outcome.status !== "resumed") {
+				runtime.ctx.showStatus(RECOVER_IDLE_TEXT[outcome.status]);
+				return;
+			}
+			runtime.ctx.showStatus(outcome.summary);
+			void session
+				.sendCustomMessage(
+					{ customType: RECOVER_CUSTOM_TYPE, content: outcome.notice, display: true, attribution: "user" },
+					{ triggerTurn: true },
+				)
+				.catch(error => runtime.ctx.showError(`/recover could not start the resumed turn: ${errorMessage(error)}`));
 		},
 	},
 	{
