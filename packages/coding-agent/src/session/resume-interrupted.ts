@@ -16,13 +16,15 @@
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { StructuredSubagentOutput, YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { getBundledAgent, resolveRetiredAgentName } from "../task/agents";
 import { discoverAgents, getAgent } from "../task/discovery";
-import { runSubagentFollowUpTurn } from "../task/executor";
+import { finalizeSubprocessOutput, runSubagentFollowUpTurn } from "../task/executor";
+import { type SubprocessToolEvent, subprocessToolRegistry } from "../task/subprocess-tool-registry";
 import type { AgentDefinition } from "../task/types";
 import type { EventBus } from "../utils/event-bus";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "./async-job-delivery";
@@ -33,7 +35,7 @@ import {
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 } from "./exit-diagnostics";
 import type { SessionEntry } from "./session-entries";
-import { SessionManager } from "./session-manager";
+import { type PersistedSessionInit, SessionManager } from "./session-manager";
 
 /**
  * Custom type of the entry recording one `/recover` run (idempotency and audit),
@@ -43,8 +45,9 @@ export const RECOVER_CUSTOM_TYPE = "recover";
 
 /**
  * Custom type of the entry a `/recover` run appends once it has handled its
- * subagents: which of them it restarted, so a later scan counts only those as
- * started again.
+ * subagents: which of them it restarted and whose report it delivered, so a
+ * later scan counts only those as still pending until the parent's journal
+ * shows their results.
  */
 export const RECOVER_OUTCOME_CUSTOM_TYPE = "recover_outcome";
 
@@ -67,7 +70,7 @@ export interface InterruptedJob {
 	jobId: string;
 	type: "bash" | "eval" | "task";
 	label: string;
-	/** When the parent last started it, in epoch ms (subagents only). */
+	/** When the parent last started it, in epoch ms (subagents only); unknown for legacy records. */
 	startedAt?: number;
 }
 
@@ -181,33 +184,50 @@ function entryTime(entry: SessionEntry): number {
 	return Date.parse(entry.timestamp);
 }
 
-function agentsOf(value: unknown, startedAt: number): InterruptedJob[] {
+/**
+ * Subagent records of a `/recover` entry, started at `restartedAt` when given,
+ * else when the parent last started them before it (unknown for legacy
+ * records, and for bare ids an older outcome wrote).
+ */
+function agentsOf(value: unknown, restartedAt?: number): InterruptedJob[] {
 	if (!Array.isArray(value)) return [];
-	return value
-		.filter(isRecord)
-		.flatMap(item =>
-			typeof item.jobId === "string" && typeof item.label === "string"
-				? [{ jobId: item.jobId, type: "task" as const, label: item.label, startedAt }]
-				: [],
-		);
+	return value.flatMap(item => {
+		if (typeof item === "string")
+			return [{ jobId: item, type: "task" as const, label: item, startedAt: restartedAt }];
+		if (!isRecord(item) || typeof item.jobId !== "string" || typeof item.label !== "string") return [];
+		const startedAt = restartedAt ?? (typeof item.startedAt === "number" ? item.startedAt : undefined);
+		return [{ jobId: item.jobId, type: "task" as const, label: item.label, startedAt }];
+	});
 }
 
 /**
- * The subagents the `/recover` run recorded at `branch[index]` restarted: those
- * its outcome entry lists, or every one it considered when it never recorded
- * an outcome (an older run, or one cut off while restarting).
+ * The subagents the `/recover` run recorded at `branch[index]` left pending:
+ * those it restarted (started again then) and those whose report it delivered
+ * (still owed until the parent's journal shows the result), per its outcome
+ * entry; or every one it considered, as started when the parent last started
+ * them, when it never recorded an outcome (an older run, or one cut off while
+ * restarting).
  */
-function restartedBy(branch: readonly SessionEntry[], index: number, end: number): InterruptedJob[] {
+function pendingAfterRecover(branch: readonly SessionEntry[], index: number, end: number): InterruptedJob[] {
 	const entry = branch[index]!;
 	if (entry.type !== "custom" || !isRecord(entry.data)) return [];
 	for (let i = index + 1; i < end; i++) {
 		const next = branch[i]!;
 		if (isCustom(next, RECOVER_CUSTOM_TYPE)) break;
 		if (next.type === "custom" && next.customType === RECOVER_OUTCOME_CUSTOM_TYPE && isRecord(next.data)) {
-			return agentsOf(next.data.restarted, entryTime(entry));
+			return [...agentsOf(next.data.restarted, entryTime(entry)), ...agentsOf(next.data.recovered)];
 		}
 	}
-	return agentsOf(entry.data.agents, entryTime(entry));
+	return agentsOf(entry.data.agents);
+}
+
+/**
+ * Where a transcript's own work starts: after its first `session_init`. A
+ * fork child's journal opens with the parent's history copied in (with fresh
+ * timestamps); that work, jobs and yields included, is the parent's.
+ */
+function ownedStart(branch: readonly SessionEntry[]): number {
+	return branch.findIndex(entry => entry.type === "session_init") + 1;
 }
 
 /** Records of jobs a `wait`, `jobs`, `cancel` or `proc://` result reports, top-level or under `proc`. */
@@ -253,7 +273,7 @@ function scanWork(
 	for (let i = from; i < to; i++) {
 		const entry = branch[i]!;
 		if (isCustom(entry, RECOVER_CUSTOM_TYPE)) {
-			for (const agent of restartedBy(branch, i, to)) start(agent);
+			for (const agent of pendingAfterRecover(branch, i, to)) start(agent);
 			continue;
 		}
 		if (
@@ -341,9 +361,9 @@ export function findInterruptedWork(branch: readonly SessionEntry[]): Interrupte
 		if (isCustom(branch[i]!, RECOVER_CUSTOM_TYPE)) return { handled: true };
 	}
 	// A /recover run inside the slice already recovered everything before it;
-	// only the subagents it restarted carry over as work that may be cut off again.
-	let scanStart = slice.start;
-	for (let i = slice.start; i < slice.end; i++) if (isCustom(branch[i]!, RECOVER_CUSTOM_TYPE)) scanStart = i;
+	// only the subagents it left pending carry over.
+	let scanStart = Math.max(slice.start, ownedStart(branch));
+	for (let i = scanStart; i < slice.end; i++) if (isCustom(branch[i]!, RECOVER_CUSTOM_TYPE)) scanStart = i;
 	const { turn, open } = scanWork(branch, scanStart, slice.end);
 
 	// Only results after the turn answer it: providers can reuse tool-call ids across turns.
@@ -394,9 +414,15 @@ export function findInterruptedWork(branch: readonly SessionEntry[]): Interrupte
 	};
 }
 
-/** A finished subagent's last report: its final `yield`, or else the text it last answered with. */
+/**
+ * A finished subagent's last report: its run's result as the executor
+ * finalizes it from the run's yields, or else the text it last answered with.
+ */
 interface SubagentReport {
 	text: string;
+	structured?: StructuredSubagentOutput;
+	/** Set when the finalized result is a failure (schema violation, aborted yield). */
+	error?: string;
 	/** When it was written, epoch ms. */
 	at: number;
 	yielded: boolean;
@@ -406,6 +432,9 @@ interface SubagentReport {
 
 /** How a subagent's own transcript left it when the previous process ended. */
 type SubagentState = { status: "interrupted" } | { status: "finished"; report: SubagentReport | undefined };
+
+/** The output contract a subagent's result is finalized against. */
+type OutputContract = Pick<PersistedSessionInit, "outputSchema" | "outputSchemaMode"> | null | undefined;
 
 function isPrompt(entry: SessionEntry): boolean {
 	if (entry.type === "message") return entry.message.role === "user" || entry.message.role === "developer";
@@ -423,26 +452,129 @@ function textOf(message: AgentMessage): string {
 		.trim();
 }
 
+/** A `yield` call and its recorded result, as the executor's yield handler reads them. */
+function yieldEvent(call: ToolCallBlock, result: ToolResultMessage): SubprocessToolEvent {
+	return {
+		toolName: call.name,
+		toolCallId: call.id,
+		args: call.arguments,
+		result: { content: result.content, details: result.details },
+		isError: result.isError,
+	};
+}
+
+/**
+ * Whether the agent loop stops after `message` instead of sampling again: a
+ * text-only `stop` that is not a `pause_turn`, or a tool turn a terminal
+ * `yield` ended. A tool turn whose calls are merely answered is not an end:
+ * the loop runs another inference on those results.
+ */
+function endsRun(message: AgentMessage, results: ReadonlyMap<string, ToolResultMessage>): boolean {
+	if (message.role !== "assistant") return false;
+	const calls = toolCallsOf(message);
+	if (calls.length === 0) return message.stopReason === "stop" && message.stopDetails?.type !== "pause_turn";
+	const handler = subprocessToolRegistry.getHandler("yield");
+	return calls.some(call => {
+		const result = results.get(call.id);
+		if (call.name !== "yield" || !result || result.isError) return false;
+		return handler?.shouldTerminate?.(yieldEvent(call, result)) ?? true;
+	});
+}
+
+/**
+ * The report of the run in `branch[from..end)`: its yields folded and
+ * validated by {@link finalizeSubprocessOutput} exactly as the executor
+ * finalizes a live run (sections, data-less finalizes, last-turn results,
+ * aborted yields), or else the text its last turn answered with.
+ */
+function runReport(
+	branch: readonly SessionEntry[],
+	from: number,
+	end: number,
+	results: ReadonlyMap<string, ToolResultMessage>,
+	contract: OutputContract,
+	promptedAt: number | undefined,
+): SubagentReport | undefined {
+	const handler = subprocessToolRegistry.getHandler("yield");
+	const items: YieldItem[] = [];
+	let yieldedAt = 0;
+	// As the run monitor tracks it: the latest report turn's text, dropped by a
+	// turn that started more work.
+	let reportTurnText: string | undefined;
+	let lastAnswer: { text: string; at: number } | undefined;
+	for (let i = from; i < end; i++) {
+		const entry = branch[i]!;
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		const message = entry.message;
+		const calls = toolCallsOf(message);
+		const text = message.content
+			.flatMap(block => (block.type === "text" && block.text ? [block.text] : []))
+			.join("\n");
+		if (calls.some(call => call.name !== "yield")) reportTurnText = undefined;
+		else if (text.trim()) reportTurnText = text;
+		lastAnswer =
+			calls.length === 0 && message.stopReason === "stop" && text.trim()
+				? { text: textOf(message), at: entryTime(entry) }
+				: undefined;
+		for (const call of calls) {
+			const result = results.get(call.id);
+			if (call.name !== "yield" || !result) continue;
+			const item = handler?.extractData?.(yieldEvent(call, result));
+			if (!isRecord(item)) continue;
+			items.push(item as YieldItem);
+			yieldedAt = entryTime(entry);
+		}
+	}
+	if (items.length === 0) {
+		return lastAnswer && { text: lastAnswer.text, at: lastAnswer.at, yielded: false, promptedAt };
+	}
+	const finalized = finalizeSubprocessOutput({
+		rawOutput: reportTurnText ?? "",
+		exitCode: 0,
+		stderr: "",
+		doneAborted: false,
+		signalAborted: false,
+		yieldItems: items,
+		outputSchema: contract?.outputSchema,
+		outputSchemaMode: contract?.outputSchemaMode,
+		lastAssistantText: reportTurnText,
+	});
+	const failed = finalized.exitCode !== 0 || finalized.abortedViaYield;
+	return {
+		text: finalized.rawOutput,
+		structured: finalized.structuredOutput,
+		error: failed ? finalized.stderr || "the subagent aborted its task" : undefined,
+		at: yieldedAt,
+		yielded: true,
+	};
+}
+
 /**
  * Judge parked subagent `id` from its own transcript: `span` is the previous
- * process's, and `startedAt` when the parent last started the subagent.
+ * process's, `startedAt` when the parent last started the subagent (unknown:
+ * unbounded), and `contract` the output contract its results are finalized
+ * against.
  *
  * It was cut off mid-work when, among what that process wrote, a tool call or
  * an owned background job it started has no result, a prompt has no answer,
- * or the process's quit aborted a turn. Calls an older process left dangling
- * do not count, nor do peers it messaged: their runs report to their own
- * parents. Otherwise it had finished: its report is the last `yield` since
- * `startedAt`, or else the text its last turn answered with.
+ * the process's quit aborted a turn, or its last turn is not one the agent
+ * loop stops at ({@link endsRun}). Calls an older process left dangling do not
+ * count, nor do peers it messaged (their runs report to their own parents),
+ * nor history a fork copied in before its own work began. Otherwise it had
+ * finished: its report is its run's result since `startedAt`
+ * ({@link runReport}).
  */
 function inspectSubagent(
 	branch: readonly SessionEntry[],
 	id: string,
 	span: ProcessSpan,
 	startedAt: number,
+	contract: OutputContract,
 ): SubagentState {
 	let end = branch.findIndex(isOpenedByThisProcess);
 	if (end < 0) end = branch.length;
-	let from = branch.findIndex(entry => entryTime(entry) >= span.since);
+	const owned = ownedStart(branch);
+	let from = branch.findIndex((entry, i) => i >= owned && entryTime(entry) >= span.since);
 	if (from < 0 || from > end) from = end;
 	const registry = AgentRegistry.global();
 	const { turn, open } = scanWork(branch, from, end, agentId => registry.get(agentId)?.parentId === id);
@@ -454,7 +586,7 @@ function inspectSubagent(
 	if (turn?.calls.some(call => !answered.has(call.id))) return { status: "interrupted" };
 	if ([...open.values()].some(stack => stack.length > 0)) return { status: "interrupted" };
 	let lastAssistant = -1;
-	for (let i = end - 1; i >= 0 && lastAssistant < 0; i--) {
+	for (let i = end - 1; i >= owned && lastAssistant < 0; i--) {
 		const entry = branch[i]!;
 		if (entry.type === "message" && entry.message.role === "assistant") lastAssistant = i;
 	}
@@ -471,36 +603,19 @@ function inspectSubagent(
 	}
 
 	const results = new Map<string, ToolResultMessage>();
-	let report: SubagentReport | undefined;
 	let promptedAt: number | undefined;
-	for (let i = 0; i < end; i++) {
+	for (let i = owned; i < end; i++) {
 		const entry = branch[i]!;
 		if (isPrompt(entry)) promptedAt = entryTime(entry);
 		if (entry.type === "message" && entry.message.role === "toolResult") {
 			results.set(entry.message.toolCallId, entry.message);
 		}
 	}
-	for (let i = end - 1; i >= 0 && !report; i--) {
-		const entry = branch[i]!;
-		if (entryTime(entry) < startedAt) break;
-		if (entry.type !== "message") continue;
-		for (const call of toolCallsOf(entry.message)) {
-			const result = results.get(call.id);
-			if (call.name !== "yield" || !result || result.isError) continue;
-			const data = call.arguments.data;
-			const text = typeof data === "string" ? data : JSON.stringify(data ?? call.arguments, null, 2);
-			report = { text, at: entryTime(entry), yielded: true };
-		}
-	}
 	const last = branch[lastAssistant];
-	if (!report && last?.type === "message" && entryTime(last) >= startedAt) {
-		const message = last.message;
-		const text = textOf(message);
-		if (message.role === "assistant" && message.stopReason === "stop" && toolCallsOf(message).length === 0 && text) {
-			report = { text, at: entryTime(last), yielded: false, promptedAt };
-		}
-	}
-	return { status: "finished", report };
+	if (last?.type !== "message" || !endsRun(last.message, results)) return { status: "interrupted" };
+	let runStart = branch.findIndex((entry, i) => i >= owned && entryTime(entry) >= startedAt);
+	if (runStart < 0) runStart = end;
+	return { status: "finished", report: runReport(branch, runStart, end, results, contract, promptedAt) };
 }
 
 /**
@@ -576,13 +691,14 @@ async function prepareSubagent(
 	id: string,
 	span: ProcessSpan,
 	startedAt: number,
+	contract: OutputContract,
 ): Promise<{ status: "interrupted"; message: string } | { status: "finished"; report: SubagentReport | undefined }> {
 	const manager = await SessionManager.open(sessionFile, undefined, undefined, {
 		suppressBreadcrumb: true,
 		throwIfMissing: true,
 	});
 	try {
-		const state = inspectSubagent(manager.getBranch(), id, span, startedAt);
+		const state = inspectSubagent(manager.getBranch(), id, span, startedAt, contract);
 		if (state.status === "finished") return state;
 		const scan = findInterruptedWork(manager.getBranch());
 		if (scan.handled) return { status: "interrupted", message: SUBAGENT_RESUME_MESSAGE };
@@ -709,11 +825,13 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 			}
 			const sessionFile = ref.sessionFile;
 			try {
+				const init = (await SessionManager.peekSessionInit(sessionFile))?.init;
 				const prepared = await prepareSubagent(
 					sessionFile,
 					interrupted.jobId,
 					scan.process,
 					interrupted.startedAt ?? Number.NEGATIVE_INFINITY,
+					init,
 				);
 				if (prepared.status === "finished") {
 					const { report } = prepared;
@@ -725,16 +843,21 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 						continue;
 					}
 					// Delivered like a restarted run's result: through a job this agent owns.
-					const text = `Recovered result of \`${interrupted.jobId}\`: it finished before OMP stopped, but this ${report.yielded ? "result" : "answer"} never reached you.\n\n${report.text}`;
-					manager.register("task", interrupted.jobId, async () => text, {
-						id: interrupted.jobId,
-						agentId: interrupted.jobId,
-						ownerId,
-					});
+					const lead = `Recovered result of \`${interrupted.jobId}\`: it finished before OMP stopped, but this ${report.yielded ? "result" : "answer"} never reached you.`;
+					const { structured, error } = report;
+					manager.register(
+						"task",
+						interrupted.jobId,
+						async () => {
+							if (error) throw new AsyncJobError(`${lead} It failed: ${error}\n\n${report.text}`, structured);
+							const text = `${lead}\n\n${report.text}`;
+							return structured ? { text, structured } : text;
+						},
+						{ id: interrupted.jobId, agentId: interrupted.jobId, ownerId },
+					);
 					recovered.push(interrupted);
 					continue;
 				}
-				const init = (await SessionManager.peekSessionInit(sessionFile))?.init;
 				const agent = await resolveAgentDefinition(init?.agent, discovered);
 				if (!agent) {
 					notResumed.push(`${jobName(interrupted)}: its agent definition was not found.`);
@@ -775,11 +898,13 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 				notResumed.push(`${jobName(interrupted)}: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}
-		// A later scan counts only these as started again: the rest were finished,
-		// delivered here, or could not be restarted.
+		// A later scan counts only these as pending: restarted ones as started
+		// again, recovered ones (with their original start) until the parent's
+		// journal shows the delivered result. The rest were finished or could
+		// not be restarted.
 		sessionManager.appendCustomEntry(RECOVER_OUTCOME_CUSTOM_TYPE, {
 			restarted,
-			recovered: recovered.map(agent => agent.jobId),
+			recovered,
 			skipped: skippedJobs.map(agent => agent.jobId),
 		});
 	}
