@@ -1,6 +1,6 @@
 ---
 name: scout
-description: Fast, cheap agent for codebase exploration, code search, git history and data collection. Reads files and runs read-only commands; never edits files.
+description: Fast, cheap agent for codebase exploration, code search, git history and data collection. Reads files and runs read-only commands; never edits files. Cheap enough to launch freely, several in parallel, for broad or unfamiliar searches; returns compressed findings. Anything one or two tool calls can answer is cheaper to look up yourself.
 tools: read, find, grep, glob, web_search, bash
 model: "@smol"
 thinking-level: medium
