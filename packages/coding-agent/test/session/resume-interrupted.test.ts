@@ -327,6 +327,33 @@ describe("/recover", () => {
 		expect(!scan.handled && [...scan.jobs, ...scan.agents, ...scan.toolCalls]).toEqual([]);
 	});
 
+	it("tracks parked agents woken by a message until their result arrives", () => {
+		const woke = (id: string, to: string) => {
+			manager.appendMessage(toolTurn({ id, name: "write", args: { path: `agent://${to}` } }));
+			manager.appendMessage(
+				toolResult(id, "write", {
+					message: { op: "send", from: "Main", to, receipts: [{ to, outcome: "revived" }] },
+				}),
+			);
+		};
+		woke("a", "Lane");
+		woke("b", "Scout");
+		woke("c", "Lane");
+		manager.appendMessage(toolTurn({ id: "d", name: "write", args: { path: "agent://Live" } }));
+		manager.appendMessage(
+			toolResult("d", "write", {
+				message: { op: "send", to: "Live", receipts: [{ to: "Live", outcome: "injected" }] },
+			}),
+		);
+		manager.appendCustomMessageEntry("async-result", "done", true, { jobs: [{ jobId: "Scout", type: "task" }] });
+		manager.appendMessage(createAssistantMessage("lanes running"));
+		openedBy(manager, "this");
+
+		const scan = findInterruptedWork(manager.getBranch());
+
+		expect(!scan.handled && scan.agents.map(agent => agent.jobId)).toEqual(["Lane"]);
+	});
+
 	it("steps past a process that opened the file and did nothing", () => {
 		manager.appendMessage(toolTurn({ id: "a", name: "bash", args: { command: "sleep 100" } }));
 		manager.appendMessage(toolResult("a", "bash", { async: { state: "running", jobId: "bg_1", type: "bash" } }));

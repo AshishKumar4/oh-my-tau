@@ -51,7 +51,7 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 			// `omp --version` 256 ms -> 30 ms on M4 Max (+52 MB binary).
 			// Keep import.meta.resolve in bundled dependencies valid under bytecode.
 			format: "esm",
-			bytecode: true,
+			bytecode: false,
 			minify: {
 				identifiers: options.minifyIdentifiers ?? false,
 				keepNames: true,

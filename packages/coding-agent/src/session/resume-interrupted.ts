@@ -232,6 +232,15 @@ export function findInterruptedWork(branch: readonly SessionEntry[]): Interrupte
 				}
 			}
 		}
+		// Messaging a parked agent revives it for a new run, which delivers its result like a spawn.
+		const sent = details && isRecord(details.message) ? details.message : undefined;
+		if (sent && Array.isArray(sent.receipts)) {
+			for (const receipt of sent.receipts) {
+				if (isRecord(receipt) && receipt.outcome === "revived" && typeof receipt.to === "string") {
+					start({ jobId: receipt.to, type: "task", label: receipt.to });
+				}
+			}
+		}
 		// A `wait` (or TaskOutput) result reports the jobs it consumed.
 		if (details && Array.isArray(details.jobs)) {
 			for (const job of details.jobs) {
@@ -272,7 +281,10 @@ export function findInterruptedWork(branch: readonly SessionEntry[]): Interrupte
 	const jobs: InterruptedJob[] = [];
 	const agents: InterruptedJob[] = [];
 	for (const stack of open.values()) {
-		for (const job of stack) (job.type === "task" ? agents : jobs).push(job);
+		// An agent runs once at a time, so it is restarted once however often it was started.
+		const latest = stack.at(-1);
+		if (latest?.type === "task") agents.push(latest);
+		else jobs.push(...stack);
 	}
 	return { handled: false, toolCalls, toolCallsRepairable: toolCalls.length > 0 && toolCallsRepairable, jobs, agents };
 }
