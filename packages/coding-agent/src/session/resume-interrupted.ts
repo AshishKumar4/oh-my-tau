@@ -122,25 +122,32 @@ function describeCall(name: string, args: unknown): string {
 	return name;
 }
 
+function hasActivity(branch: readonly SessionEntry[], start: number, end: number): boolean {
+	for (let i = start; i < end; i++) if (isActivity(branch[i]!)) return true;
+	return false;
+}
+
 /**
- * Slice of `branch` written by the process that preceded this one. It ends
- * where this process opened the file (the whole branch for a parked
- * subagent's transcript) and starts at the previous process's `session_open`
- * marker. Files older than those markers fall back to `session_exit` markers:
- * with activity after the last one that process crashed; otherwise it is the
- * one that ended there, together with the records it wrote while unwinding.
+ * Slice of `branch` written by the last process before this one that did any
+ * work. It ends where this process opened the file (the whole branch for a
+ * parked subagent's transcript) and starts at that process's `session_open`
+ * marker; a process that only opened the file and left interrupted nothing,
+ * so the scan steps past it. Files older than those markers fall back to
+ * `session_exit` markers: with activity after the last one that process
+ * crashed; otherwise it is the one that ended there, together with the
+ * records it wrote while unwinding.
  */
 function previousProcessSlice(branch: readonly SessionEntry[]): { start: number; end: number } | undefined {
 	let end = branch.findIndex(isOpenedByThisProcess);
 	if (end < 0) end = branch.length;
 	for (let i = end - 1; i >= 0; i--) {
-		if (isCustom(branch[i]!, SESSION_OPEN_CUSTOM_TYPE)) return { start: i + 1, end };
+		if (!isCustom(branch[i]!, SESSION_OPEN_CUSTOM_TYPE)) continue;
+		if (hasActivity(branch, i + 1, end)) return { start: i + 1, end };
+		end = i;
 	}
 	let lastExit = -1;
 	for (let i = 0; i < end; i++) if (isCustom(branch[i]!, SESSION_EXIT_CUSTOM_TYPE)) lastExit = i;
-	for (let i = lastExit + 1; i < end; i++) {
-		if (isActivity(branch[i]!)) return { start: lastExit + 1, end };
-	}
+	if (hasActivity(branch, lastExit + 1, end)) return { start: lastExit + 1, end };
 	if (lastExit < 0) return undefined;
 	let previousExit = -1;
 	for (let i = 0; i < lastExit; i++) if (isCustom(branch[i]!, SESSION_EXIT_CUSTOM_TYPE)) previousExit = i;

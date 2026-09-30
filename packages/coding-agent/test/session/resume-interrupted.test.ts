@@ -327,6 +327,19 @@ describe("/recover", () => {
 		expect(!scan.handled && [...scan.jobs, ...scan.agents, ...scan.toolCalls]).toEqual([]);
 	});
 
+	it("steps past a process that opened the file and did nothing", () => {
+		manager.appendMessage(toolTurn({ id: "a", name: "bash", args: { command: "sleep 100" } }));
+		manager.appendMessage(toolResult("a", "bash", { async: { state: "running", jobId: "bg_1", type: "bash" } }));
+		manager.appendMessage(createAssistantMessage("crashed while bg_1 ran"));
+		openedBy(manager, 202);
+		sessionExit(manager);
+		openedBy(manager, "this");
+
+		const scan = findInterruptedWork(manager.getBranch());
+
+		expect(!scan.handled && scan.jobs.map(job => job.jobId)).toEqual(["bg_1"]);
+	});
+
 	it("never counts this process's own work as interrupted", () => {
 		manager.appendMessage(createAssistantMessage("previous process finished"));
 		openedBy(manager, "this");
