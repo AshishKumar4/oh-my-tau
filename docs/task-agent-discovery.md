@@ -203,7 +203,7 @@ Lookup is exact-name linear search:
 1. atomically reloads the live session's persisted global, project, and explicit overlay settings while preserving runtime overrides
 2. resolves the omitted or explicit agent name from the parent spawn policy
 3. enforces depth, blocked-self-recursion, and parent spawn-policy guards
-4. rediscovers agents with `discoverAgents(session.cwd)`, appends user-tagged session agents, and performs exact lookup
+4. rediscovers agents with `discoverAgents(session.cwd)`, appends user-tagged session agents, and performs exact lookup; a definition in the session's `pinnedAgents` wins over both
 5. checks `task.disabledAgents`
 6. resolves plan-mode restrictions, output schema, model policy, and isolation policy
 

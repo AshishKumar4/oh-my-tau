@@ -9,13 +9,13 @@ import { AuthStorage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { createCleanseAgentRuntime } from "@oh-my-pi/pi-coding-agent/cleanse/agent";
 import { runCommitAgentSession } from "@oh-my-pi/pi-coding-agent/commit/agentic/agent";
+import * as commitToolsModule from "@oh-my-pi/pi-coding-agent/commit/agentic/tools";
 import * as modelResolver from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { loadBundledAgents } from "@oh-my-pi/pi-coding-agent/task/agents";
@@ -79,11 +79,13 @@ describe("built-in flow agent routing", () => {
 		await $`git init -q`.cwd(tempDir.path());
 		const settings = Settings.isolated({ "task.isolation.enabled": false });
 		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "agent.db"));
-		const created = Promise.withResolvers<CreateAgentSessionOptions>();
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			created.resolve(options);
-			throw new Error("stop after capturing the commit session options");
+		const createCommitTools = commitToolsModule.createCommitTools;
+		let commitTools: ReturnType<typeof createCommitTools> = [];
+		const createTools = vi.spyOn(commitToolsModule, "createCommitTools").mockImplementation(options => {
+			commitTools = createCommitTools(options);
+			return commitTools;
 		});
+		vi.spyOn(sdkModule, "createAgentSession").mockRejectedValue(new Error("stop once the commit tools exist"));
 		await runCommitAgentSession({
 			cwd: tempDir.path(),
 			model: model(),
@@ -93,9 +95,8 @@ describe("built-in flow agent routing", () => {
 			changelogTargets: [],
 			requireChangelog: false,
 		}).catch(() => undefined);
-		const commitSession = await created.promise;
-		expect(commitSession.spawns).toBe("scout");
-		const analyze = commitSession.customTools?.find(tool => tool.name === "analyze_files");
+		expect(createTools.mock.calls[0]?.[0].spawns).toBe("scout");
+		const analyze = commitTools.find(tool => tool.name === "analyze_files");
 		if (!analyze) throw new Error("expected the analyze_files tool");
 
 		const spawned = captureSpawns();

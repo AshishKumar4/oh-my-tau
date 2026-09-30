@@ -554,6 +554,7 @@ describe("persisted subagent revival", () => {
 		];
 		const captured: CreateAgentSessionOptions[] = [];
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("expected session options");
 			captured.push(options);
 			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
 		});

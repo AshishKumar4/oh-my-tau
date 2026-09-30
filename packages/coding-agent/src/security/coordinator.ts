@@ -45,7 +45,12 @@ import { SecurityStore, writeSecurityBundleToDirectory } from "./store";
 
 import { cfgRetryFallbackChains, cfgRetryModelFallback, cfgRetryUsageAwareFallback } from "../session/settings";
 import { cfgSecurityEnabled } from "../tools/settings";
-import { cfgTaskAgentAdvisor, cfgTaskAgentModelOverrides, cfgTaskAgentPrewalk } from "../task/settings";
+import {
+	cfgTaskAgentAdvisor,
+	cfgTaskAgentModelOverrides,
+	cfgTaskAgentPrewalk,
+	cfgTaskDisabledAgents,
+} from "../task/settings";
 
 const SECURITY_SESSION_TOOLS = ["read", "grep", "glob", "lsp", "ast_grep", "task", "security_publish"];
 /** Scans may cover untrusted code, so workers only read it: no bash, network, or spawning. */
@@ -317,8 +322,13 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 	cfgRetryModelFallback.override(scanSettings, false);
 	cfgRetryUsageAwareFallback.override(scanSettings, false);
 	cfgRetryFallbackChains.override(scanSettings, {});
-	// `reviewer` settings meant for ordinary reviews must not route workers to
-	// other models: the scan pins one model and account.
+	// `reviewer` settings meant for ordinary delegation must not disable the
+	// scan's workers or route them to other models: the scan pins one model and
+	// account.
+	cfgTaskDisabledAgents.override(
+		scanSettings,
+		cfgTaskDisabledAgents.get(scanSettings).filter(name => name !== worker.name),
+	);
 	cfgTaskAgentModelOverrides.override(scanSettings, {
 		...cfgTaskAgentModelOverrides.get(scanSettings),
 		[worker.name]: modelSelector,
