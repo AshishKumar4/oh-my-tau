@@ -130,7 +130,7 @@ Bundled agents are embedded at build time (`src/task/agents.ts`) using text impo
 - `scout` and `reviewer` from prompt files
 - `task` from the `task.md` body plus injected frontmatter; no bundled agent sets `prewalk` — the generic `task` agent's hand-off is armed by the `task.prewalk` setting (default off), or per agent via `/agents` / `task.agentPrewalk` / user agent frontmatter
 
-`task` is the laborer for fully specified implementation and test work and cannot spawn subagents. `scout` has `bash` for git and data collection but no edit or write tools. `reviewer` reviews on two axes, correctness and design quality, and tags each finding `kind: bug` or `kind: design`; only bugs make its verdict `incorrect`. `sonic` and `security-reviewer` were removed: `/security` runs `reviewer` pinned to its read-only scan contract, and `/recover` restarts old `sonic` and `security-reviewer` transcripts as `task` and `reviewer`.
+`task` is the laborer for fully specified implementation and test work and cannot spawn subagents. `scout` has `bash` for git and data collection but no edit or write tools. `reviewer` reviews on two axes, correctness and design quality, loads the relevant review skills from its skill list, and tags each finding `kind: bug` or `kind: design`; only bugs make its verdict `incorrect`. `sonic` and `security-reviewer` were removed: `/security` runs `reviewer` pinned to its read-only scan contract, and `/recover` restarts old `sonic` and `security-reviewer` transcripts as `task` and `reviewer`.
 
 Loading path:
 
