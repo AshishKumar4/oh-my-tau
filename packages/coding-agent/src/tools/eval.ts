@@ -424,7 +424,7 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 			autoBackgroundEnabled: cfgEvalAutoBackgroundEnabled.get(session.settings),
 			evalTools: cfgEvalToolsEnabled.get(session.settings),
 			eagerDelegation: sessionDelegationBias(session) === "eager",
-			// Named as presented; Claude Code withholds `wait` unless TaskOutput stands in.
+			// Named as presented: TaskOutput stands in for `wait` where a Claude Code capture declares it.
 			waitTool: hasWaitTool(session) && toolRefs.wait !== undefined,
 			waitToolName: toolRefs.wait ?? null,
 			preludes: this.#advertisedPreludes(session),

@@ -321,8 +321,7 @@ const RATCHET_REQUIRED_TOOLS = ["eval", "task"] as const;
  * render the kickoff prompt carrying the user's request as data.
  */
 function prepareRatchet(session: AgentSession, request: string): { kickoff: string } | { error: string } {
-	// What the model can reach: a tool the harness profile withholds cannot run the loop.
-	const tools = session.getPromptToolNames();
+	const tools = session.getEnabledToolNames();
 	const missing = RATCHET_REQUIRED_TOOLS.filter(tool => !tools.includes(tool));
 	if (missing.length > 0) return { error: `/ratchet needs the ${missing.join(" and ")} tool active.` };
 	const previous = cfgRatchetEnabled.get(session.settings);

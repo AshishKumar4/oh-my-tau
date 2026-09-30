@@ -19,8 +19,9 @@ import {
 	runSubagentFollowUpTurn,
 	runSubprocess,
 } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { type AgentDefinition, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { isRecord } from "@oh-my-pi/pi-utils";
 
 const AGENT_ID = "accepted-result";
 
@@ -273,7 +274,12 @@ describe("runSubprocess result acceptance", () => {
 	it("terminalizes the ref when an autonomous wake turn's yield is accepted", async () => {
 		const harness = createHarness();
 		registerRunning(harness.session);
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		const eventBus = new EventBus();
+		const runEnded = Promise.withResolvers<void>();
+		eventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, data => {
+			if (isRecord(data) && data.status !== "started") runEnded.resolve();
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, eventBus });
 		const observer = harness.wakeObserver();
 		expect(observer).toBeDefined();
 
@@ -290,6 +296,8 @@ describe("runSubprocess result acceptance", () => {
 		expect(finish).toBeDefined();
 		harness.emitTerminalYield({ report: "answered while woken" });
 		await finish?.(undefined);
+		// The turn's settle only lets the run go on; the run ends once it has driven the session to rest.
+		await runEnded.promise;
 
 		const settled = AgentRegistry.global().get(AGENT_ID);
 		expect(settled?.status).not.toBe("running");
@@ -331,7 +339,7 @@ describe("runSubprocess result acceptance", () => {
 					} as unknown as AgentMessage,
 				]);
 				harness.emitTerminalYield({ report });
-				// Pending from acceptance until finalization: the parent's `wait` can block on it.
+				// Pending from the run's start until finalization: the parent's `wait` can block on it.
 				expect(manager.getRunningJobs({ ownerId: "Parent" }).map(job => job.agentId)).toEqual([AGENT_ID]);
 				await finish?.(undefined);
 				await manager.waitForAll();

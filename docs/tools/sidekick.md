@@ -36,7 +36,7 @@
 - `block: false`: `Handoff <n> dispatched to the sidekick (job \`<jobId>\`). Its report auto-delivers when it finishes; wait for it with \`<wait tool>\` rather than polling.`
 - Blocking wait cut short (timeout or interrupt): `No report within 45m` or `The wait was interrupted`, then `; the sidekick is still working on handoff job \`<jobId>\`.` and the same wait hint.
 - Mid-handoff call: `Update injected into the sidekick's running handoff (job \`<jobId>\`); its report will cover the updated brief.` The job part is absent for an inline handoff.
-- `<wait tool>` is the tool the description names: the profile's job-wait facade (`TaskOutput` under `claude-code`, `wait` under `codex`), otherwise `wait`.
+- `<wait tool>` is the tool the description names: `TaskOutput` under `claude-code` where the served capture declares it, otherwise `wait`. A session with no wait tool is told to end its turn instead; the report arrives as a notification.
 - `details = { agentId?, jobId?, mode: "spawn" | "rebrief" | "interrupt", pending }`. `pending` is `true` when the call returned before the handoff settled.
 - While a blocking call waits, progress updates read `Sidekick: <intent or current tool> (<n> tool calls, <duration>)`.
 

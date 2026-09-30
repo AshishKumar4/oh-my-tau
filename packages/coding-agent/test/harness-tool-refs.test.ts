@@ -50,7 +50,7 @@ function claudeCodeSurface(
 	});
 }
 
-/** A root session serving a 2.1.284 capture: no TaskOutput, so nothing waits on the wire. */
+/** A root session serving a 2.1.284 capture: no TaskOutput, so `wait` is presented as itself. */
 const CLAUDE_CODE = claudeCodeSurface(ROOT_TOOLS).toolRefs;
 /** A read-only subagent (scout, reviewer): no `write`, so no messaging or stop facade. */
 const READ_ONLY = claudeCodeSurface(["read", "bash"], { taskDepth: 1 }).toolRefs;
@@ -70,8 +70,11 @@ function unmountedNames(refs: Readonly<Record<string, string>>): string[] {
 const PARENT = "RefsParent";
 const CHILD = "RefsChild";
 
-/** omp primitives a Claude Code surface never names: its agents reach them through the facades. */
-const OMP_PHRASES = ["write agent://", "`write`", "read proc://", "proc://<id>/kill", "`wait`", "`edit`", "`bash`"];
+/**
+ * omp primitives a Claude Code surface never names: its agents reach them
+ * through the facades. `wait` is presented as itself, so naming it is not a leak.
+ */
+const OMP_PHRASES = ["write agent://", "`write`", "read proc://", "proc://<id>/kill", "`edit`", "`bash`"];
 
 function leaks(text: string): string[] {
 	return OMP_PHRASES.filter(phrase => text.includes(phrase));
@@ -98,7 +101,7 @@ describe("harnessToolRefs", () => {
 		expect(harnessSurface(undefined, ROOT_TOOLS, { settings: Settings.isolated() }).toolRefs).toBe(NATIVE);
 	});
 
-	it("names exactly what a 2.1.284 surface presents: no TaskOutput, so no wait", () => {
+	it("names exactly what a 2.1.284 surface presents: no TaskOutput, so wait under its own name", () => {
 		const surface = claudeCodeSurface(ROOT_TOOLS);
 		expect(surface.toolRefs).toMatchObject({
 			task: "Agent",
@@ -113,11 +116,9 @@ describe("harnessToolRefs", () => {
 			Skill: "Skill",
 			WebFetch: "WebFetch",
 		});
-		expect(surface.toolRefs.wait).toBeUndefined();
+		expect(surface.toolRefs.wait).toBe("wait");
 		expect(surface.toolRefs.TaskOutput).toBeUndefined();
-		// Withheld with nothing standing in: prompts and predicates drop it.
-		expect([...surface.unavailable]).toEqual(["wait"]);
-		expect(surface.hidden.has("wait")).toBe(true);
+		expect(surface.hidden.has("wait")).toBe(false);
 		expect(surface.facades.map(spec => spec.wireName)).not.toContain("TaskOutput");
 	});
 
@@ -125,7 +126,6 @@ describe("harnessToolRefs", () => {
 		const surface = claudeCodeSurface(ROOT_TOOLS, { taskOutput: true });
 		expect(surface.toolRefs.wait).toBe("TaskOutput");
 		expect(surface.toolRefs.TaskOutput).toBe("TaskOutput");
-		expect([...surface.unavailable]).toEqual([]);
 		expect(surface.hidden.has("wait")).toBe(true);
 	});
 
@@ -331,7 +331,7 @@ describe("multi-agent templates under claude-code", () => {
 		expect(claudeCode).toContain(CHILD);
 		expect(leaks(claudeCode)).toEqual([]);
 		expect(claudeCode).toContain('message them via `SendMessage` (`to: "<id>"`)');
-		// Without write there is no message or stop tool to name, and no wait.
+		// Without write there is no message or stop tool to name.
 		const readOnly = textOf(READ_ONLY);
 		expect(readOnly).toContain(CHILD);
 		expect(leaks(readOnly)).toEqual([]);
@@ -368,7 +368,7 @@ describe("claude-code tool surface", () => {
 	): Promise<{
 		presented: string[];
 		promptNames: string[];
-		promptToolNames: string[];
+		enabledToolNames: string[];
 		refs: Readonly<Record<string, string>>;
 	}> {
 		const tools = toolNames.map(stubTool);
@@ -395,14 +395,14 @@ describe("claude-code tool surface", () => {
 		return {
 			presented: session.agent.state.tools.map(tool => tool.name),
 			promptNames,
-			promptToolNames: session.getPromptToolNames(),
+			enabledToolNames: session.getEnabledToolNames(),
 			refs: session.getToolRefs(),
 		};
 	}
 
-	it("withholds wait only under claude-code, where no capture declares TaskOutput", async () => {
+	it("presents wait as itself under claude-code where no capture declares TaskOutput", async () => {
 		const claudeCode = await presentedNames("claude-code");
-		expect(claudeCode.presented).not.toContain("wait");
+		expect(claudeCode.presented).toContain("wait");
 		expect(claudeCode.presented).not.toContain("TaskOutput");
 		expect(claudeCode.presented).toEqual(
 			expect.arrayContaining([
@@ -416,11 +416,12 @@ describe("claude-code tool surface", () => {
 				"todo",
 			]),
 		);
-		// Prompt gates never see the withheld tool, and the refs match the wire.
-		expect(claudeCode.promptNames).not.toContain("wait");
+		// Prompt gates see it, and the refs match the wire.
+		expect(claudeCode.promptNames).toContain("wait");
 		expect(claudeCode.promptNames).toContain("task");
-		expect(claudeCode.promptToolNames).toEqual(claudeCode.promptNames);
-		expect(claudeCode.refs.wait).toBeUndefined();
+		// Prompt gates (e.g. /ratchet) read the enabled names; they must match what the prompt was built from.
+		expect(claudeCode.enabledToolNames).toEqual(claudeCode.promptNames);
+		expect(claudeCode.refs.wait).toBe("wait");
 		expect(claudeCode.refs.task).toBe("Agent");
 		expect(claudeCode.refs.SendMessage).toBe("SendMessage");
 
@@ -428,7 +429,7 @@ describe("claude-code tool surface", () => {
 		expect(native.presented).toContain("wait");
 		expect(native.presented).not.toContain("SendMessage");
 		expect(native.promptNames).toContain("wait");
-		expect(native.promptToolNames).toEqual(native.promptNames);
+		expect(native.enabledToolNames).toEqual(native.promptNames);
 		expect(native.refs).toBe(NATIVE);
 	});
 

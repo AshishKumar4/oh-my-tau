@@ -15,7 +15,6 @@ function acpRuntime(options: { tools?: string[]; available?: boolean; profile?: 
 		session: {
 			settings,
 			getEnabledToolNames: () => tools,
-			getPromptToolNames: () => tools.filter(name => !surface.unavailable.has(name)),
 			getToolRefs: () => surface.toolRefs,
 			getEvalPreludes: () =>
 				cfgRatchetEnabled.get(settings) && options.available !== false ? [{ name: "ratchet" }] : [],

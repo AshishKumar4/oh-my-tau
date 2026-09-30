@@ -2446,10 +2446,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		};
 		/**
 		 * Loads the capture the prompt build will serve before the surface is read.
-		 * Whether TaskOutput mounts, and so whether `wait` is reachable, depends on
-		 * it: read before the build loads it, the first prompt and predicates would
-		 * drop `wait` while the tools presented afterwards offer TaskOutput, and the
-		 * next rebuild would rewrite the cached prompt. Memoized per profile and
+		 * Whether TaskOutput mounts, and so the name `wait` is reached by, depends
+		 * on it: read before the build loads it, the first prompt would name `wait`
+		 * while the tools presented afterwards offer TaskOutput, and the next
+		 * rebuild would rewrite the cached prompt. Memoized per profile and
 		 * model; skipped exactly when the build serves no capture (a caller-owned or
 		 * discovered SYSTEM.md prompt) and bounded like the build's own load.
 		 */
@@ -3390,11 +3390,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const toolContextStore = new ToolContextStore(getSessionContext);
 		toolSession.getToolContext = () => toolContextStore.getContext();
 		const setSessionActiveToolNames = (names: Iterable<string>): void => {
-			// A tool the harness profile withholds with no facade standing in is
-			// not the model's to call; predicates and tool context never see it.
-			const requested = Array.from(names);
-			const { unavailable } = harnessPromptSurface(requested);
-			const snapshot = unavailable.size === 0 ? requested : requested.filter(name => !unavailable.has(name));
+			const snapshot = Array.from(names);
 			setActiveToolNames(snapshot);
 			toolContextStore.setToolNames(snapshot);
 		};
@@ -3785,21 +3781,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			compress: createSkillDescriptionCompressor(modelRegistry, settings),
 		});
 		const rebuildSystemPrompt = async (
-			requestedToolNames: string[],
+			toolNames: string[],
 			tools: Map<string, AgentTool>,
 			rebuildOptions?: { directToolNames?: readonly string[] },
 		): Promise<BuildSystemPromptResult> => {
 			const promptCwd = sessionManager.getCwd();
-			// The prompt describes the surface the wire carries: a tool the harness
-			// profile withholds with no facade standing in is not listed or gated
-			// on, and `toolRefs` name what did mount — with the served capture
-			// loaded first, so this prompt is the one later rebuilds reproduce.
+			// The prompt's `toolRefs` name what the wire carries — with the served
+			// capture loaded first, so this prompt is the one later rebuilds reproduce.
 			await loadServedHarnessPrompt(promptCwd);
-			const surface = harnessPromptSurface(requestedToolNames);
-			const toolNames =
-				surface.unavailable.size === 0
-					? requestedToolNames
-					: requestedToolNames.filter(name => !surface.unavailable.has(name));
+			const surface = harnessPromptSurface(toolNames);
 			const activeRepoContext = hasSession
 				? await logger.time("resolveActiveRepoContext", resolveRepoContext, promptCwd)
 				: initialActiveRepoContext;

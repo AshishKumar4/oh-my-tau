@@ -12,14 +12,15 @@ interface SessionStub {
 	disposeCalls: () => number;
 }
 
-/** Minimal session: the lifecycle manager only ever calls dispose() on it. */
-function makeSessionStub(dispose?: () => Promise<void>): SessionStub {
+/** Minimal session: the lifecycle manager only disposes it and asks whether background work is pending. */
+function makeSessionStub(dispose?: () => Promise<void>, hasPendingAsyncWork = () => false): SessionStub {
 	let calls = 0;
 	const stub = {
 		dispose: async () => {
 			calls++;
 			await dispose?.();
 		},
+		hasPendingAsyncWork,
 	};
 	return { session: stub as unknown as AgentSession, disposeCalls: () => calls };
 }
@@ -154,6 +155,26 @@ describe("AgentLifecycleManager", () => {
 		vi.advanceTimersByTime(TTL);
 		await flushAsync();
 		expect(registry.get("2-Sub")?.status).toBe("parked");
+		expect(stub.disposeCalls()).toBe(1);
+	});
+
+	it("does not idle-park an agent waiting on its own background jobs; parks once they settle", async () => {
+		vi.useFakeTimers();
+		let jobsPending = true;
+		const stub = makeSessionStub(undefined, () => jobsPending);
+		registerIdleSub("Busy-Sub", stub.session);
+		lifecycle.adopt("Busy-Sub", { idleTtlMs: TTL });
+
+		vi.advanceTimersByTime(TTL * 3);
+		await flushAsync();
+		expect(registry.get("Busy-Sub")?.status).toBe("idle");
+		expect(registry.get("Busy-Sub")?.session).toBe(stub.session);
+		expect(stub.disposeCalls()).toBe(0);
+
+		jobsPending = false;
+		vi.advanceTimersByTime(TTL);
+		await flushAsync();
+		expect(registry.get("Busy-Sub")?.status).toBe("parked");
 		expect(stub.disposeCalls()).toBe(1);
 	});
 

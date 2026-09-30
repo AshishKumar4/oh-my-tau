@@ -17,6 +17,7 @@
 ### Changed
 
 - `omp auth-gateway serve` now attributes peers to the socket address by default; deployments behind a trusted reverse proxy can restore forwarded peer headers with `--trust-proxy-headers` ([#13827](https://github.com/can1357/oh-my-pi/pull/13827) by [@shawnkoh](https://github.com/shawnkoh))
+- Claude Code mode presents the `wait` tool again (as `TaskOutput` where the served Claude Code capture still declares that tool), and its prompts tell the agent to wait with it instead of ending the turn
 - `--no-ui` now also works with `--mode rpc-ui`: extensions run headless while tool UI such as the `ask` tool still reaches the host ([#13718](https://github.com/can1357/oh-my-pi/pull/13718) by [@alphastorm](https://github.com/alphastorm))
 
 ### Fixed
@@ -35,6 +36,8 @@
 - Fixed compiled OMP extensions importing `@oh-my-pi/pi-catalog` and its provider-model subpaths ([#13731](https://github.com/can1357/oh-my-pi/issues/13731)).
 - Explicit `symbolPreset: unicode` now stays Unicode after a Glyph Protocol handshake instead of switching the status bar to Nerd Font icons ([#13865](https://github.com/can1357/oh-my-pi/issues/13865)).
 - Fixed rewinding (`/rewind`, `/tree`) during a running turn hiding the queued-prompt bar, making the still-pending queue look deleted and uneditable ([#13680](https://github.com/can1357/oh-my-pi/issues/13680))
+- A subagent woken by a message now delivers its result to its parent when it finishes in a later turn, for example after its own background command completes; that result used to be lost. It stays in the running-subagents list until it finishes, and an idle subagent is no longer parked while its own background jobs are still running
+- While a subagent woken by a message works, its parent sees a running job for it: `wait` blocks on it and returns its result, and killing that job stops the subagent's run and its background commands. A reply sent only by message ends the job without delivering the reply a second time. A woken run that times out or fails also stops its background commands, and a sidekick hand-off, workpool turn or `/recover` restart waits for an open woken run instead of driving the same subagent alongside it
 
 ## [18.4.4] - 2026-09-29
 

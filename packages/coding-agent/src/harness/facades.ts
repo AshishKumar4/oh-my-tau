@@ -457,27 +457,12 @@ export function harnessFacadeSpecs(profile: HarnessProfile): readonly HarnessFac
 	return FACADES[profile];
 }
 
-/**
- * omp tools a harness profile never presents as themselves. Claude Code has no
- * wait tool: its agents end the turn and are woken by the next result or
- * message (TaskOutput stands in where the served client still declares it).
- */
-const PROFILE_WITHHELD_TOOLS: Partial<Readonly<Record<HarnessProfile, readonly string[]>>> = {
-	"claude-code": ["wait"],
-};
-
 /** What a harness profile presents over a set of enabled omp tools. */
 export interface HarnessSurface {
 	/** Facades that mount, in presentation order. */
 	readonly facades: readonly HarnessFacadeSpec[];
-	/** Enabled tools kept off the wire as themselves: withheld by the profile or replaced by a mounted facade. */
+	/** Enabled tools kept off the wire as themselves: replaced by a mounted facade. */
 	readonly hidden: ReadonlySet<string>;
-	/**
-	 * Enabled tools nothing on the wire reaches: withheld by the profile with no
-	 * mounted facade standing in. Prompt gates and tool predicates treat them as
-	 * absent.
-	 */
-	readonly unavailable: ReadonlySet<string>;
 	/** Tool names for omp's own prompt templates; see {@link harnessToolRefs}. */
 	readonly toolRefs: Readonly<Record<string, string>>;
 }
@@ -485,7 +470,6 @@ export interface HarnessSurface {
 const NATIVE_SURFACE: HarnessSurface = {
 	facades: [],
 	hidden: new Set(),
-	unavailable: new Set(),
 	toolRefs: harnessToolRefs(undefined),
 };
 
@@ -511,16 +495,9 @@ export function harnessSurface(
 			(spec.requires ?? []).every(name => enabled.has(name)) &&
 			spec.mounts?.(host) !== false,
 	);
-	const replaced = new Set(facades.flatMap(spec => (spec.replacesTarget ? [spec.target] : [])));
-	const withheld = PROFILE_WITHHELD_TOOLS[profile] ?? [];
-	const unavailable = new Set(withheld.filter(name => !replaced.has(name)));
 	return {
 		facades,
-		hidden: new Set([...withheld, ...replaced]),
-		unavailable,
-		toolRefs: harnessToolRefs(profile, {
-			toolNames: enabledToolNames.filter(name => !unavailable.has(name)),
-			facades,
-		}),
+		hidden: new Set(facades.flatMap(spec => (spec.replacesTarget ? [spec.target] : []))),
+		toolRefs: harnessToolRefs(profile, { toolNames: enabledToolNames, facades }),
 	};
 }
