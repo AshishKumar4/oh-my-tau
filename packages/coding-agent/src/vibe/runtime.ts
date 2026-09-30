@@ -74,6 +74,17 @@ const VIBE_FAST_TIER: Pick<AgentDefinition, "model" | "thinkingLevel"> = {
 	thinkingLevel: Effort.Medium,
 };
 
+/**
+ * Settings layered over the parent's for `fast` workers. The executor reads
+ * `task.agentPrewalk` / `task.agentAdvisor` (and the `task.prewalk` toggle) by
+ * agent name; those target ordinary `task` spawns and would move a `fast`
+ * worker off `@smol` or pair it with an advisor.
+ */
+const VIBE_FAST_TIER_SETTINGS: Readonly<Record<string, unknown>> = {
+	"task.agentPrewalk": { [VIBE_WORKER_AGENT]: "off" },
+	"task.agentAdvisor": { [VIBE_WORKER_AGENT]: "off" },
+};
+
 /** One completed tool call in the per-turn activity trace. */
 interface VibeTraceEntry {
 	tool: string;
@@ -1314,7 +1325,7 @@ export class VibeSessionRegistry {
 			onProgress,
 			authStorage: session.authStorage,
 			modelRegistry: session.modelRegistry,
-			settings: session.settings,
+			settings: record.cli === "fast" ? session.settings.overlay(VIBE_FAST_TIER_SETTINGS) : session.settings,
 			inheritedSessionAgents: session.getSessionAgents?.(),
 			mcpManager: session.mcpManager ?? MCPManager.instance(),
 			contextFiles: session.contextFiles?.filter(file => path.basename(file.path).toLowerCase() !== "agents.md"),

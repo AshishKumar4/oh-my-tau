@@ -152,18 +152,6 @@ describe("structured subagent primitive", () => {
 		expect(policy.modelOverride).toEqual(["b/y"]);
 	});
 
-	it("resolves a session's pinned definition ahead of a same-named discovered agent", async () => {
-		mockDiscovery({ ...AGENT, tools: ["read", "bash", "write"] });
-		const pinned: AgentDefinition = { ...AGENT, tools: ["read", "grep"], systemPrompt: "Pinned contract." };
-		const pinnedSession = session({ spawns: "worker" });
-		pinnedSession.pinnedAgents = [pinned];
-
-		const policy = await resolveEffectiveSubagentPolicy(request({ session: pinnedSession }));
-
-		expect(policy.agent).toBe(pinned);
-		expect(policy.effectiveAgent.tools).toEqual(["read", "grep"]);
-	});
-
 	it("uses caller, agent, then session schemas in precedence order", async () => {
 		mockDiscovery();
 		const callerSchema = { type: "object", properties: { caller: { type: "string" } } };

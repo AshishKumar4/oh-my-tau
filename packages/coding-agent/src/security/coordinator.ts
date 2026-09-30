@@ -10,14 +10,13 @@ import type { Settings } from "../config/settings";
 import type { ToolDefinition } from "../extensibility/extensions";
 import securityCoordinatorPrompt from "../prompts/security/scan-coordinator.md" with { type: "text" };
 import securityRequestPrompt from "../prompts/security/scan-request.md" with { type: "text" };
-import securityWorkerPrompt from "../prompts/security/scan-worker.md" with { type: "text" };
+import securityWorkerAgent from "../prompts/security/scan-worker.md" with { type: "text" };
 import securityPublishDescription from "../prompts/tools/security-publish.md" with { type: "text" };
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
-import { getBundledAgent } from "../task/agents";
-import type { AgentDefinition } from "../task/types";
+import { parseAgent } from "../task/agents";
 import { createSecurityAuthResolver, selectSecurityAuth } from "./auth";
 import type {
 	SecurityCoverage,
@@ -53,72 +52,10 @@ import {
 } from "../task/settings";
 
 const SECURITY_SESSION_TOOLS = ["read", "grep", "glob", "lsp", "ast_grep", "task", "security_publish"];
-/** Scans may cover untrusted code, so workers only read it: no bash, web search, or spawning. */
-const SECURITY_WORKER_TOOLS = ["read", "find", "grep", "glob", "lsp", "ast_grep"];
-/** One worker's review; the coordinator reconciles these into `security_publish`. */
-const SECURITY_WORKER_OUTPUT = {
-	properties: {
-		coverage_summary: { type: "string" },
-	},
-	optionalProperties: {
-		findings: {
-			elements: {
-				properties: {
-					rule_id: { type: "string" },
-					title: { type: "string" },
-					summary: { type: "string" },
-					severity: { enum: ["critical", "high", "medium", "low", "informational"] },
-					confidence: { enum: ["high", "medium", "low"] },
-					category: { type: "string" },
-					locations: {
-						elements: {
-							properties: {
-								path: { type: "string" },
-								start_line: { type: "number" },
-							},
-							optionalProperties: {
-								end_line: { type: "number" },
-								role: { type: "string" },
-							},
-						},
-					},
-					cwe: { elements: { type: "string" } },
-					evidence: {
-						elements: {
-							properties: {
-								label: { type: "string" },
-								explanation: { type: "string" },
-							},
-							optionalProperties: {
-								excerpt: { type: "string" },
-							},
-						},
-					},
-				},
-				optionalProperties: {
-					anchor: { type: "string" },
-					remediation: { type: "string" },
-				},
-			},
-		},
-		reviewed_paths: { elements: { type: "string" } },
-		deferred: {
-			elements: {
-				properties: {
-					reason: { type: "string" },
-				},
-				optionalProperties: {
-					paths: { elements: { type: "string" } },
-				},
-			},
-		},
-	},
-};
 const SECURITY_WORKFLOW_FINGERPRINT = createSecurityWorkflowFingerprint([
 	securityCoordinatorPrompt,
 	securityRequestPrompt,
-	securityWorkerPrompt,
-	JSON.stringify({ tools: SECURITY_WORKER_TOOLS, output: SECURITY_WORKER_OUTPUT }),
+	securityWorkerAgent,
 	securityPublishDescription,
 ]);
 
@@ -297,28 +234,12 @@ function initialBundle(
 	};
 }
 
-/**
- * The scan's worker: the bundled `reviewer` pinned to the scan's contract, so
- * project or user agent files cannot widen it. The scan prompt replaces the
- * reviewer's patch-review body, which reviews a diff through bash and yields
- * verdict fields the scan's output lacks.
- */
-function createSecurityReviewer(): AgentDefinition {
-	const reviewer = getBundledAgent("reviewer");
-	if (!reviewer) throw new Error("Bundled reviewer agent is unavailable");
-	return {
-		...reviewer,
-		systemPrompt: prompt.render(securityWorkerPrompt),
-		tools: SECURITY_WORKER_TOOLS,
-		spawns: undefined,
-		output: SECURITY_WORKER_OUTPUT,
-	};
-}
-
 async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInput): Promise<AgentSession> {
 	const scanSettings = await input.host.settings.cloneForCwd(input.executionRoot);
 	const modelSelector = `${input.model.provider}/${input.model.id}`;
-	const worker = createSecurityReviewer();
+	// Scans may cover untrusted code, so the worker only reads it. The definition
+	// is private and pinned: project or user agent files cannot replace it.
+	const worker = parseAgent("embedded:security/scan-worker.md", securityWorkerAgent, "bundled");
 	cfgRetryModelFallback.override(scanSettings, false);
 	cfgRetryUsageAwareFallback.override(scanSettings, false);
 	cfgRetryFallbackChains.override(scanSettings, {});

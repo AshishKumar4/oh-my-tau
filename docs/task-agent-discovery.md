@@ -106,7 +106,7 @@ After dispatch, press `Alt+A` to open [Agent Hub](./agent-hub.md). Its live rost
 
 ### `vibe_spawn` tier routing
 
-Both `vibe_spawn` tiers run bundled `task` (`src/vibe/runtime.ts`). `good` keeps `task`'s model, so `task.agentModelOverrides.task` applies. `fast` runs on the `@smol` role at medium thinking and ignores that override, so it stays cheap.
+Both `vibe_spawn` tiers run bundled `task` (`src/vibe/runtime.ts`). `good` keeps `task`'s model, so `task.agentModelOverrides.task` applies. `fast` runs on the `@smol` role at medium thinking and ignores that override, so it stays cheap; `task`'s prewalk and advisor settings do not apply to it either.
 
 Route the tiers through roles by keeping aliases in `task.agentModelOverrides` and concrete selectors only in `modelRoles`:
 

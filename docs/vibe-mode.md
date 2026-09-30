@@ -30,7 +30,7 @@ Every worker is a real, keep-alive task-executor subagent with the normal coding
 | `fast` | `task`        | `@smol`, medium thinking | Mechanical execution, drafts, high-volume work      |
 | `good` | `task`        | `@task`                  | Design, judgment calls, and reviewing `fast` output |
 
-Both tiers run the bundled `task` definition, not a same-named discovered custom agent. `good` matches task-agent routing: `task.agentModelOverrides.task` wins over the bundled agent model. `fast` always uses the `@smol` role and ignores that override. Role aliases resolve through `modelRoles`, with the parent active/default model as fallback. Workers from sessions saved before this change, recorded as `sonic`, restore as `fast` workers.
+Both tiers run the bundled `task` definition, not a same-named discovered custom agent. `good` matches task-agent routing: `task.agentModelOverrides.task` wins over the bundled agent model. `fast` always uses the `@smol` role and ignores that override, and `task.agentPrewalk.task`, `task.agentAdvisor.task` and the `task.prewalk` toggle do not apply to it. Role aliases resolve through `modelRoles`, with the parent active/default model as fallback. Workers from sessions saved before this change, recorded as `sonic`, restore as `fast` workers.
 
 ## Worker-control tools
 
