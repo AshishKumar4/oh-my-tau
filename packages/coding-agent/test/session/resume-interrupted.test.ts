@@ -82,6 +82,30 @@ function singleResult(output: string): SingleResult {
 	};
 }
 
+/** An IRC message from `from` as a recipient's transcript records it. */
+function ircFrom(manager: SessionManager, from: string, text: string, options: { wakeRelay?: boolean } = {}): void {
+	manager.appendCustomMessageEntry("irc:incoming", text, true, {
+		id: `${from}-${Date.now()}`,
+		from,
+		message: text,
+		...(options.wakeRelay ? { wakeRelay: true } : {}),
+	});
+}
+
+/** The parent messaged parked subagent `to`, reviving it for a new run. */
+function revived(manager: SessionManager, to: string): void {
+	const id = `wake_${to}_${Date.now()}`;
+	manager.appendMessage(toolTurn({ id, name: "write", args: { path: `agent://${to}` } }));
+	manager.appendMessage(
+		toolResult(id, "write", { message: { op: "send", from: "Main", to, receipts: [{ to, outcome: "revived" }] } }),
+	);
+}
+
+/** Lets entry timestamps (ms resolution) tell writes apart. */
+function tick(): Promise<void> {
+	return Bun.sleep(5);
+}
+
 function resultsFor(manager: SessionManager, toolCallId: string): ToolResultMessage[] {
 	return manager
 		.getBranch()
@@ -122,6 +146,36 @@ describe("/recover", () => {
 			getAgentId: () => "Main",
 			replaced,
 		};
+	}
+
+	/** A parked subagent of `Main` whose transcript `lane` the test writes; close it with {@link parked}. */
+	function laneSession(): SessionManager {
+		return SessionManager.create(dir.path(), path.join(dir.path(), "children"));
+	}
+
+	async function parked(id: string, lane: SessionManager): Promise<string> {
+		await lane.flush();
+		const file = lane.getSessionFile();
+		await lane.close();
+		if (!file) throw new Error("subagent session has no file");
+		AgentRegistry.global().register({
+			id,
+			displayName: id,
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			sessionFile: file,
+			status: "parked",
+		});
+		return file;
+	}
+
+	function deliveries(jobs: AsyncJobManager): Array<{ id: string; text: string }> {
+		const delivered: Array<{ id: string; text: string }> = [];
+		jobs.registerDeliverySink("Main", (id, text) => {
+			delivered.push({ id, text });
+		});
+		return delivered;
 	}
 
 	it("gives a crash-interrupted tool call a glitch result and keeps it in context", async () => {
@@ -449,7 +503,8 @@ describe("/recover", () => {
 		]) {
 			const child = SessionManager.create(dir.path(), path.join(dir.path(), "children"));
 			child.appendSessionInit({ systemPrompt: `${agent} prompt`, task: "work", tools: ["read"], agent });
-			child.appendMessage(createAssistantMessage("working"));
+			// Cut off mid-call: a finished transcript would not be restarted.
+			child.appendMessage(toolTurn({ id: `${id}_call`, name: "read", args: { path: "src" } }));
 			await child.flush();
 			const file = child.getSessionFile();
 			await child.close();
@@ -490,7 +545,7 @@ describe("/recover", () => {
 
 	it("restarts a subagent once when /recover runs twice at the same time", async () => {
 		const child = SessionManager.create(dir.path(), path.join(dir.path(), "children"));
-		child.appendMessage(createAssistantMessage("working"));
+		child.appendMessage(toolTurn({ id: "lane_call", name: "bash", args: { command: "bun test" } }));
 		await child.flush();
 		const laneFile = child.getSessionFile();
 		await child.close();
@@ -521,5 +576,247 @@ describe("/recover", () => {
 		expect([first.status, second.status]).toEqual(["resumed", "handled"]);
 		expect(followUp).toHaveBeenCalledTimes(1);
 		await jobs.dispose();
+	});
+	it("does not restart a subagent that finished with a text answer, and recovers one that never reached the parent", async () => {
+		const answered = laneSession();
+		const silent = laneSession();
+		revived(manager, "Answered");
+		revived(manager, "Silent");
+		ircFrom(answered, "Main", "Is the fix ready?");
+		answered.appendMessage(createAssistantMessage("The fix is ready."));
+		ircFrom(manager, "Answered", "The fix is ready.", { wakeRelay: true });
+		ircFrom(silent, "Main", "Get the fix reviewed.");
+		silent.appendMessage(createAssistantMessage("Sent it to the reviewer."));
+		ircFrom(manager, "Silent", "Sent it to the reviewer.", { wakeRelay: true });
+		await tick();
+		// The reviewer's reply woke Silent again; its conclusion went only to the reviewer.
+		ircFrom(silent, "Reviewer", "Approved.");
+		silent.appendMessage(createAssistantMessage("The reviewer approved the fix; nothing is left."));
+		await parked("Answered", answered);
+		await parked("Silent", silent);
+		manager.appendMessage(createAssistantMessage("waiting on the reviews"));
+		openedBy(manager, "this");
+		const jobs = new AsyncJobManager({ retentionMs: 0 });
+		const delivered = deliveries(jobs);
+		const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockResolvedValue(singleResult("report"));
+
+		const outcome = await resumeInterruptedWork(host(jobs));
+		await jobs.waitForAll();
+		await jobs.drainDeliveries({ timeoutMs: 1000 });
+
+		if (outcome.status !== "resumed") throw new Error(`expected resumed, got ${outcome.status}`);
+		expect(followUp).not.toHaveBeenCalled();
+		expect(outcome.restarted).toEqual([]);
+		expect(outcome.skipped.map(agent => agent.jobId)).toEqual(["Answered"]);
+		expect(outcome.recovered.map(agent => agent.jobId)).toEqual(["Silent"]);
+		expect(outcome.notice).toContain("- `Answered`: its last report already reached you.");
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]?.id).toBe("Silent");
+		expect(delivered[0]?.text).toContain("The reviewer approved the fix; nothing is left.");
+		await jobs.dispose();
+	});
+
+	it("delivers once, without restarting it, a finished subagent's yield that never reached the parent", async () => {
+		const lane = laneSession();
+		revived(manager, "Lane");
+		ircFrom(lane, "Main", "Run the probe, then report.");
+		lane.appendMessage(toolTurn({ id: "probe", name: "bash", args: { command: "./probe" } }));
+		lane.appendMessage(toolResult("probe", "bash", { async: { state: "running", jobId: "bg_1", type: "bash" } }));
+		lane.appendMessage(createAssistantMessage("Waiting for the probe."));
+		ircFrom(manager, "Lane", "Waiting for the probe.", { wakeRelay: true });
+		await tick();
+		lane.appendCustomMessageEntry("async-result", "3 of 3 passed", true, { jobs: [{ jobId: "bg_1", type: "bash" }] });
+		lane.appendMessage(toolTurn({ id: "y", name: "yield", args: { data: { report: "probe passed: 3 of 3" } } }));
+		lane.appendMessage(toolResult("y", "yield"));
+		const laneFile = await parked("Lane", lane);
+		manager.appendMessage(createAssistantMessage("waiting on Lane"));
+		openedBy(manager, "this");
+		const jobs = new AsyncJobManager({ retentionMs: 0 });
+		const delivered = deliveries(jobs);
+		const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockResolvedValue(singleResult("report"));
+
+		const outcome = await resumeInterruptedWork(host(jobs));
+		await jobs.waitForAll();
+		await jobs.drainDeliveries({ timeoutMs: 1000 });
+
+		if (outcome.status !== "resumed") throw new Error(`expected resumed, got ${outcome.status}`);
+		expect(followUp).not.toHaveBeenCalled();
+		expect(outcome.recovered.map(agent => agent.jobId)).toEqual(["Lane"]);
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]?.text).toContain("Recovered result of `Lane`");
+		expect(delivered[0]?.text).toContain("probe passed: 3 of 3");
+		expect((await resumeInterruptedWork(host(jobs))).status).toBe("handled");
+		expect(delivered).toHaveLength(1);
+		// A finished transcript is left as it was.
+		const laneBranch = (await SessionManager.open(laneFile)).getBranch();
+		expect(laneBranch.at(-1)?.type === "message" && laneBranch.at(-1)).toMatchObject({
+			message: { role: "toolResult" },
+		});
+		await jobs.dispose();
+	});
+
+	it("does not count a peer the subagent messaged as its unfinished work", async () => {
+		const lane = laneSession();
+		revived(manager, "Lane");
+		ircFrom(lane, "Main", "Get the fix reviewed.");
+		// Reviewer is Main's subagent: its run reports to Main, not to Lane.
+		revived(lane, "Reviewer");
+		lane.appendMessage(createAssistantMessage("Sent the fix to Reviewer; nothing else is pending."));
+		ircFrom(manager, "Lane", "Sent the fix to Reviewer; nothing else is pending.", { wakeRelay: true });
+		await parked("Lane", lane);
+		AgentRegistry.global().register({
+			id: "Reviewer",
+			displayName: "Reviewer",
+			kind: "sub",
+			parentId: "Main",
+			session: null,
+			status: "parked",
+		});
+		manager.appendMessage(createAssistantMessage("waiting on the review"));
+		openedBy(manager, "this");
+		const jobs = new AsyncJobManager({ retentionMs: 0 });
+		const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockResolvedValue(singleResult("report"));
+
+		const outcome = await resumeInterruptedWork(host(jobs));
+
+		if (outcome.status !== "resumed") throw new Error(`expected resumed, got ${outcome.status}`);
+		expect(followUp).not.toHaveBeenCalled();
+		expect(outcome.skipped.map(agent => agent.jobId)).toEqual(["Lane"]);
+		await jobs.dispose();
+	});
+
+	it("restarts a subagent whose turn the previous process's quit cut off", async () => {
+		const lane = laneSession();
+		openedBy(manager, 101);
+		revived(manager, "Lane");
+		ircFrom(lane, "Main", "Run the tests.");
+		lane.appendMessage(toolTurn({ id: "tests", name: "bash", args: { command: "bun test" } }));
+		await tick();
+		sessionExit(manager);
+		// The quit aborts the subagent's running call after the parent's exit marker.
+		lane.appendMessage({ ...toolResult("tests", "bash"), isError: true });
+		lane.appendMessage(stoppedTurn("aborted"));
+		await parked("Lane", lane);
+		openedBy(manager, "this");
+		const jobs = new AsyncJobManager({ retentionMs: 0 });
+		const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockResolvedValue(singleResult("report"));
+
+		const outcome = await resumeInterruptedWork(host(jobs));
+		await jobs.waitForAll();
+
+		if (outcome.status !== "resumed") throw new Error(`expected resumed, got ${outcome.status}`);
+		expect(outcome.restarted.map(agent => agent.jobId)).toEqual(["Lane"]);
+		expect(followUp).toHaveBeenCalledTimes(1);
+		await jobs.dispose();
+	});
+
+	it("does not restart a finished subagent over a call an older process left dangling", async () => {
+		const lane = laneSession();
+		lane.appendMessage(toolTurn({ id: "old", name: "bash", args: { command: "make" } }));
+		await tick();
+		openedBy(manager, 101);
+		await tick();
+		revived(manager, "Lane");
+		ircFrom(lane, "Main", "Is the build fixed?");
+		lane.appendMessage(createAssistantMessage("Yes, the build is fixed."));
+		ircFrom(manager, "Lane", "Yes, the build is fixed.", { wakeRelay: true });
+		const laneFile = await parked("Lane", lane);
+		manager.appendMessage(createAssistantMessage("done"));
+		openedBy(manager, "this");
+		const jobs = new AsyncJobManager({ retentionMs: 0 });
+		const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockResolvedValue(singleResult("report"));
+
+		const outcome = await resumeInterruptedWork(host(jobs));
+
+		if (outcome.status !== "resumed") throw new Error(`expected resumed, got ${outcome.status}`);
+		expect(followUp).not.toHaveBeenCalled();
+		expect(outcome.skipped.map(agent => agent.jobId)).toEqual(["Lane"]);
+		const laneManager = await SessionManager.open(laneFile);
+		expect(resultsFor(laneManager, "old")).toEqual([]);
+		await laneManager.close();
+		await jobs.dispose();
+	});
+
+	it("does not resurrect a subagent an earlier /recover considered but did not restart", async () => {
+		const lane = laneSession();
+		const ghost = laneSession();
+		manager.appendMessage(toolTurn({ id: "spawn", name: "task", args: { tasks: [] } }));
+		manager.appendMessage(
+			toolResult("spawn", "task", {
+				async: { state: "running", jobId: "Lane", type: "task" },
+				progress: [
+					{ id: "Lane", status: "running" },
+					{ id: "Ghost", status: "running" },
+				],
+			}),
+		);
+		lane.appendMessage(toolTurn({ id: "lane_call", name: "bash", args: { command: "bun test" } }));
+		ghost.appendMessage({ role: "user", content: "Check the docs.", timestamp: Date.now() });
+		ghost.appendMessage(createAssistantMessage("The docs are fine."));
+		ircFrom(manager, "Ghost", "The docs are fine.");
+		const laneFile = await parked("Lane", lane);
+		await parked("Ghost", ghost);
+		await tick();
+		// The previous process ran /recover: it restarted Lane and skipped Ghost, then crashed mid-run.
+		openedBy(manager, 101);
+		const jobs = new AsyncJobManager({ retentionMs: 0 });
+		const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockResolvedValue(singleResult("report"));
+		const earlier = await resumeInterruptedWork(host(jobs));
+		if (earlier.status !== "resumed") throw new Error(`expected resumed, got ${earlier.status}`);
+		expect(earlier.restarted.map(agent => agent.jobId)).toEqual(["Lane"]);
+		await jobs.waitForAll();
+		await tick();
+		const laneAgain = await SessionManager.open(laneFile);
+		laneAgain.appendMessage(toolTurn({ id: "lane_call_2", name: "bash", args: { command: "bun test" } }));
+		await laneAgain.flush();
+		await laneAgain.close();
+		manager.appendMessage(createAssistantMessage("Lane restarted"));
+		openedBy(manager, "this");
+		followUp.mockClear();
+
+		const outcome = await resumeInterruptedWork(host(jobs));
+		await jobs.waitForAll();
+
+		if (outcome.status !== "resumed") throw new Error(`expected resumed, got ${outcome.status}`);
+		expect(outcome.restarted.map(agent => agent.jobId)).toEqual(["Lane"]);
+		expect([...outcome.recovered, ...outcome.skipped]).toEqual([]);
+		expect(followUp.mock.calls.map(([options]) => options.id)).toEqual(["Lane"]);
+		expect(outcome.notice).not.toContain("Ghost");
+		await jobs.dispose();
+	});
+
+	it("does not count work the parent stopped through a harness facade as interrupted", () => {
+		manager.appendMessage(
+			toolTurn(
+				{ id: "spawn", name: "task", args: { tasks: [] } },
+				{ id: "bg", name: "bash", args: { command: "serve" } },
+			),
+		);
+		manager.appendMessage(
+			toolResult("spawn", "task", {
+				async: { state: "running", jobId: "Lane", type: "task" },
+				progress: [{ id: "Lane", status: "running" }],
+			}),
+		);
+		manager.appendMessage(toolResult("bg", "bash", { async: { state: "running", jobId: "bg_1", type: "bash" } }));
+		// Claude Code's TaskStop: recorded as `write` with the vendor's arguments.
+		for (const id of ["Lane", "bg_1"]) {
+			manager.appendMessage(toolTurn({ id: `stop_${id}`, name: "write", args: { task_id: id } }));
+			manager.appendMessage(
+				toolResult(`stop_${id}`, "write", {
+					proc: {
+						op: "cancel",
+						jobs: [{ id, status: "cancelled" }],
+						cancelled: [{ id, status: "cancelled" }],
+					},
+				}),
+			);
+		}
+		manager.appendMessage(createAssistantMessage("stopped both"));
+		openedBy(manager, "this");
+
+		const scan = findInterruptedWork(manager.getBranch());
+
+		expect(!scan.handled && [...scan.agents, ...scan.jobs]).toEqual([]);
 	});
 });
