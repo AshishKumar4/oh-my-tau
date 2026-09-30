@@ -222,6 +222,7 @@ import {
 import { isLowSignalTitleInput } from "../tiny/text";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
+import type { EventBus } from "../utils/event-bus";
 import { resolveApproval } from "../tools/approval";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { type AskToolInput, recoverAskQuestions } from "../tools/ask";
@@ -835,6 +836,8 @@ export class AgentSession implements SettingsScope {
 
 	readonly #eval: EvalRunner;
 	readonly #evalToolSession: ToolSession | undefined;
+	readonly #eventBus: EventBus | undefined;
+	readonly #subagentEventBus: EventBus | undefined;
 	/**
 	 * AsyncJobManager owned by this session (top-level only). Subagents leave
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
@@ -1496,6 +1499,8 @@ export class AgentSession implements SettingsScope {
 			kernelOwnerId: config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`,
 		});
 		this.#evalToolSession = config.evalToolSession;
+		this.#eventBus = config.eventBus;
+		this.#subagentEventBus = config.subagentEventBus;
 		const initialEvalStateContext = this.#buildEvalStateContextMessage();
 		if (initialEvalStateContext) this.agent.appendMessage(initialEvalStateContext);
 		const ircHost: IrcBridgeHost = {
@@ -2427,6 +2432,14 @@ export class AgentSession implements SettingsScope {
 
 	get asyncJobManager(): AsyncJobManager | undefined {
 		return this.#asyncJobManager;
+	}
+
+	get eventBus(): EventBus | undefined {
+		return this.#eventBus;
+	}
+
+	get subagentEventBus(): EventBus | undefined {
+		return this.#subagentEventBus;
 	}
 
 	getAgentId(): string | undefined {

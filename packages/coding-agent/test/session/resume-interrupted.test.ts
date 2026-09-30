@@ -17,6 +17,7 @@ import {
 	resumeInterruptedWork,
 } from "@oh-my-pi/pi-coding-agent/session/resume-interrupted";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import * as executor from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -107,11 +108,15 @@ describe("/recover", () => {
 		dir.removeSync();
 	});
 
+	const bus = new EventBus();
+
 	function host(jobs?: AsyncJobManager): RecoverHost & { replaced: AgentMessage[][] } {
 		const replaced: AgentMessage[][] = [];
 		return {
 			sessionManager: manager,
 			asyncJobManager: jobs,
+			eventBus: bus,
+			subagentEventBus: bus,
 			agent: { replaceMessages: messages => replaced.push(messages) },
 			buildDisplaySessionContext: () => manager.buildSessionContext(),
 			getAgentId: () => "Main",
@@ -243,6 +248,9 @@ describe("/recover", () => {
 		expect(outcome.notice).toContain("- `Lane` (fix the lane)\n- `Scout`\n");
 		expect(followUp).toHaveBeenCalledTimes(2);
 		expect(followUp.mock.calls[0]?.[0].id).toBe("Lane");
+		// The session's buses carry the restart's lifecycle frames to the running-subagents list.
+		expect(followUp.mock.calls[0]?.[0].eventBus).toBe(bus);
+		expect(followUp.mock.calls[0]?.[0].subagentEventBus).toBe(bus);
 		expect(followUp.mock.calls[0]?.[0].message).toContain("A system glitch stopped OMP and interrupted your run");
 		expect(delivered.some(delivery => delivery.id === "Lane" && delivery.text.includes("lane report"))).toBe(true);
 		const laneBranch = (await SessionManager.open(laneFile)).getBranch();

@@ -19,6 +19,7 @@ import { getBundledAgent } from "../task/agents";
 import { discoverAgents, getAgent } from "../task/discovery";
 import { runSubagentFollowUpTurn } from "../task/executor";
 import type { AgentDefinition } from "../task/types";
+import type { EventBus } from "../utils/event-bus";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "./async-job-delivery";
 import {
 	SESSION_EXIT_CUSTOM_TYPE,
@@ -358,6 +359,9 @@ async function resolveAgentDefinition(
 export interface RecoverHost {
 	readonly sessionManager: SessionManager;
 	readonly asyncJobManager: AsyncJobManager | undefined;
+	/** Buses a restarted subagent announces itself on, so it shows in the running-subagents list like a spawn. */
+	readonly eventBus: EventBus | undefined;
+	readonly subagentEventBus: EventBus | undefined;
 	readonly agent: { replaceMessages(messages: AgentMessage[]): void };
 	buildDisplaySessionContext(): { messages: AgentMessage[] };
 	getAgentId(): string | undefined;
@@ -456,6 +460,8 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 							outputSchema: init?.outputSchema,
 							outputSchemaMode: init?.outputSchemaMode,
 							signal,
+							eventBus: host.eventBus,
+							subagentEventBus: host.subagentEventBus,
 							artifactsDir,
 						});
 						const text = result.output.trim() || `(${interrupted.jobId} finished without a report)`;

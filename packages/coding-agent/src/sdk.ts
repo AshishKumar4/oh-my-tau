@@ -4720,6 +4720,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			extensionRunner,
 			getEvalPreludes,
 			evalToolSession: toolSession,
+			eventBus,
+			subagentEventBus,
 			customCommands: customCommandsResult.commands,
 			skills,
 			skillDescriptions,
