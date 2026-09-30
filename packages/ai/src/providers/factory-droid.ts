@@ -422,6 +422,10 @@ function streamMessagesWire(a: Attempt, inner: Model<"anthropic-messages">): Ass
 		taskBudget: options?.taskBudget,
 		fallbackCreditRedemption: options?.fallbackCreditRedemption,
 		anthropicSlowMode: options?.anthropicSlowMode,
+		// The inner Messages model would resolve its own catalog harness profile
+		// (claude-code for recent Claude lineages); the factory-droid-agent model
+		// the session presents has none, so only the caller's override applies.
+		harnessProfile: options?.harnessProfile ?? null,
 		thinkingEnabled: !a.disabled,
 		effort: outputEffort as AnthropicOptions["effort"],
 		// Token budgets come from the KDL ladder; adaptive thinking has none.

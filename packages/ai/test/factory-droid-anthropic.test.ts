@@ -80,6 +80,40 @@ describe("Factory Droid anthropic wire (Claude)", () => {
 		const tools = captured[0].body.tools as Array<{ name: string }>;
 		expect(captured[0].body.tool_choice).toEqual(expected(tools[0].name));
 	});
+
+	// The inner Messages model for Opus 5.5 resolves the claude-code catalog
+	// profile, which drops the tool cache anchor; the factory-droid-agent model
+	// resolves none, so only a caller-forced profile may reach the wire.
+	it.each([
+		["omitted", undefined, true],
+		["native", null, true],
+		["forced claude-code", "claude-code", false],
+	] as const)(
+		"applies the caller's harness profile (%s), not the inner model's",
+		async (_label, harnessProfile, anchored) => {
+			const captured: CapturedRequest[] = [];
+			await streamFactoryDroid(
+				factoryModel("claude-opus-5-5"),
+				{
+					messages: [{ role: "user", content: "read it", timestamp: 1 }],
+					tools: [
+						{ name: "read", description: "Read file", parameters: type({ path: "string" }) },
+						{ name: "bash", description: "Run a command", parameters: type({ command: "string" }) },
+					],
+				},
+				{
+					apiKey: WORKOS_TOKEN,
+					fetch: captureFetch(captured, anthropicChunks("OK")),
+					reasoning: Effort.High,
+					...(harnessProfile !== undefined ? { harnessProfile } : {}),
+				},
+			).result();
+			const tools = captured[0].body.tools;
+			if (!Array.isArray(tools)) throw new Error("the request declared no tools");
+			const lastTool: unknown = tools.at(-1);
+			expect(typeof lastTool === "object" && lastTool !== null && "cache_control" in lastTool).toBe(anchored);
+		},
+	);
 });
 
 const usage = {
