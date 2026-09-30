@@ -47,6 +47,7 @@ async function childSessionOptions(agent: AgentDefinition): Promise<CreateAgentS
 	} as unknown as ModelRegistry;
 	const captured = Promise.withResolvers<CreateAgentSessionOptions>();
 	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+		if (!options) throw new Error("expected session options");
 		captured.resolve(options);
 		throw new Error("stop after capturing the child session options");
 	});

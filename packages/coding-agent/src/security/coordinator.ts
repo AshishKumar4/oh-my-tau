@@ -53,7 +53,7 @@ import {
 } from "../task/settings";
 
 const SECURITY_SESSION_TOOLS = ["read", "grep", "glob", "lsp", "ast_grep", "task", "security_publish"];
-/** Scans may cover untrusted code, so workers only read it: no bash, network, or spawning. */
+/** Scans may cover untrusted code, so workers only read it: no bash, web search, or spawning. */
 const SECURITY_WORKER_TOOLS = ["read", "find", "grep", "glob", "lsp", "ast_grep"];
 /** One worker's review; the coordinator reconciles these into `security_publish`. */
 const SECURITY_WORKER_OUTPUT = {

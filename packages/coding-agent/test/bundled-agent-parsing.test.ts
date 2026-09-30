@@ -8,6 +8,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
+import { buildOutputValidator } from "@oh-my-pi/pi-coding-agent/tools/output-schema-validator";
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 
 describe("bundled agent parsing", () => {
@@ -17,6 +18,26 @@ describe("bundled agent parsing", () => {
 		expect(task).toBeDefined();
 		expect(task?.model).toEqual(["@task"]);
 		expect(task?.thinkingLevel).toBe(AUTO_THINKING);
+	});
+
+	it("accepts reviewer findings with or without a design kind", () => {
+		const findingValidator = buildOutputValidator(getBundledAgent("reviewer")?.output).validator?.validateSection.get(
+			"findings",
+		);
+		const finding = {
+			title: "Reuse parseRef instead of a second parser",
+			body: "parseTarget duplicates parseRef; call parseRef and delete the copy.",
+			priority: 2,
+			confidence: 0.8,
+			file_path: "src/ref.ts",
+			line_start: 10,
+			line_end: 60,
+		};
+
+		expect(findingValidator).toBeDefined();
+		expect(findingValidator?.(finding).success).toBe(true);
+		expect(findingValidator?.({ ...finding, kind: "design" }).success).toBe(true);
+		expect(findingValidator?.({ ...finding, kind: "style" }).success).toBe(false);
 	});
 
 	// Issue #4761: with `modelRoles.slow: ...:xhigh`, the role's explicit effort
