@@ -251,6 +251,8 @@ describe("/recover", () => {
 		// The session's buses carry the restart's lifecycle frames to the running-subagents list.
 		expect(followUp.mock.calls[0]?.[0].eventBus).toBe(bus);
 		expect(followUp.mock.calls[0]?.[0].subagentEventBus).toBe(bus);
+		// The restart's job delivers to this session's agent, so its relays skip it.
+		expect(followUp.mock.calls[0]?.[0].resultOwnerId).toBe("Main");
 		expect(followUp.mock.calls[0]?.[0].message).toContain("A system glitch stopped OMP and interrupted your run");
 		expect(delivered.some(delivery => delivery.id === "Lane" && delivery.text.includes("lane report"))).toBe(true);
 		const laneBranch = (await SessionManager.open(laneFile)).getBranch();

@@ -463,6 +463,7 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 							eventBus: host.eventBus,
 							subagentEventBus: host.subagentEventBus,
 							artifactsDir,
+							resultOwnerId: host.getAgentId(),
 						});
 						const text = result.output.trim() || `(${interrupted.jobId} finished without a report)`;
 						const structured = result.structuredOutput;

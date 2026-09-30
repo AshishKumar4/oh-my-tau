@@ -670,23 +670,27 @@ export class AsyncJobManager {
 	}
 
 	/**
-	 * Cancel every job owned by `ownerId`, then wait only until `deadlineAt`.
-	 * The returned completion keeps waiting for actual process settlement when
-	 * the deadline expires, so callers can move that cleanup out of the
-	 * user-visible Task wait without losing ownership of the live work.
+	 * Cancel the given jobs, then wait only until `deadlineAt` for them to
+	 * settle. The returned completion keeps waiting for actual process
+	 * settlement when the deadline expires, so callers can move that cleanup
+	 * out of the user-visible wait without losing ownership of the live work.
+	 * Unknown ids are skipped.
 	 */
-	async cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
-		this.cancelAll({ ownerId });
-		const timeoutMs = Math.max(0, deadlineAt - Date.now());
-		const settled = await this.waitForOwnerJobs(ownerId, { timeoutMs });
-		if (settled) {
+	async cancelAndReapJobs(jobIds: readonly string[], deadlineAt: number): Promise<AsyncJobReapResult> {
+		const jobs = jobIds.flatMap(id => this.#jobs.get(id) ?? []);
+		for (const job of jobs) this.cancel(job.id);
+		const completion = Promise.all(jobs.map(job => job.promise)).then(() => {});
+		const unsettled = () => jobs.filter(job => job.endTime === undefined).map(job => job.id);
+		if (unsettled().length === 0 || (await this.#waitForDeliveryPromise(completion, deadlineAt))) {
 			return { settled: true, pendingJobIds: [], completion: Promise.resolve() };
 		}
-		const pendingJobIds = this.#filterJobs(this.#jobs.values(), { ownerId })
-			.filter(job => job.status === "running" || job.status === "cancelled")
-			.map(job => job.id);
-		const completion = this.waitForOwnerJobs(ownerId).then(() => {});
-		return { settled: false, pendingJobIds, completion };
+		return { settled: false, pendingJobIds: unsettled(), completion };
+	}
+
+	/** {@link cancelAndReapJobs} for every job `ownerId` registered. */
+	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
+		const jobIds = this.#filterJobs(this.#jobs.values(), { ownerId }).map(job => job.id);
+		return this.cancelAndReapJobs(jobIds, deadlineAt);
 	}
 
 	async #waitForAllUntil(deadline: number): Promise<boolean> {
