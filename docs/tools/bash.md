@@ -22,10 +22,10 @@
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `command` | `string` | Yes | Shell command text to execute. A leading `cd <path> && ...` is rewritten into `cwd` only when `cwd` was omitted. |
-| `timeout` | `number` | No | Timeout in seconds. Default `300`. `0` disables the deadline. Positive values are capped by `tools.maxTimeout` when that setting is positive, then clamped to the Bash range `1..3600`. |
+| `timeout` | `number` | No | Timeout in seconds. Foreground-only default `300`; explicit background starts and eligible auto-background runs have no default deadline. `0` disables the deadline. Explicit positive values are capped by positive `tools.maxTimeout`, then clamped to `1..3600` in every mode. |
 | `cwd` | `string` | No | Working directory, resolved against `session.cwd` via `resolveToCwd`. Must exist and be a directory. |
 | `pty` | `boolean` | No | Request PTY mode. Default `false`. Foreground PTY requires a UI and `PI_NO_PTY !== "1"`; named services forward this setting to the broker. |
-| `async` | `boolean` | No | Background execution request. Present only when `async.enabled` is true for the session. Returns immediately with a job id instead of waiting; it does not change the effective deadline, including a disabled deadline from `timeout: 0`. |
+| `async` | `boolean` | No | Background execution request. Present only when `async.enabled` is true for the session. Returns immediately with a job id instead of waiting; without an explicit timeout it has no deadline. Caller-supplied timeouts still apply. |
 | `name` | `string` | No | Supervised service name (≤48 characters; project-unique). Present only when `launch.enabled` and the session can launch. A live name restarts using the new spec. Incompatible with `async` and `timeout`. |
 | `ready` | `{ log?: string; port?: number; host?: string; timeout?: number }` | No | Service readiness: output regex and/or TCP port must pass; host defaults to `127.0.0.1`, timeout to 30 seconds. Only with `name`. |
 | `env` | `Record<string, string>` | No | Environment overrides for the service. Only with `name`. |
@@ -42,7 +42,7 @@ The tool returns a single `text` content block plus optional `details`.
 
 - Success, foreground:
   - `content[0].text`: command output, or `(no output)` when the command produced nothing.
-  - `details.timeoutSeconds`: effective positive timeout after global/per-tool clamping, or `details.timeoutDisabled: true` when `timeout: 0`.
+  - `details.timeoutSeconds`: effective positive timeout after global/per-tool clamping, or `details.timeoutDisabled: true` for `timeout: 0` or a managed background-capable run without an explicit timeout.
   - `details.requestedTimeoutSeconds`: present when a positive requested timeout differed from the effective timeout.
   - `details.wallTimeMs`: elapsed wall-clock milliseconds for completed local/client-terminal runs.
   - `details.terminalId`: present when execution was routed through a client terminal bridge.
@@ -135,16 +135,16 @@ Choose the setting by the desired outcome:
 - Use `bash.patterns` when the question is **whether the command may execute**.
 - Use `bashInterceptor.patterns` when the question is **which tool should perform the operation**.
 
-1. `BashTool.execute()` in `packages/coding-agent/src/tools/bash.ts` reads `command`. A `name` selects supervised service mode (through the user's shell and launch broker); normal Bash execution defaults `timeout` to `300`.
+1. `BashTool.execute()` in `packages/coding-agent/src/tools/bash.ts` reads `command`. A `name` selects supervised service mode (through the user's shell and launch broker); foreground-only Bash execution defaults `timeout` to `300`.
 2. If `cwd` is absent, it rewrites a leading `cd <path> && ...` into the structured `cwd` field and strips that prefix from `command`.
 3. If `async: true` is requested while `async.enabled` is off, it throws `ToolError` before any execution.
 4. If `bashInterceptor.enabled` is on, `checkBashInterception()` runs against both the original command and the `cd`-stripped command. For each form, configured regexes still check the complete input first, then each flat command separated by unquoted/unescaped `&&`, `||`, `;`, `|`, `|&`, `&`, or newlines (excluding stages that consume piped stdin from `|` or `|&`, including across blank/comment continuations), followed by versions of those fragments without leading `NAME=value` assignments. A matching enabled rule throws before execution.
 5. The command text is passed through unchanged; a per-run `InternalUrlFilesystem` is injected into the native shell so every `scheme://` path resolves at operation time.
 6. A host `cwd` resolves against `session.cwd` and `fs.stat()` verifies it is a directory; a URL `cwd` is checked through the URL filesystem and handed to the shell as-is (service and PTY modes refuse it).
-7. `timeout: 0` disables the deadline. Otherwise `clampTimeout("bash", requestedTimeoutSec, tools.maxTimeout)` applies a positive global ceiling (when configured), then `TOOL_TIMEOUTS.bash` (`min: 1`, `max: 3600`). When clamped, `#buildCompletedResult()` / `#buildBackgroundStartResult()` append a notice line.
+7. `timeout: 0`, or an omitted timeout on an explicit or eligible auto-background run, disables the deadline. Otherwise `clampTimeout("bash", requestedTimeoutSec, tools.maxTimeout)` applies a positive global ceiling (when configured), then `TOOL_TIMEOUTS.bash` (`min: 1`, `max: 3600`). When clamped, `#buildCompletedResult()` / `#buildBackgroundStartResult()` append a notice line.
 8. Execution path splits:
    1. `async: true` -> `#startManagedBashJob()` registers a session async job and returns immediately.
-   2. Non-PTY with `bash.autoBackground.enabled`, an async job manager below its running-job cap, and no client-terminal bridge available (the bridge wins when both apply) -> starts a managed job, waits up to `min(thresholdMs, timeoutMs - 1000)`, and either returns the completed result or converts the run into a background job.
+   2. Non-PTY with `bash.autoBackground.enabled`, an async job manager below its running-job cap, and no client-terminal bridge available (the bridge wins when both apply) -> starts a managed job, waits for `thresholdMs` (bounded to `timeoutMs - 1000` only when an explicit deadline exists), and either returns the completed result or converts the run into a background job.
    3. Non-PTY client-terminal bridge, when the session advertises terminal capability and `pty` is false -> creates a remote terminal, streams/polls current output, and releases the terminal after completion.
    4. Otherwise runs foreground execution.
 9. Foreground non-PTY without client terminal calls `executeBash()` from `packages/coding-agent/src/exec/bash-executor.ts`; that path performs direnv/devenv preflight itself.
@@ -171,7 +171,7 @@ Choose the setting by the desired outcome:
    - Supports interactive input; `Esc` kills the session from the overlay.
 4. Explicit background job
    - Requires `async: true` and `async.enabled`.
-   - Registers a job with `session.asyncJobManager` and returns `{ state: "running", jobId }` immediately. `timeout: 0` leaves the job without a tool-imposed deadline.
+   - Registers a job with `session.asyncJobManager` and returns `{ state: "running", jobId }` immediately. Omitting `timeout` or passing `timeout: 0` leaves the job without a tool-imposed deadline.
 5. Auto-backgrounded non-PTY job
    - Requires `bash.autoBackground.enabled`, no PTY/client-terminal bridge, and an async job manager below its running-job cap.
    - Starts like a foreground managed job, then backgrounds it when it outlives the wait window; at capacity, Bash falls back to direct foreground execution.
@@ -203,11 +203,11 @@ Choose the setting by the desired outcome:
   - PTY mode opens a TUI overlay titled `Console` and forwards input to the PTY.
   - Background start messages note that the result is delivered automatically; use `wait` only when there is no other work.
 - Background work / cancellation
-  - Async and auto-background jobs continue after the initial tool return, until completion, cancellation, or their deadline (unless `timeout: 0` disabled it).
+  - Async and auto-background jobs continue after the initial tool return until completion, cancellation, or a caller-supplied deadline; there is no default background deadline.
   - Cancellation aborts the native run; PTY overlay dismissal also kills the PTY.
 
 ## Limits & Caps
-- Default timeout: `300s` (`TOOL_TIMEOUTS.bash.default` in `packages/coding-agent/src/tools/tool-timeouts.ts`).
+- Foreground-only default timeout: `300s` (`TOOL_TIMEOUTS.bash.default` in `packages/coding-agent/src/tools/tool-timeouts.ts`). Explicit and eligible auto-background runs have no deadline unless the caller supplies one.
 - `timeout: 0` disables the command deadline.
 - Positive timeout clamp: `tools.maxTimeout` is an optional global ceiling (`0` means no global ceiling), followed by the Bash `1..3600s` range.
 - Auto-background default threshold: `60_000ms` (`DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS` in `packages/coding-agent/src/tools/bash.ts`), further capped to `timeoutMs - 1000` when a deadline exists; a disabled deadline leaves the threshold uncapped.

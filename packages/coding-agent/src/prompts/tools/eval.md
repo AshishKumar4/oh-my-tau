@@ -34,4 +34,4 @@ More globals; `read` the linked docs before first use:
 NEVER repeat successful setup. Kernel-loss notice means reload setup.
 </critical>
 
-{{#if autoBackgroundEnabled}}Long cells may auto-background and deliver later; the kernel stays busy. `timeout: 0` disables the cell deadline, not the foreground wait.{{/if}}
+{{#if autoBackgroundEnabled}}Long cells may auto-background and deliver later; the kernel stays busy. Without an explicit timeout, these runs have no cell deadline; explicit limits still apply. `timeout: 0` disables the cell deadline, not the foreground wait.{{/if}}

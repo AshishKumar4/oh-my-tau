@@ -26,7 +26,7 @@ Current tool input:
   language: "py";
   code: string;    // inline source or a standalone %load / %pip install
   title?: string;
-  timeout?: number; // seconds; default 30, 0 disables, otherwise clamped to 1..3600
+  timeout?: number; // seconds; foreground-only default 30; background default unlimited; 0 disables
   reset?: boolean;  // wipe the Python kernel before this call
 }
 ```
@@ -154,7 +154,7 @@ The runner accepts a `{"type": "tool", "id", "op": "describe"|"call", ...}` requ
 
 ### Cell timeout
 
-`timeout` is in seconds and defaults to 30. `0` disables the cell timeout; nonzero values are clamped to `1..3600` seconds and by a positive `tools.maxTimeout` ceiling before being passed to `IdleTimeout`. The timeout is suspended while a host-side `wait()` on `agent()` / `completion()` handles is in flight: those calls emit reference-counted pause/resume events through `withBridgeTimeoutPause`, and a fresh timeout window begins when control returns.
+`timeout` is in seconds and defaults to 30 for foreground-only calls. Eligible auto-background runs without an explicit timeout have no cell deadline. `0` also disables the cell timeout; explicit nonzero values are clamped to `1..3600` seconds and by a positive `tools.maxTimeout` ceiling before being passed to `IdleTimeout`. The timeout is suspended while a host-side `wait()` on `agent()` / `completion()` handles is in flight: those calls emit reference-counted pause/resume events through `withBridgeTimeoutPause`, and a fresh timeout window begins when control returns.
 
 The pause/resume events are the sole mechanism that suspends the budget. Compute, `stdout`/`stderr`, `log()`/`phase()`, and ordinary tool calls count against it. The tool combines caller, session, and watchdog abort signals with `AbortSignal.any(...)`; the backend does not arm a competing deadline.
 

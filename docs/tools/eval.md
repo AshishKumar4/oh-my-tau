@@ -25,7 +25,7 @@ The params object is one cell. There is no `cells` array, header parser, languag
 | `language` | `"py" \| "js"` | Yes | Explicit backend token. Normally the live schema includes only enabled runtimes. |
 | `code` | `string` | Yes | Inline code, or one standalone `%load` / `%pip install` (py) / `%bun add` / `%environment` (js) command. |
 | `title` | `string` | No | Short transcript label. |
-| `timeout` | `number` | No | Runtime-work timeout in seconds. Default 30; `0` disables the cell timeout. Nonzero values are clamped by the tool timeout policy (`TOOL_TIMEOUTS.eval`: 1–3600 s) and `tools.maxTimeout`. |
+| `timeout` | `number` | No | Runtime-work timeout in seconds. Foreground-only default 30; eligible auto-background runs have no default deadline. `0` disables the cell timeout. Explicit nonzero values are clamped by `TOOL_TIMEOUTS.eval` (1–3600 s) and `tools.maxTimeout` in every mode. |
 | `reset` | `boolean` | No | Recreate this language's retained runtime before execution. Other language runtimes are untouched. Default `false`. |
 
 Example across three calls:
@@ -101,7 +101,7 @@ The renderer merges call and result inline, syntax-highlights from the declared 
 1. `EvalTool` builds a session-specific schema from enabled languages. It is essential, strict, `approval="exec"`, and `concurrency="exclusive"` within one agent session.
 2. `execute()` maps `py/js` to `python/js`, resolves availability, reads JS file-backed source once, and wraps the input in the renderer-compatible cell list. The JS backend installs requested packages inside the cancellation/background lifecycle.
 3. It obtains the retained executor id from `session.getEvalSessionId?.()` or `defaultEvalSessionId(session)`, allocates the output sink/artifact, and registers the run through `trackEvalExecution?.(...)`.
-4. The timeout defaults to 30 seconds. `0` creates no watchdog. Otherwise `IdleTimeout` is combined with tool and session abort signals.
+4. Foreground-only calls default to 30 seconds; an eligible auto-background run without an explicit timeout creates no watchdog, as does `timeout: 0`. Otherwise `IdleTimeout` is combined with tool and session abort signals. Backend availability probes retain their bounded discovery timeout.
 5. Waiting on `agent()` and `completion()` handles emits pause/resume status operations: time spent in those host bridges does not consume the cell's runtime-work budget. Compute, output, status helpers, and ordinary `tool.*` calls do consume it.
 6. The selected backend receives cwd, retained session id, session file, kernel owner, reset flag, callbacks, and cancellation signal.
 7. Output chunks stream into an artifact-aware `OutputSink` and live tail. Rich displays are separated into JSON, image, markdown, and status channels.
@@ -111,10 +111,10 @@ The renderer merges call and result inline, syntax-highlights from the declared 
 
 With `eval.autoBackground.enabled` (default `false`), a cell that outlives `eval.autoBackground.thresholdMs` (default 60000 ms) is converted into a managed async job instead of blocking the turn:
 
-- The tool foreground-waits for `resolveAutoBackgroundWaitMs(thresholdMs, clampedCellTimeoutMs)`: the threshold, clamped down to the cell's own clamped timeout minus a 1 s buffer so a deadline expiry resolves inline rather than backgrounding moments before it fires. Raising `timeout` therefore does not extend foreground execution beyond the threshold. A threshold of `0` backgrounds immediately.
+- The tool foreground-waits for the configured threshold. An explicit nonzero timeout bounds that wait to its clamped budget minus a 1 s buffer so a deadline expiry resolves inline rather than backgrounding moments before it fires. Without an explicit timeout there is no cell deadline, including after backgrounding. Raising `timeout` therefore does not extend foreground execution beyond the threshold. A threshold of `0` backgrounds immediately.
 - On backgrounding, the tool returns the live output tail plus `Backgrounded as job <id>; result will be delivered automatically.`, with `details.async = { state: "running", jobId, type: "eval" }`. The job's completion is delivered later like a backgrounded bash command.
 - A queued user/peer message (steer) arriving mid-wait backgrounds the cell immediately ("Backgrounded early to handle an incoming message; the cell keeps running.").
-- At the async-job manager's running-job capacity the tool falls through to ordinary foreground execution instead of failing.
+- At the async-job manager's running-job capacity, or without a job manager, the tool falls through to ordinary foreground execution with its default timeout instead of failing.
 - A failed, cancelled, or timed-out cell is reported as a failed background job (an errored execution is re-entered into the job manager's failure path), never as a silent success.
 
 ## Runtime behavior
