@@ -52,6 +52,8 @@ interface LaneOptions {
 	maxRuntimeMs?: number;
 	/** Adopt the lane with this idle TTL, so it parks like a kept-alive subagent. */
 	idleTtlMs?: number;
+	/** Running-job cap of the job manager the lane and its parent share, read at every registration. */
+	maxRunningJobs?: () => number;
 }
 
 interface Lane {
@@ -62,10 +64,12 @@ interface Lane {
 	delivered: string[];
 	/** Lifecycle frame statuses the lane's runs published. */
 	lifecycle: string[];
-	/** Resolves with the id of the background job the lane started. */
+	/** Resolves with the id of the first background job the lane started. */
 	jobStarted: Promise<string>;
-	/** Completes the lane's background job with this output. */
-	finishJob: (output: string) => void;
+	/** Resolves with the id of the background job the lane started under `label`. */
+	jobStartedAs: (label: string) => Promise<string>;
+	/** Completes the lane's background job `label` with this output. */
+	finishJob: (output: string, label?: string) => void;
 	/** Resolves when a run publishes its end frame. */
 	runEnded: Promise<void>;
 	/** Waits for the run's relay and every delivery of the parent's jobs to land. */
@@ -88,23 +92,36 @@ function toolCall(name: string, args: Record<string, unknown>): MockResponse {
 function createLane(responses: MockHandler[], laneOptions: LaneOptions = {}): Lane {
 	const tempDir = TempDir.createSync("@pi-wake-run-delivery-");
 	tempDirs.push(tempDir);
-	const manager = new AsyncJobManager({});
+	const manager = new AsyncJobManager({ maxRunningJobs: laneOptions.maxRunningJobs });
 	const delivered: string[] = [];
 	manager.registerDeliverySink(MAIN_AGENT_ID, (_jobId, text) => {
 		delivered.push(text);
 	});
-	const job = Promise.withResolvers<string>();
 	const jobStarted = Promise.withResolvers<string>();
+	const jobs = new Map<string, { started: PromiseWithResolvers<string>; output: PromiseWithResolvers<string> }>();
+	const jobFor = (label: string) => {
+		let job = jobs.get(label);
+		if (!job) {
+			job = { started: Promise.withResolvers<string>(), output: Promise.withResolvers<string>() };
+			jobs.set(label, job);
+		}
+		return job;
+	};
 	const backgroundTool: AgentTool<typeof backgroundSchema> = {
 		name: "background",
 		label: "Background",
 		description: "Run a command in the background",
 		parameters: backgroundSchema,
 		async execute(_toolCallId, params) {
-			const jobId = manager.register("bash", params.label, ({ signal }) => untilAborted(signal, job.promise), {
-				ownerId: LANE,
-			});
+			const job = jobFor(params.label);
+			const jobId = manager.register(
+				"bash",
+				params.label,
+				({ signal }) => untilAborted(signal, job.output.promise),
+				{ ownerId: LANE },
+			);
 			jobStarted.resolve(jobId);
+			job.started.resolve(jobId);
 			return { content: [{ type: "text", text: `Backgrounded as job ${jobId}.` }] };
 		},
 	};
@@ -178,7 +195,8 @@ function createLane(responses: MockHandler[], laneOptions: LaneOptions = {}): La
 		delivered,
 		lifecycle,
 		jobStarted: jobStarted.promise,
-		finishJob: output => job.resolve(output),
+		jobStartedAs: label => jobFor(label).started.promise,
+		finishJob: (output, label = "probe") => jobFor(label).output.resolve(output),
 		runEnded: runEnded.promise,
 		settle: async () => {
 			await session.waitForIrcReplies();
@@ -214,6 +232,20 @@ function captureRelays(): (to: string) => string[] {
 	const send = vi.spyOn(IrcBus.global(), "send");
 	return to =>
 		send.mock.calls.flatMap(([message]) => (message.from === LANE && message.to === to ? [message.body] : []));
+}
+
+/** `Main`'s `wait` tool, over the job manager it shares with the lane. */
+function parentWait(lane: Lane): WaitTool {
+	return new WaitTool({
+		cwd: "/tmp",
+		hasUI: false,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+		settings: Settings.isolated({ "launch.enabled": false }),
+		agentRegistry: AgentRegistry.global(),
+		asyncJobManager: lane.manager,
+		getAgentId: () => MAIN_AGENT_ID,
+	});
 }
 
 /** Ids of the running jobs `Main` owns on the lane's manager. */
@@ -283,16 +315,7 @@ describe("IRC wake run delivery", () => {
 			{ content: ["Waiting for the probe."] },
 			toolCall("yield", { data: { report: "probe passed: 3 of 3" } }),
 		]);
-		const wait = new WaitTool({
-			cwd: "/tmp",
-			hasUI: false,
-			getSessionFile: () => null,
-			getSessionSpawns: () => "*",
-			settings: Settings.isolated({ "launch.enabled": false }),
-			agentRegistry: AgentRegistry.global(),
-			asyncJobManager: lane.manager,
-			getAgentId: () => MAIN_AGENT_ID,
-		});
+		const wait = parentWait(lane);
 
 		await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Run the probe, then report." });
 		await lane.jobStarted;
@@ -591,5 +614,184 @@ describe("IRC wake run delivery", () => {
 		expect(lane.delivered[0]).toContain("probe passed: 3 of 3");
 		expect(result.output).toContain("handoff: summary written");
 		expect(result.output).not.toContain("probe passed");
+	});
+	it("returns the parent's wait with the quiet settle when a run a peer started only answers", async () => {
+		const lane = createLane([
+			toolCall("background", { label: "probe" }),
+			{ content: ["Waiting for the probe."] },
+			{ content: ["The probe passed; nothing to record."] },
+		]);
+		const relaysTo = captureRelays();
+
+		await IrcBus.global().send({ from: REVIEWER, to: LANE, body: "Does the probe pass?" });
+		await lane.jobStarted;
+		await lane.session.waitForIdle();
+		let returned = false;
+		const waiting = parentWait(lane)
+			.execute("wait-1", {})
+			.finally(() => {
+				returned = true;
+			});
+		await drainEventLoop();
+		expect(returned).toBe(false);
+
+		lane.finishJob("3 of 3 passed");
+		const result = await waiting;
+		const text = result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
+		expect(text).toContain(`${LANE} answered by message and recorded no result.`);
+		await lane.settle();
+		expect(lane.delivered).toEqual([]);
+		expect(relaysTo(REVIEWER)).toEqual(["The probe passed; nothing to record."]);
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
+	});
+
+	it("reaps only its own work when a successor run took the lane before its teardown", async () => {
+		const lane = createLane([
+			toolCall("background", { label: "probe" }),
+			{ content: ["Waiting for the probe."] },
+			toolCall("background", { label: "second" }),
+			{ content: ["Waiting for the second probe."] },
+			toolCall("yield", { data: { report: "second probe passed" } }),
+		]);
+
+		await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Run the probe, then report." });
+		const probeId = await lane.jobStartedAs("probe");
+		await lane.session.waitForIdle();
+		await drainEventLoop();
+		// Hold the killed run's session abort, so the reviewer's wake takes the
+		// lane and starts work while that run's teardown is still ahead.
+		const abortGate = Promise.withResolvers<void>();
+		const abort = lane.session.abort.bind(lane.session);
+		vi.spyOn(lane.session, "abort").mockImplementation(async options => {
+			await abortGate.promise;
+			return abort(options);
+		});
+		const [wakeJob] = lane.manager.getRunningJobs({ ownerId: MAIN_AGENT_ID });
+		if (!wakeJob) throw new Error("the woken lane has no job for its parent");
+		expect(lane.manager.cancel(wakeJob.id, { ownerId: MAIN_AGENT_ID })).toBe(true);
+
+		await IrcBus.global().send({ from: REVIEWER, to: LANE, body: "Run the second probe." });
+		const secondId = await lane.jobStartedAs("second");
+		expect(await until(() => lane.mock.calls.length >= 4)).toBe(true);
+		await lane.session.waitForIdle();
+		abortGate.resolve();
+
+		expect(await until(() => lane.lifecycle.includes("aborted"))).toBe(true);
+		expect(lane.manager.getJob(probeId)?.status).toBe("cancelled");
+		expect(lane.manager.getJob(secondId)?.status).toBe("running");
+
+		lane.finishJob("2 of 2 passed", "second");
+		expect(await until(() => lane.lifecycle.includes("completed"))).toBe(true);
+		await lane.settle();
+		expect(lane.delivered).toHaveLength(1);
+		expect(lane.delivered[0]).toContain("second probe passed");
+	});
+
+	it("does not relay a follow-up run's result to the parent whose status wake it took in", async () => {
+		const statusAnswered = Promise.withResolvers<void>();
+		const lane = createLane([
+			toolCall("background", { label: "probe" }),
+			{ content: ["Waiting for the probe."] },
+			() => {
+				statusAnswered.resolve();
+				return { content: ["The probe is still running."] };
+			},
+			toolCall("yield", { data: { report: "handoff: probe passed" } }),
+		]);
+		const relaysTo = captureRelays();
+
+		// The caller's job (here the test) carries the follow-up's result to the parent.
+		const followUp = runSubagentFollowUpTurn({ id: LANE, agent: laneAgent, message: "Run the probe, then report." });
+		await lane.jobStarted;
+		await lane.session.waitForIdle();
+		await drainEventLoop();
+		const receipt = await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Status?" });
+		expect(receipt.outcome).toBe("woken");
+		await statusAnswered.promise;
+		await lane.session.waitForIdle();
+
+		lane.finishJob("3 of 3 passed");
+		const result = await followUp;
+		expect(result.output).toContain("handoff: probe passed");
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
+	});
+
+	it("does not drive a lane released while a follow-up waited for a wake run opened during its install", async () => {
+		const lane = createLane([toolCall("background", { label: "probe" }), { content: ["Waiting for the probe."] }]);
+		// The parent's message wakes the lane while the follow-up installs its
+		// yield contract, so a wake run owns the lane once the install returns.
+		const install = lane.session.setWorkPoolYieldItems.bind(lane.session);
+		vi.spyOn(lane.session, "setWorkPoolYieldItems").mockImplementationOnce(async items => {
+			await install(items);
+			await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Run the probe, then report." });
+			await lane.jobStarted;
+			await lane.session.waitForIdle();
+		});
+
+		const followUp = runSubagentFollowUpTurn({ id: LANE, agent: laneAgent, message: "Write the summary." }).then(
+			() => "drove the lane",
+			(error: unknown) => (error instanceof Error ? error.message : String(error)),
+		);
+		await lane.jobStarted;
+		await lane.session.waitForIdle();
+		await drainEventLoop();
+		expect(lane.lifecycle).toEqual(["started"]);
+
+		// Released while the follow-up waits for that run to end.
+		await AgentLifecycleManager.global().release(LANE);
+		const outcome = await Promise.race([followUp, Bun.sleep(2000).then(() => "still waiting")]);
+		expect(outcome).toMatch(/released/);
+		expect(lane.mock.calls).toHaveLength(2);
+	});
+
+	it("routes the result through a job opened at the run's end when the parent's manager had no room at its start", async () => {
+		let cap = 1;
+		const lane = createLane(
+			[
+				() => {
+					cap = 15;
+					return toolCall("background", { label: "probe" });
+				},
+				{ content: ["Waiting for the probe."] },
+				toolCall("yield", { data: { report: "probe passed: 3 of 3" } }),
+			],
+			{ maxRunningJobs: () => cap },
+		);
+		const filler = Promise.withResolvers<string>();
+		lane.manager.register("bash", "filler", () => filler.promise, { ownerId: MAIN_AGENT_ID });
+		const relaysTo = captureRelays();
+
+		await IrcBus.global().send({ from: REVIEWER, to: LANE, body: "Run the probe, then report." });
+		await lane.jobStarted;
+		await lane.session.waitForIdle();
+		expect(parentJobs(lane)).not.toContain(LANE);
+
+		lane.finishJob("3 of 3 passed");
+		await lane.runEnded;
+		filler.resolve("filler done");
+		await lane.settle();
+		expect(lane.delivered.filter(text => text.includes("probe passed: 3 of 3"))).toHaveLength(1);
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
+		expect(relaysTo(REVIEWER)).toHaveLength(1);
+	});
+
+	it("hands the result to the parent as a message when its manager never has room for the job", async () => {
+		const lane = createLane([toolCall("yield", { data: { report: "answered directly" } })], {
+			maxRunningJobs: () => 1,
+		});
+		const filler = Promise.withResolvers<string>();
+		lane.manager.register("bash", "filler", () => filler.promise, { ownerId: MAIN_AGENT_ID });
+		const relaysTo = captureRelays();
+
+		await IrcBus.global().send({ from: REVIEWER, to: LANE, body: "What did you find?" });
+		await lane.runEnded;
+		await lane.session.waitForIrcReplies();
+
+		const toParent = relaysTo(MAIN_AGENT_ID);
+		expect(toParent).toHaveLength(1);
+		expect(toParent[0]).toContain("answered directly");
+		expect(relaysTo(REVIEWER)).toHaveLength(1);
+		expect(parentJobs(lane)).not.toContain(LANE);
+		filler.resolve("filler done");
 	});
 });
