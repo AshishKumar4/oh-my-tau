@@ -557,6 +557,33 @@ describe("persisted subagent revival", () => {
 		expect(capturedOptions?.agentName).toBe("scout");
 	});
 
+	it("revives transcripts of removed bundled agents from their recorded contract", async () => {
+		const contracts = [
+			{ agent: "security-reviewer", tools: ["read", "find", "grep", "glob", "lsp", "ast_grep", "yield"] },
+			{ agent: "sonic", tools: ["read", "edit", "write", "bash", "yield"] },
+		];
+		const captured: CreateAgentSessionOptions[] = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("expected session options");
+			captured.push(options);
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		for (const contract of contracts) {
+			const cwd = makeTempDir(`@pi-revive-retired-${contract.agent}-`);
+			const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, contract);
+			const ref = createRef(sessionFile);
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			await reviver(ref);
+		}
+
+		// No definition lookup: each keeps the tools it ran with and its rule scope.
+		expect(captured.map(options => [options.agentName, options.toolNames])).toEqual(
+			contracts.map(contract => [contract.agent, contract.tools]),
+		);
+	});
+
 	it("falls back to the ref display name reviving a legacy session file without a persisted agent name", async () => {
 		const cwd = makeTempDir("@pi-revive-agent-name-legacy-");
 		const sessionFile = await createPersistedSession(cwd);

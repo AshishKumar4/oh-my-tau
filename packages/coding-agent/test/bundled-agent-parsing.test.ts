@@ -20,28 +20,24 @@ describe("bundled agent parsing", () => {
 		expect(task?.thinkingLevel).toBe(AUTO_THINKING);
 	});
 
-	it("accepts security-reviewer findings with optional remediation metadata", () => {
-		const securityReviewer = getBundledAgent("security-reviewer");
-		const findingValidator = buildOutputValidator(securityReviewer?.output).validator?.validateSection.get(
+	it("accepts reviewer findings with or without a design kind", () => {
+		const findingValidator = buildOutputValidator(getBundledAgent("reviewer")?.output).validator?.validateSection.get(
 			"findings",
 		);
+		const finding = {
+			title: "Reuse parseRef instead of a second parser",
+			body: "parseTarget duplicates parseRef; call parseRef and delete the copy.",
+			priority: 2,
+			confidence: 0.8,
+			file_path: "src/ref.ts",
+			line_start: 10,
+			line_end: 60,
+		};
 
 		expect(findingValidator).toBeDefined();
-		expect(
-			findingValidator?.({
-				rule_id: "command-injection",
-				title: "Unsanitized command input",
-				summary: "User input reaches a shell command",
-				severity: "high",
-				confidence: "high",
-				category: "injection",
-				locations: [{ path: "src/run.ts", start_line: 10 }],
-				cwe: ["CWE-78"],
-				evidence: [{ label: "data flow", explanation: "Input reaches exec" }],
-				anchor: "run",
-				remediation: "Pass arguments without a shell",
-			}).success,
-		).toBe(true);
+		expect(findingValidator?.(finding).success).toBe(true);
+		expect(findingValidator?.({ ...finding, kind: "design" }).success).toBe(true);
+		expect(findingValidator?.({ ...finding, kind: "style" }).success).toBe(false);
 	});
 
 	// Issue #4761: with `modelRoles.slow: ...:xhigh`, the role's explicit effort
@@ -94,7 +90,6 @@ describe("bundled agent parsing", () => {
 
 		for (const [name, role, model] of [
 			["task", "task", "anthropic/sonnet"],
-			["sonic", "smol", "fast/hy3"],
 			["scout", "smol", "fast/hy3"],
 			["reviewer", "slow", "codex/sol"],
 		] as const) {

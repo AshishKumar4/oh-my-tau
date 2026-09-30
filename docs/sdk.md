@@ -307,6 +307,10 @@ Only after work capable of appending session entries has settled does disposal c
   `allowRestrictedCustomTools: true` and their names also appear in
   `toolNames`.
 - Hidden tools (for example `yield`) are opt-in unless required by options.
+- `spawns` limits which agents the session's `task` tool may spawn.
+  `pinnedAgents` supplies definitions those spawns use ahead of agent
+  discovery, matched by name, so project or user agent files cannot replace a
+  worker's tools, prompt, or output schema. Children do not inherit them.
 
 ```ts
 const { session } = await createAgentSession({

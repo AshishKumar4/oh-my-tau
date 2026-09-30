@@ -18,7 +18,20 @@
 
 - `omp auth-gateway serve` now attributes peers to the socket address by default; deployments behind a trusted reverse proxy can restore forwarded peer headers with `--trust-proxy-headers` ([#13827](https://github.com/can1357/oh-my-pi/pull/13827) by [@shawnkoh](https://github.com/shawnkoh))
 - Claude Code mode presents the `wait` tool again (as `TaskOutput` where the served Claude Code capture still declares that tool), and its prompts tell the agent to wait with it instead of ending the turn
+- `createAgentSession` accepts `pinnedAgents`: definitions the session's own spawns use ahead of agent discovery, matched by name, so project or user agent files cannot replace a worker's tools, prompt, or output schema
+
+### Changed
+
+- The bundled `task` agent is now a laborer for fully specified implementation and test work and can no longer spawn subagents. Agents for `^model` mentions run as `task`, so they cannot spawn either
+- The bundled `scout` agent now has `bash` for git history and data collection, never for changing files, and takes over `sonic`'s read-only work. Its `files` and `architecture` output fields are optional, so git and data jobs return a `summary` and a `report`. The task tool no longer tags it read-only, since `bash` is an exec-tier tool
+- `/security` scan workers now run as `reviewer`, pinned to the scan's worker prompt, output schema and read-only tools (`read`, `find`, `grep`, `glob`, `lsp`, `ast_grep`; no `bash`, `web_search` or spawning), so project or user agent files cannot widen them. `reviewer` entries in `task.disabledAgents`, `task.agentModelOverrides`, `task.agentPrewalk` and `task.agentAdvisor` do not reach scan workers. Scan plans made before this change are stale; plan the scan again
+- `omp commit` file analysis now runs `scout`; `/cleanse` repair workers and vibe `fast` workers now run `task`. The `fast` tier keeps the `@smol` model at medium thinking and ignores `task.agentModelOverrides.task`
+- The bundled `reviewer` now reviews design quality as well as correctness. It loads the code-quality review skills in its skill list, plus prose-quality skills for docs, prompts and user-facing text, applies them, and names them in its verdict. Findings carry an optional `kind` (`bug` or `design`); design findings may span more than 10 lines or cite code outside the diff, and never make the verdict `incorrect`
 - `--no-ui` now also works with `--mode rpc-ui`: extensions run headless while tool UI such as the `ask` tool still reaches the host ([#13718](https://github.com/can1357/oh-my-pi/pull/13718) by [@alphastorm](https://github.com/alphastorm))
+
+### Removed
+
+- Removed the bundled `sonic` and `security-reviewer` agents. Revived subagents keep the tools they ran with, `/recover` restarts their transcripts as `task` and `reviewer`, and vibe sessions restore `sonic` workers as `fast` workers. `task.agentModelOverrides` entries for either name no longer apply
 
 ### Fixed
 

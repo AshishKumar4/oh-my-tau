@@ -71,8 +71,8 @@ describe("keyword notices under Claude Code", () => {
 		for (const omp of ["`edit`", "`write`", "`bash`", "undefined"]) {
 			expect(orchestrate).not.toContain(omp);
 		}
-		expect(orchestrate).toContain("10. Right-size offload: `Agent`/`sonic` only for substantial");
-		expect(orchestrate).toContain("- `Agent`/`sonic` Target/Change/Acceptance scaffolding");
+		expect(orchestrate).toContain("10. Right-size offload: `Agent` only for substantial");
+		expect(orchestrate).toContain("- `Agent` Target/Change/Acceptance scaffolding");
 		expect(orchestrate).not.toContain("`task`");
 		const workflow = renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true, toolRefs });
 		expect(workflow).toContain("call `wait`");
@@ -111,8 +111,8 @@ describe("keyword notices under Claude Code", () => {
 		const orchestrate = renderOrchestrateNotice({ tools });
 		expect(orchestrate).toContain("Blocked with nothing else to do? Use `wait`.");
 		expect(orchestrate).toContain("`task` subagents");
-		expect(orchestrate).toContain("10. Right-size offload: `task`/`sonic` only for substantial");
-		expect(orchestrate).toContain("- `task`/`sonic` Target/Change/Acceptance scaffolding");
+		expect(orchestrate).toContain("10. Right-size offload: `task` only for substantial");
+		expect(orchestrate).toContain("- `task` Target/Change/Acceptance scaffolding");
 		expect(renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true })).toContain(
 			"Leave `eval` and call `wait`",
 		);

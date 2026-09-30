@@ -432,13 +432,10 @@ function mergeSyncPayloads(
 	};
 }
 
-/** Generic worker agent types; several in one call usually means a more specific type exists. */
-const GENERIC_SPAWN_AGENTS: ReadonlySet<string> = new Set(["task", "sonic"]);
-
 /**
  * Advisory — never a rejection — nudging the spawner toward tailored
- * specific agent types when one call resolves ≥2 items to a generic
- * `task`/`sonic` worker and the spawner still holds spawn capacity
+ * specific agent types when one call resolves ≥2 items to the generic
+ * `task` worker and the spawner still holds spawn capacity
  * (DepthCapacity: it currently has the `task` tool). `agentNames` are the
  * per-item resolved agent types. Returns undefined when no nudge applies.
  */
@@ -449,7 +446,7 @@ export function buildSpecializationAdvisory(
 	toolRefs = harnessToolRefs(undefined),
 ): string | undefined {
 	if (!depthCapacity) return undefined;
-	const generics = agentNames.filter(name => GENERIC_SPAWN_AGENTS.has(name));
+	const generics = agentNames.filter(name => name === "task");
 	if (generics.length < 2) return undefined;
 	return prompt
 		.render(taskSpecializationAdvisoryTemplate, {
@@ -733,10 +730,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const disabledAgents = cfgTaskDisabledAgents.get(this.session.settings);
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationEnabled = cfgTaskIsolationEnabled.get(this.session.settings);
+		const discovered =
+			discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
+			this.#discoveredAgents;
+		const pinned = this.session.pinnedAgents ?? [];
 		return renderDescription(template, {
-			agents:
-				discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
-				this.#discoveredAgents,
+			agents: [...pinned, ...discovered.filter(agent => !pinned.some(entry => entry.name === agent.name))],
 			sessionAgents: this.session.advertisedSessionAgents?.() ?? this.session.getSessionAgents?.() ?? [],
 			isolationEnabled: !planMode && isolationEnabled,
 			applyIsolatedChanges: cfgTaskIsolationApply.get(this.session.settings),

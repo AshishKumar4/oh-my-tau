@@ -325,7 +325,7 @@ test("the quick picker is an md sheet with the summary below and a task-model to
 // ─── Agents per role ────────────────────────────────────────────────────────
 
 const ROLE_AGENTS: ReadonlyMap<string, readonly string[]> = new Map([
-	["REVIEWER", ["reviewer", "security-reviewer"]],
+	["REVIEWER", ["reviewer", "triage"]],
 	["smol", ["scout"]],
 ]);
 
@@ -416,7 +416,7 @@ function renderedRow(lines: readonly string[], role: string): string {
 	return lines.find(line => line.includes(` ${role} `)) ?? "";
 }
 
-const REVIEWER_AGENTS = "reviewer, security-reviewer";
+const REVIEWER_AGENTS = "reviewer, triage";
 const SPARE_HINT = "No agent runs on @SPARE yet. To use it, set an agent's model to @SPARE in /agents.";
 
 test("the picker lists a role's agents and badges a custom role nothing uses", async () => {

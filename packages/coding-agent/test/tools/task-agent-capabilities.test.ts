@@ -10,11 +10,10 @@ function agentByName(agents: AgentDefinition[], name: string): AgentDefinition {
 }
 
 describe("task agent capability descriptions", () => {
-	it("classifies bundled scout as the only read-only delegated agent", () => {
+	it("classifies no bundled agent as read-only: scout's bash is an exec-tier tool", () => {
 		const agents = loadBundledAgents();
 
-		expect(isReadOnlyAgent(agentByName(agents, "scout"))).toBe(true);
-		for (const name of ["task", "sonic", "reviewer"]) {
+		for (const name of ["scout", "task", "reviewer"]) {
 			expect(isReadOnlyAgent(agentByName(agents, name))).toBe(false);
 		}
 	});

@@ -59,7 +59,7 @@ describe("job renderer task-result preview", () => {
 
 	it("previews the envelope body, not the wrapper markup", () => {
 		const summary = prompt.render(taskSummaryTemplate, {
-			agentName: "sonic",
+			agentName: "scout",
 			id: "SpawnProbe",
 			status: "completed",
 			duration: "8.7s",
@@ -94,7 +94,7 @@ describe("job renderer task-result preview", () => {
 
 	it("flattens a pretty-printed JSON body instead of previewing a lone brace", () => {
 		const summary = prompt.render(taskSummaryTemplate, {
-			agentName: "sonic",
+			agentName: "scout",
 			id: "EchoAlpha",
 			status: "completed",
 			duration: "11.6s",

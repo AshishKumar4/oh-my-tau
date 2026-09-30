@@ -440,6 +440,52 @@ describe("/recover", () => {
 		await jobs.dispose();
 	});
 
+	it("restarts transcripts of removed bundled agents under the agent that replaced them", async () => {
+		for (const [id, agent] of [
+			["Scanner", "security-reviewer"],
+			["Mechanic", "sonic"],
+		]) {
+			const child = SessionManager.create(dir.path(), path.join(dir.path(), "children"));
+			child.appendSessionInit({ systemPrompt: `${agent} prompt`, task: "work", tools: ["read"], agent });
+			child.appendMessage(createAssistantMessage("working"));
+			await child.flush();
+			const file = child.getSessionFile();
+			await child.close();
+			if (!file) throw new Error("child session has no file");
+			AgentRegistry.global().register({
+				id,
+				displayName: id,
+				kind: "sub",
+				session: null,
+				sessionFile: file,
+				status: "parked",
+			});
+		}
+		manager.appendMessage(toolTurn({ id: "spawn", name: "task", args: { tasks: [] } }));
+		manager.appendMessage(
+			toolResult("spawn", "task", {
+				async: { state: "running", jobId: "Scanner", type: "task" },
+				progress: [
+					{ id: "Scanner", status: "running" },
+					{ id: "Mechanic", status: "running" },
+				],
+			}),
+		);
+		manager.appendMessage(createAssistantMessage("agents running"));
+		openedBy(manager, "this");
+		const jobs = new AsyncJobManager({ retentionMs: 0 });
+		const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockResolvedValue(singleResult("report"));
+
+		await resumeInterruptedWork(host(jobs));
+		await jobs.waitForAll();
+
+		expect(followUp.mock.calls.map(([options]) => [options.id, options.agent.name])).toEqual([
+			["Scanner", "reviewer"],
+			["Mechanic", "task"],
+		]);
+		await jobs.dispose();
+	});
+
 	it("restarts a subagent once when /recover runs twice at the same time", async () => {
 		const child = SessionManager.create(dir.path(), path.join(dir.path(), "children"));
 		child.appendMessage(createAssistantMessage("working"));

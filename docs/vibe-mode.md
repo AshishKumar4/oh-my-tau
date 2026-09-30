@@ -25,12 +25,12 @@ Toggle it with the `/vibe` slash command:
 
 Every worker is a real, keep-alive task-executor subagent with the normal coding tool surface and its own persisted child transcript. Choose a tier when spawning:
 
-| Tier   | Bundled agent | Default role | Use for                                             |
-| ------ | ------------- | ------------ | --------------------------------------------------- |
-| `fast` | `sonic`       | `@smol`      | Mechanical execution, drafts, high-volume work      |
-| `good` | `task`        | `@task`      | Design, judgment calls, and reviewing `fast` output |
+| Tier   | Bundled agent | Default role             | Use for                                             |
+| ------ | ------------- | ------------------------ | --------------------------------------------------- |
+| `fast` | `task`        | `@smol`, medium thinking | Mechanical execution, drafts, high-volume work      |
+| `good` | `task`        | `@task`                  | Design, judgment calls, and reviewing `fast` output |
 
-The tier always selects the bundled `sonic` or `task` definition, not a same-named discovered custom agent. Model resolution otherwise matches task-agent routing: `task.agentModelOverrides.sonic` / `.task` wins over the bundled agent model, and role aliases resolve through `modelRoles`, with the parent active/default model as fallback.
+Both tiers run the bundled `task` definition, not a same-named discovered custom agent. `good` matches task-agent routing: `task.agentModelOverrides.task` wins over the bundled agent model. `fast` always uses the `@smol` role and ignores that override. Role aliases resolve through `modelRoles`, with the parent active/default model as fallback. Workers from sessions saved before this change, recorded as `sonic`, restore as `fast` workers.
 
 ## Worker-control tools
 
