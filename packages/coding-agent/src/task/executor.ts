@@ -2979,8 +2979,16 @@ interface LaneRun {
 	 * was terminated or cancelled.
 	 */
 	join(records: AgentMessage[]): ((turnError?: unknown) => void) | undefined;
-	/** Stop observing the session, so a successor run owns it while this one finalizes. */
+	/**
+	 * Hand the lane to a successor run while this one finalizes: stop observing
+	 * the session, and pin this run's background jobs to those the lane has
+	 * running now, so this run's teardown leaves the successor's work alone.
+	 */
+	handOver(): void;
+	/** Stop observing the session at the run's own end. */
 	detach(): void;
+	/** The lane's background jobs that are this run's: those pinned at hand-over, else all it has running. */
+	ownJobIds(): string[];
 	/** Settles once the run has finalized. */
 	readonly released: Promise<void>;
 }
@@ -2989,11 +2997,23 @@ interface LaneRun {
 const laneRuns = new WeakMap<AgentSession, LaneRun>();
 
 function createLaneRun(
+	session: AgentSession,
+	id: string,
 	turns: LaneRunTurns,
 	monitor: SubagentRunMonitor,
 	unsubscribe: () => void,
 	released: Promise<void>,
 ): LaneRun {
+	const runningJobIds = (): string[] =>
+		session.asyncJobManager?.getRunningJobs({ ownerId: id }).map(job => job.id) ?? [];
+	let pinnedJobIds: string[] | undefined;
+	const detach = (): void => {
+		unsubscribe();
+		// Also drops the monitor's handle on the session: a late abort of
+		// this run must not abort the successor's turn.
+		const active = monitor.takeActiveSession();
+		if (active) monitor.captureSalvage(active);
+	};
 	return {
 		join: records => {
 			if (!turns.open || monitor.abortSignal.aborted) return undefined;
@@ -3002,13 +3022,12 @@ function createLaneRun(
 			turns.pending.push(settled.promise);
 			return turnError => settled.resolve(turnError);
 		},
-		detach: () => {
-			unsubscribe();
-			// Also drops the monitor's handle on the session: a late abort of
-			// this run must not abort the successor's turn.
-			const active = monitor.takeActiveSession();
-			if (active) monitor.captureSalvage(active);
+		handOver: () => {
+			pinnedJobIds ??= runningJobIds();
+			detach();
 		},
+		detach,
+		ownJobIds: () => pinnedJobIds ?? runningJobIds(),
 		released,
 	};
 }
@@ -3061,7 +3080,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		const open = laneRuns.get(session);
 		const joined = open?.join(records);
 		if (joined) return joined;
-		open?.detach();
+		open?.handOver();
 		return openWakeRun(session, options, records);
 	});
 }
@@ -3084,11 +3103,13 @@ interface WakeJobSettlement {
  * a yield with no owned background work pending, or a stop with nothing left
  * running. Its owner-routed job opens with it, so the parent's `wait` and job
  * list see the lane working; the job's body settles with the run, and
- * cancelling the job cancels the run. A yield is delivered through the job;
- * a run without one settles the job quietly, and its answer reaches the
- * wakers through {@link relayWakeTurnOutput} alone. The relay is registered as
- * a pending reply on the session up front so a `send await:true` waiter holds
- * its "stopped without replying" verdict until the relay has been delivered.
+ * cancelling the job cancels the run. A parent manager with no room at the
+ * open gets the job at the run's end, else the result as a message. A yield is
+ * delivered through the job; a run without one settles the job quietly, and its
+ * answer reaches the wakers through {@link relayWakeTurnOutput} alone. The
+ * relay is registered as a pending reply on the session up front so a
+ * `send await:true` waiter holds its "stopped without replying" verdict until
+ * the relay has been delivered.
  */
 function openWakeRun(
 	session: AgentSession,
@@ -3158,12 +3179,40 @@ function openWakeRun(
 	const firstTurn = Promise.withResolvers<unknown>();
 	const turns: LaneRunTurns = { records: [...records], pending: [firstTurn.promise], open: true };
 	const released = Promise.withResolvers<void>();
-	const run = createLaneRun(turns, monitor, monitor.attach(session), released.promise);
+	const run = createLaneRun(session, id, turns, monitor, monitor.attach(session), released.promise);
 	laneRuns.set(session, run);
 
 	const ownerId = AgentRegistry.global().get(id)?.parentId;
 	const manager = session.asyncJobManager;
 	let jobOwnerId: string | undefined;
+	/**
+	 * Register the job that carries the run's outcome to the parent; returns its
+	 * owner, or undefined when there is none. Called once `settlement` exists.
+	 */
+	const routeToParent = (): string | undefined => {
+		if (!ownerId || !manager) return undefined;
+		try {
+			manager.register(
+				"task",
+				id,
+				async ({ jobId, signal }) => {
+					signal.addEventListener("abort", () => cancel.abort(signal.reason), { once: true });
+					const { quiet, outcome } = await settlement;
+					if (quiet) manager.acknowledgeDeliveries([jobId]);
+					if (outcome instanceof Error) throw outcome;
+					return outcome;
+				},
+				{ id, agentId: id, ownerId },
+			);
+			return ownerId;
+		} catch (error) {
+			logger.warn("IRC wake-run job registration failed", {
+				id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return undefined;
+		}
+	};
 	const settlement = (async (): Promise<WakeJobSettlement> => {
 		try {
 			const { outcome, turnError } = await driveLaneRun(session, monitor, undefined, turns, {
@@ -3197,18 +3246,30 @@ function openWakeRun(
 			// A run that did not finish cleanly (cancelled, timed out, failed)
 			// may leave owned background work running: reap it as a spawned
 			// run's teardown does, so it cannot wake the lane outside a run.
+			// Only this run's own jobs, picked and cancelled in one step: a
+			// successor that took the lane meanwhile owns what it started.
 			if (manager && (outcome.aborted || exitCode !== 0)) {
-				const reap = await manager.cancelAndReapOwnerJobs(id, Date.now() + TASK_ABORT_CLEANUP_GRACE_MS);
-				if (!reap.settled) {
+				const reaped = run.ownJobIds().flatMap(jobId => {
+					const job = manager.getJob(jobId);
+					return job && manager.cancel(jobId) ? [job] : [];
+				});
+				try {
+					await untilAborted(AbortSignal.timeout(TASK_ABORT_CLEANUP_GRACE_MS), () =>
+						Promise.all(reaped.map(job => job.promise)),
+					);
+				} catch {
 					logger.warn("Wake run async job cleanup exceeded its deadline", {
 						id,
-						pendingJobIds: reap.pendingJobIds,
+						pendingJobIds: reaped.filter(job => job.endTime === undefined).map(job => job.id),
 					});
 				}
 			}
 			// Read before finalization: a schema-bearing agent that answered in
 			// prose gets a missing-yield warning prepended to `result.output`.
-			const turnText = monitor.rawOutput() || (monitor.lastAssistantSalvageText() ?? "");
+			// The answer is the run's last report turn, not every turn's prose
+			// ("Waiting for the probe." included).
+			const turnText =
+				monitor.lastReportTurnText() ?? (monitor.rawOutput() || (monitor.lastAssistantSalvageText() ?? ""));
 			let result: SingleResult | undefined;
 			let finalizeError: unknown;
 			try {
@@ -3248,7 +3309,12 @@ function openWakeRun(
 			}
 			// A yield is the lane's result: the job carries it (or the failure
 			// that superseded it) to the parent, so the relay skips the parent.
+			// A parent manager that had no room for the job when the run opened
+			// may have room now; with still none, the result reaches the parent
+			// as a message rather than not at all.
+			if (yielded && jobOwnerId === undefined) jobOwnerId = routeToParent();
 			const carrier = yielded ? jobOwnerId : undefined;
+			const unrouted = yielded && carrier === undefined ? ownerId : undefined;
 			const relayArgs = {
 				id,
 				yielded,
@@ -3267,8 +3333,16 @@ function openWakeRun(
 					...relayArgs,
 					records: turns.records,
 					turnStartTime: runStartTime,
-					jobOwnerId: carrier,
+					jobOwnerId: carrier ?? unrouted,
 				});
+				if (unrouted) {
+					await IrcBus.global().send({
+						from: id,
+						to: unrouted,
+						body: buildWakeRelayBody({ ...relayArgs, alreadyMessaged: false }),
+						wakeRelay: true,
+					});
+				}
 			} catch (relayError) {
 				logger.warn("IRC wake-turn relay threw", {
 					id,
@@ -3305,28 +3379,7 @@ function openWakeRun(
 			released.resolve();
 		}
 	})();
-	if (ownerId && manager) {
-		try {
-			manager.register(
-				"task",
-				id,
-				async ({ jobId, signal }) => {
-					signal.addEventListener("abort", () => cancel.abort(signal.reason), { once: true });
-					const { quiet, outcome } = await settlement;
-					if (quiet) manager.acknowledgeDeliveries([jobId]);
-					if (outcome instanceof Error) throw outcome;
-					return outcome;
-				},
-				{ id, agentId: id, ownerId },
-			);
-			jobOwnerId = ownerId;
-		} catch (error) {
-			logger.warn("IRC wake-run job registration failed", {
-				id,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
-	}
+	jobOwnerId = routeToParent();
 	return turnError => firstTurn.resolve(turnError);
 }
 
@@ -3532,29 +3585,31 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 			}
 		}
 	};
-	await acquireOwnership();
-	// Revalidate until the worker survives an install round-trip unchanged: the
-	// waits/rebuild above can outlast the idle TTL, letting park() detach this
-	// instance mid-install. Each observed replacement means another full park
-	// cycle, so reinstall on the fresh session (revivals start empty) and check
-	// again; genuine churn fails fast instead of driving a stale instance, and
-	// a released worker throws instead of driving a corpse. A replacement may
-	// already be streaming a wake, so ownership is reacquired every round.
-	for (let acquireAttempts = 0; ; acquireAttempts++) {
+	// Revalidate until the worker survives an ownership wait and an install
+	// round-trip unchanged: the waits/rebuild can outlast the idle TTL, letting
+	// park() detach this instance, or the lane can be released meanwhile. Each
+	// observed replacement means another full park cycle, so reinstall on the
+	// fresh session (revivals start empty) and check again; genuine churn fails
+	// fast instead of driving a stale instance, and a released worker throws
+	// instead of driving a corpse. A wake may open a run on the validated
+	// session during the install, so the round repeats until one ends with the
+	// session unclaimed; nothing from that check to the claim below awaits.
+	for (let replacements = 0; ;) {
+		await acquireOwnership();
 		await session.setWorkPoolYieldItems(options.workPoolYieldItems ?? []);
 		const live = await AgentLifecycleManager.global().ensureLive(id);
-		if (live === session) break;
-		if (acquireAttempts >= 2) {
+		if (live === session) {
+			if (!laneRuns.has(session) && !session.isStreaming) break;
+			continue;
+		}
+		if (replacements >= 2) {
 			throw new Error(
 				`Subagent ${id} was replaced during every install attempt; refusing to drive a stale worker session`,
 			);
 		}
+		replacements++;
 		session = live;
-		await acquireOwnership();
 	}
-	// The install awaited, so a wake may have opened a run meanwhile. Nothing
-	// from here to the claim below awaits.
-	await acquireOwnership();
 	// A kept-alive session reuses its YieldTool across turns; clear the prior
 	// run's incremental-section flag and retry counters so this turn's guards
 	// evaluate against its own state, not stale accumulators.
@@ -3610,7 +3665,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	// this run joins it instead of opening a wake run of its own.
 	const turns: LaneRunTurns = { records: [], pending: [], open: true };
 	const released = Promise.withResolvers<void>();
-	const run = createLaneRun(turns, monitor, () => attemptUnsubscribe(), released.promise);
+	const run = createLaneRun(session, id, turns, monitor, () => attemptUnsubscribe(), released.promise);
 	laneRuns.set(session, run);
 	try {
 		try {
@@ -3646,7 +3701,9 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		}
 
 		// Read before finalization: a missing yield prepends a warning to `result.output`.
-		const turnText = monitor.rawOutput() || (monitor.lastAssistantSalvageText() ?? "");
+		// The answer is the run's last report turn, as a wake run's is.
+		const turnText =
+			monitor.lastReportTurnText() ?? (monitor.rawOutput() || (monitor.lastAssistantSalvageText() ?? ""));
 		const result = await finalizeRunResult({
 			monitor,
 			done: { ...outcome, abortReason: outcome.abortReasonText, durationMs: Date.now() - startTime },
@@ -3668,7 +3725,9 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 			sessionFile,
 			startTime,
 		});
-		// Wakes this run took in are answered with its outcome, as a wake run's are.
+		// Wakes this run took in are answered with its outcome, as a wake run's are,
+		// except the lane's parent's: the caller's job (sidekick hand-off, workpool
+		// batch, `/recover` restart, vibe turn) carries this outcome to it.
 		try {
 			await relayWakeTurnOutput({
 				id,
@@ -3681,7 +3740,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 				aborted: outcome.aborted,
 				abortReason: outcome.abortReasonText,
 				finalizeError: undefined,
-				jobOwnerId: undefined,
+				jobOwnerId: ref?.parentId,
 			});
 		} catch (relayError) {
 			logger.warn("IRC wake-turn relay threw", {
