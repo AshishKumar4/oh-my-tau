@@ -2,7 +2,6 @@
 name: reviewer
 description: "Highly capable reviewer for code, architecture, interface and security quality: finds bugs and design problems. Reviews and critiques; does not implement or plan."
 tools: read, find, grep, glob, bash, lsp, web_search, ast_grep
-spawns: scout
 model: "@slow"
 output:
   properties:

@@ -16,6 +16,7 @@
 
 ### Changed
 
+- The bundled `reviewer` agent can no longer spawn subagents; reviews run in one context
 - `omp auth-gateway serve` now attributes peers to the socket address by default; deployments behind a trusted reverse proxy can restore forwarded peer headers with `--trust-proxy-headers` ([#13827](https://github.com/can1357/oh-my-pi/pull/13827) by [@shawnkoh](https://github.com/shawnkoh))
 - Claude Code mode presents the `wait` tool again (as `TaskOutput` where the served Claude Code capture still declares that tool), and its prompts tell the agent to wait with it instead of ending the turn
 - `createAgentSession` accepts `pinnedAgents`: definitions the session's own spawns use ahead of agent discovery, matched by name, so project or user agent files cannot replace a worker's tools, prompt, or output schema
