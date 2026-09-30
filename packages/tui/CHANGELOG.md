@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `ModelHubOptions.roleAgents` takes a promise of the agents per role; once it resolves, the Roles view lists the agents on the selected role and marks a custom role nothing uses with a `no agents` badge
+
 ## [18.4.4] - 2026-09-29
 
 ### Added

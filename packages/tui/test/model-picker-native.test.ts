@@ -1,8 +1,10 @@
-import { afterEach, beforeAll, expect, test } from "bun:test";
+import { afterEach, beforeAll, expect, test, vi } from "bun:test";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import type { TspPickerGroup, TspPickerProps } from "@oh-my-pi/pi-wire";
+import { logger } from "@oh-my-pi/pi-utils";
+import type { TspPickerGroup, TspPickerProps, TspText } from "@oh-my-pi/pi-wire";
 import type { DescribeContext, NativeChild, NativeNode } from "../src/native/node";
+import { plainText } from "../src/native/spans";
 import { ModelHubComponent, type ModelHubRegistry, type ModelHubSource } from "../src/overlays/model-hub";
 import { ModelPickerComponent } from "../src/overlays/model-picker";
 import { initTheme } from "../src/theme";
@@ -45,7 +47,7 @@ const MODELS = [
 	model("openai", "gpt-5.6-mini", { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }),
 ];
 
-function source(roles: Record<string, string>, mru: string[]): ModelHubSource {
+function source(roles: Record<string, string>, mru: string[], extra: Partial<ModelHubSource> = {}): ModelHubSource {
 	return {
 		revision: 0,
 		defaultThinkingLevel: "off",
@@ -67,6 +69,7 @@ function source(roles: Record<string, string>, mru: string[]): ModelHubSource {
 		getProjectModelRole: () => undefined,
 		getGlobalModelRole: role => roles[role],
 		getModelRoleSource: () => "global",
+		...extra,
 	};
 }
 
@@ -89,6 +92,7 @@ const ui = { requestRender: () => {}, terminal: { rows: 40 } } as unknown as TUI
 const hubs: ModelHubComponent[] = [];
 afterEach(() => {
 	for (const hub of hubs.splice(0)) hub.dispose();
+	vi.restoreAllMocks();
 });
 
 function openHub(calls: { assign: string[]; cancel: number }): ModelHubComponent {
@@ -302,4 +306,223 @@ test("the quick picker is an md sheet with the summary below and a task-model to
 	expect(p.actions?.find(action => action.id === "task")?.on).toBe(true);
 	picker.handleNativeEvent({ type: "activate", key: "", item: "openai/gpt-5.6" });
 	expect(picked).toEqual(["task:openai/gpt-5.6"]);
+});
+
+// ─── Agents per role ────────────────────────────────────────────────────────
+
+const ROLE_AGENTS: ReadonlyMap<string, readonly string[]> = new Map([
+	["REVIEWER", ["reviewer", "security-reviewer"]],
+	["smol", ["scout"]],
+]);
+
+/**
+ * A hub on its Roles view: built-in `slow` (no agents), custom `REVIEWER` (two agents),
+ * custom `SPARE` (none) and custom `CYCLED` (none, but a quick-switch stop).
+ */
+function openRolesHub(roleAgents: Promise<ReadonlyMap<string, readonly string[]>>): ModelHubComponent {
+	const hub = new ModelHubComponent(
+		ui,
+		source(
+			{
+				default: "demo/demo",
+				slow: "anthropic/claude-opus-5",
+				REVIEWER: "anthropic/claude-sonnet-5-5",
+				SPARE: "openai/gpt-5.6",
+				CYCLED: "openai/gpt-5.6-mini",
+			},
+			[],
+			{
+				knownRoleIds: ["default", "smol", "slow", "REVIEWER", "SPARE", "CYCLED"],
+				cycleOrder: ["default", "CYCLED"],
+			},
+		),
+		registry(MODELS),
+		MODELS.map(entry => ({ model: entry })),
+		{ onAssign: () => {}, onUnassign: () => {}, onCancel: () => {} },
+		{ roleAgents },
+	);
+	hubs.push(hub);
+	hub.handleNativeEvent({ type: "action", key: "", act: "scope", value: "roles", mods: [] });
+	return hub;
+}
+
+function selectRole(hub: ModelHubComponent, role: string): void {
+	hub.handleNativeEvent({ type: "select", key: "", item: `role:${role}` });
+}
+
+function spansText(value: TspText | undefined): string {
+	return typeof value === "string" ? value : (value ?? []).map(part => part.t).join("");
+}
+
+/** The first node keyed `key` in a described tree. */
+function findKey(child: NativeChild, key: string): NativeNode | undefined {
+	if (!("k" in child)) return undefined;
+	if (child.key === key) return child;
+	for (const nested of child.c ?? []) {
+		const hit = findKey(nested, key);
+		if (hit) return hit;
+	}
+	return undefined;
+}
+
+/** A picker preview section's body text, found by its head. */
+function sectionText(children: readonly NativeChild[] | undefined, head: string): string | undefined {
+	const section = children?.find(child => prop(child, "head") === head);
+	if (!section || !("k" in section)) return undefined;
+	return (section.c ?? [])
+		.map(child => ("k" in child && child.k === "text" ? (child.p?.text ?? spansText(child.p?.spans)) : ""))
+		.join("\n");
+}
+
+function pickerBadges(hub: ModelHubComponent): Record<string, string[]> {
+	const badges: Record<string, string[]> = {};
+	for (const item of props(hub.describe(withPicker)).items ?? []) {
+		if (item.id.startsWith("role:")) badges[item.id.slice(5)] = (item.badges ?? []).map(badge => badge.text);
+	}
+	return badges;
+}
+
+function frameRowValue(hub: ModelHubComponent, role: string): string {
+	const row = findKey(hub.describe(withoutPicker), `role:${role}`);
+	return row?.k === "item" ? spansText(row.p?.value) : "";
+}
+
+function frameAgentsLine(hub: ModelHubComponent): string | undefined {
+	const line = findKey(hub.describe(withoutPicker), "agents");
+	return line?.k === "text" ? spansText(line.p?.spans) : undefined;
+}
+
+/** The plain-text frame, ANSI stripped. */
+function renderedLines(hub: ModelHubComponent): string[] {
+	return hub.render(200).map(line => plainText(line));
+}
+
+/** The plain-text Roles row of `role` (its tag stands padded between spaces; hint lines only say `@role`). */
+function renderedRow(lines: readonly string[], role: string): string {
+	return lines.find(line => line.includes(` ${role} `)) ?? "";
+}
+
+const REVIEWER_AGENTS = "reviewer, security-reviewer";
+const SPARE_HINT = "No agent runs on @SPARE yet. To use it, set an agent's model to @SPARE in /agents.";
+
+test("the picker lists a role's agents and badges a custom role nothing uses", async () => {
+	const roleAgents = Promise.resolve(ROLE_AGENTS);
+	const hub = openRolesHub(roleAgents);
+	await roleAgents;
+
+	// Only SPARE is unused: slow is built in, REVIEWER has agents, CYCLED is a cycle stop.
+	expect(pickerBadges(hub)).toEqual({
+		default: ["cycle 1"],
+		smol: [],
+		slow: [],
+		REVIEWER: [],
+		SPARE: ["no agents"],
+		CYCLED: ["cycle 2"],
+	});
+	const spare = props(hub.describe(withPicker)).items?.find(item => item.id === "role:SPARE");
+	expect(spare?.badges).toEqual([{ text: "no agents", tone: "warning", title: "No agent runs on @SPARE" }]);
+
+	selectRole(hub, "REVIEWER");
+	expect(sectionText(hub.describe(withPicker).c, "Agents")).toBe(REVIEWER_AGENTS);
+	selectRole(hub, "smol");
+	expect(sectionText(hub.describe(withPicker).c, "Agents")).toBe("scout");
+	selectRole(hub, "SPARE");
+	expect(sectionText(hub.describe(withPicker).c, "Agents")).toBe(SPARE_HINT);
+	// A cycle stop is used, but still no agent runs on it.
+	selectRole(hub, "CYCLED");
+	expect(sectionText(hub.describe(withPicker).c, "Agents")).toBe(
+		"No agent runs on @CYCLED yet. To use it, set an agent's model to @CYCLED in /agents.",
+	);
+	// A built-in role without agents says nothing: OMP features use it.
+	selectRole(hub, "slow");
+	const slowPreview = hub.describe(withPicker).c;
+	expect(titleOf(slowPreview)).toBe("claude-opus-5");
+	expect(sectionText(slowPreview, "Agents")).toBeUndefined();
+});
+
+test("the native frame rows carry the same badge and the selected role's agents line", async () => {
+	const roleAgents = Promise.resolve(ROLE_AGENTS);
+	const hub = openRolesHub(roleAgents);
+	await roleAgents;
+
+	expect(frameRowValue(hub, "SPARE")).toEndWith("no agents");
+	expect(frameRowValue(hub, "slow")).not.toContain("no agents");
+	expect(frameRowValue(hub, "REVIEWER")).not.toContain("no agents");
+	expect(frameRowValue(hub, "CYCLED")).not.toContain("no agents");
+	expect(frameRowValue(hub, "CYCLED")).toEndWith(" 2");
+
+	selectRole(hub, "REVIEWER");
+	expect(frameAgentsLine(hub)).toBe(`Agents: ${REVIEWER_AGENTS}`);
+	selectRole(hub, "SPARE");
+	expect(frameAgentsLine(hub)).toBe(SPARE_HINT);
+	selectRole(hub, "slow");
+	expect(frameAgentsLine(hub)).toBeUndefined();
+});
+
+test("the plain-text Roles view shows the badge and an agents line above the cycle track", async () => {
+	const roleAgents = Promise.resolve(ROLE_AGENTS);
+	const hub = openRolesHub(roleAgents);
+	await roleAgents;
+
+	selectRole(hub, "REVIEWER");
+	let lines = renderedLines(hub);
+	expect(renderedRow(lines, "SPARE")).toContain("no agents");
+	for (const role of ["slow", "REVIEWER", "CYCLED", "default"]) {
+		expect(renderedRow(lines, role)).toContain(role);
+		expect(renderedRow(lines, role)).not.toContain("no agents");
+	}
+	const cycleLine = lines.findIndex(line => line.includes("cycle:"));
+	expect(cycleLine).toBeGreaterThan(0);
+	expect(lines[cycleLine - 1]).toContain(`Agents: ${REVIEWER_AGENTS}`);
+
+	selectRole(hub, "SPARE");
+	lines = renderedLines(hub);
+	expect(lines[lines.findIndex(line => line.includes("cycle:")) - 1]).toContain(SPARE_HINT);
+
+	selectRole(hub, "slow");
+	lines = renderedLines(hub);
+	expect(lines.some(line => line.includes("Agents:") || line.includes("No agent runs"))).toBe(false);
+});
+
+test("nothing about agents shows before the scan resolves, then every path updates", async () => {
+	const scan = Promise.withResolvers<ReadonlyMap<string, readonly string[]>>();
+	const hub = openRolesHub(scan.promise);
+	selectRole(hub, "SPARE");
+
+	expect(pickerBadges(hub).SPARE).toEqual([]);
+	expect(sectionText(hub.describe(withPicker).c, "Agents")).toBeUndefined();
+	expect(frameRowValue(hub, "SPARE")).not.toContain("no agents");
+	expect(frameAgentsLine(hub)).toBeUndefined();
+	let lines = renderedLines(hub);
+	expect(lines.some(line => line.includes("no agents") || line.includes("No agent runs"))).toBe(false);
+
+	scan.resolve(ROLE_AGENTS);
+	await scan.promise;
+	expect(pickerBadges(hub).SPARE).toEqual(["no agents"]);
+	expect(sectionText(hub.describe(withPicker).c, "Agents")).toBe(SPARE_HINT);
+	expect(frameRowValue(hub, "SPARE")).toEndWith("no agents");
+	expect(frameAgentsLine(hub)).toBe(SPARE_HINT);
+	lines = renderedLines(hub);
+	expect(renderedRow(lines, "SPARE")).toContain("no agents");
+	expect(lines.some(line => line.includes(SPARE_HINT))).toBe(true);
+});
+
+test("a scan that lands after the hub closes, or fails, leaves the Roles view as it was", async () => {
+	const late = Promise.withResolvers<ReadonlyMap<string, readonly string[]>>();
+	const closed = openRolesHub(late.promise);
+	closed.dispose();
+	late.resolve(ROLE_AGENTS);
+	await late.promise;
+	expect(pickerBadges(closed).SPARE).toEqual([]);
+
+	const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+	const failed = Promise.reject(new Error("agent scan failed"));
+	const hub = openRolesHub(failed);
+	await failed.catch(() => {});
+	expect(warn).toHaveBeenCalledWith("Model hub: failed to load the agents per role", {
+		error: "Error: agent scan failed",
+	});
+	selectRole(hub, "SPARE");
+	expect(pickerBadges(hub).SPARE).toEqual([]);
+	expect(sectionText(hub.describe(withPicker).c, "Agents")).toBeUndefined();
 });

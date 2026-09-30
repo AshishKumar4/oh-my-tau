@@ -25,6 +25,7 @@ import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { providerEntry } from "@oh-my-pi/pi-catalog/compat/providers";
 import { MODEL_KINDS, modelKind, type ModelKind } from "@oh-my-pi/pi-catalog/types";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { Component, TUI } from "../tui";
 import { extractPrintableText, matchesKey } from "../keys";
 import { fuzzyFilter } from "../fuzzy";
@@ -53,6 +54,7 @@ import { matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../keyb
 import {
 	buildBrowserItems,
 	MODEL_PICKER_COLUMNS,
+	MODEL_ROLE_IDS,
 	ModelBrowser,
 	type ModelBrowserItem,
 	modelSearchText,
@@ -162,6 +164,11 @@ export interface ModelHubOptions {
 	initialProviderId?: string;
 	/** `provider/id` of the session's model, marked current in the native picker. */
 	currentSelector?: string;
+	/**
+	 * Enabled agents keyed by the role their model runs on, names sorted. Resolves after the
+	 * hub opens; until then the Roles view says nothing about agents.
+	 */
+	roleAgents?: Promise<ReadonlyMap<string, readonly string[]>>;
 }
 
 interface SidebarEntry extends HubSidebarEntry<"recent" | "roles" | "all" | "separator" | "provider"> {
@@ -305,6 +312,8 @@ export class ModelHubComponent implements Component {
 	#candidateItems: ModelBrowserItem[] = [];
 	#modelKindTab: "all" | ModelKind = "all";
 	#roleTab: RoleTab = "all";
+	/** Enabled agents per role they run on; undefined until the host's scan resolves. */
+	#roleAgents: ReadonlyMap<string, readonly string[]> | undefined;
 	#configError: string | undefined;
 
 	#entries: SidebarEntry[] = [];
@@ -382,13 +391,20 @@ export class ModelHubComponent implements Component {
 	#catalogRefreshing = false;
 	#kindTabsMemo: { candidates: readonly ModelBrowserItem[]; tabs: TspPickerProps["tabs"] } | undefined;
 	#pickerRoleItems:
-		| { rows: readonly RolesRow[]; roles: RoleAssignments; cycle: string; items: readonly TspPickerItem[] }
+		| {
+				rows: readonly RolesRow[];
+				roles: RoleAssignments;
+				cycle: string;
+				roleAgents: ReadonlyMap<string, readonly string[]> | undefined;
+				items: readonly TspPickerItem[];
+		  }
 		| undefined;
 	#pickerRolePreview:
 		| {
 				row: RolesRow | undefined;
 				roles: RoleAssignments;
 				rows: readonly RolesRow[];
+				roleAgents: ReadonlyMap<string, readonly string[]> | undefined;
 				children: readonly NativeChild[];
 		  }
 		| undefined;
@@ -445,6 +461,17 @@ export class ModelHubComponent implements Component {
 					this.#requestRender();
 				});
 		}
+
+		options.roleAgents?.then(
+			roleAgents => {
+				if (this.#disposed) return;
+				this.#roleAgents = roleAgents;
+				this.#requestRender();
+			},
+			error => {
+				logger.warn("Model hub: failed to load the agents per role", { error: String(error) });
+			},
+		);
 	}
 
 	/** Cancel pending provider refresh timers and the spinner. Host calls this on overlay close. */
@@ -477,6 +504,24 @@ export class ModelHubComponent implements Component {
 
 	#visibleRoleIds(): string[] {
 		return this.#settings.knownRoleIds.filter(role => !this.#settings.getRoleInfo(role).hidden);
+	}
+
+	/**
+	 * What the Roles view says about the agents on `role`: their names, or, for a custom role no
+	 * agent runs on, how to use it. Undefined for an agentless built-in role (OMP features use
+	 * those) and while the host's agent scan is pending.
+	 */
+	#roleAgentsNote(role: string): { agents: string } | { hint: string } | undefined {
+		const agents = this.#roleAgents?.get(role) ?? [];
+		if (agents.length > 0) return { agents: agents.join(", ") };
+		if (!this.#roleAgents || MODEL_ROLE_IDS.some(builtIn => builtIn === role)) return undefined;
+		return { hint: `No agent runs on @${role} yet. To use it, set an agent's model to @${role} in /agents.` };
+	}
+
+	/** A custom role that no agent runs on and that the quick-switch cycle skips gets the `no agents` badge. */
+	#isUnusedRole(role: string, cycleOrder: readonly string[]): boolean {
+		const note = this.#roleAgentsNote(role);
+		return note !== undefined && "hint" in note && !cycleOrder.includes(role);
 	}
 
 	/** Resolve every known role: configured values first, auto-selection for the rest. */
@@ -2372,12 +2417,18 @@ export class ModelHubComponent implements Component {
 				value = theme.fg("dim", "—");
 			}
 
-			// Quick-cycle membership badge (`⟳ 2` = second stop of the ctrl+p cycle).
+			// Quick-cycle membership badge (`⟳ 2` = second stop of the ctrl+p cycle);
+			// an unused custom role reads `no agents` in the same slot.
 			const cycleIndex = cycleOrder.indexOf(role);
-			const cycleStyled = cycleIndex >= 0 ? theme.fg("accent", `${theme.icon.loop} ${cycleIndex + 1}`) : "";
+			const badgeStyled =
+				cycleIndex >= 0
+					? theme.fg("accent", `${theme.icon.loop} ${cycleIndex + 1}`)
+					: this.#isUnusedRole(role, cycleOrder)
+						? theme.fg("warning", "no agents")
+						: "";
 
 			let line = ` ${cursor} ${dot} ${tagStyled}  ${value}`;
-			const right = [levelStyled, cycleStyled].filter(part => part.length > 0).join("  ");
+			const right = [levelStyled, badgeStyled].filter(part => part.length > 0).join("  ");
 			const rightWidth = visibleWidth(right);
 			const lineWidth = visibleWidth(line);
 			if (rightWidth > 0 && lineWidth + rightWidth + 2 <= width) {
@@ -2398,11 +2449,21 @@ export class ModelHubComponent implements Component {
 
 		// Live preview of the quick-switch cycle, rendered with the exact
 		// segment track the ctrl+p status uses; the selected role's chip fills.
+		// The spacer line above it names the agents on the selected role.
 		while (lines.length < rows - 1) lines.push("");
+		const selectedRow = this.#rolesRows[this.#roleIndex];
+		const agentsNote = selectedRow?.kind === "role" ? this.#roleAgentsNote(selectedRow.role) : undefined;
+		if (agentsNote && rows - 2 >= this.#rolesRowStart) {
+			lines[rows - 2] = truncateToWidth(
+				"agents" in agentsNote
+					? `  ${theme.fg("dim", "Agents:")} ${theme.fg("muted", agentsNote.agents)}`
+					: theme.fg("dim", `  ${agentsNote.hint}`),
+				width,
+			);
+		}
 		if (rows >= 2) {
 			const cycleKey = editorKey("app.model.cycleForward") || formatKeyHint("ctrl+p");
 			if (cycleOrder.length > 0) {
-				const selectedRow = this.#rolesRows[this.#roleIndex];
 				const selectedRole =
 					selectedRow && (selectedRow.kind === "role" || selectedRow.kind === "fallback") ? selectedRow.role : "";
 				const activeIndex = cycleOrder.indexOf(selectedRole);
@@ -2810,7 +2871,21 @@ export class ModelHubComponent implements Component {
 			items,
 			"roles",
 		);
-		return [tabs, list, this.#describeCycle(cycleOrder)];
+		const agentsNote = selectedRow?.kind === "role" ? this.#roleAgentsNote(selectedRow.role) : undefined;
+		if (!agentsNote) return [tabs, list, this.#describeCycle(cycleOrder)];
+		const agentsLine = node(
+			"text",
+			{
+				spans:
+					"agents" in agentsNote
+						? [span("Agents: ", "dim"), span(agentsNote.agents, "muted")]
+						: [span(agentsNote.hint, "dim")],
+				wrap: "word",
+			},
+			undefined,
+			"agents",
+		);
+		return [tabs, list, agentsLine, this.#describeCycle(cycleOrder)];
 	}
 
 	#describeRolesRow(rowDef: RolesRow, index: number, cycleOrder: readonly string[]): NativeNode {
@@ -2864,11 +2939,14 @@ export class ModelHubComponent implements Component {
 				? [span(`auto → ${assignment.model.provider}/${assignment.model.id}`, "dim")]
 				: [span("—", "dim")];
 		}
-		// Quick-cycle membership badge (`⟳ 2` = second stop of the ctrl+p cycle).
+		// Quick-cycle membership badge (`⟳ 2` = second stop of the ctrl+p cycle);
+		// an unused custom role reads `no agents` in the same slot.
 		const cycleIndex = cycleOrder.indexOf(role);
-		if (cycleIndex >= 0) {
+		if (cycleIndex >= 0 || this.#isUnusedRole(role, cycleOrder)) {
 			if (value.length > 0) value.push(span("  "));
-			value.push(span(`${theme.icon.loop} ${cycleIndex + 1}`, "accent"));
+			value.push(
+				cycleIndex >= 0 ? span(`${theme.icon.loop} ${cycleIndex + 1}`, "accent") : span("no agents", "warning"),
+			);
 		}
 		return node("item", { label, detail, value: value.length > 0 ? value : undefined }, undefined, key);
 	}
@@ -3312,12 +3390,19 @@ export class ModelHubComponent implements Component {
 		};
 	}
 
-	/** Roles-view rows as picker items; rebuilt only when the rows, roles or cycle change. */
+	/** Roles-view rows as picker items; rebuilt only when the rows, roles, cycle or agents per role change. */
 	#rolePickerItems(): readonly TspPickerItem[] {
 		const cycleOrder = this.#cycleOrder();
 		const cycle = cycleOrder.join("\0");
 		const memo = this.#pickerRoleItems;
-		if (memo?.rows === this.#rolesRows && memo.roles === this.#roles && memo.cycle === cycle) return memo.items;
+		if (
+			memo?.rows === this.#rolesRows &&
+			memo.roles === this.#roles &&
+			memo.cycle === cycle &&
+			memo.roleAgents === this.#roleAgents
+		) {
+			return memo.items;
+		}
 		const items: TspPickerItem[] = [];
 		this.#rolesRows.forEach((row, index) => {
 			const id = rolesRowKey(row, index);
@@ -3353,26 +3438,28 @@ export class ModelHubComponent implements Component {
 				facts.model = "—";
 			}
 			const cycleIndex = cycleOrder.indexOf(row.role);
+			const badges: TspPickerItem["badges"] =
+				cycleIndex >= 0
+					? [
+							{
+								text: `cycle ${cycleIndex + 1}`,
+								tone: "accent",
+								title: `Stop ${cycleIndex + 1} of the quick-switch cycle`,
+							},
+						]
+					: this.#isUnusedRole(row.role, cycleOrder)
+						? [{ text: "no agents", tone: "warning", title: `No agent runs on @${row.role}` }]
+						: undefined;
 			items.push({
 				id,
 				label: tag,
 				...(info.name && info.name !== tag ? { detail: info.name } : {}),
 				facts,
 				...(assignment && !assignment.autoSelected ? {} : { tone: "muted" as const }),
-				...(cycleIndex >= 0
-					? {
-							badges: [
-								{
-									text: `cycle ${cycleIndex + 1}`,
-									tone: "accent" as const,
-									title: `Stop ${cycleIndex + 1} of the quick-switch cycle`,
-								},
-							],
-						}
-					: {}),
+				...(badges ? { badges } : {}),
 			});
 		});
-		this.#pickerRoleItems = { rows: this.#rolesRows, roles: this.#roles, cycle, items };
+		this.#pickerRoleItems = { rows: this.#rolesRows, roles: this.#roles, cycle, roleAgents: this.#roleAgents, items };
 		return items;
 	}
 
@@ -3399,10 +3486,16 @@ export class ModelHubComponent implements Component {
 		return order;
 	}
 
-	/** The selected Roles-view row's preview: its model's facts and its fallback chain. */
+	/** The selected Roles-view row's preview: its model's facts, the agents running on it, and its fallback chain. */
 	#rolePreview(row: RolesRow | undefined): readonly NativeChild[] {
 		const memo = this.#pickerRolePreview;
-		if (memo !== undefined && memo.row === row && memo.roles === this.#roles && memo.rows === this.#rolesRows) {
+		if (
+			memo !== undefined &&
+			memo.row === row &&
+			memo.roles === this.#roles &&
+			memo.rows === this.#rolesRows &&
+			memo.roleAgents === this.#roleAgents
+		) {
 			return memo.children;
 		}
 		const children: NativeChild[] = [];
@@ -3443,6 +3536,16 @@ export class ModelHubComponent implements Component {
 						text([span("Not assigned; no available model fits this role.", "muted")], { wrap: "word" }),
 					);
 				}
+				const agentsNote = this.#roleAgentsNote(row.role);
+				if (agentsNote) {
+					children.push(
+						node("section", { head: "Agents" }, [
+							"agents" in agentsNote
+								? text(agentsNote.agents, { wrap: "word" })
+								: text([span(agentsNote.hint, "muted")], { wrap: "word" }),
+						]),
+					);
+				}
 				const chain = chainList(row.role);
 				if (chain) children.push(chain);
 				break;
@@ -3476,7 +3579,13 @@ export class ModelHubComponent implements Component {
 				);
 				break;
 		}
-		this.#pickerRolePreview = { row, roles: this.#roles, rows: this.#rolesRows, children };
+		this.#pickerRolePreview = {
+			row,
+			roles: this.#roles,
+			rows: this.#rolesRows,
+			roleAgents: this.#roleAgents,
+			children,
+		};
 		return children;
 	}
 

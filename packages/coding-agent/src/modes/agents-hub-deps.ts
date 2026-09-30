@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AgentsHubDeps } from "@oh-my-pi/pi-tui/overlays/agents-hub";
+import type { AgentsHubDeps, HubAgent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { isEnoent, prompt } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
@@ -11,6 +11,7 @@ import type { ModelRegistry } from "../config/model-registry";
 import {
 	resolveAgentAdvisorSelection,
 	resolveAgentModelPatterns,
+	resolveAgentModelSelection,
 	resolveAgentPrewalkPattern,
 	resolveConfiguredModelPatterns,
 	resolveModelOverride,
@@ -52,6 +53,56 @@ function extractAssistantText(messages: AgentMessage[]): string | null {
 	return null;
 }
 
+/** Discovered agents with their saved enabled state and per-agent overrides. */
+async function loadHubAgents(
+	cwd: string,
+	settings: Settings,
+	extensionRoots: EffectiveExtensionRoots,
+): Promise<HubAgent[]> {
+	const { agents } = await discoverAgents(cwd, undefined, extensionRoots);
+	const disabled = new Set(cfgTaskDisabledAgents.get(settings));
+	const overrides = cfgTaskAgentModelOverrides.get(settings);
+	const prewalkOverrides = cfgTaskAgentPrewalk.get(settings);
+	const advisorOverrides = cfgTaskAgentAdvisor.get(settings);
+	return agents.map(agent => {
+		const override = overrides[agent.name];
+		const overrideModel = (Array.isArray(override) ? override.join(",") : (override ?? "")).trim();
+		return {
+			...agent,
+			disabled: disabled.has(agent.name),
+			overrideModel: overrideModel || undefined,
+			prewalkOverride: prewalkOverrides[agent.name]?.trim() || undefined,
+			advisorOverride: advisorOverrides[agent.name]?.trim() || undefined,
+		};
+	});
+}
+
+/**
+ * Enabled agents keyed by the model role they run on (`@slow` → `slow`), names sorted, for the
+ * model hub. Agents on a literal model or the session's model belong to no role.
+ */
+export async function loadRoleAgents(
+	cwd: string,
+	settings: Settings,
+	extensionRoots: EffectiveExtensionRoots,
+): Promise<ReadonlyMap<string, readonly string[]>> {
+	const roleAgents = new Map<string, string[]>();
+	for (const agent of await loadHubAgents(cwd, settings, extensionRoots)) {
+		if (agent.disabled) continue;
+		const { role } = resolveAgentModelSelection({
+			settingsOverride: agent.overrideModel,
+			agentModel: agent.model,
+			settings,
+		});
+		if (!role) continue;
+		const names = roleAgents.get(role);
+		if (names) names.push(agent.name);
+		else roleAgents.set(role, [agent.name]);
+	}
+	for (const names of roleAgents.values()) names.sort();
+	return roleAgents;
+}
+
 export function createAgentsHubDeps(
 	cwd: string,
 	settings: Settings,
@@ -62,24 +113,7 @@ export function createAgentsHubDeps(
 ): AgentsHubDeps {
 	return {
 		browserSource: createModelBrowserSource(settings),
-		loadAgents: async () => {
-			const { agents } = await discoverAgents(cwd, undefined, extensionRoots());
-			const disabled = new Set(cfgTaskDisabledAgents.get(settings));
-			const overrides = cfgTaskAgentModelOverrides.get(settings);
-			const prewalkOverrides = cfgTaskAgentPrewalk.get(settings);
-			const advisorOverrides = cfgTaskAgentAdvisor.get(settings);
-			return agents.map(agent => {
-				const override = overrides[agent.name];
-				const overrideModel = (Array.isArray(override) ? override.join(",") : (override ?? "")).trim();
-				return {
-					...agent,
-					disabled: disabled.has(agent.name),
-					overrideModel: overrideModel || undefined,
-					prewalkOverride: prewalkOverrides[agent.name]?.trim() || undefined,
-					advisorOverride: advisorOverrides[agent.name]?.trim() || undefined,
-				};
-			});
-		},
+		loadAgents: () => loadHubAgents(cwd, settings, extensionRoots()),
 		getAvailableModels: () => modelRegistry.getAvailable(),
 		effectiveModelPatterns: agent =>
 			resolveAgentModelPatterns({

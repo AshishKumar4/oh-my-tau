@@ -86,7 +86,7 @@ import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { getAssistantMessageLinkTargets } from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "@oh-my-pi/pi-tui/overlays/advisor-config";
-import { createAgentsHubDeps } from "../agents-hub-deps";
+import { createAgentsHubDeps, loadRoleAgents } from "../agents-hub-deps";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { collapseSharedUsageReports } from "@oh-my-pi/pi-tui/overlays/usage-display";
 import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
@@ -1016,6 +1016,7 @@ export class SelectorController {
 				currentSelector: this.ctx.session.model
 					? `${this.ctx.session.model.provider}/${this.ctx.session.model.id}`
 					: undefined,
+				roleAgents: loadRoleAgents(getProjectDir(), this.ctx.settings, this.ctx.session.effectiveExtensionRoots),
 			},
 		);
 		const overlayHandle = this.#showFullscreenMenu(hub);
