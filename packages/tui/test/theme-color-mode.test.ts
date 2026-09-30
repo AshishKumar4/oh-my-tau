@@ -33,6 +33,8 @@ describe("theme color mode", () => {
 					ITERM_SESSION_ID: "",
 					VSCODE_PID: "",
 					ALACRITTY_WINDOW_ID: "",
+					// Inside tmux the child would probe the real client terminal instead.
+					TMUX: "",
 					TERM_PROGRAM: "Apple_Terminal",
 					TERM: "xterm-256color",
 					COLORTERM: "",

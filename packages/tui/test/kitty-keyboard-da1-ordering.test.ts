@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
 import {
@@ -35,6 +35,15 @@ function restoreEnv(name: "SSH_CONNECTION" | "SSH_TTY" | "SSH_CLIENT" | "TMUX", 
 
 describe("ProcessTerminal kitty keyboard progressive-enhancement ordering", () => {
 	let harness: ProcessTerminalRenderHarness | undefined;
+
+	// Start every case outside SSH and tmux, whatever session runs the tests
+	// (SSH gates the modifyOtherKeys fallback); cases that need one set it.
+	beforeEach(() => {
+		delete Bun.env.SSH_CONNECTION;
+		delete Bun.env.SSH_TTY;
+		delete Bun.env.SSH_CLIENT;
+		delete Bun.env.TMUX;
+	});
 
 	afterEach(() => {
 		harness?.dispose();

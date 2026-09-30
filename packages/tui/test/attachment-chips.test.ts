@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import { AttachmentChipsBand } from "@oh-my-pi/pi-tui/prompt/attachment-chips";
 import { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { chipLabel } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
@@ -19,6 +19,19 @@ function makeBand(): { editor: CustomEditor; band: AttachmentChipsBand } {
 
 beforeAll(async () => {
 	await initTheme(false);
+});
+
+// Inside tmux every Kitty sequence rides a DCS passthrough envelope; these
+// cases describe a direct terminal, whatever session runs the tests.
+const ORIGINAL_TMUX = Bun.env.TMUX;
+
+beforeEach(() => {
+	delete Bun.env.TMUX;
+});
+
+afterEach(() => {
+	if (ORIGINAL_TMUX === undefined) delete Bun.env.TMUX;
+	else Bun.env.TMUX = ORIGINAL_TMUX;
 });
 
 describe("AttachmentChipsBand", () => {
