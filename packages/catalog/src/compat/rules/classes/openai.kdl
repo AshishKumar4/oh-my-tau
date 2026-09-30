@@ -59,11 +59,21 @@ class "openai" {
 			harness-profile "codex"
 		}
 	}
-	// GPT-6 Astra changes reasoning effort mid-conversation through a
+	// GPT-6 SKUs change reasoning effort mid-conversation through a
 	// `configuration_update` input item so the request-level effort (and the
-	// cached prompt prefix) stays put; every other SKU 400s on the item type.
+	// cached prompt prefix) stays put; a request-level change resends the
+	// prefix uncached. Astra takes the item on any host. Codex lists Sol, Luna
+	// and 6.1 Sol with `supports_reasoning_effort_updates` and keeps the
+	// response chain and cache across their updates; their other hosts are
+	// unverified. Codex also accepts the item from GPT-5.6 Sol, but lists it
+	// without that support, so it stays off.
 	models "gpt-6-astra" {
 		supports-configuration-update #true
+	}
+	on-api "openai-codex-responses" {
+		models "gpt-6.1-sol" "gpt-6-sol" "gpt-6-luna" {
+			supports-configuration-update #true
+		}
 	}
 	// Codex SKUs: the advertised 400K figure includes the output budget; the
 	// true prompt window is 272K. Spark budgets are its own family's.

@@ -1,6 +1,6 @@
 /**
  * Mid-conversation reasoning effort via `configuration_update` input items
- * (GPT-6 Astra; `model.compat.supportsConfigurationUpdate`).
+ * (GPT-6 SKUs; `model.compat.supportsConfigurationUpdate`).
  *
  * The request-level `reasoning.effort` is pinned to the value of the session's
  * first request so the cached prompt prefix survives an effort change. Each
@@ -14,10 +14,10 @@
  * Used by both the platform Responses provider and the Codex provider; the
  * state lives in each provider's session state, keyed per conversation.
  *
- * Wire constraints (verified against the Codex backend): only `gpt-6-astra`
- * accepts the item type, consecutive updates are rejected, and
- * `/responses/compact` rejects histories containing them — compaction
- * requests are built outside this planner and never carry the items.
+ * Wire constraints (verified against the Codex backend): consecutive updates
+ * are rejected, and `/responses/compact` rejects histories containing them —
+ * compaction requests are built outside this planner and never carry the
+ * items.
  */
 
 /** `configuration_update` input item; only `reasoning.effort` is updatable. */

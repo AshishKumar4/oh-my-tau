@@ -1791,7 +1791,7 @@ function relocateCodexHarnessToolSurface(body: RequestBody): void {
 
 /**
  * Keep the request-level effort byte-stable across a conversation and carry
- * later changes as `configuration_update` items (GPT-6 Astra). Requires a
+ * later changes as `configuration_update` items (the GPT-6 SKUs). Requires a
  * session id and provider session state to remember the baseline; without
  * them every request stands alone and sends its own effort.
  */

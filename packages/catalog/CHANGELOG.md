@@ -6,6 +6,7 @@
 
 - Added the hand-maintained Factory Droid catalog with account policy and regional discovery, upstream-specific reasoning controls, and base credit rates ([#8577](https://github.com/can1357/oh-my-pi/pull/8577) by [@will-bogusz](https://github.com/will-bogusz), continued in [#13276](https://github.com/can1357/oh-my-pi/pull/13276) by [@DusKing1](https://github.com/DusKing1)).
 - Added the `codex` harness profile for `openai-codex/gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna`, so `harness.mode: auto` presents the Codex CLI surface on them as it already did on GPT-6 Astra and GPT-5.6 Sol; each surface was verified against a real Codex CLI 0.159.2 request.
+- Added `configuration_update` effort changes for `openai-codex/gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna`, so changing the thinking level mid-session keeps the response chain and the cached prompt instead of resending the whole prompt uncached.
 
 ### Changed
 
