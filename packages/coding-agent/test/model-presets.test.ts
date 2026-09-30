@@ -23,6 +23,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { isolateAwsCredentialSources } from "./helpers/aws-isolation";
 
 const SONNET = "anthropic/claude-sonnet-4-5";
 const SONNET_46 = "anthropic/claude-sonnet-4-6";
@@ -321,6 +322,8 @@ describe("model presets", () => {
 	it("refuses a preset with no default and no authed model before writing", async () => {
 		const dir = TempDir.createSync("@pi-model-presets-noauth-");
 		tempDirs.push(dir);
+		// "No authed model" must not depend on the host: a `~/.aws` profile makes Bedrock available.
+		const restoreAwsEnv = isolateAwsCredentialSources(dir.path());
 		const noAuth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
 		const registry = new ModelRegistry(noAuth, path.join(dir.path(), "models.yml"));
 		try {
@@ -350,6 +353,7 @@ describe("model presets", () => {
 			expect(settings.getModelRole("default")).toBe(SONNET);
 		} finally {
 			noAuth.close();
+			restoreAwsEnv();
 		}
 	});
 
