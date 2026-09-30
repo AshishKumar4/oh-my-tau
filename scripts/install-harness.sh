@@ -10,13 +10,10 @@
 #   ./scripts/install-harness.sh --record-only   # skip the build, just record
 #   ./scripts/install-harness.sh --build-only    # skip recording
 #   ./scripts/install-harness.sh --help
-#
-# AI ASSISTANT DISCLAIMER: an AI assistant wrote and maintains this script.
-# Presented as-is.
 
 set -euo pipefail
 
-REPO="${OMP_HARNESS_REPO:-https://github.com/AshishKumar4/oh-my-pi.git}"
+REPO="${OMP_HARNESS_REPO:-https://github.com/AshishKumar4/oh-my-tau.git}"
 BRANCH="${OMP_HARNESS_BRANCH:-main}"
 SRC_DIR="${OMP_HARNESS_SRC:-$HOME/.omp/src/oh-my-pi}"
 CACHE_DIR="${OMP_HARNESS_CACHE_DIR:-$HOME/.omp/cache/harness}"
