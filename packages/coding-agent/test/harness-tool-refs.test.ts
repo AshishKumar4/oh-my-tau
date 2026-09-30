@@ -365,7 +365,12 @@ describe("claude-code tool surface", () => {
 	async function presentedNames(
 		mode: string,
 		toolNames: readonly string[] = ["read", "write", "wait", "task", "eval", "todo"],
-	): Promise<{ presented: string[]; promptNames: string[]; refs: Readonly<Record<string, string>> }> {
+	): Promise<{
+		presented: string[];
+		promptNames: string[];
+		promptToolNames: string[];
+		refs: Readonly<Record<string, string>>;
+	}> {
 		const tools = toolNames.map(stubTool);
 		let promptNames: string[] = [];
 		const session = new AgentSession({
@@ -390,6 +395,7 @@ describe("claude-code tool surface", () => {
 		return {
 			presented: session.agent.state.tools.map(tool => tool.name),
 			promptNames,
+			promptToolNames: session.getPromptToolNames(),
 			refs: session.getToolRefs(),
 		};
 	}
@@ -413,6 +419,7 @@ describe("claude-code tool surface", () => {
 		// Prompt gates never see the withheld tool, and the refs match the wire.
 		expect(claudeCode.promptNames).not.toContain("wait");
 		expect(claudeCode.promptNames).toContain("task");
+		expect(claudeCode.promptToolNames).toEqual(claudeCode.promptNames);
 		expect(claudeCode.refs.wait).toBeUndefined();
 		expect(claudeCode.refs.task).toBe("Agent");
 		expect(claudeCode.refs.SendMessage).toBe("SendMessage");
@@ -421,6 +428,7 @@ describe("claude-code tool surface", () => {
 		expect(native.presented).toContain("wait");
 		expect(native.presented).not.toContain("SendMessage");
 		expect(native.promptNames).toContain("wait");
+		expect(native.promptToolNames).toEqual(native.promptNames);
 		expect(native.refs).toBe(NATIVE);
 	});
 

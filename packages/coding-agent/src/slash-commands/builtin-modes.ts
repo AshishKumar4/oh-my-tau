@@ -30,6 +30,7 @@ import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
 import type { AgentRef } from "../registry/agent-registry";
 import ratchetKickoffPrompt from "../prompts/ratchet-kickoff.md" with { type: "text" };
+import { ratchetAskToolName } from "../ratchet/prelude";
 import type { AgentSession } from "../session/agent-session";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
@@ -320,7 +321,8 @@ const RATCHET_REQUIRED_TOOLS = ["eval", "task"] as const;
  * render the kickoff prompt carrying the user's request as data.
  */
 function prepareRatchet(session: AgentSession, request: string): { kickoff: string } | { error: string } {
-	const tools = session.getEnabledToolNames();
+	// What the model can reach: a tool the harness profile withholds cannot run the loop.
+	const tools = session.getPromptToolNames();
 	const missing = RATCHET_REQUIRED_TOOLS.filter(tool => !tools.includes(tool));
 	if (missing.length > 0) return { error: `/ratchet needs the ${missing.join(" and ")} tool active.` };
 	const previous = cfgRatchetEnabled.get(session.settings);
@@ -329,7 +331,13 @@ function prepareRatchet(session: AgentSession, request: string): { kickoff: stri
 		if (!previous) cfgRatchetEnabled.override(session.settings, previous);
 		return { error: "The ratchet eval prelude is unavailable in this session." };
 	}
-	const kickoff = prompt.render(ratchetKickoffPrompt, { request: request.trim() || undefined, tools }).trim();
+	const kickoff = prompt
+		.render(ratchetKickoffPrompt, {
+			request: request.trim() || undefined,
+			tools,
+			askTool: ratchetAskToolName(session.getToolRefs()),
+		})
+		.trim();
 	return { kickoff };
 }
 

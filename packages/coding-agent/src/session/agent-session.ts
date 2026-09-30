@@ -5968,6 +5968,11 @@ export class AgentSession implements SettingsScope {
 		return this.#tools.toolRefs();
 	}
 
+	/** Enabled tool names a prompt may treat as available: the harness profile's withheld tools dropped. */
+	getPromptToolNames(): string[] {
+		return this.#tools.getPromptToolNames();
+	}
+
 	/** Names of dynamic tools mounted under `xd://`. */
 	getMountedXdevToolNames(): string[] {
 		return this.#tools.getMountedXdevToolNames();

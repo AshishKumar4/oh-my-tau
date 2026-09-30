@@ -28,8 +28,8 @@ The runner is the user's code in the user's idiom; it calls the app's real entry
 - Resume idempotent on (case, rep); hard per-case wall-clock ceiling; jittered backoff with retry counts recorded; strict scoring (pass-on-retry is a fail unless the user decides otherwise); bounded concurrency near the rate limit; fresh state per trial.
 - Ground truth reachable by the grader only: not in the app's prompt, tools, sandbox, or anything the model under test can read.
 
-# Phase 1 — Grill (one batched `ask`)
-Read the code first, then ask everything in one `ask` call with your recommendation first on each question:
+# Phase 1 — Grill (one batched `{{askTool}}`)
+Read the code first, then ask everything in one `{{askTool}}` call with your recommendation first on each question:
 - Which flow and entry point; what one input carries (files, profile, conversation prefix).
 - Input source, best first: production transcripts (ask about retention/PII before pulling; if unkeepable, store ids and fetch at run time), bug reports/tickets, 5–10 user-written cases, then synthesis anchored on 3–5 real examples plus what makes a case hard.
 - Goal: raise the headline metric, cut cost or latency holding quality, or move to another model and recover quality.
@@ -70,4 +70,4 @@ Changing grader, reps, or price overrides mid-loop invalidates approvals by desi
 Leave the tuned files at the best round (`status()` marks it ★). Rewrite `narrative.md`: the status table, then Recommended change, Versus baseline (test delta with intervals; within noise → say so and recommend not merging), Why trust this, What else was tried. Tag each applied change `[REQUIRED]` (fixes something broken) or `[TUNE]` (judgment call). Include 2–3 before/after train transcript pairs, a failure taxonomy when zeros have mixed causes, and the untried levers. Then ask once whether to commit the eval (runner, cases, grader, flow dir minus `traces/`).
 
 # Headless
-Without `ask`, never build or approve. Continue only a flow whose `status()` shows every approval `current`; otherwise stop and say an interactive session is needed.
+Without `{{askTool}}`, never build or approve. Continue only a flow whose `status()` shows every approval `current`; otherwise stop and say an interactive session is needed.

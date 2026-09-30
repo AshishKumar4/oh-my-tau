@@ -3,8 +3,9 @@ import type { AgentToolResult, ToolApprovalDecision } from "@oh-my-pi/pi-agent-c
 import type { ModelCost } from "@oh-my-pi/pi-catalog/types";
 import type { ExtensionAskDialogResult } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { untilAborted } from "@oh-my-pi/pi-utils";
+import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
+import { sessionToolRefs } from "../harness/effective-profile";
 import { cfgRatchetEnabled } from "../tools/settings";
 import ratchetDocumentation from "../prompts/tools/ratchet.md" with { type: "text" };
 import type { ToolSession } from "../tools";
@@ -275,12 +276,28 @@ async function invokeRatchet(
 	}
 }
 
+/**
+ * Name the session presents omp's `ask` tool under (`toolRefs`; Claude Code's
+ * AskUserQuestion), or omp's own name when nothing on the wire answers to it.
+ */
+export function ratchetAskToolName(toolRefs: Readonly<Record<string, string>>): string {
+	return toolRefs.ask ?? "ask";
+}
+
+/** The `xd://eval/ratchet` doc, naming the question tool the way the session presents it. */
+export function renderRatchetDocumentation(toolRefs: Readonly<Record<string, string>>): string {
+	return prompt.render(ratchetDocumentation, { askTool: ratchetAskToolName(toolRefs) });
+}
+
 /** Create the ratchet eval prelude; `/ratchet` enables it for the session via `ratchet.enabled`. */
 export function createRatchetPrelude(session: ToolSession): EvalPreludeDefinition {
 	const lookup = catalogPriceLookup(session);
 	return {
 		name: "ratchet",
-		documentation: ratchetDocumentation,
+		// Rendered on each read: a model switch can change the harness profile, and with it the tool names.
+		get documentation() {
+			return renderRatchetDocumentation(sessionToolRefs(session));
+		},
 		javascript: ratchetJavascript,
 		python: ratchetPython,
 		exports: ["ratchet"],
