@@ -996,13 +996,6 @@ export class SessionTools {
 		return this.#surface(this.#harnessProfile(), this.getEnabledToolNames()).toolRefs;
 	}
 
-	/** Enabled tool names a prompt may treat as available: what the profile withholds with no stand-in dropped. */
-	getPromptToolNames(): string[] {
-		const enabled = this.getEnabledToolNames();
-		const { unavailable } = this.#surface(this.#harnessProfile(), enabled);
-		return unavailable.size === 0 ? enabled : enabled.filter(name => !unavailable.has(name));
-	}
-
 	/** Appends `profile`'s facades to an already-presented tool list, replacing the targets they stand in for. */
 	#presentTools(
 		tools: AgentTool[],
@@ -1303,12 +1296,7 @@ export class SessionTools {
 		const previousToolPredicateNames = this.#toolPredicateNames;
 		this.#enabledToolNames = new Set([...validToolNames, ...mountNames]);
 		this.#setMountedNames(mountNames);
-		// A tool the profile withholds with no facade standing in is not the
-		// model's to call: prompt gates and tool predicates must not see it.
-		const { unavailable } = this.#surface(profile, [...this.#enabledToolNames]);
-		const reachable = (names: readonly string[]): string[] =>
-			unavailable.size === 0 ? [...names] : names.filter(name => !unavailable.has(name));
-		this.#toolPredicateNames = reachable(codeMode.active ? [...this.#enabledToolNames] : appliedNames);
+		this.#toolPredicateNames = codeMode.active ? [...this.#enabledToolNames] : appliedNames;
 		this.#setActiveToolNames?.(this.#toolPredicateNames);
 		// The eval tool advertises whatever stays direct, including a plan-mode
 		// transport `write`, so the applied partition lands before the rebuild
@@ -1331,7 +1319,7 @@ export class SessionTools {
 				// the Code Mode eval bridge. The rendered tool inventory is restricted
 				// to the direct names so the prompt never advertises bridge-only tools
 				// as provider-callable functions.
-				const promptToolNames = reachable(codeMode.active ? [...this.#enabledToolNames] : appliedNames);
+				const promptToolNames = codeMode.active ? [...this.#enabledToolNames] : appliedNames;
 				const promptTools = codeMode.active
 					? promptToolNames.flatMap(name => {
 							const tool = presentedRegistry.get(name);
@@ -2118,14 +2106,9 @@ export class SessionTools {
 		if (this.#host.isDisposed() || !this.#rebuildSystemPrompt || isCurrent?.() === false) return;
 		// Local alias: closures below cannot observe the field narrowing.
 		const rebuildSystemPrompt = this.#rebuildSystemPrompt;
-		// As in the apply path: a tool the profile withholds with no facade
-		// standing in reaches neither prompt gates nor tool predicates.
-		const { unavailable } = this.#surface(this.#harnessProfile(), this.getEnabledToolNames());
-		const reachable = (names: readonly string[]): string[] =>
-			unavailable.size === 0 ? [...names] : names.filter(name => !unavailable.has(name));
-		const activeToolNames = reachable(this.getActiveToolNames());
+		const activeToolNames = this.getActiveToolNames();
 		const promptToolNames =
-			this.#codeModeDirectWireSignature === undefined ? activeToolNames : reachable(this.getEnabledToolNames());
+			this.#codeModeDirectWireSignature === undefined ? activeToolNames : this.getEnabledToolNames();
 		// Under Code Mode the active names are exactly the direct keep-set.
 		const directToolNames = this.#codeModeDirectWireSignature === undefined ? undefined : activeToolNames;
 		this.#setActiveToolNames?.(this.#toolPredicateNames ?? activeToolNames);

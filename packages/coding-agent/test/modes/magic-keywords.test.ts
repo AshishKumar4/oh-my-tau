@@ -49,31 +49,54 @@ describe("orchestrate notice", () => {
 });
 
 describe("keyword notices under Claude Code", () => {
-	// A 2.1.284 surface: `task` is presented as Agent, `wait` is withheld with no
-	// TaskOutput in its place, so it is neither in the reachable tools nor the refs.
-	const toolRefs = { task: "Agent", read: "Read", write: "Write", edit: "Edit", bash: "Bash", eval: "eval" };
-	const tools = ["read", "task", "edit", "write", "bash", "todo", "eval"];
+	// A 2.1.284 surface: `task` is presented as Agent and, with no TaskOutput in
+	// its place, `wait` as itself.
+	const toolRefs = {
+		task: "Agent",
+		read: "Read",
+		write: "Write",
+		edit: "Edit",
+		bash: "Bash",
+		eval: "eval",
+		wait: "wait",
+	};
+	const tools = ["read", "task", "edit", "write", "bash", "todo", "eval", "wait"];
 
-	it("name the presented tools and never the withheld wait", () => {
+	it("name the presented tools", () => {
 		const orchestrate = renderOrchestrateNotice({ tools, toolRefs });
 		expect(orchestrate).toContain("`Agent` subagents");
 		expect(orchestrate).toContain("launch all parallel `Agent` subagents in one message");
 		expect(orchestrate).toContain("git via `Bash`");
-		for (const omp of ["`wait`", "`edit`", "`write`", "`bash`", "undefined"]) {
+		expect(orchestrate).toContain("Blocked with nothing else to do? Use `wait`.");
+		for (const omp of ["`edit`", "`write`", "`bash`", "undefined"]) {
 			expect(orchestrate).not.toContain(omp);
 		}
 		expect(orchestrate).toContain("10. Right-size offload: `Agent`/`sonic` only for substantial");
 		expect(orchestrate).toContain("- `Agent`/`sonic` Target/Change/Acceptance scaffolding");
 		expect(orchestrate).not.toContain("`task`");
 		const workflow = renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true, toolRefs });
+		expect(workflow).toContain("call `wait`");
+		expect(workflow).not.toContain("end your turn");
+		expect(workflow).not.toContain("undefined");
+	});
+
+	it("tell a session with no wait tool to end its turn", () => {
+		const noWait = { task: "Agent", read: "Read", write: "Write", edit: "Edit", bash: "Bash", eval: "eval" };
+		const orchestrate = renderOrchestrateNotice({ tools: tools.filter(tool => tool !== "wait"), toolRefs: noWait });
+		expect(orchestrate).not.toContain("`wait`");
+		const workflow = renderWorkflowNotice({
+			taskBatch: true,
+			scoutAvailable: true,
+			evalTools: true,
+			toolRefs: noWait,
+		});
 		expect(workflow).toContain("end your turn: results arrive as notifications");
 		expect(workflow).not.toContain("`wait`");
-		expect(workflow).not.toContain("undefined");
 	});
 
 	it("name TaskOutput where it stands in for wait", () => {
 		const withTaskOutput = { ...toolRefs, wait: "TaskOutput" };
-		const orchestrate = renderOrchestrateNotice({ tools: [...tools, "wait"], toolRefs: withTaskOutput });
+		const orchestrate = renderOrchestrateNotice({ tools, toolRefs: withTaskOutput });
 		expect(orchestrate).toContain("Blocked with nothing else to do? Use `TaskOutput`.");
 		const workflow = renderWorkflowNotice({
 			taskBatch: true,
@@ -85,7 +108,7 @@ describe("keyword notices under Claude Code", () => {
 	});
 
 	it("keep the native text when no refs are given", () => {
-		const orchestrate = renderOrchestrateNotice({ tools: [...tools, "wait"] });
+		const orchestrate = renderOrchestrateNotice({ tools });
 		expect(orchestrate).toContain("Blocked with nothing else to do? Use `wait`.");
 		expect(orchestrate).toContain("`task` subagents");
 		expect(orchestrate).toContain("10. Right-size offload: `task`/`sonic` only for substantial");

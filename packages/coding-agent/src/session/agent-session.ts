@@ -6928,9 +6928,7 @@ export class AgentSession implements SettingsScope {
 		for (const keyword of MAGIC_KEYWORDS) {
 			if (!this.#magicKeywordEnabled(keyword.id) || !containsMagicKeyword(text, keyword.word)) continue;
 			context ??= {
-				// Only what the model can reach: a tool the harness profile
-				// withholds is no notice's to name.
-				tools: this.#tools.getPromptToolNames(),
+				tools: this.getEnabledToolNames(),
 				toolRefs: this.getToolRefs(),
 				taskBatch: cfgTaskBatch.get(this.settings),
 				scoutAvailable: this.#isScoutAvailable(),

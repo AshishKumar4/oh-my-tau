@@ -307,8 +307,11 @@ describe("fusion sidekick tool", () => {
 				"harness.mode": "claude-code",
 			});
 			/** The lead's session; `declaresTaskOutput` models a pre-2.1.284 capture. */
-			const claudeCodeSession = (declaresTaskOutput: boolean): ToolSession => {
-				const surface = harnessSurface("claude-code", ["read", "write", "wait", "task", SIDEKICK_TOOL], {
+			const claudeCodeSession = (
+				declaresTaskOutput: boolean,
+				toolNames = ["read", "write", "wait", "task", SIDEKICK_TOOL],
+			): ToolSession => {
+				const surface = harnessSurface("claude-code", toolNames, {
 					settings,
 					vendorTool: name => (declaresTaskOutput && name === "TaskOutput" ? taskOutput : undefined),
 				});
@@ -341,19 +344,26 @@ describe("fusion sidekick tool", () => {
 				return result.content[0]?.type === "text" ? result.content[0].text : "";
 			};
 
-			// 2.1.284: TaskOutput is not served and `wait` is withheld — nothing waits on the wire.
+			// 2.1.284: TaskOutput is not served, so `wait` is presented as itself.
 			const bare = SidekickTool.createIf(claudeCodeSession(false));
 			if (!bare) throw new Error("sidekick tool should mount");
-			expect(bare.description).toContain("end your turn rather than polling; the report arrives as a notification.");
+			expect(bare.description).toContain("wait for it with `wait`");
 			const bareHint = await backgroundHint(bare);
-			expect(bareHint).toContain(
-				"Its report arrives as a notification when it finishes; end your turn rather than polling.",
-			);
+			expect(bareHint).toContain("wait for it with `wait` rather than polling.");
 			for (const text of [bare.description, bareHint]) {
 				expect(text).not.toContain("TaskOutput");
-				expect(text).not.toContain("`wait`");
 				expect(text).not.toContain("undefined");
 			}
+
+			// A session with no wait tool at all ends its turn for the report.
+			const waitless = SidekickTool.createIf(claudeCodeSession(false, ["read", "write", "task", SIDEKICK_TOOL]));
+			if (!waitless) throw new Error("sidekick tool should mount");
+			expect(waitless.description).toContain(
+				"end your turn rather than polling; the report arrives as a notification.",
+			);
+			expect(await backgroundHint(waitless)).toContain(
+				"Its report arrives as a notification when it finishes; end your turn rather than polling.",
+			);
 
 			// An older capture serves TaskOutput in `wait`'s place: both name it.
 			const served = SidekickTool.createIf(claudeCodeSession(true));

@@ -30,8 +30,7 @@ describe("fusion lead prompt section", () => {
 		/** Claude Code only: the served capture still declares TaskOutput (pre-2.1.284). */
 		taskOutput?: boolean;
 	}): Promise<string> {
-		// What the session hands the builder under Claude Code: the presented
-		// surface's refs, and the tool names minus what it withholds.
+		// What the session hands the builder under Claude Code: the presented surface's refs.
 		const surface =
 			options.harnessProfile === "claude-code"
 				? harnessSurface("claude-code", options.toolNames, {
@@ -39,7 +38,7 @@ describe("fusion lead prompt section", () => {
 						vendorTool: name => (options.taskOutput && name === "TaskOutput" ? TASK_OUTPUT : undefined),
 					})
 				: undefined;
-		const toolNames = options.toolNames.filter(name => !surface?.unavailable.has(name));
+		const toolNames = options.toolNames;
 		const tools = new Map<string, SystemPromptToolMetadata>(toolNames.map(name => [name, meta(name)]));
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir.path(),
@@ -95,17 +94,29 @@ describe("fusion lead prompt section", () => {
 		expect(customOff).not.toContain("`sidekick` tool");
 	});
 
-	it("tells a Claude Code lead with no wait tool to end its turn for the report", async () => {
-		// A 2.1.284 capture declares no TaskOutput and the profile withholds `wait`.
+	it("names `wait` for a Claude Code lead whose capture declares no TaskOutput", async () => {
+		// A 2.1.284 capture declares no TaskOutput, so `wait` is presented as itself.
 		const text = await build({
 			toolNames: ["read", "wait", "sidekick"],
 			harnessProfile: "claude-code",
 			customPrompt: "VENDOR PROMPT",
 		});
 		expect(text).toContain("`sidekick` tool");
+		expect(text).toContain("wait for the report with `wait`");
+		expect(text).not.toContain("TaskOutput");
+		expect(text).not.toContain("end your turn; the report arrives as a notification.");
+		expect(text).not.toContain("undefined");
+	});
+
+	it("tells a Claude Code lead with no wait tool to end its turn for the report", async () => {
+		const text = await build({
+			toolNames: ["read", "sidekick"],
+			harnessProfile: "claude-code",
+			customPrompt: "VENDOR PROMPT",
+		});
+		expect(text).toContain("`sidekick` tool");
 		expect(text).toContain("end your turn; the report arrives as a notification.");
 		expect(text).not.toContain("TaskOutput");
-		expect(text).not.toContain("`wait`");
 		expect(text).not.toContain("wait for the report with");
 		expect(text).not.toContain("undefined");
 	});

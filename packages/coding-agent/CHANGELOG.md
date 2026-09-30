@@ -11,6 +11,7 @@
 
 ### Changed
 
+- Claude Code mode presents the `wait` tool again (as `TaskOutput` where the served Claude Code capture still declares that tool), and its prompts tell the agent to wait with it instead of ending the turn
 - `--no-ui` now also works with `--mode rpc-ui`: extensions run headless while tool UI such as the `ask` tool still reaches the host ([#13718](https://github.com/can1357/oh-my-pi/pull/13718) by [@alphastorm](https://github.com/alphastorm))
 
 ### Fixed
