@@ -48,7 +48,7 @@ The installer records profiles for the clients it finds on your PATH. Claude Cod
 
 Use `native` to disable profile prompts and tool adaptations. The other explicit values force that profile on the selected model. The `pi` profile uses a bundled prompt. Profiles do not promise the original clients' behavior or request settings. `wait` stays available in Claude Code mode; captures that declare `TaskOutput` present it under that name.
 
-When a capture is served, Claude Code request headers use its client version. `PI_AI_CLAUDE_CODE_VERSION` overrides it; otherwise a server-enforced minimum can raise it. In Claude Code mode, the OAuth billing fingerprint uses user text without leading system reminders.
+When a capture is served, Claude Code request headers use its client version. `PI_AI_CLAUDE_CODE_VERSION` overrides it.
 
 Codex `spawn_agent` inherits the resolved parent conversation by default. Use `fork_turns: "none"` for a fresh context, or a positive integer string for recent turns. Each child keeps its own session and tool state.
 
@@ -60,13 +60,15 @@ The bundled roster is small:
 
 - `task` implements fully specified work and runs its checks. It cannot spawn subagents.
 - `scout` handles cheap, read-only exploration, git history, and data collection. It has `bash` for read-only commands and takes over the old `sonic` exploration work.
-- `reviewer` reviews correctness and design. It loads review skills, including prose skills for user-facing text. It can spawn `scout`, but does not implement changes.
+- `reviewer` reviews correctness and design. It loads review skills, including prose skills for user-facing text. It cannot spawn subagents and does not implement changes.
 
 `sonic` and `security-reviewer` are no longer bundled. `/security` uses a private, pinned read-only worker named `reviewer`. That worker has no `bash` or spawning. User agent files cannot replace it. Add your own agent files in `~/.omp/agent/agents/`; see [agent discovery](docs/task-agent-discovery.md).
 
 After a crash or quit, resume the session and run `/recover`. It repairs unfinished tail tool calls and lists lost background jobs for re-run. It checks each subagent's own transcript, resumes interrupted work as a background job, and delivers lost final reports once. It does not re-run finished work. The parent then continues; a second call does not repeat recovery.
 
-Message-woken subagents show as running jobs and deliver their results to their parent. Message-only `wait` uses peer liveness and dependency checks instead of short polling timeouts. It returns on a message or when waiting cannot make progress; a 30-minute safety cap still applies. See [wait](docs/tools/wait.md).
+Message-woken subagents show as running jobs and deliver their results to their parent. Message-only `wait` uses peer liveness and dependency checks instead of short polling timeouts. It returns on a message or when waiting cannot make progress; a 2-hour safety cap still applies. See [wait](docs/tools/wait.md).
+
+Background `bash` and `eval` commands, whether started in the background or moved there after 60 seconds, have no default deadline. They run until they finish or you cancel them, and their result arrives on its own. An explicit timeout still applies.
 
 ## Fusion mode
 
@@ -93,7 +95,7 @@ Codex forks retain the parent's prompt-cache lineage when the provider, endpoint
 
 On the four GPT-6 Codex models listed above, thinking-effort changes use `configuration_update` instead of changing request-level effort. This keeps the response chain and cached prefix across effort changes; GPT-5.6 Sol does not use this path.
 
-The status line can show prompt-cache health from per-request usage. Context accounting includes the served profile prompt and counts the skills listing in the correct prompt block.
+The status line can show prompt-cache health from per-request usage. Context accounting includes the served profile prompt.
 
 ## Updates and configuration
 
@@ -130,7 +132,7 @@ Hindsight and Mnemopi replay saved memory recall on resume instead of recalling 
 
 `session_before_compact` handlers can return `rewrite: [{ entryId, message }]` to reduce existing message bodies before compaction, or instead of a summary. The host preserves message roles and branch order. Check `supportsRewrite`; experimental rollover paths disable rewriting. See [compaction](docs/compaction.md).
 
-Codex code mode renders base64 `data:` URLs passed to `image(...)` as image content rather than JSON text. Guarded extension loads preserve the TUI's stdin listeners in place.
+Codex code mode renders base64 `data:` URLs passed to `image(...)` as image content rather than JSON text.
 
 For OMP's other features and settings, see the [upstream documentation](https://github.com/can1357/oh-my-pi#readme).
 
