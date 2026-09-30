@@ -34,6 +34,9 @@ export default class AuthGateway extends Command {
 			description:
 				"Record the harness surface of inbound Claude Code / Codex requests into the harness capture cache (serve). Pair with --no-auth for clients that send no bearer.",
 		}),
+		"trust-proxy-headers": Flags.boolean({
+			description: "Trust forwarded peer IP headers from a reverse proxy (serve); off by default.",
+		}),
 		strict: Flags.boolean({
 			description:
 				"For `check`: additionally probe each credential against its provider's chat-completion endpoint. Slower; consumes a tiny amount of quota per credential.",
@@ -43,6 +46,7 @@ export default class AuthGateway extends Command {
 	static examples = [
 		"# Boot the gateway against the configured broker\n  omp auth-gateway serve",
 		"# Boot on a non-default port\n  omp auth-gateway serve --bind=127.0.0.1:4000",
+		"# Trust client IP headers from a trusted reverse proxy\n  omp auth-gateway serve --trust-proxy-headers",
 		"# Print the gateway bearer token (creates one on first run)\n  omp auth-gateway token",
 		"# Rotate the gateway bearer token\n  omp auth-gateway token --regenerate",
 		"# Run on loopback without any bearer (anyone on this host can call)\n  omp auth-gateway serve --no-auth",
@@ -67,6 +71,7 @@ export default class AuthGateway extends Command {
 				regenerate: flags.regenerate,
 				noAuth: flags["no-auth"],
 				recordHarness: flags["record-harness"],
+				trustProxyHeaders: flags["trust-proxy-headers"],
 				strict: flags.strict,
 			},
 		};

@@ -619,10 +619,11 @@ function roleChipSpans(role: string, assignment: RoleAssignment, settings: Model
 	return spans;
 }
 
-/** Both token legs at zero cost — the condition {@link formatCostPair} renders as `free`. */
+/** No token price and no subscription-credit charge. */
 function isFreeModel(model: Model): boolean {
 	const cost = model.cost;
-	return !cost || (cost.input === 0 && cost.output === 0);
+	const credits = model.factoryDroidCredits;
+	return (!cost || (cost.input === 0 && cost.output === 0)) && (credits === undefined || credits === 0);
 }
 
 /** One per-million price leg: `3`, `0.25`, `12.5`; `?` when unknown. */
@@ -635,10 +636,22 @@ function formatCostLeg(n: number): string {
 	return s.includes(".") ? s.replace(/\.?0+$/, "") : s;
 }
 
-/** `$in/out` per-million cost pair; `free` when both legs are zero. */
+/**
+ * Adds Factory Droid's `N×` base Standard Credits rate to a dollar price,
+ * replacing the price when the model has no dollar reference. Neither the
+ * reference price nor the base credit rate includes live promotions.
+ */
+function withCreditBadge(model: Model, price: string): string {
+	const credits = model.factoryDroidCredits;
+	if (credits === undefined) return price;
+	const badge = `${formatCostLeg(credits)}×`;
+	return model.cost.input !== 0 || model.cost.output !== 0 ? `${price} ${badge}` : badge;
+}
+
+/** `$in/out` per-million cost pair with any credit badge; `free` when nothing is charged. */
 function formatCostPair(model: Model): string {
 	if (isFreeModel(model)) return "free";
-	return `$${formatCostLeg(model.cost.input)}/${formatCostLeg(model.cost.output)}`;
+	return withCreditBadge(model, `$${formatCostLeg(model.cost.input)}/${formatCostLeg(model.cost.output)}`);
 }
 
 /** Fact columns of a model picker (Stencil `NATIVE_REDESIGN.md` §4.7); the lowest priority hides first. */
@@ -652,7 +665,7 @@ export const MODEL_PICKER_COLUMNS: readonly TspPickerColumn[] = [
 /** `$3·15` price fact of a picker row (`free` at zero cost). */
 function pickerPrice(model: Model): string {
 	if (isFreeModel(model)) return "free";
-	return `$${formatCostLeg(model.cost.input)}·${formatCostLeg(model.cost.output)}`;
+	return withCreditBadge(model, `$${formatCostLeg(model.cost.input)}·${formatCostLeg(model.cost.output)}`);
 }
 
 /** `$2 in · $10 out · $0.2 cache` for a model preview. */
@@ -660,7 +673,7 @@ function previewPrice(model: Model): string {
 	const cost = model.cost;
 	const parts = [`$${formatCostLeg(cost.input)} in`, `$${formatCostLeg(cost.output)} out`];
 	if (cost.cacheRead > 0) parts.push(`$${formatCostLeg(cost.cacheRead)} cache`);
-	return parts.join(" · ");
+	return withCreditBadge(model, parts.join(" · "));
 }
 
 /** The omp theme token of a thinking level's dot (`thinkingHigh`); none for inherit and auto. */

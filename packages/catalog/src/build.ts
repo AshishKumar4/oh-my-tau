@@ -76,6 +76,11 @@ function isInputModalities(value: unknown): value is ("text" | "image")[] {
 function applyCatalogAssignments<TApi extends Api>(model: Model<TApi>, catalog: Record<string, unknown>): void {
 	const kind = MODEL_KINDS.find(value => value === catalog.kind);
 	if (kind !== undefined) model.kind = kind;
+	if (catalog.contextWindowAuthoritative === true) {
+		model.contextWindowAuthoritative = true;
+	} else {
+		delete model.contextWindowAuthoritative;
+	}
 	const webSearch = catalog.webSearch;
 	if (
 		webSearch === "gemini" ||
@@ -136,6 +141,11 @@ function applyCatalogAssignments<TApi extends Api>(model: Model<TApi>, catalog: 
 		model.supportsAssistantPrefill = true;
 	} else {
 		delete model.supportsAssistantPrefill;
+	}
+	// The same KDL output-cap contract gates host options and the Responses
+	// transport. Materialize it because the transport consumes the model field.
+	if (typeof catalog.omitMaxOutputTokens === "boolean" && model.omitMaxOutputTokens === undefined) {
+		model.omitMaxOutputTokens = catalog.omitMaxOutputTokens;
 	}
 	const contextPromotionTarget = catalog.contextPromotionTarget;
 	if (typeof contextPromotionTarget === "string" && model.contextPromotionTarget === undefined) {

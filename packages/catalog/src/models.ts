@@ -44,6 +44,11 @@ function getProviderModels(provider: string): Map<string, Model<Api>> | undefine
 
 export type GeneratedProvider = keyof typeof MODELS;
 
+/** Whether `provider` has bundled rows in models.json (e.g. a provider id authored in KDL). */
+export function isGeneratedProvider(provider: string): provider is GeneratedProvider {
+	return Object.hasOwn(MODELS, provider);
+}
+
 export function getBundledModel<TApi extends Api = Api>(provider: GeneratedProvider, modelId: string): Model<TApi> {
 	const providerModels = getProviderModels(provider);
 	return providerModels?.get(modelId) as Model<TApi>;

@@ -19,6 +19,7 @@ export type KnownApi =
 	| "google-vertex"
 	| "ollama-chat"
 	| "cursor-agent"
+	| "factory-droid-agent"
 	| "gitlab-duo-agent"
 	| "devin-agent"
 	| "apple-foundation-models";
@@ -284,12 +285,21 @@ export interface OpenAICompat {
 	thinkingKeep?: "all" | false;
 	/** Which reasoning content field to emit on assistant messages. Default: auto-detected. */
 	reasoningContentField?: "reasoning_content" | "reasoning" | "reasoning_text";
+	/** Decode Mistral thinking parts in streamed content and replay them as typed assistant content. */
+	mistralReasoningContentParts?: boolean;
 	/** Whether assistant tool-call messages must include reasoning content. Default: false. */
 	requiresReasoningContentForToolCalls?: boolean;
 	/** Whether all assistant messages must include reasoning content. Default: false. */
 	requiresReasoningContentForAllAssistantTurns?: boolean;
 	/** Whether the provider accepts a synthetic placeholder (e.g. ".") for missing reasoning_content on tool-call turns. Default: true. Set to false for providers like DeepSeek that validate the exact reasoning_content value. */
 	allowsSyntheticReasoningContentForToolCalls?: boolean;
+	/**
+	 * Value emitted for the reasoning field on tool-call turns when the provider
+	 * requires it (`requiresReasoningContentForToolCalls`) but no reasoning was
+	 * captured. Default: "". Some upstreams validate the exact value — the droid
+	 * proxy's DeepSeek family requires a single space.
+	 */
+	syntheticReasoningContentFallback?: string;
 	/**
 	 * Replay preserved thinking blocks as `reasoning_content` (or the configured
 	 * `reasoningContentField`) on EVERY assistant turn that carried reasoning,
@@ -675,6 +685,25 @@ export interface AnthropicCompat {
 	stripImageInput?: boolean;
 	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
 	thinkingLoopGuard?: "gemini" | "deepseek" | "xai";
+	/**
+	 * Drop the enabled `thinking` config and replayed thinking blocks when the
+	 * conversation is not thinking-led (a proxy contract for non-interleaved
+	 * budget models). Default: false.
+	 */
+	stripThinkingHistory?: boolean;
+	/**
+	 * Send the `effort-2025-11-24` beta exactly when `output_config.effort`
+	 * rides the request. Unset keeps the transport's legacy heuristic.
+	 */
+	effortBeta?: boolean;
+	/**
+	 * Wire form of a disabled-thinking turn: omit the field, send
+	 * `{ type: "disabled" }`, or keep adaptive thinking. Unset keeps the
+	 * direct-provider behavior.
+	 */
+	disabledThinking?: "omit" | "disabled" | "adaptive";
+	/** The model is a fast-mode SKU: send `speed: "fast"` with the fast-mode beta. Default: false. */
+	fastMode?: boolean;
 }
 
 /**
@@ -782,9 +811,12 @@ export interface ResolvedOpenAISharedCompat {
 	supportsForcedToolChoice: boolean;
 	supportsNamedToolChoice: boolean;
 	reasoningContentField?: OpenAICompat["reasoningContentField"];
+	mistralReasoningContentParts?: boolean;
 	requiresReasoningContentForToolCalls: boolean;
 	requiresReasoningContentForAllAssistantTurns: boolean;
 	allowsSyntheticReasoningContentForToolCalls: boolean;
+	/** See {@link OpenAICompat.syntheticReasoningContentFallback}. */
+	syntheticReasoningContentFallback?: string;
 	replayReasoningContent: boolean;
 	qwenPreserveThinking: boolean;
 	qwenTemplateReasoningEffort: boolean;
@@ -862,9 +894,11 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "supportsForcedToolChoice"
 			| "supportsNamedToolChoice"
 			| "reasoningContentField"
+			| "mistralReasoningContentParts"
 			| "requiresReasoningContentForToolCalls"
 			| "requiresReasoningContentForAllAssistantTurns"
 			| "allowsSyntheticReasoningContentForToolCalls"
+			| "syntheticReasoningContentFallback"
 			| "replayReasoningContent"
 			| "qwenPreserveThinking"
 			| "qwenTemplateReasoningEffort"
@@ -979,8 +1013,25 @@ export type ResolvedOpenRouterCompat = ResolvedOpenAICompat & ResolvedOpenAIResp
 
 /** Fully-resolved anthropic-messages compat view (same contract as `ResolvedOpenAICompat`). */
 export type ResolvedAnthropicCompat = Required<
-	Omit<AnthropicCompat, "streamIdleTimeoutMs" | "thinkingLoopGuard" | "bedrockMessagesApi">
+	Omit<
+		AnthropicCompat,
+		| "streamIdleTimeoutMs"
+		| "thinkingLoopGuard"
+		| "bedrockMessagesApi"
+		| "effortBeta"
+		| "disabledThinking"
+		| "stripThinkingHistory"
+		| "fastMode"
+	>
 > & {
+	/** Effort-beta override; undefined keeps the transport's legacy heuristic. */
+	effortBeta?: AnthropicCompat["effortBeta"];
+	/** Disabled-thinking wire form; undefined keeps the direct-provider behavior. */
+	disabledThinking?: AnthropicCompat["disabledThinking"];
+	/** Strip thinking history on non-thinking-led turns; undefined behaves as false. */
+	stripThinkingHistory?: AnthropicCompat["stripThinkingHistory"];
+	/** Fast-mode SKU; undefined behaves as false. */
+	fastMode?: AnthropicCompat["fastMode"];
 	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
 	thinkingLoopGuard?: AnthropicCompat["thinkingLoopGuard"];
 	/**
@@ -1329,6 +1380,14 @@ export interface Model<TApi extends Api = Api> {
 	 * bundled/config rows and on single-account discovery.
 	 */
 	accountAccess?: Readonly<Record<string, ModelAccountAccess>>;
+	/** Factory Droid: account-resolved upstream rotation (first entry is the default `x-api-provider`). */
+	factoryDroidApiProviders?: string[];
+	/** Factory Droid: `configured_order` when live routing chose the rotation; absent means registry order. */
+	factoryDroidRoutingSource?: "configured_order";
+	/** Factory Droid Standard Credits base rate (relative per-token weight, not dollars). */
+	factoryDroidCredits?: number;
+	/** Canonical organization resolved during Factory discovery. */
+	factoryDroidOrgId?: string;
 	cost: ModelCost;
 	/**
 	 * Prompt-cache entry lifetime per retention tier, in seconds. Populated only
@@ -1341,6 +1400,8 @@ export interface Model<TApi extends Api = Api> {
 	/** Premium Copilot requests charged per user-initiated request (defaults to 1). */
 	premiumMultiplier?: number;
 	contextWindow: number | null;
+	/** Preserve the host's supplied window instead of applying inferred expansion or reference-price caps. */
+	contextWindowAuthoritative?: boolean;
 	/** Optional larger prompt window available when extended context is enabled. */
 	maxContextWindow?: number;
 	maxTokens: number | null;

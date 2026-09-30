@@ -222,6 +222,9 @@ export type CompletionProbeCredential =
 			email?: string;
 			enterpriseUrl?: string;
 			apiEndpoint?: string;
+			orgId?: string;
+			region?: string;
+			inferenceRegion?: "global" | "eu" | "us";
 	  };
 
 /**
@@ -494,6 +497,13 @@ export type AuthApiKeyOptions = {
 	refreshReason?: OAuthRefreshReason;
 };
 
+/** Non-secret identity bound to the OAuth credential selected for one request attempt. */
+export interface OAuthRequestIdentity {
+	orgId?: string;
+	region?: string;
+	inferenceRegion?: "global" | "eu" | "us";
+}
+
 /**
  * Refreshed OAuth access plus identity metadata returned by
  * {@link AuthStorage.oauth.access}. Callers that authenticate via a bearer
@@ -513,6 +523,8 @@ export interface OAuthAccess {
 	/** Organization/workspace the credential is scoped to (Anthropic/ChatGPT multi-subscription). */
 	orgId?: string;
 	orgName?: string;
+	region?: string;
+	inferenceRegion?: "global" | "eu" | "us";
 }
 
 /**
@@ -941,10 +953,14 @@ export interface KeysApi {
 	 *
 	 * Lower priority than {@link setRuntimeApiKey} so a CLI `--api-key`
 	 * still wins for the duration of a single invocation.
+	 *
+	 * `fallback: true` ranks the value below stored OAuth and `/login`
+	 * credentials instead, so a provider's default key reference cannot shadow
+	 * a key the user logged in with.
 	 */
-	setConfig(provider: string, apiKeyConfig: string): void;
+	setConfig(provider: string, apiKeyConfig: string, options?: { fallback?: boolean }): void;
 	/**
-	 * Remove a single config-sourced API key override.
+	 * Remove a single config-sourced API key (override or fallback).
 	 */
 	removeConfig(provider: string): void;
 	/**
