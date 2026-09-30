@@ -15,7 +15,7 @@ import { isRecord } from "@oh-my-pi/pi-utils";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
-import { getBundledAgent } from "../task/agents";
+import { getBundledAgent, resolveRetiredAgentName } from "../task/agents";
 import { discoverAgents, getAgent } from "../task/discovery";
 import { runSubagentFollowUpTurn } from "../task/executor";
 import type { AgentDefinition } from "../task/types";
@@ -349,7 +349,7 @@ async function resolveAgentDefinition(
 	discovered: () => Promise<AgentDefinition[]>,
 ): Promise<AgentDefinition | undefined> {
 	if (name) {
-		const agent = getAgent(await discovered(), name) ?? getBundledAgent(name);
+		const agent = getAgent(await discovered(), name) ?? getBundledAgent(resolveRetiredAgentName(name));
 		if (agent) return agent;
 	}
 	return getBundledAgent("task");

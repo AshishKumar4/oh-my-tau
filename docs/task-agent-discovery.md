@@ -106,21 +106,20 @@ After dispatch, press `Alt+A` to open [Agent Hub](./agent-hub.md). Its live rost
 
 ### `vibe_spawn` tier routing
 
-`vibe_spawn` maps `fast` to bundled `sonic` and `good` to bundled `task`. Both resolve through `task.agentModelOverrides` before their bundled agent model defaults (`src/vibe/runtime.ts`, `src/task/agents.ts`).
+Both `vibe_spawn` tiers run bundled `task` (`src/vibe/runtime.ts`). `good` keeps `task`'s model, so `task.agentModelOverrides.task` applies. `fast` runs on the `@smol` role at medium thinking and ignores that override, so it stays cheap.
 
-Route these tiers through roles by keeping aliases in `task.agentModelOverrides` and concrete selectors only in `modelRoles`:
+Route the tiers through roles by keeping aliases in `task.agentModelOverrides` and concrete selectors only in `modelRoles`:
 
 ```yaml
 task:
   agentModelOverrides:
-    sonic: "@fast_worker"
     task: "@good_worker"
 modelRoles:
-  fast_worker: openai/gpt-5-mini
+  smol: openai/gpt-5-mini
   good_worker: openai/gpt-5.4:high
 ```
 
-The `vibe_spawn` `cli` remains `fast` or `good`; update `modelRoles` to change the worker model.
+The `vibe_spawn` `cli` remains `fast` or `good`; update `modelRoles` to change the worker model. The `smol` role also drives `scout`.
 
 ## Bundled agents
 
@@ -128,8 +127,10 @@ Bundled agents are embedded at build time (`src/task/agents.ts`) using text impo
 
 `EMBEDDED_AGENT_DEFS` defines:
 
-- `scout`, `reviewer`, and `security-reviewer` from prompt files
-- `task` and `sonic` from the shared `task.md` body plus injected frontmatter; no bundled agent sets `prewalk` — the generic `task` agent's hand-off is armed by the `task.prewalk` setting (default off), or per agent via `/agents` / `task.agentPrewalk` / user agent frontmatter
+- `scout` and `reviewer` from prompt files
+- `task` from the `task.md` body plus injected frontmatter; no bundled agent sets `prewalk` — the generic `task` agent's hand-off is armed by the `task.prewalk` setting (default off), or per agent via `/agents` / `task.agentPrewalk` / user agent frontmatter
+
+`task` is the laborer for fully specified implementation and test work and cannot spawn subagents. `scout` has `bash` for git and data collection but no edit or write tools. `sonic` and `security-reviewer` were removed: `/security` runs `reviewer` pinned to its read-only scan contract, and `/recover` restarts old `sonic` and `security-reviewer` transcripts as `task` and `reviewer`.
 
 Loading path:
 
@@ -250,7 +251,7 @@ Runtime output schema precedence is:
 
 The task item's optional `schemaMode` overrides the parent session mode; the default is `permissive`.
 
-The model-facing prompt (`src/prompts/tools/task.md`) tags read-only agents and warns against offloading reasoning to `scout`/`sonic`.
+The model-facing prompt (`src/prompts/tools/task.md`) tags read-only agents and warns against offloading reasoning to `scout`.
 
 ## Command discovery interaction
 

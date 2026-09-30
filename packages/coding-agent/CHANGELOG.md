@@ -8,10 +8,20 @@
 - `/recover` restores the work a crash, power cut, or quit interrupted, after resuming the session: tool calls that never finished get an interruption result the model can see (instead of being silently dropped from context), background jobs that never finished are listed so they can be re-run, interrupted subagents are revived as background jobs that report back like a fresh spawn, and the agent then continues. Running it again does nothing. Sessions now record a `session_open` entry each time a process resumes them, so `/recover` can tell which process left what behind.
 - RPC hosts can follow each cache-warming refresh through `cache_warming_start` and `cache_warming_end` events (also written by `--mode json`), which report the outcome and the recorded usage, and can set the session's warming mode with `set_cache_warming` without changing `config.yml`; the Python client gains `set_cache_warming()` ([#13717](https://github.com/can1357/oh-my-pi/pull/13717) by [@alphastorm](https://github.com/alphastorm))
 - The model hub's Roles view now shows which agents run on each role. A custom role that no agent runs on and that is not in the quick-switch cycle is marked `no agents`, and selecting it explains how to use it: set an agent's model to `@ROLE` in `/agents`
+- `createAgentSession` accepts `pinnedAgents`: definitions the session's own spawns use ahead of agent discovery, matched by name, so project or user agent files cannot replace a worker's tools, prompt, or output schema
 
 ### Changed
 
+- The bundled `task` agent is now a laborer for fully specified implementation and test work and can no longer spawn subagents. Agents for `^model` mentions run as `task`, so they cannot spawn either
+- The bundled `scout` agent now has `bash` for git history and data collection, never for changing files, and takes over `sonic`'s read-only work. Its `files` and `architecture` output fields are optional, so git and data jobs return a `summary` and a `report`. The task tool no longer tags it read-only, since `bash` is an exec-tier tool
+- `/security` scan workers now run as `reviewer`, pinned to the scan's worker prompt, output schema and read-only tools (`read`, `find`, `grep`, `glob`, `lsp`, `ast_grep`; no `bash`, network or spawning), so project or user agent files cannot widen them. `reviewer` entries in `task.agentModelOverrides`, `task.agentPrewalk` and `task.agentAdvisor` do not reach scan workers. Scan plans made before this change are stale; plan the scan again
+- `omp commit` file analysis now runs `scout`; `/cleanse` repair workers and vibe `fast` workers now run `task`. The `fast` tier keeps the `@smol` model at medium thinking and ignores `task.agentModelOverrides.task`
+- The bundled `reviewer` is now described as a reviewer for code, architecture, interface and security quality that critiques rather than implements or plans
 - `--no-ui` now also works with `--mode rpc-ui`: extensions run headless while tool UI such as the `ask` tool still reaches the host ([#13718](https://github.com/can1357/oh-my-pi/pull/13718) by [@alphastorm](https://github.com/alphastorm))
+
+### Removed
+
+- Removed the bundled `sonic` and `security-reviewer` agents. Revived subagents keep the tools they ran with, `/recover` restarts their transcripts as `task` and `reviewer`, and vibe sessions restore `sonic` workers as `fast` workers. `task.agentModelOverrides` entries for either name no longer apply
 
 ### Fixed
 

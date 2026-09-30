@@ -103,7 +103,7 @@ Operation phases are:
 queued → preparing → reviewing → publishing → completed
 ```
 
-Terminal alternatives are `partial`, `cancelled`, and `failed`. The coordinator creates a restricted, auto-approved scan session with read-only repository inspection tools, read-only LSP, and only `security-reviewer` task workers. Extension discovery, MCP, and IRC are disabled. Model fallback and account rotation are disabled.
+Terminal alternatives are `partial`, `cancelled`, and `failed`. The coordinator creates a restricted, auto-approved scan session with read-only repository inspection tools, read-only LSP, and only `reviewer` task workers. The scan pins each worker's contract, so project or user agent files cannot replace it: the scan's worker prompt and output schema, and read-only tools (`read`, `find`, `grep`, `glob`, `lsp`, `ast_grep`) with no `bash`, network, or spawning, because the scanned code may be untrusted. `task.agentModelOverrides`, `task.agentPrewalk`, and `task.agentAdvisor` entries for `reviewer` do not apply to scan workers; they run on the scan's model. Extension discovery, MCP, and IRC are disabled. Model fallback and account rotation are disabled.
 
 For `ref_diff`, execution creates a detached temporary worktree at the pinned head revision and supplies the pinned diff to the review session; cleanup removes that worktree. Other target kinds review the repository root directly.
 

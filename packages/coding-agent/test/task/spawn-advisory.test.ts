@@ -11,7 +11,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 // Contract: the task tool appends an advisory (never a rejection) steering the
 // spawner toward more specific agent types when one call resolves ≥2 items to
-// a generic `task`/`sonic` worker and the spawner still holds spawn capacity
+// the generic `task` worker and the spawner still holds spawn capacity
 // (DepthCapacity). It is gated on depth so a leaf at max recursion is never
 // nagged, and a lone generic spawn is never flagged.
 
@@ -36,12 +36,6 @@ describe("buildSpecializationAdvisory", () => {
 
 	it("stays silent for a mixed call with only one generic worker", () => {
 		expect(buildSpecializationAdvisory(["task", "scout"], true)).toBeUndefined();
-	});
-
-	it("counts sonic as generic alongside task", () => {
-		const advice = buildSpecializationAdvisory(["sonic", "task"], true);
-		expect(advice).toBeDefined();
-		expect(advice).toContain("2 generic");
 	});
 });
 

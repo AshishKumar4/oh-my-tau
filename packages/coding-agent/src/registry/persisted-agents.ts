@@ -80,8 +80,7 @@ function inferBundledAgent(systemPrompt: string): { agent?: string; modelRole?: 
 		const rolePrompt = agent.systemPrompt.trim();
 		return rolePrompt.length > 0 && systemPrompt.includes(rolePrompt);
 	});
-	// `task` and `sonic` intentionally share a prompt body. Ambiguous historical
-	// prompts stay unlabelled rather than inventing provenance.
+	// Ambiguous historical prompts stay unlabelled rather than inventing provenance.
 	if (matches.length !== 1) return {};
 	const [agent] = matches;
 	return {

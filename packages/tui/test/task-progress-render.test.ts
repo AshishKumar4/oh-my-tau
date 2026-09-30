@@ -344,26 +344,26 @@ describe("task progress rendering", () => {
 	it("keeps the agent type badge on progress and result rows", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
-		const badge = `${theme.format.bracketLeft}sonic${theme.format.bracketRight}`;
+		const badge = `${theme.format.bracketLeft}reviewer${theme.format.bracketRight}`;
 
 		const progressRow = Bun.stripANSI(
 			findRow(
 				taskToolRenderer.renderResult(
 					{
 						content: [{ type: "text", text: "" }],
-						details: detailsFor(runningProgress({ id: "SonicCount", agent: "sonic" })),
+						details: detailsFor(runningProgress({ id: "ReviewPass", agent: "reviewer" })),
 					},
 					options,
 					theme,
 				),
-				"SonicCount",
+				"ReviewPass",
 			),
 		);
 		expect(progressRow).toContain(badge);
 
 		const resultDetails: TaskToolDetails = {
 			projectAgentsDir: null,
-			results: [finishedResult({ id: "SonicCount", agent: "sonic" })],
+			results: [finishedResult({ id: "ReviewPass", agent: "reviewer" })],
 			totalDurationMs: 0,
 		};
 		const resultRow = Bun.stripANSI(
@@ -373,7 +373,7 @@ describe("task progress rendering", () => {
 					{ expanded: false, isPartial: false },
 					theme,
 				),
-				"SonicCount",
+				"ReviewPass",
 			),
 		);
 		expect(resultRow).toContain(badge);
@@ -402,7 +402,7 @@ describe("task progress rendering", () => {
 			totalDurationMs: 0,
 			progress: [
 				runningProgress({ index: 0, id: "ScoutProbe", agent: "scout" }),
-				runningProgress({ index: 1, id: "SonicCount", agent: "sonic" }),
+				runningProgress({ index: 1, id: "ReviewPass", agent: "reviewer" }),
 			],
 		};
 		const header = Bun.stripANSI(
@@ -416,7 +416,7 @@ describe("task progress rendering", () => {
 			),
 		);
 		expect(header).not.toContain("2 agents:");
-		expect(header).not.toContain("scout, sonic");
+		expect(header).not.toContain("scout, reviewer");
 	});
 
 	it("keeps the agent dot when shimmer is disabled", async () => {

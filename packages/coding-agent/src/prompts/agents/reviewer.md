@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: "Code review specialist for quality/security analysis"
+description: "Highly capable reviewer for code, architecture, interface and security quality. Reviews and critiques; does not implement or plan."
 tools: read, find, grep, glob, bash, lsp, web_search, ast_grep
 spawns: scout
 model: "@slow"

@@ -1,14 +1,15 @@
 /**
  * Contract: a vibe worker's spawn options carry the pre-expansion model role.
  *
- * `#resolveWorker` expands the bundled worker's role alias (`good` -> `task` ->
- * `@task`, `fast` -> `sonic` -> `@smol`) into concrete patterns, so the role
+ * `#resolveWorker` expands the worker's role alias (`good` -> `task` -> `@task`,
+ * `fast` -> `task` on its `@smol` tier) into concrete patterns, so the role
  * survives only as a separate field forwarded across `ResolvedVibeWorker` ->
  * `VibeRecord` -> `#buildSpawnOptions` -> `runSubprocess`. The executor keys the
  * child's inherited `retry.fallbackChains` entry off it; drop any link in that
  * chain and vibe children silently retry on the `default` role's chain.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { Effort } from "@oh-my-pi/pi-ai";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -83,6 +84,33 @@ describe("vibe worker spawn model role", () => {
 			"fast",
 			Settings.isolated({
 				modelRoles: { default: "anthropic/opus", smol: "fast/hy3" },
+			}),
+		);
+
+		expect(options.modelOverride).toEqual(["fast/hy3"]);
+		expect(options.modelRole).toBe("smol");
+	});
+
+	it("runs the `fast` tier on the edit-capable `task` agent at medium thinking", async () => {
+		const options = await spawnAndCaptureOptions(
+			"fast",
+			Settings.isolated({
+				modelRoles: { default: "anthropic/opus", smol: "fast/hy3" },
+			}),
+		);
+
+		expect(options.agent.name).toBe("task");
+		// No explicit tool list: the worker keeps the full coding surface, edit and write included.
+		expect(options.agent.tools).toBeUndefined();
+		expect(options.thinkingLevel).toBe(Effort.Medium);
+	});
+
+	it("keeps the `fast` tier on `@smol` when `task` has a per-agent model override", async () => {
+		const options = await spawnAndCaptureOptions(
+			"fast",
+			Settings.isolated({
+				modelRoles: { default: "anthropic/opus", smol: "fast/hy3" },
+				"task.agentModelOverrides": { task: "openai-codex/sol" },
 			}),
 		);
 

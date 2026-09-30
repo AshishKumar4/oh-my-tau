@@ -324,7 +324,10 @@ export async function resolveEffectiveSubagentPolicy(
 
 	const discovery = await discoverAgents(request.session.cwd, undefined, request.session.effectiveExtensionRoots?.());
 	const agents = [...discovery.agents, ...(request.session.getSessionAgents?.() ?? [])];
-	const agent = request.agentDefinition ?? getAgent(agents, agentName);
+	const agent =
+		request.agentDefinition ??
+		request.session.pinnedAgents?.find(pinned => pinned.name === agentName) ??
+		getAgent(agents, agentName);
 	if (!agent) {
 		const available = agents.map(candidate => candidate.name).join(", ") || "none";
 		const searched = discovery.searchedDirs?.map(dir => shortenPath(dir)).join(", ") || "none";

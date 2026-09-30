@@ -8,14 +8,16 @@ import type { AsyncJobManager } from "../async/job-manager";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { ToolDefinition } from "../extensibility/extensions";
-import securityReviewerPrompt from "../prompts/agents/security-reviewer.md" with { type: "text" };
 import securityCoordinatorPrompt from "../prompts/security/scan-coordinator.md" with { type: "text" };
 import securityRequestPrompt from "../prompts/security/scan-request.md" with { type: "text" };
+import securityWorkerPrompt from "../prompts/security/scan-worker.md" with { type: "text" };
 import securityPublishDescription from "../prompts/tools/security-publish.md" with { type: "text" };
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
+import { getBundledAgent } from "../task/agents";
+import type { AgentDefinition } from "../task/types";
 import { createSecurityAuthResolver, selectSecurityAuth } from "./auth";
 import type {
 	SecurityCoverage,
@@ -43,13 +45,75 @@ import { SecurityStore, writeSecurityBundleToDirectory } from "./store";
 
 import { cfgRetryFallbackChains, cfgRetryModelFallback, cfgRetryUsageAwareFallback } from "../session/settings";
 import { cfgSecurityEnabled } from "../tools/settings";
-import { cfgTaskAgentModelOverrides, cfgTaskAgentPrewalk } from "../task/settings";
+import { cfgTaskAgentAdvisor, cfgTaskAgentModelOverrides, cfgTaskAgentPrewalk } from "../task/settings";
 
 const SECURITY_SESSION_TOOLS = ["read", "grep", "glob", "lsp", "ast_grep", "task", "security_publish"];
+/** Scans may cover untrusted code, so workers only read it: no bash, network, or spawning. */
+const SECURITY_WORKER_TOOLS = ["read", "find", "grep", "glob", "lsp", "ast_grep"];
+/** One worker's review; the coordinator reconciles these into `security_publish`. */
+const SECURITY_WORKER_OUTPUT = {
+	properties: {
+		coverage_summary: { type: "string" },
+	},
+	optionalProperties: {
+		findings: {
+			elements: {
+				properties: {
+					rule_id: { type: "string" },
+					title: { type: "string" },
+					summary: { type: "string" },
+					severity: { enum: ["critical", "high", "medium", "low", "informational"] },
+					confidence: { enum: ["high", "medium", "low"] },
+					category: { type: "string" },
+					locations: {
+						elements: {
+							properties: {
+								path: { type: "string" },
+								start_line: { type: "number" },
+							},
+							optionalProperties: {
+								end_line: { type: "number" },
+								role: { type: "string" },
+							},
+						},
+					},
+					cwe: { elements: { type: "string" } },
+					evidence: {
+						elements: {
+							properties: {
+								label: { type: "string" },
+								explanation: { type: "string" },
+							},
+							optionalProperties: {
+								excerpt: { type: "string" },
+							},
+						},
+					},
+				},
+				optionalProperties: {
+					anchor: { type: "string" },
+					remediation: { type: "string" },
+				},
+			},
+		},
+		reviewed_paths: { elements: { type: "string" } },
+		deferred: {
+			elements: {
+				properties: {
+					reason: { type: "string" },
+				},
+				optionalProperties: {
+					paths: { elements: { type: "string" } },
+				},
+			},
+		},
+	},
+};
 const SECURITY_WORKFLOW_FINGERPRINT = createSecurityWorkflowFingerprint([
 	securityCoordinatorPrompt,
 	securityRequestPrompt,
-	securityReviewerPrompt,
+	securityWorkerPrompt,
+	JSON.stringify({ tools: SECURITY_WORKER_TOOLS, output: SECURITY_WORKER_OUTPUT }),
 	securityPublishDescription,
 ]);
 
@@ -228,19 +292,44 @@ function initialBundle(
 	};
 }
 
+/**
+ * The scan's worker: the bundled `reviewer` pinned to the scan's contract, so
+ * project or user agent files cannot widen it. The scan prompt replaces the
+ * reviewer's patch-review body, which reviews a diff through bash and yields
+ * verdict fields the scan's output lacks.
+ */
+function createSecurityReviewer(): AgentDefinition {
+	const reviewer = getBundledAgent("reviewer");
+	if (!reviewer) throw new Error("Bundled reviewer agent is unavailable");
+	return {
+		...reviewer,
+		systemPrompt: prompt.render(securityWorkerPrompt),
+		tools: SECURITY_WORKER_TOOLS,
+		spawns: undefined,
+		output: SECURITY_WORKER_OUTPUT,
+	};
+}
+
 async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInput): Promise<AgentSession> {
 	const scanSettings = await input.host.settings.cloneForCwd(input.executionRoot);
 	const modelSelector = `${input.model.provider}/${input.model.id}`;
+	const worker = createSecurityReviewer();
 	cfgRetryModelFallback.override(scanSettings, false);
 	cfgRetryUsageAwareFallback.override(scanSettings, false);
 	cfgRetryFallbackChains.override(scanSettings, {});
+	// `reviewer` settings meant for ordinary reviews must not route workers to
+	// other models: the scan pins one model and account.
 	cfgTaskAgentModelOverrides.override(scanSettings, {
 		...cfgTaskAgentModelOverrides.get(scanSettings),
-		"security-reviewer": modelSelector,
+		[worker.name]: modelSelector,
 	});
 	cfgTaskAgentPrewalk.override(scanSettings, {
 		...cfgTaskAgentPrewalk.get(scanSettings),
-		"security-reviewer": "off",
+		[worker.name]: "off",
+	});
+	cfgTaskAgentAdvisor.override(scanSettings, {
+		...cfgTaskAgentAdvisor.get(scanSettings),
+		[worker.name]: "off",
 	});
 	const providerSessionId = `security:${input.scanId}`;
 	const { session } = await createAgentSession({
@@ -260,7 +349,8 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 		toolNames: SECURITY_SESSION_TOOLS,
 		restrictToolNames: true,
 		allowRestrictedCustomTools: true,
-		spawns: "security-reviewer",
+		spawns: worker.name,
+		pinnedAgents: [worker],
 		appendSystemPrompt: securityCoordinatorPrompt.trim(),
 		disableExtensionDiscovery: true,
 		enableMCP: false,

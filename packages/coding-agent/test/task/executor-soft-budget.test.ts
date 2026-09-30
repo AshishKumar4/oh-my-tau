@@ -666,12 +666,10 @@ describe("runSubprocess soft request budget", () => {
 describe("resolveSoftRequestBudget", () => {
 	it("lets a configured budget lower a bundled agent's ceiling", () => {
 		expect(resolveSoftRequestBudget("scout", 20)).toBe(20);
-		expect(resolveSoftRequestBudget("sonic", 20)).toBe(20);
 	});
 
 	it("keeps the bundled ceiling when the configured budget is higher", () => {
 		expect(resolveSoftRequestBudget("scout", 200)).toBe(100);
-		expect(resolveSoftRequestBudget("sonic", 200)).toBe(100);
 	});
 
 	it("uses the configured budget for agents without a bundled entry", () => {

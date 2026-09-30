@@ -59,25 +59,24 @@ describe("loadRoleAgents", () => {
 				REVIEWER: "openai/gpt-5.6",
 			},
 			"task.agentModelOverrides": {
-				reviewer: "@REVIEWER",
-				"security-reviewer": ["@REVIEWER"],
-				scout: "openai/gpt-5.6-mini",
+				reviewer: ["@REVIEWER"],
+				task: "openai/gpt-5.6-mini",
 			},
 			"task.disabledAgents": ["idle-planner"],
 		});
 
 		const roleAgents = await loadRoleAgents(projectDir, settings, NO_EXTENSIONS);
 
-		// The bundled reviewers follow their overrides onto the custom role; the agent file's own
-		// `@REVIEWER` joins them, and the names come back sorted.
-		expect(roleAgents.get("REVIEWER")).toEqual(["reviewer", "security-reviewer", "triage"]);
+		// The bundled reviewer follows its override onto the custom role; the agent file's own
+		// `@REVIEWER` joins it, and the names come back sorted.
+		expect(roleAgents.get("REVIEWER")).toEqual(["reviewer", "triage"]);
 		// The bundled reviewer's `@slow` is overridden away and the disabled planner is left out.
 		expect(roleAgents.get("slow")).toEqual(["planner"]);
-		// A literal override takes scout off `@smol`; sonic keeps it.
-		expect(roleAgents.get("smol")).toEqual(["sonic"]);
+		// A literal override takes task off `@task`; scout keeps `@smol`.
+		expect(roleAgents.get("smol")).toEqual(["scout"]);
 		const onAnyRole = [...roleAgents.values()].flat();
 		expect(onAnyRole).not.toContain("pinned");
-		expect(onAnyRole).not.toContain("scout");
+		expect(onAnyRole).not.toContain("task");
 		expect(onAnyRole).not.toContain("idle-planner");
 	});
 });
