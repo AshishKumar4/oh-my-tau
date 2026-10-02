@@ -755,6 +755,19 @@ interface SessionWithRepeatReadTracker extends ToolSession {
 }
 
 /**
+ * Put an internal resource's warnings ahead of its content, each in its own
+ * text block, so the content block stays exactly what the resource resolved to.
+ */
+function withResourceWarnings(
+	result: AgentToolResult<ReadToolDetails>,
+	warnings: readonly string[] | undefined,
+): AgentToolResult<ReadToolDetails> {
+	if (!warnings?.length) return result;
+	const blocks: TextContent[] = warnings.map(text => ({ type: "text", text }));
+	return { ...result, content: [...blocks, ...result.content] };
+}
+
+/**
  * Append a loop-breaking hint when the same read selector returns
  * byte-identical output repeatedly. Weak models re-issue an unchanged read
  * dozens of times (observed: 29 bare re-reads of one file, ~645k tokens);
@@ -2710,17 +2723,23 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 			if (parsedSel.kind !== "none" && parsedSel.kind !== "raw") {
 				throw new ToolError("Cannot combine query extraction with line selectors");
 			}
-			return toolResult(details).text(resource.content).sourceInternal(url).done();
+			return withResourceWarnings(
+				toolResult(details).text(resource.content).sourceInternal(url).done(),
+				resource.warnings,
+			);
 		}
 
-		return buildInMemorySelectorResult(this.session, resource.content, parsedSel, {
-			details,
-			sourcePath: resource.sourcePath,
-			sourceInternal: url,
-			entityLabel: "resource",
-			ignoreResultLimits: spec.unbounded === true,
-			immutable: resource.immutable,
-		});
+		return withResourceWarnings(
+			buildInMemorySelectorResult(this.session, resource.content, parsedSel, {
+				details,
+				sourcePath: resource.sourcePath,
+				sourceInternal: url,
+				entityLabel: "resource",
+				ignoreResultLimits: spec.unbounded === true,
+				immutable: resource.immutable,
+			}),
+			resource.warnings,
+		);
 	}
 
 	/**

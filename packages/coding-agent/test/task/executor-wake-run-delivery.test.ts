@@ -21,6 +21,8 @@ import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { YieldTool } from "@oh-my-pi/pi-coding-agent/tools/yield";
 import { attachIrcWakeTurnMonitor, runSubagentFollowUpTurn } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -352,6 +354,58 @@ describe("IRC wake run delivery", () => {
 			const settled = await read();
 			expect(settled).not.toContain("running a newer turn");
 			expect(settled).toContain("probe passed: 3 of 3");
+		} finally {
+			unregisterDir();
+		}
+	});
+
+	it("warns on a JSON-path read of the previous run's output while the lane's run is open", async () => {
+		const lane = createLane([
+			toolCall("background", { label: "probe" }),
+			{ content: ["Waiting for the probe."] },
+			toolCall("yield", { data: { report: "probe passed: 3 of 3", counts: { passed: 3, total: 3 } } }),
+		]);
+		const unregisterDir = registerArtifactsDir(lane.artifactsDir);
+		const previous = { report: "previous run: probe never ran", counts: { passed: 0, total: 3 } };
+		await fs.writeFile(path.join(lane.artifactsDir, `${LANE}.md`), JSON.stringify(previous));
+		const reader: ToolSession = {
+			cwd: lane.artifactsDir,
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getArtifactsDir: () => lane.artifactsDir,
+			settings: Settings.isolated(),
+		};
+		/** The text blocks the model receives for `read <url>`. */
+		const read = async (url: string) =>
+			(await new ReadTool(reader).execute("read-lane", { path: url })).content.flatMap(part =>
+				part.type === "text" ? [part.text] : [],
+			);
+		try {
+			await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Run the probe, then report." });
+			await lane.jobStarted;
+			await lane.session.waitForIdle();
+			await drainEventLoop();
+
+			// The run is open between turns: both extractions are the previous run's.
+			const report = await read(`agent://${LANE}/report`);
+			expect(report).toHaveLength(2);
+			expect(report[0]).toContain(`\`${LANE}\` is running a newer turn.`);
+			expect(report[0]).toContain("PREVIOUS run");
+			expect(report[1]).toBe(previous.report);
+			const counts = await read(`agent://${LANE}/counts`);
+			expect(counts).toHaveLength(2);
+			expect(counts[0]).toContain("PREVIOUS run");
+			expect(JSON.parse(counts[1] ?? "")).toEqual(previous.counts);
+
+			lane.finishJob("3 of 3 passed");
+			await lane.runEnded;
+			await lane.settle();
+			// The run rewrote the output: plain values, no warning.
+			expect(await read(`agent://${LANE}/report`)).toEqual(["probe passed: 3 of 3"]);
+			const settled = await read(`agent://${LANE}/counts`);
+			expect(settled).toHaveLength(1);
+			expect(JSON.parse(settled[0] ?? "")).toEqual({ passed: 3, total: 3 });
 		} finally {
 			unregisterDir();
 		}
