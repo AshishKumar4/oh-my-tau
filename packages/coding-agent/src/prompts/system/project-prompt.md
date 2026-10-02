@@ -69,6 +69,12 @@ Additional workspace directories. This CURRENT workspace state supersedes worksp
 - Before yielding, MUST verify significant behavioral changes: run the specific test, command, or scenario covering the change.
 {{/if}}
 </critical>
+{{else}}
+{{#if subagent}}
+<critical>
+- Changes complete → yield; verification is main agent's job. NEVER run it yourself unless your assignment explicitly instructs it.
+</critical>
+{{/if}}
 {{/unless}}
 
 {{#if appendPrompt}}

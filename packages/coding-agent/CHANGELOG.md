@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- Subagents served a Claude Code or Codex prompt under a harness profile now get the verification hand-off too (leave builds, tests and smoke runs to the main agent unless the assignment asks); the served prompt replaces omp's directives, which carried it
 - `agent://<id>` also marks an output as the previous run's while a subagent woken by a message, or given a follow-up, waits between turns on its own background work: that run is still open and rewrites the output only when it ends
 - `/ratchet` under the Claude Code harness profile now names the question tool `AskUserQuestion` in its kickoff and `xd://eval/ratchet` doc instead of omp's `ask`, and checks its required tools against what the profile presents
 - Background bash commands and auto-backgrounded eval cells now run without a default deadline; explicit timeouts still apply, and `wait`'s safety cap is now 2 hours.

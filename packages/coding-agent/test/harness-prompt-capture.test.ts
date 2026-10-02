@@ -116,7 +116,7 @@ describe("harness prompt custody", () => {
 		fs.writeFileSync(path.join(dir, `2.1.267-${entrypoint}.json`), JSON.stringify(capture));
 	}
 
-	function build(harnessProfile?: "claude-code" | "codex") {
+	function build(harnessProfile?: "claude-code" | "codex", subagent = false) {
 		return buildSystemPrompt({
 			cwd: dirs.root,
 			contextFiles: [{ path: path.join(dirs.root, "AGENTS.md"), content: "Project rule: run bun check." }],
@@ -128,6 +128,7 @@ describe("harness prompt custody", () => {
 			workspaceTree: { ...EMPTY_TREE, rootPath: dirs.root },
 			personality: "none",
 			...(harnessProfile !== undefined && { harnessProfile }),
+			...(subagent && { subagent }),
 		});
 	}
 
@@ -140,6 +141,25 @@ describe("harness prompt custody", () => {
 		expect(served?.tools).toEqual({ Read: { description: "Reads a file from the local filesystem." } });
 		expect(systemPrompt.join("\n")).not.toContain("<critical>");
 		expect((await build()).systemPrompt.join("\n")).toContain("<critical>");
+	});
+
+	it("keeps the subagent verification hand-off when a vendor prompt replaces omp's directives", async () => {
+		writeCapture();
+		const handOff =
+			"- Changes complete → yield; verification is main agent's job. NEVER run it yourself unless your assignment explicitly instructs it.";
+
+		const vendorSubagent = (await build("claude-code", true)).systemPrompt.join("\n");
+		expect(vendorSubagent).toContain(handOff);
+		expect(vendorSubagent).not.toContain("Before yielding, MUST verify");
+		// The lead under the same capture keeps omp's directives out of the footer.
+		expect((await build("claude-code")).systemPrompt.join("\n")).not.toContain("<critical>");
+
+		resetHarnessPromptCache();
+		const nativeSubagent = (await build(undefined, true)).systemPrompt.join("\n");
+		expect(nativeSubagent).toContain(handOff);
+		expect(nativeSubagent).toContain(
+			"NEVER verify your changes (builds, tests, linters, formatters, smoke runs) unless your assignment explicitly instructs it.",
+		);
 	});
 
 	it("names no omp search tool in the project footer under claude-code, and keeps the native wording", async () => {
