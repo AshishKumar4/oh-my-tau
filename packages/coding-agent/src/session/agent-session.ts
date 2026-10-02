@@ -7146,7 +7146,7 @@ export class AgentSession implements SettingsScope {
 				outcome.sessionClaimed = this.agent.state.isStreaming;
 				throw new AgentBusyError();
 			}
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
+			const queued = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
 				prependMessages: keywordNotices,
@@ -7157,8 +7157,11 @@ export class AgentSession implements SettingsScope {
 				},
 				onPromptAdmitted: options?.onPromptAdmitted,
 			});
+			// The abort race was decided by the generation check above; an aside can
+			// still be dropped by a session switch.
+			outcome.sessionClaimed = queued;
 			// The report-first guidance refers to "the message above": it follows the user message.
-			if (reportFirstNotice) await this.#queueCustomMessage(reportFirstNotice, streamingBehavior);
+			if (queued && reportFirstNotice) await this.#queueCustomMessage(reportFirstNotice, streamingBehavior);
 			return true;
 		}
 

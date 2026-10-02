@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- A prompt sent during a manual `/compact` that ends up queued behind a turn started while its images were being prepared no longer also resumes the turn the compaction interrupted, which ran a second turn
 - Subagents served a Claude Code or Codex prompt under a harness profile now get the verification hand-off too (leave builds, tests and smoke runs to the main agent unless the assignment asks); the served prompt replaces omp's directives, which carried it
 - `agent://<id>` also marks an output as the previous run's while a subagent woken by a message, or given a follow-up, waits between turns on its own background work: that run is still open and rewrites the output only when it ends
 - `/ratchet` under the Claude Code harness profile now names the question tool `AskUserQuestion` in its kickoff and `xd://eval/ratchet` doc instead of omp's `ask`, and checks its required tools against what the profile presents

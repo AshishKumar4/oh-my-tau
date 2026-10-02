@@ -17,6 +17,7 @@ import {
 	type Tool,
 	type ToolSession,
 } from "@oh-my-pi/pi-coding-agent/tools";
+import * as imageLoading from "@oh-my-pi/pi-coding-agent/utils/image-loading";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -231,6 +232,52 @@ describe.each([false, true])("AgentSession compaction cancellation source (exper
 
 		expect(prompted).toHaveLength(1);
 		expect(prompted[0]?.some(message => message.role === "developer" && message.synthetic === true)).toBe(true);
+	});
+
+	it("drops the interrupted-turn resume when a parked prompt queues behind a turn started during its image normalization", async () => {
+		const started = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		session = await createSession("park", started.resolve, gate.promise);
+		cfgCompactionAutoContinue.override(session.settings, true);
+		// The turn the manual compaction interrupts, so it owes a resume.
+		session.agent.state.isStreaming = true;
+		vi.spyOn(session, "abort").mockImplementation(async () => {
+			session.agent.state.isStreaming = false;
+		});
+		const prompts = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {});
+		const continues = vi.spyOn(session.agent, "continue").mockImplementation(async () => {});
+		const normalizing = Promise.withResolvers<void>();
+		const normalized = Promise.withResolvers<void>();
+		vi.spyOn(imageLoading, "normalizeModelContextImages").mockImplementation(async images => {
+			normalizing.resolve();
+			await normalized.promise;
+			return images;
+		});
+
+		const compaction = session.compact();
+		await started.promise;
+		// Parks on the compaction barrier, then passes the idle check and suspends
+		// in image normalization.
+		const prompt = session.prompt("look at this", {
+			images: [{ type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }],
+			streamingBehavior: "followUp",
+		});
+		gate.resolve();
+		await compaction;
+		await normalizing.promise;
+		// Another turn takes the session meanwhile, so the prompt queues behind it.
+		session.agent.state.isStreaming = true;
+		normalized.resolve();
+		expect(await prompt).toBe(true);
+		expect(session.agent.hasQueuedMessages()).toBe(true);
+
+		// The queued prompt is the user's next intent: the interrupted turn is not
+		// resumed on top of it once the session settles.
+		session.agent.state.isStreaming = false;
+		await Bun.sleep(250);
+		await session.waitForIdle();
+		expect(prompts).not.toHaveBeenCalled();
+		expect(continues).not.toHaveBeenCalled();
 	});
 	if (experimental) {
 		for (const mutation of ["branch", "disable"] as const) {
