@@ -179,7 +179,7 @@ describe("StatusLineComponent", () => {
 		);
 
 		const stripped = statusLine.getTopBorder(WIDE_ENOUGH_FOR_COST_SEGMENT).content.replace(/\x1b\[[0-9;]*m/g, "");
-		expect(stripped).toContain("S2.67 + 👁 S0.41");
+		expect(stripped).toContain("S2.67 + 👁 0.41");
 	});
 
 	it("renders ASCII preset fallback with (adv) for advisor costs", async () => {
@@ -200,7 +200,7 @@ describe("StatusLineComponent", () => {
 				),
 			);
 			const stripped = statusLine.getTopBorder(WIDE_ENOUGH_FOR_COST_SEGMENT).content.replace(/\x1b\[[0-9;]*m/g, "");
-			expect(stripped).toContain("S2.67 + S0.41 (adv)");
+			expect(stripped).toContain("S2.67 + 0.41 (adv)");
 		} finally {
 			setThemeInstance(baseTheme);
 		}
@@ -240,7 +240,7 @@ describe("StatusLineComponent", () => {
 				),
 			);
 			const stripped = statusLine.getTopBorder(WIDE_ENOUGH_FOR_COST_SEGMENT).content.replace(/\x1b\[[0-9;]*m/g, "");
-			expect(stripped).toContain("\u{f067a} 2.67 + \uea70 \u{f067a} 0.41");
+			expect(stripped).toContain("\u{f067a} 2.67 + \uea70 0.41");
 		} finally {
 			setThemeInstance(baseTheme);
 		}

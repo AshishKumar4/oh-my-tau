@@ -130,6 +130,24 @@ function agentControls(toolRefs: Readonly<Record<string, string>>): {
 	return { stop: id => `\`write proc://${id}/kill\``, message: "`write agent://<id>`" };
 }
 
+/**
+ * Suffix flagging a claimed-running agent with no turn in flight; empty for a
+ * live one. Shared by `jobs`, empty-wait results, and the `proc://` roster so
+ * every surface tells a finished-but-unterminalized run (#11079) from real work.
+ * The clean-up it names goes through the tools the caller presents (`toolRefs`).
+ */
+export function agentStaleNote(agent: AgentActivitySnapshot, toolRefs: Readonly<Record<string, string>>): string {
+	if (agent.live) return "";
+	// An accepted final result with no turn in flight is the #11079 leak:
+	// the run is over but the ref never terminalized, so say so actionably
+	// instead of the generic stale-registration hint.
+	const { stop } = agentControls(toolRefs);
+	const clear = stop ? `; clear it with ${stop(agent.id)}` : "";
+	return agent.acceptedAt !== undefined
+		? ` — final result accepted ${formatDuration(Math.max(0, Date.now() - agent.acceptedAt))} ago but still running${clear}`
+		: " — no turn in flight (stale registration?)";
+}
+
 /** Model-facing lines for the running-agents section shared by `jobs` and empty-wait results. */
 function describeAgents(agents: AgentActivitySnapshot[], toolRefs: Readonly<Record<string, string>>): string[] {
 	const { stop, message } = agentControls(toolRefs);
@@ -137,16 +155,9 @@ function describeAgents(agents: AgentActivitySnapshot[], toolRefs: Readonly<Reco
 	for (const agent of agents) {
 		const parent = agent.parentId ? ` (spawned by \`${agent.parentId}\`)` : "";
 		const activity = agent.activity ? ` — ${agent.activity}` : "";
-		// An accepted final result with no turn in flight is the #11079 leak:
-		// the run is over but the ref never terminalized, so say so actionably
-		// instead of the generic stale-registration hint.
-		const clear = stop ? `; clear it with ${stop(agent.id)}` : "";
-		const stale = agent.live
-			? ""
-			: agent.acceptedAt !== undefined
-				? ` — final result accepted ${formatDuration(Math.max(0, Date.now() - agent.acceptedAt))} ago but still running${clear}`
-				: " — no turn in flight (stale registration?)";
-		lines.push(`- \`${agent.id}\`${parent} — up ${formatDuration(agent.ageMs)}${activity}${stale}`);
+		lines.push(
+			`- \`${agent.id}\`${parent} — up ${formatDuration(agent.ageMs)}${activity}${agentStaleNote(agent, toolRefs)}`,
+		);
 	}
 	const reach = message ? ` message them via ${message},` : "";
 	lines.push("", `These agents have no job entry;${reach} transcripts at \`history://<id>\`.`);
@@ -186,6 +197,7 @@ export function snapshotJobs(
 		let resolvedModelIdentity: string | undefined;
 		let resolvedThinkingLevel: JobSnapshot["resolvedThinkingLevel"];
 		let advisor = false;
+		let completionPercent: number | undefined;
 		if (latest.type === "task") {
 			const progressValue = latest.latestDetails?.progress;
 			if (Array.isArray(progressValue)) {
@@ -214,6 +226,10 @@ export function snapshotJobs(
 					resolvedThinkingLevel = parseConfiguredThinkingLevel(thinkingValue);
 				}
 				advisor = progressRecord?.advisor === true;
+				const completionValue = progressRecord?.completionPercent;
+				if (typeof completionValue === "number" && Number.isFinite(completionValue)) {
+					completionPercent = completionValue;
+				}
 			}
 		}
 		return {
@@ -227,6 +243,7 @@ export function snapshotJobs(
 			...(resolvedModelIdentity ? { resolvedModelIdentity } : {}),
 			...(resolvedThinkingLevel !== undefined ? { resolvedThinkingLevel } : {}),
 			...(advisor ? { advisor: true } : {}),
+			...(completionPercent !== undefined && latest.status === "running" ? { completionPercent } : {}),
 			...(!resultConsumed && options.includeResults !== false && latest.resultText
 				? { resultText: latest.resultText }
 				: {}),

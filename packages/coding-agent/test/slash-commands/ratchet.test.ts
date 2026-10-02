@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { harnessSurface } from "@oh-my-pi/pi-coding-agent/harness/facades";
-import { renderRatchetDocumentation } from "@oh-my-pi/pi-coding-agent/ratchet/prelude";
+import { renderRatchetDocumentation } from "@oh-my-pi/pi-coding-agent/ratchet/prelude-definition";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { cfgRatchetEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
 

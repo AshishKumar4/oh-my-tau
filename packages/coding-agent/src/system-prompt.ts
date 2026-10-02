@@ -600,6 +600,11 @@ export interface BuildSystemPromptOptions {
 	 * footer names Skill, TaskOutput-for-`wait` and the like only while mounted.
 	 */
 	harnessToolRefs?: Readonly<Record<string, string>>;
+	/**
+	 * Whether this prompt is for a subagent session. Replaces the Verify workflow with a hand-off:
+	 * the main agent verifies once after all subagents land, so parallel children don't storm the CPU.
+	 */
+	subagent?: boolean;
 }
 
 /** Result of building provider-facing system prompt messages. */
@@ -684,6 +689,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		xdevDocs = "",
 		autoQaEnabled = false,
 		writeTransportOnly = false,
+		subagent = false,
 		activeRepoContext: providedActiveRepoContext,
 		harnessProfile,
 		harnessToolRefs,
@@ -1048,6 +1054,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		// Claude Code's own prompt is served, so the footer names only the tools that
 		// surface serves. Without a capture the native prompt is served, byte for byte.
 		claudeCodeVendorPrompt: harnessPromptText !== undefined && harnessProfile === "claude-code",
+		subagent,
 	};
 	// A served vendor prompt renders the footer-only template too, so the harness
 	// case takes the same branch as a literal custom prompt.

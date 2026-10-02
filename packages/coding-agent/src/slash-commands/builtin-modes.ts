@@ -30,7 +30,7 @@ import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
 import type { AgentRef } from "../registry/agent-registry";
 import ratchetKickoffPrompt from "../prompts/ratchet-kickoff.md" with { type: "text" };
-import { ratchetAskToolName } from "../ratchet/prelude";
+import { ratchetAskToolName } from "../ratchet/prelude-definition";
 import type { AgentSession } from "../session/agent-session";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";

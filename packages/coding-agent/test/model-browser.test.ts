@@ -18,7 +18,7 @@ import { createModelMentionSource } from "@oh-my-pi/pi-tui/prompt/model-mention-
 
 /** Optional presentation metadata a catalog or discovery source may attach. */
 type NativeMetadata = Pick<Model, "description" | "isNew" | "isBeta" | "isRecommended" | "int" | "tps"> &
-	Partial<Pick<Model, "cost" | "kind">>;
+	Partial<Pick<Model, "cost" | "kind" | "pricingStatus">>;
 
 function makeModel(provider: string, id: string, metadata?: NativeMetadata): Model {
 	return buildModel({
@@ -400,6 +400,33 @@ describe("ModelBrowser native model metadata", () => {
 
 	test("models without upstream metadata render the plain detail line", () => {
 		expect(renderDetail(makeModel("openai", "gpt-5"))).toContain("gpt-5 · 128k ctx · 1k out · free per M");
+	});
+
+	test("labels declared pricing states instead of calling the zero rate card free", () => {
+		// Published rates win over any declared state.
+		expect(
+			renderDetail(
+				makeModel("openai", "metered", {
+					cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
+					pricingStatus: "unknown",
+				}),
+			),
+		).toContain("$1.25/10 per M");
+		expect(renderDetail(makeModel("subscription", "included", { pricingStatus: "included" }))).toContain(
+			" · included",
+		);
+		expect(renderDetail(makeModel("fixture", "unpriced", { pricingStatus: "unknown" }))).toContain(
+			" · pricing unknown",
+		);
+
+		const variable = makeModel("cursor", "default", { pricingStatus: "variable" });
+		const browser = makeBrowser([variable], []);
+		const lines = browser.render(160).map(line => Bun.stripANSI(line));
+		expect(lines[2]).toContain("varies");
+		expect(lines[lines.length - 2]).toContain("price varies");
+		// A router priced per request is not free, so the `free` filter skips it.
+		browser.setQuery("free");
+		expect(browser.visibleCount).toBe(0);
 	});
 
 	test("price rows preserve free labels and identify invalid rates", () => {

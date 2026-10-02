@@ -10,8 +10,8 @@
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
-import type { ModelKind } from "@oh-my-pi/pi-catalog/types";
+import { getModelPricingStatus, modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+import type { ModelKind, ModelPricingStatus } from "@oh-my-pi/pi-catalog/types";
 import type { Component } from "../tui";
 import { fuzzyRank } from "../fuzzy";
 import { Input } from "../components/input";
@@ -619,8 +619,20 @@ function roleChipSpans(role: string, assignment: RoleAssignment, settings: Model
 	return spans;
 }
 
-/** No token price and no subscription-credit charge. */
+/**
+ * The non-rate pricing state a catalog rule declared for a zero-rate row
+ * (`pricing-status`), or `undefined` when the row publishes rates or declares
+ * nothing. Undeclared zero-rate rows keep the `free` convention below.
+ */
+function declaredPricingStatus(model: Model): Exclude<ModelPricingStatus, "fixed"> | undefined {
+	if (model.pricingStatus === undefined) return undefined;
+	const status = getModelPricingStatus(model);
+	return status === "fixed" ? undefined : status;
+}
+/** No token price and no subscription-credit charge (unless a pricing state is declared). */
 function isFreeModel(model: Model): boolean {
+	const declared = declaredPricingStatus(model);
+	if (declared !== undefined) return declared === "free";
 	const cost = model.cost;
 	const credits = model.factoryDroidCredits;
 	return (!cost || (cost.input === 0 && cost.output === 0)) && (credits === undefined || credits === 0);
@@ -648,10 +660,25 @@ function withCreditBadge(model: Model, price: string): string {
 	return model.cost.input !== 0 || model.cost.output !== 0 ? `${price} ${badge}` : badge;
 }
 
-/** `$in/out` per-million cost pair with any credit badge; `free` when nothing is charged. */
+const PRICING_STATUS_LABELS: Record<Exclude<ModelPricingStatus, "fixed">, { short: string; detail: string }> = {
+	free: { short: "free", detail: "free" },
+	included: { short: "included", detail: "included" },
+	variable: { short: "varies", detail: "price varies" },
+	unknown: { short: "unknown", detail: "pricing unknown" },
+};
+
+/** `$in/out` per-million cost pair with any credit badge; `free` when nothing is charged; a declared pricing state otherwise. */
 function formatCostPair(model: Model): string {
+	const declared = declaredPricingStatus(model);
+	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].short;
 	if (isFreeModel(model)) return "free";
 	return withCreditBadge(model, `$${formatCostLeg(model.cost.input)}/${formatCostLeg(model.cost.output)}`);
+}
+
+/** Detail-pane price fact: `$3/15 per M`, or the declared pricing state in words. */
+function formatCostDetail(model: Model): string {
+	const declared = declaredPricingStatus(model);
+	return declared !== undefined ? PRICING_STATUS_LABELS[declared].detail : `${formatCostPair(model)} per M`;
 }
 
 /** Fact columns of a model picker (Stencil `NATIVE_REDESIGN.md` §4.7); the lowest priority hides first. */
@@ -662,14 +689,18 @@ export const MODEL_PICKER_COLUMNS: readonly TspPickerColumn[] = [
 	{ id: "price", head: "$/M", format: "price", priority: 3 },
 ];
 
-/** `$3·15` price fact of a picker row (`free` at zero cost). */
+/** `$3·15` price fact of a picker row; `free` at zero cost; a declared pricing state otherwise. */
 function pickerPrice(model: Model): string {
+	const declared = declaredPricingStatus(model);
+	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].short;
 	if (isFreeModel(model)) return "free";
 	return withCreditBadge(model, `$${formatCostLeg(model.cost.input)}·${formatCostLeg(model.cost.output)}`);
 }
 
 /** `$2 in · $10 out · $0.2 cache` for a model preview. */
 function previewPrice(model: Model): string {
+	const declared = declaredPricingStatus(model);
+	if (declared !== undefined) return PRICING_STATUS_LABELS[declared].detail;
 	const cost = model.cost;
 	const parts = [`$${formatCostLeg(cost.input)} in`, `$${formatCostLeg(cost.output)} out`];
 	if (cost.cacheRead > 0) parts.push(`$${formatCostLeg(cost.cacheRead)} cache`);
@@ -1314,7 +1345,7 @@ export class ModelBrowser implements Component {
 		if (model.isRecommended) facts.push("recommended");
 		if (model.contextWindow) facts.push(`${formatNumber(model.contextWindow).toLowerCase()} ctx`);
 		if (model.maxTokens) facts.push(`${formatNumber(model.maxTokens).toLowerCase()} out`);
-		facts.push(`${formatCostPair(model)} per M`);
+		facts.push(formatCostDetail(model));
 		if (model.reasoning) facts.push("reasoning");
 		if (model.input.includes("image")) facts.push("vision");
 		const intelligence = formatIntelligence(model);
@@ -1577,7 +1608,7 @@ export class ModelBrowser implements Component {
 			const facts: string[] = [];
 			if (model.contextWindow) facts.push(`${formatNumber(model.contextWindow).toLowerCase()} ctx`);
 			if (model.maxTokens) facts.push(`${formatNumber(model.maxTokens).toLowerCase()} out`);
-			facts.push(`${formatCostPair(model)} per M`);
+			facts.push(formatCostDetail(model));
 			if (model.reasoning) facts.push("reasoning");
 			if (model.input.includes("image")) facts.push("vision");
 			const intelligence = formatIntelligence(model);
@@ -1894,7 +1925,7 @@ export class ModelBrowser implements Component {
 			const facts: { k: TspText; v: TspText }[] = [];
 			if (ctx > 0) facts.push({ k: "ctx", v: formatNumber(ctx).toLowerCase() });
 			if (out > 0) facts.push({ k: "out", v: formatNumber(out).toLowerCase() });
-			facts.push({ k: "price", v: isFreeModel(model) ? "free" : `${formatCostPair(model)} per M` });
+			facts.push({ k: "price", v: isFreeModel(model) ? "free" : formatCostDetail(model) });
 			facts.push({ k: "reasoning", v: model.reasoning ? "yes" : "no" });
 			const children: NativeChild[] = [node("kv", { items: facts, layout: "inline" })];
 			const chips: NativeChild[] = [];

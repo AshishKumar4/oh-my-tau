@@ -240,17 +240,23 @@ export class OAuthAccounts implements OAuthApi {
 			return [];
 		}
 		const activeCredentialId = this.#deps.affinity.activeOAuthId(provider, sessionId);
-		return this.#getStoredOAuthSelections(provider).map((selection, position) => ({
-			position,
-			credentialId: selection.credentialId,
-			accountId: selection.credential.accountId,
-			email: selection.credential.email,
-			projectId: selection.credential.projectId,
-			enterpriseUrl: selection.credential.enterpriseUrl,
-			orgId: selection.credential.orgId,
-			orgName: selection.credential.orgName,
-			active: selection.credentialId === activeCredentialId,
-		}));
+		const activeLastUsedAtMs =
+			activeCredentialId !== undefined ? this.#deps.affinity.get(provider, sessionId)?.lastUsedAtMs : undefined;
+		return this.#getStoredOAuthSelections(provider).map((selection, position) => {
+			const active = selection.credentialId === activeCredentialId;
+			return {
+				position,
+				credentialId: selection.credentialId,
+				accountId: selection.credential.accountId,
+				email: selection.credential.email,
+				projectId: selection.credential.projectId,
+				enterpriseUrl: selection.credential.enterpriseUrl,
+				orgId: selection.credential.orgId,
+				orgName: selection.credential.orgName,
+				active,
+				...(active && activeLastUsedAtMs !== undefined ? { lastUsedAtMs: activeLastUsedAtMs } : {}),
+			};
+		});
 	}
 
 	/**

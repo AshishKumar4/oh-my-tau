@@ -312,10 +312,11 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 	}
 
 	/**
-	 * Find the registry ref for `agentId` (exact, then case-insensitive),
-	 * skipping advisor transcripts.
+	 * The registry roster as the caller sees it: the caller root's persisted
+	 * roster is refreshed first, and its artifact dir leads every on-disk scan.
+	 * Both the bare index and `history://<id>` lookups read this one source.
 	 */
-	async #lookup(agentId: string, context: ResolveContext | undefined): Promise<RefLookup> {
+	async #roster(context: ResolveContext | undefined): Promise<Omit<RefLookup, "ref">> {
 		const registry = AgentRegistry.global();
 		// A caller resolving a possibly-parked id refreshes its own root's
 		// persisted roster first: a same-named parked ref restored by another
@@ -331,7 +332,16 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		// Advisor transcripts are observability-only — surfaced in the Agent Hub, never
 		// in the agent-facing roster. Hide them from the index, lookup, and completions.
 		const visible = registry.list().filter(ref => ref.kind !== "advisor");
-		let ref = registry.get(agentId);
+		return { visible, preferredArtifactDir };
+	}
+
+	/**
+	 * Find the registry ref for `agentId` (exact, then case-insensitive),
+	 * skipping advisor transcripts.
+	 */
+	async #lookup(agentId: string, context: ResolveContext | undefined): Promise<RefLookup> {
+		const { visible, preferredArtifactDir } = await this.#roster(context);
+		let ref = AgentRegistry.global().get(agentId);
 		if (ref?.kind === "advisor") ref = undefined;
 		if (!ref) {
 			// Case-insensitive fallback: agent ids are human-typed (e.g. AuthLoader).
@@ -367,11 +377,11 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			// `history://?live` lists only agents a message reaches without a
 			// revival: running or idle, no parked refs or on-disk transcripts.
 			const live = url.searchParams.has("live");
-			const visible = AgentRegistry.global()
-				.list()
-				.filter(ref => ref.kind !== "advisor" && (!live || ref.status === "running" || ref.status === "idle"));
+			const { visible: roster, preferredArtifactDir } = await this.#roster(context);
+			const visible = live ? roster.filter(ref => ref.status === "running" || ref.status === "idle") : roster;
 			const content = await this.#renderIndex(visible, {
 				includeDisk: !live,
+				preferredArtifactDir,
 				readRef: context?.session ? sessionToolRefs(context.session).read : "read",
 			});
 			return {
@@ -462,7 +472,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 
 	async #renderIndex(
 		refs: AgentRef[],
-		options: { includeDisk: boolean; readRef: string | undefined },
+		options: { includeDisk: boolean; preferredArtifactDir: string | undefined; readRef: string | undefined },
 	): Promise<string> {
 		const entries: IndexEntry[] = refs.map(ref => ({
 			id: ref.id,
@@ -474,7 +484,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		// Merge on-disk transcripts for agents absent from the registry.
 		if (options.includeDisk) {
 			const registered = new Set(refs.map(ref => ref.id));
-			const disk = await sessionFilesFromDisk();
+			const disk = await sessionFilesFromDisk(options.preferredArtifactDir);
 			for (const id of disk.keys()) {
 				if (registered.has(id)) continue;
 				entries.push({ id, status: "on disk", kind: "—", parent: "—", lastActivity: "—" });

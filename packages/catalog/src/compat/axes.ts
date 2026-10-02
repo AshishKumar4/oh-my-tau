@@ -299,7 +299,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"stream-first-event-timeout-ms": wire("streamFirstEventTimeoutMs", [...OAI, "google"]),
 	"stream-idle-timeout-ms": wire("streamIdleTimeoutMs", [...OAI, "anthropic", "bedrock", "google"]),
 	"strip-image-input": wire("stripImageInput", [...OAI, "anthropic", "google"]),
-	"supports-forced-tool-choice": wire("supportsForcedToolChoice", [...OAI, "anthropic"]),
+	"supports-forced-tool-choice": wire("supportsForcedToolChoice", [...OAI, "anthropic", "bedrock"]),
 	"supports-sampling-params": wire("supportsSamplingParams", [...OAI, "anthropic"]),
 	"thinking-loop-guard": wire("thinkingLoopGuard", [...OAI, "anthropic", "google"], "scalar", [
 		"gemini",
@@ -404,6 +404,12 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"prompt-cache": { key: "promptCache", set: "catalog", shape: "object" },
 	"long-usage-limit-fallback": { key: "longUsageLimitFallback", set: "catalog", shape: "scalar" },
 	"max-context-window": { key: "maxContextWindow", set: "catalog", shape: "scalar" },
+	"pricing-status": {
+		key: "pricingStatus",
+		set: "catalog",
+		shape: "scalar",
+		values: ["free", "included", "variable", "unknown"],
+	},
 	"requires-cursor-tool-schema-projection": {
 		key: "requiresCursorToolSchemaProjection",
 		set: "catalog",
