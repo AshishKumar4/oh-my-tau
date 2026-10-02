@@ -2,26 +2,33 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import {
 	createSessionOpenData,
+	INTERRUPTED_TOOL_RESULT_TEXT,
 	SESSION_EXIT_CUSTOM_TYPE,
 	SESSION_OPEN_CUSTOM_TYPE,
+	TOOL_EXECUTION_START_CUSTOM_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import {
 	findInterruptedWork,
-	INTERRUPTED_TOOL_RESULT_TEXT,
 	RECOVER_CUSTOM_TYPE,
 	type RecoverHost,
 	resumeInterruptedWork,
 } from "@oh-my-pi/pi-coding-agent/session/resume-interrupted";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import * as executor from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createAssistantMessage } from "../helpers/agent-session-setup";
+import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 function toolTurn(...calls: Array<{ id: string; name: string; args: Record<string, unknown> }>): AssistantMessage {
 	return {
@@ -1016,5 +1023,109 @@ describe("/recover", () => {
 		expect(restartedIds).toEqual([]);
 		expect(outcome.recovered.map(agent => agent.jobId)).toEqual(["Fork"]);
 		expect(delivered[0]?.text).toContain("the docs are fine");
+	});
+});
+
+describe("/recover after the SDK's resume repair", () => {
+	let dir: TempDir;
+	const sessions: AgentSession[] = [];
+	const registries: ModelRegistry[] = [];
+
+	beforeEach(() => {
+		dir = TempDir.createSync("@recover-sdk-");
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	afterEach(async () => {
+		for (const session of sessions.splice(0)) await session.dispose();
+		for (const registry of registries.splice(0)) registry.authStorage.close();
+		dir.removeSync();
+	});
+
+	it("reports a call a quit left running, continues once, and adds no second result", async () => {
+		// The previous process quit while `bash` ran: session_exit lists the call as pending.
+		const previous = SessionManager.create(dir.path(), path.join(dir.path(), "sessions"));
+		previous.appendMessage({ role: "user", content: "run the tests", timestamp: Date.now() });
+		previous.appendMessage(toolTurn({ id: "call_1", name: "bash", args: { command: "bun test" } }));
+		previous.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
+			toolCallId: "call_1",
+			toolName: "bash",
+			startedAt: new Date().toISOString(),
+		});
+		previous.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "dispose",
+			kind: "normal",
+			recordedAt: new Date().toISOString(),
+			pendingToolCalls: [{ toolCallId: "call_1", toolName: "bash", args: { command: "bun test" } }],
+		});
+		await previous.flush();
+		const file = previous.getSessionFile();
+		await previous.close();
+		if (!file) throw new Error("previous session has no file");
+
+		const auth = createInMemoryAuthStorage();
+		auth.keys.setRuntime("mock", "test-key");
+		const modelRegistry = new ModelRegistry(auth);
+		registries.push(modelRegistry);
+		const mock = createMockModel({ responses: [{ content: [{ type: "text", text: "re-running the tests" }] }] });
+		const { session } = await createAgentSession({
+			cwd: dir.path(),
+			agentDir: dir.path(),
+			modelRegistry,
+			model: mock,
+			sessionManager: await SessionManager.open(file),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"retry.enabled": false,
+				"todo.enabled": false,
+				"todo.reminders": false,
+			}),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			toolNames: [],
+		});
+		sessions.push(session);
+		session.agent.streamFn = mock.stream;
+		const resultsOf = () =>
+			session.sessionManager
+				.getBranch()
+				.flatMap(entry =>
+					entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolCallId === "call_1"
+						? [entry.message]
+						: [],
+				);
+		// Opening paired the call with an interruption result for the provider.
+		expect(resultsOf()).toHaveLength(1);
+
+		const output: string[] = [];
+		const result = await executeAcpBuiltinSlashCommand("/recover", {
+			session,
+			sessionManager: session.sessionManager,
+			settings: session.settings,
+			cwd: dir.path(),
+			output: text => {
+				output.push(text);
+			},
+			refreshCommands: () => {},
+			reloadPlugins: async () => {},
+		});
+		await session.waitForIdle();
+
+		expect(result).toEqual({ consumed: true, agentInvoked: true });
+		expect(output.join("\n")).toContain("1 interrupted tool call");
+		const notice = session.sessionManager
+			.getBranch()
+			.flatMap(entry =>
+				entry.type === "custom_message" && entry.customType === RECOVER_CUSTOM_TYPE ? [entry.content] : [],
+			);
+		expect(notice.join("\n")).toContain("`call_1` bash: bun test");
+		expect(mock.calls).toHaveLength(1);
+		expect(resultsOf()).toHaveLength(1);
 	});
 });

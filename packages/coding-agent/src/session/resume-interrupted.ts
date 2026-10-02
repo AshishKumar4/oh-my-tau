@@ -29,6 +29,8 @@ import type { AgentDefinition } from "../task/types";
 import type { EventBus } from "../utils/event-bus";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "./async-job-delivery";
 import {
+	createInterruptedToolResult,
+	isInterruptedToolResult,
 	SESSION_EXIT_CUSTOM_TYPE,
 	SESSION_OPEN_CUSTOM_TYPE,
 	summarizeToolArguments,
@@ -51,10 +53,6 @@ export const RECOVER_CUSTOM_TYPE = "recover";
  */
 export const RECOVER_OUTCOME_CUSTOM_TYPE = "recover_outcome";
 
-/** Result recorded for every tool call the interruption cut off. */
-export const INTERRUPTED_TOOL_RESULT_TEXT =
-	"A system glitch interrupted this tool call before it finished: the OMP process stopped unexpectedly. It may have partially run. Check the current state, then resume: re-run it if it is still needed.";
-
 const SUBAGENT_RESUME_MESSAGE =
 	"A system glitch stopped OMP and interrupted your run. Tool calls marked as interrupted may have partially run. Check the current state and resume your assignment from where you left off; if it is already complete, yield your final report again.";
 
@@ -64,6 +62,8 @@ export interface InterruptedToolCall {
 	toolCallId: string;
 	toolName: string;
 	label: string;
+	/** Already paired with its interruption result (resume records one when the previous process quit mid-call). */
+	resultRecorded: boolean;
 }
 
 export interface InterruptedJob {
@@ -366,15 +366,23 @@ export function findInterruptedWork(branch: readonly SessionEntry[]): Interrupte
 	for (let i = scanStart; i < slice.end; i++) if (isCustom(branch[i]!, RECOVER_CUSTOM_TYPE)) scanStart = i;
 	const { turn, open } = scanWork(branch, scanStart, slice.end);
 
-	// Only results after the turn answer it: providers can reuse tool-call ids across turns.
+	// Only results after the turn answer it: providers can reuse tool-call ids
+	// across turns. An interruption result pairs the call but does not answer it.
 	const answered = new Set<string>();
+	const recorded = new Set<string>();
 	for (let i = (turn?.index ?? branch.length) + 1; i < branch.length; i++) {
 		const entry = branch[i]!;
-		if (entry.type === "message" && entry.message.role === "toolResult") answered.add(entry.message.toolCallId);
+		if (entry.type !== "message" || entry.message.role !== "toolResult") continue;
+		(isInterruptedToolResult(entry.message) ? recorded : answered).add(entry.message.toolCallId);
 	}
 	const toolCalls = (turn?.calls ?? [])
 		.filter(block => !answered.has(block.id))
-		.map(block => ({ toolCallId: block.id, toolName: block.name, label: describeCall(block.name, block.arguments) }));
+		.map(block => ({
+			toolCallId: block.id,
+			toolName: block.name,
+			label: describeCall(block.name, block.arguments),
+			resultRecorded: recorded.has(block.id),
+		}));
 	// Results must directly follow the turn that issued the calls: anything the
 	// model or user said since then rules out appending them.
 	let toolCallsRepairable = turn !== undefined;
@@ -581,7 +589,9 @@ function inspectSubagent(
 	const answered = new Set<string>();
 	for (let i = (turn?.index ?? end) + 1; i < end; i++) {
 		const entry = branch[i]!;
-		if (entry.type === "message" && entry.message.role === "toolResult") answered.add(entry.message.toolCallId);
+		if (entry.type === "message" && entry.message.role === "toolResult" && !isInterruptedToolResult(entry.message)) {
+			answered.add(entry.message.toolCallId);
+		}
 	}
 	if (turn?.calls.some(call => !answered.has(call.id))) return { status: "interrupted" };
 	if ([...open.values()].some(stack => stack.length > 0)) return { status: "interrupted" };
@@ -607,7 +617,7 @@ function inspectSubagent(
 	for (let i = owned; i < end; i++) {
 		const entry = branch[i]!;
 		if (isPrompt(entry)) promptedAt = entryTime(entry);
-		if (entry.type === "message" && entry.message.role === "toolResult") {
+		if (entry.type === "message" && entry.message.role === "toolResult" && !isInterruptedToolResult(entry.message)) {
 			results.set(entry.message.toolCallId, entry.message);
 		}
 	}
@@ -649,22 +659,15 @@ function reachedParent(branch: readonly SessionEntry[], id: string, report: Suba
 	return false;
 }
 
-/** Record the interruption result for each cut-off tool call, right after the turn that issued it. */
+/** Record the interruption result for each cut-off tool call that has none yet, right after the turn that issued it. */
 export function appendInterruptedToolResults(
 	sessionManager: SessionManager,
 	calls: readonly InterruptedToolCall[],
 	now = Date.now(),
 ): void {
 	for (const call of calls) {
-		const result: ToolResultMessage = {
-			role: "toolResult",
-			toolCallId: call.toolCallId,
-			toolName: call.toolName,
-			content: [{ type: "text", text: INTERRUPTED_TOOL_RESULT_TEXT }],
-			isError: true,
-			timestamp: now,
-		};
-		sessionManager.appendMessage(result);
+		if (call.resultRecorded) continue;
+		sessionManager.appendMessage(createInterruptedToolResult({ id: call.toolCallId, name: call.toolName }, now));
 	}
 }
 

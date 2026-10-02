@@ -183,6 +183,42 @@ export function createInterruptedTurnAbortMessage(
 	};
 }
 
+/** Result text for a tool call a stopped OMP process left without a result. */
+export const INTERRUPTED_TOOL_RESULT_TEXT =
+	"The OMP process stopped before this tool call returned, so its outcome is unknown: it may have partially run. Check the current state, then re-run it if it is still needed.";
+
+/**
+ * Details of the result recorded for a tool call that a stopped OMP process
+ * left without one. The result pairs the call for the provider; the marker
+ * tells `/recover` that the call was cut off, not answered.
+ */
+export interface InterruptedToolResultDetails {
+	__processInterrupted: true;
+}
+
+/** The one result recorded for a tool call a stopped OMP process cut off, by resume and `/recover` alike. */
+export function createInterruptedToolResult(
+	call: { id: string; name: string },
+	timestamp = Date.now(),
+): ToolResultMessage<InterruptedToolResultDetails> {
+	return {
+		role: "toolResult",
+		toolCallId: call.id,
+		toolName: call.name,
+		content: [{ type: "text", text: INTERRUPTED_TOOL_RESULT_TEXT }],
+		details: { __processInterrupted: true },
+		isError: true,
+		timestamp,
+	};
+}
+
+/** Whether `message` is an {@link createInterruptedToolResult} placeholder rather than the call's real answer. */
+export function isInterruptedToolResult(
+	message: AgentMessage,
+): message is ToolResultMessage<InterruptedToolResultDetails> {
+	return message.role === "toolResult" && isObject(message.details) && message.details.__processInterrupted === true;
+}
+
 /** Pairs the last interrupted assistant turn's unresolved calls before resume builds model context. */
 export function createInterruptedToolResults(entries: readonly SessionEntry[]): ToolResultMessage[] {
 	let tail: AgentMessage | undefined;
@@ -201,19 +237,7 @@ export function createInterruptedToolResults(entries: readonly SessionEntry[]): 
 	const results: ToolResultMessage[] = [];
 	for (const call of assistant.content) {
 		if (call.type !== "toolCall" || !pendingIds.has(call.id)) continue;
-		results.push({
-			role: "toolResult",
-			toolCallId: call.id,
-			toolName: call.name,
-			content: [
-				{
-					type: "text",
-					text: "Previous OMP process exited before this tool returned; its outcome is unknown.",
-				},
-			],
-			isError: true,
-			timestamp: Date.now(),
-		});
+		results.push(createInterruptedToolResult(call));
 	}
 	return results;
 }
