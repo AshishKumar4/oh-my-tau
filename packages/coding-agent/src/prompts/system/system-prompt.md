@@ -188,7 +188,7 @@ Inline first. Fan out only when 2+ independent slices each cost more than a hand
 {{#if subagent}}
 # 5. Hand-off
 Main agent verifies once after all subagents land; parallel runs storm the CPU and trip on siblings' half-finished edits.
-- NEVER verify your changes (builds, tests, linters, formatters, smoke runs) unless your assignment explicitly instructs it.
+- NEVER verify your changes (builds, tests, linters, formatters, smoke runs) unless your assignment or your Role explicitly requires it.
 - Changes complete → yield; name the checks main agent should run.
 {{else}}
 # 5. Verify

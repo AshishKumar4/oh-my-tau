@@ -9,6 +9,8 @@
 
 ### Changed
 
+- Subagents whose agent definition requires verification keep running their checks: the hand-off rule now yields to the assignment or the agent's Role, not the assignment alone.
+
 - The bundled `reviewer` agent can no longer spawn subagents; reviews run in one context
 - Claude Code mode presents the `wait` tool again (as `TaskOutput` where the served Claude Code capture still declares that tool), and its prompts tell the agent to wait with it instead of ending the turn
 - `createAgentSession` accepts `pinnedAgents`: definitions the session's own spawns use ahead of agent discovery, matched by name, so project or user agent files cannot replace a worker's tools, prompt, or output schema

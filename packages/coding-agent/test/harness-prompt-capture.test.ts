@@ -146,7 +146,7 @@ describe("harness prompt custody", () => {
 	it("keeps the subagent verification hand-off when a vendor prompt replaces omp's directives", async () => {
 		writeCapture();
 		const handOff =
-			"- Changes complete → yield; verification is main agent's job. NEVER run it yourself unless your assignment explicitly instructs it.";
+			"- Changes complete → yield; verification is main agent's job. NEVER run it yourself unless your assignment or your Role explicitly requires it.";
 
 		const vendorSubagent = (await build("claude-code", true)).systemPrompt.join("\n");
 		expect(vendorSubagent).toContain(handOff);
@@ -158,7 +158,7 @@ describe("harness prompt custody", () => {
 		const nativeSubagent = (await build(undefined, true)).systemPrompt.join("\n");
 		expect(nativeSubagent).toContain(handOff);
 		expect(nativeSubagent).toContain(
-			"NEVER verify your changes (builds, tests, linters, formatters, smoke runs) unless your assignment explicitly instructs it.",
+			"NEVER verify your changes (builds, tests, linters, formatters, smoke runs) unless your assignment or your Role explicitly requires it.",
 		);
 	});
 
