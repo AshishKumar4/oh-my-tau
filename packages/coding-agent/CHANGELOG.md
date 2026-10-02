@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- `agent://<id>` also marks an output as the previous run's while a subagent woken by a message, or given a follow-up, waits between turns on its own background work: that run is still open and rewrites the output only when it ends
 - `/ratchet` under the Claude Code harness profile now names the question tool `AskUserQuestion` in its kickoff and `xd://eval/ratchet` doc instead of omp's `ask`, and checks its required tools against what the profile presents
 - Background bash commands and auto-backgrounded eval cells now run without a default deadline; explicit timeouts still apply, and `wait`'s safety cap is now 2 hours.
 - A subagent woken by a message now delivers its result to its parent when it finishes in a later turn, for example after its own background command completes; that result used to be lost. It stays in the running-subagents list until it finishes, and an idle subagent is no longer parked while its own background jobs are still running

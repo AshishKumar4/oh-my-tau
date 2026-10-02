@@ -99,6 +99,7 @@ import { startCompletionProbe } from "./completion-probe";
 import { attributeSubagentError } from "./error-attribution";
 import type { ForkSnapshot } from "./fork";
 import { generateTaskLabel } from "./label";
+import { type LaneRun, laneRuns } from "./lane-runs";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
@@ -2994,31 +2995,6 @@ function extractIrcRecordText(content: string | ReadonlyArray<{ type: string; te
 		.map(part => part.text ?? "")
 		.join("\n");
 }
-
-/**
- * A kept-alive lane's open run: a wake run ({@link attachIrcWakeTurnMonitor})
- * or a follow-up run ({@link runSubagentFollowUpTurn}). A lane has one run at
- * a time, so each yield is accepted by one monitor and delivered once.
- */
-interface LaneRun {
-	/**
-	 * Take a wake's turn into this run. Returns the turn's settle callback, or
-	 * undefined once the run takes no more turns: it is ending, or its monitor
-	 * was terminated or cancelled.
-	 */
-	join(records: AgentMessage[]): ((turnError?: unknown) => void) | undefined;
-	/**
-	 * Hand the lane to a successor run while this one finalizes: stop observing
-	 * the session, and pin this run's background jobs to those the lane has
-	 * running now, so this run's teardown leaves the successor's work alone.
-	 */
-	handOver(): void;
-	/** Settles once the run has finalized and relayed its end. */
-	readonly released: Promise<void>;
-}
-
-/** The open run of each kept-alive lane's session. */
-const laneRuns = new WeakMap<AgentSession, LaneRun>();
 
 /** How a lane run starts; see {@link runLane}. */
 interface LaneRunStart {

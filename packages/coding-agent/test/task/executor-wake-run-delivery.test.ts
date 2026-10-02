@@ -13,6 +13,8 @@ import { createMockModel, type MockHandler, type MockModel, type MockResponse } 
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/agent-protocol";
+import { registerArtifactsDir } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
@@ -24,6 +26,8 @@ import { YieldTool } from "@oh-my-pi/pi-coding-agent/tools/yield";
 import { attachIrcWakeTurnMonitor, runSubagentFollowUpTurn } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { type AgentDefinition, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { isRecord, TempDir, untilAborted } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
@@ -80,6 +84,8 @@ interface Lane {
 	runEnded: Promise<void>;
 	/** Waits for the run's relay and every delivery of the parent's jobs to land. */
 	settle: () => Promise<void>;
+	/** Where the lane's runs write `<id>.md`. */
+	artifactsDir: string;
 }
 
 const openLanes: Lane[] = [];
@@ -196,6 +202,7 @@ function createLane(responses: MockHandler[], laneOptions: LaneOptions = {}): La
 	});
 
 	const lane: Lane = {
+		artifactsDir: tempDir.path(),
 		session,
 		manager,
 		mock,
@@ -314,6 +321,40 @@ describe("IRC wake run delivery", () => {
 		// The parent hears through the job only, not again as a relay.
 		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
 		expect(lane.manager.getRunningJobs()).toEqual([]);
+	});
+
+	it("marks the lane's published output as the previous run's while its run waits on its own job", async () => {
+		const lane = createLane([
+			toolCall("background", { label: "probe" }),
+			{ content: ["Waiting for the probe."] },
+			toolCall("yield", { data: { report: "probe passed: 3 of 3" } }),
+		]);
+		const unregisterDir = registerArtifactsDir(lane.artifactsDir);
+		const previous = "previous run: probe never ran";
+		await fs.writeFile(path.join(lane.artifactsDir, `${LANE}.md`), previous);
+		const read = async () => (await new AgentProtocolHandler().resolve(new URL(`agent://${LANE}`) as never)).content;
+		try {
+			await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Run the probe, then report." });
+			await lane.jobStarted;
+			await lane.session.waitForIdle();
+			await drainEventLoop();
+
+			// Between turns, waiting on its own job: no turn streams, but the run
+			// is open, and the file on disk is still the previous run's.
+			expect(lane.session.isStreaming).toBe(false);
+			const whileOpen = await read();
+			expect(whileOpen).toStartWith(`> \`${LANE}\` is running a newer turn.`);
+			expect(whileOpen.endsWith(previous)).toBe(true);
+
+			lane.finishJob("3 of 3 passed");
+			await lane.runEnded;
+			await lane.settle();
+			const settled = await read();
+			expect(settled).not.toContain("running a newer turn");
+			expect(settled).toContain("probe passed: 3 of 3");
+		} finally {
+			unregisterDir();
+		}
 	});
 
 	it("lets the parent's wait block on the woken lane and return its result", async () => {

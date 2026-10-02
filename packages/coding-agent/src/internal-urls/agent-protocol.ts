@@ -30,6 +30,7 @@ import agentPromptDoc from "../prompts/internal-urls/agent.md" with { type: "tex
 import agentProgressTemplate from "../prompts/tools/agent-url-progress.md" with { type: "text" };
 import agentSupersededTemplate from "../prompts/tools/agent-url-superseded.md" with { type: "text" };
 import { loadSessionMessagesReadOnly } from "../session/session-loader";
+import { laneRuns } from "../task/lane-runs";
 import { artifactsDirsFromRegistry } from "./registry-helpers";
 import type {
 	InternalResource,
@@ -127,10 +128,16 @@ function lastAssistantText(messages: readonly AgentMessage[]): string | undefine
 	return undefined;
 }
 
-/** Whether `<id>`'s published output predates a turn the agent is streaming now. */
+/**
+ * Whether `<id>`'s published output predates a run the agent is in now: a turn
+ * it is streaming, or a kept-alive lane's open run, which spans the gaps where
+ * the lane waits on its own background work and rewrites the output only when
+ * it ends.
+ */
 function isSuperseded(registry: AgentRegistry, outputId: string): boolean {
 	const ref = registry.get(outputId);
-	return ref !== undefined && ref.kind !== "advisor" && registry.isRunning(ref);
+	if (ref === undefined || ref.kind === "advisor") return false;
+	return registry.isRunning(ref) || (ref.session !== null && laneRuns.has(ref.session));
 }
 
 /**
