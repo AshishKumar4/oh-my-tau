@@ -2488,7 +2488,8 @@ function b() {
 			const result = await autoBackgroundBashTool.execute("test-call-9-auto-inline", { command: "echo short" });
 
 			expect(getTextOutput(result)).toContain("short");
-			expect(result.details?.timeoutSeconds).toBe(300);
+			// An auto-background-eligible run gets no default deadline (6e1f6e3abb), even when it finishes inline.
+			expect(result.details?.timeoutSeconds).toBeUndefined();
 			expect(result.details?.async).toBeUndefined();
 			await asyncJobManager.waitForAll();
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
