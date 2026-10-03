@@ -509,7 +509,9 @@ export const readToolRenderer = {
 			}));
 		}
 		const details = result.details;
-		const rawText = result.content?.find(c => c.type === "text")?.text ?? "";
+		// Every text block, as the model sees it: a resource warning (e.g. a superseded
+		// agent:// value) arrives as its own block ahead of the value.
+		const rawText = resultText(result);
 		// Prefer structured `displayContent` from details when available so the TUI
 		// shows clean file content (no model-only hashline anchors) without parsing the formatted text.
 		// Fall back to the raw text, but strip the LLM-facing notice so it doesn't

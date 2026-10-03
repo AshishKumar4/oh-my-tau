@@ -180,6 +180,31 @@ describe("readToolRenderer markdown content", () => {
 	});
 });
 
+describe("readToolRenderer multi-block results", () => {
+	it("shows a resource warning block and the value block after it", async () => {
+		const theme = await getThemeByName("dark");
+		expect(theme).toBeDefined();
+		const warning = "Superseded: Lane is running a newer turn; this is its previous run's output.";
+		const value = '{\n  "passed": 2,\n  "total": 3\n}';
+		const component = readToolRenderer.renderResult(
+			{
+				content: [
+					{ type: "text", text: warning },
+					{ type: "text", text: value },
+				],
+				details: { contentType: "application/json" },
+			},
+			{ expanded: true, isPartial: false },
+			theme!,
+			{ path: "agent://Lane/counts" },
+		);
+
+		const rendered = Bun.stripANSI(component.render(200).join("\n"));
+		expect(rendered).toContain("Superseded: Lane is running a newer turn");
+		expect(rendered).toContain('"passed": 2');
+	});
+});
+
 describe("readToolRenderer error sanitization", () => {
 	it("strips Windows CRLF and expands tabs in ssh failure output", async () => {
 		const theme = await getThemeByName("dark");

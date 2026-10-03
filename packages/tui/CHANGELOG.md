@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The terminal read card shows every text block of a result, so a warning such as a superseded `agent://` value no longer hides the value itself.
+
 ### Added
 
 - `ModelHubOptions.roleAgents` takes a promise of the agents per role; once it resolves, the Roles view lists the agents on the selected role and marks a custom role nothing uses with a `no agents` badge
