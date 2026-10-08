@@ -336,6 +336,76 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		).toBe(true);
 	});
 
+	it("records the producing prompt before reparented sibling replies on the rewind branch", async () => {
+		const taskTool: AgentTool = {
+			name: "task",
+			label: "Task",
+			description: "Run a subagent",
+			parameters: type({ goal: "string" }),
+			async execute() {
+				return { content: [{ type: "text", text: "<task-result>completed work</task-result>" }] };
+			},
+		};
+		const promptChangingCheckpoint: AgentTool<typeof checkpointSchema, { startedAt: string }> = {
+			...checkpointTool,
+			async execute(toolCallId, params, signal, onUpdate, context) {
+				session.agent.setSystemPrompt(["Changed"]);
+				return checkpointTool.execute(toolCallId, params, signal, onUpdate, context);
+			},
+		};
+		const { session } = await createHarness(
+			[
+				{
+					content: [{ type: "toolCall", id: "checkpoint", name: "checkpoint", arguments: { goal: "inspect" } }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{ type: "toolCall", id: "rewind", name: "rewind", arguments: { report: "investigation complete" } },
+						{ type: "toolCall", id: "task", name: "task", arguments: { goal: "complete work" } },
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["DONE"], stopReason: "stop" },
+			],
+			[promptChangingCheckpoint, rewindTool, taskTool],
+		);
+		const recordedPromptBefore = (entryId: string): string | undefined => {
+			for (let entry = session.sessionManager.getEntry(entryId); entry;) {
+				if (entry.type === "custom" && entry.customType === "system-prompt-digest") {
+					return typeof entry.data === "string" ? entry.data : undefined;
+				}
+				entry = entry.parentId ? session.sessionManager.getEntry(entry.parentId) : undefined;
+			}
+			return undefined;
+		};
+
+		await session.prompt("investigate with a subagent");
+
+		const replies = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "message" && entry.message.role === "assistant");
+		const rewindReply = replies.find(
+			entry =>
+				entry.type === "message" &&
+				entry.message.role === "assistant" &&
+				entry.message.content.some(block => block.type === "toolCall" && block.id === "rewind"),
+		);
+		const reparentedReply = replies.find(
+			entry =>
+				entry !== rewindReply &&
+				entry.type === "message" &&
+				entry.message.role === "assistant" &&
+				entry.message.content.some(block => block.type === "toolCall" && block.id === "task"),
+		);
+		const firstReply = replies[0];
+		if (!rewindReply || !reparentedReply || !firstReply) throw new Error("Expected original and reparented replies");
+		const explorationDigest = recordedPromptBefore(rewindReply.id);
+		expect(explorationDigest).toBeDefined();
+		expect(recordedPromptBefore(reparentedReply.id)).toBe(explorationDigest);
+		expect(recordedPromptBefore(reparentedReply.id)).not.toBe(recordedPromptBefore(firstReply.id));
+	});
+
 	it("shows a transient checkpoint-active reminder that is branch-cut away on rewind", async () => {
 		const report = "findings: transient reminder";
 		const proceed = Promise.withResolvers<void>();

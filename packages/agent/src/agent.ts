@@ -485,6 +485,7 @@ export class Agent {
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
 	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
+	#onModelCallSystemPrompt?: (systemPrompt: string[]) => void;
 	#beforeModelCall?: AgentBeforeModelCall;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
@@ -1101,6 +1102,11 @@ export class Agent {
 			| undefined,
 	): void {
 		this.#onTurnEnd = fn;
+	}
+
+	/** Called with the exact system prompt each model call is built from, after before-model-call hooks. */
+	setOnModelCallSystemPrompt(fn: ((systemPrompt: string[]) => void) | undefined): void {
+		this.#onModelCallSystemPrompt = fn;
 	}
 
 	/**
@@ -1802,6 +1808,7 @@ export class Agent {
 					await Bun.sleep(0);
 				}
 				context.systemPrompt = this.#state.systemPrompt;
+				this.#onModelCallSystemPrompt?.(context.systemPrompt);
 				context.tools = this.#toolsForModel(this.#state.model ?? model);
 			},
 			beforeModelCall:
