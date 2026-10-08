@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import type { UsageReport } from "@oh-my-pi/pi-ai";
+import { AuthStorage, type UsageReport } from "@oh-my-pi/pi-ai";
+import { openaiCodexUsageProvider } from "@oh-my-pi/pi-ai/usage/openai-codex";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	buildRedactionMap,
@@ -472,6 +473,86 @@ describe("formatUsageBreakdown", () => {
 		);
 
 		expect(text).toContain("policy: priority 100 · reserve 50% (override) · eligible · 80.0% left");
+	});
+
+	it("keeps the usage view consistent with reserve-boundary pool selection and recovery", async () => {
+		await using tempDir = await TempDir.create("@omp-usage-reserve-");
+		let preferredUsedPercent = 70;
+		const usageFetch: typeof fetch = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const url = new URL(input instanceof Request ? input.url : input.toString());
+				if (url.pathname !== "/backend-api/wham/usage") return new Response(null, { status: 404 });
+				const accountId = new Headers(init?.headers).get("ChatGPT-Account-Id");
+				if (accountId !== "preferred" && accountId !== "sibling") return new Response(null, { status: 503 });
+				return Response.json({
+					plan_type: "plus",
+					rate_limit: {
+						allowed: true,
+						limit_reached: false,
+						primary_window: { used_percent: accountId === "preferred" ? preferredUsedPercent : 50 },
+					},
+				});
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const storage = await AuthStorage.create(path.join(tempDir.path(), "agent.db"), {
+			usageFetch,
+			usageProviderResolver: provider => (provider === "openai-codex" ? openaiCodexUsageProvider : undefined),
+			defaultReservePct: 30,
+			accountPolicies: [
+				{ provider: "openai-codex", account: { accountId: "preferred" }, priority: 100, reservePct: 30 },
+				{ provider: "openai-codex", account: { accountId: "sibling" }, priority: 20, reservePct: 0 },
+			],
+		});
+		try {
+			await storage.credentials.set("openai-codex", [
+				{
+					type: "oauth",
+					access: "preferred-access",
+					refresh: "preferred-refresh",
+					expires: Date.now() + SEVEN_DAYS,
+					accountId: "preferred",
+					email: "preferred@example.test",
+				},
+				{
+					type: "oauth",
+					access: "sibling-access",
+					refresh: "sibling-refresh",
+					expires: Date.now() + SEVEN_DAYS,
+					accountId: "sibling",
+					email: "sibling@example.test",
+				},
+			]);
+			const policyOptions: UsagePolicyDiagnosticsOptions = {
+				globalReservePct: 30,
+				getAccountPolicy: (provider, identity) => storage.oauth.policy(provider, identity),
+			};
+			const reports = await storage.usage.reports();
+			if (!reports) throw new Error("expected account usage reports");
+			const text = stripVTControlCharacters(
+				formatUsageBreakdown(reports, [], Date.now(), undefined, [], policyOptions),
+			);
+			expect(text.split("\n").find(line => line.includes("priority 100"))).toContain("inside reserve");
+			expect((await storage.health.model("openai-codex", { reserveFraction: 0.3 })).accounts[0]?.state).toBe(
+				"reserve",
+			);
+			expect(await storage.keys.get("openai-codex", "cli-boundary")).toBe("sibling-access");
+
+			preferredUsedPercent = 69;
+			await storage.usage.invalidate("openai-codex");
+			const recoveredReports = await storage.usage.reports();
+			if (!recoveredReports) throw new Error("expected recovered usage reports");
+			const recoveredText = stripVTControlCharacters(
+				formatUsageBreakdown(recoveredReports, [], Date.now(), undefined, [], policyOptions),
+			);
+			expect(recoveredText.split("\n").find(line => line.includes("priority 100"))).toContain("eligible");
+			expect((await storage.health.model("openai-codex", { reserveFraction: 0.3 })).accounts[0]?.state).toBe(
+				"healthy",
+			);
+			expect(await storage.keys.get("openai-codex", "cli-recovered")).toBe("preferred-access");
+		} finally {
+			storage.close();
+		}
 	});
 
 	it("shows the inherited global reserve for an unconfigured sibling in a policy-enabled provider", () => {
