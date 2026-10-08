@@ -3,6 +3,8 @@ import { ModelRegistry } from "../config/model-registry";
 import { formatModelString, resolveCliModel } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { IrcBus } from "../irc/bus";
+import { setSharedLspEnabled } from "../lsp/client";
+import { cfgLspShared } from "../lsp/settings";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import { discoverAuthStorage } from "../sdk";
 import { SessionManager } from "../session/session-manager";
@@ -78,6 +80,8 @@ export async function createCleanseAgentRuntime(options: {
 }): Promise<CleanseAgentRuntime> {
 	const cwd = options.cwd ?? getProjectDir();
 	const settings = await Settings.init({ cwd });
+	// This standalone process creates only subagents, none of which binds process state.
+	setSharedLspEnabled(cfgLspShared.get(settings));
 	const authStorage = await discoverAuthStorage(undefined, { settings });
 	const modelRegistry = new ModelRegistry(authStorage);
 	await modelRegistry.refresh();
