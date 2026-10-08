@@ -252,6 +252,10 @@ function promptDigestOfEntry(entry: SessionEntry): string | undefined | null {
 	return typeof entry.data === "string" ? entry.data : undefined;
 }
 
+function replyHasProviderOutput(message: AgentMessage): boolean {
+	return message.role === "assistant" && message.content.some(block => block.type !== "text" || block.text.length > 0);
+}
+
 /**
  * Structured payload persisted on each {@link XDEV_MOUNT_NOTICE_MESSAGE_TYPE}
  * custom message. Lets a resumed session reconstruct which dynamic devices the
@@ -1531,7 +1535,14 @@ export class SessionTools {
 	/** Digest of the base prompt the current branch's newest reply with provider output was produced under. */
 	recordedPromptDigest(): string | undefined {
 		const branch = this.#host.sessionManager.getBranch();
+		// The digest and reply are separate appends; a crash can leave only the trailing digest durable.
+		let foundReply = false;
 		for (let index = branch.length - 1; index >= 0; index--) {
+			if (!foundReply) {
+				const entry = branch[index];
+				foundReply = entry.type === "message" && replyHasProviderOutput(entry.message);
+				continue;
+			}
 			const digest = promptDigestOfEntry(branch[index]);
 			if (digest !== null) return digest;
 		}
@@ -1561,8 +1572,7 @@ export class SessionTools {
 	bindReplyToCapturedPrompt(reply: AgentMessage): void {
 		const digest = this.#capturedPromptDigest;
 		this.#capturedPromptDigest = undefined;
-		if (digest === undefined || reply.role !== "assistant") return;
-		if (reply.content.some(block => block.type !== "text" || block.text.length > 0)) {
+		if (digest !== undefined && replyHasProviderOutput(reply)) {
 			this.#replyPromptDigests.set(reply, digest);
 		}
 	}
@@ -1578,7 +1588,11 @@ export class SessionTools {
 
 	/** Records `digest` on the current branch unless it is already the branch's newest record. */
 	recordPromptDigest(digest: string | undefined): void {
-		if (digest !== undefined && digest !== this.recordedPromptDigest()) {
+		if (digest === undefined) return;
+		// A pending/orphan marker must not retarget the previous reply, but must be
+		// superseded when the next reply is produced under a different prompt.
+		const previous = this.#host.sessionManager.getBranch().findLast(entry => promptDigestOfEntry(entry) !== null);
+		if (previous === undefined || promptDigestOfEntry(previous) !== digest) {
 			this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE, digest);
 		}
 	}

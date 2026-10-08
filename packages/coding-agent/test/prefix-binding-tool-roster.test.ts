@@ -486,9 +486,18 @@ describe("prefix-bound tool roster changes", () => {
 			expect(providerText(resumed.contexts[0])).toContain("Now available: bash.");
 		});
 
-		it("freezes a restored transcript with a malformed latest prompt digest", async () => {
+		it("freezes a restored transcript with a malformed digest attached to its latest reply", async () => {
 			const transcript = await liveTranscript();
 			transcript.sessionManager.appendCustomEntry("system-prompt-digest", { malformed: true });
+			const previous = transcript.sessionManager
+				.getEntries()
+				.findLast(entry => entry.type === "message" && entry.message.role === "assistant");
+			if (previous?.type !== "message" || previous.message.role !== "assistant") throw new Error("Expected a reply");
+			transcript.sessionManager.appendMessage({
+				...previous.message,
+				content: [{ type: "text", text: "Reply after the malformed record" }],
+				timestamp: Date.now(),
+			});
 			const resumed = newSession(createPrefixBindingModel(), { sessionManager: transcript.sessionManager });
 			sessions.push(resumed.session);
 			await resumed.session.setActiveToolPresentation(["read"], []);
@@ -498,6 +507,51 @@ describe("prefix-bound tool roster changes", () => {
 
 			expect(resumed.systemPrompts[0]).toEqual(["tools:read"]);
 			expect(providerText(resumed.contexts[0])).toContain("Now available: bash.");
+		});
+
+		it("ignores a prompt digest left orphaned by interrupted reply persistence on cold reopen", async () => {
+			using tempDir = TempDir.createSync("@pi-prefix-binding-interrupted-");
+			const sessionManager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+			const live = newSession(createPrefixBindingModel(), { sessionManager });
+			sessions.push(live.session);
+			await live.session.setActiveToolPresentation(["read"], []);
+			await live.session.prompt("first");
+			await live.session.setActiveToolPresentation(["read", "bash"], []);
+			await live.session.refreshBaseSystemPrompt();
+			await live.session.prompt("second");
+			const entries = sessionManager.getEntries();
+			const orphanIndex = entries.findLastIndex(
+				entry => entry.type === "custom" && entry.customType === "system-prompt-digest",
+			);
+			const header = sessionManager.getHeader();
+			const sessionFile = sessionManager.getSessionFile();
+			if (orphanIndex < 0 || !header || !sessionFile) throw new Error("Expected a durable second prompt digest");
+			await live.session.dispose();
+			// A crash can leave the digest append durable while losing its following reply.
+			await Bun.write(
+				sessionFile,
+				`${[header, ...entries.slice(0, orphanIndex + 1)].map(entry => JSON.stringify(entry)).join("\n")}\n`,
+			);
+			const reopened = await SessionManager.open(sessionFile);
+			const resumed = newSession(createPrefixBindingModel(), { sessionManager: reopened });
+			sessions.push(resumed.session);
+			await resumed.session.setActiveToolPresentation(["read"], []);
+			await resumed.session.setActiveToolPresentation(["read", "bash"], []);
+
+			await resumed.session.prompt("third");
+
+			expect(resumed.systemPrompts[0]).toEqual(["tools:read"]);
+			expect(providerText(resumed.contexts[0])).toContain("Now available: bash.");
+			await resumed.session.dispose();
+			const again = newSession(createPrefixBindingModel(), {
+				sessionManager: await SessionManager.open(sessionFile),
+			});
+			sessions.push(again.session);
+			await again.session.setActiveToolPresentation(["read"], []);
+			await again.session.setActiveToolPresentation(["read", "bash"], []);
+			await again.session.prompt("fourth");
+			expect(again.systemPrompts[0]).toEqual(["tools:read"]);
+			expect(providerText(again.contexts[0])).toContain("Now available: bash.");
 		});
 
 		/** Kept out of the test body so no strong local binding outlives the capture. */
