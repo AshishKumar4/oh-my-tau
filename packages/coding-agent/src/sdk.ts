@@ -1881,7 +1881,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		  }
 		| undefined;
 	if (options.credentialSourceSessionId) {
-		modelRegistry.authStorage.sessions.inherit(options.credentialSourceSessionId, providerSessionId);
+		// A revived child's transcript pins the account holding its cache. The
+		// parent's automatic affinity must not displace it; explicit user pins win.
+		const ownPins = sessionManager.getCredentialPins();
+		modelRegistry.authStorage.sessions.inherit(
+			options.credentialSourceSessionId,
+			providerSessionId,
+			(provider, explicit) => explicit || !ownPins.has(provider),
+		);
 	}
 
 	const forkCacheShapeChanged =
