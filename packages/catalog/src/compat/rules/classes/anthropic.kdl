@@ -1,6 +1,9 @@
 // Model-lineage compat for "anthropic"; regenerated from the frozen census using class taxonomy selectors.
 
 class "anthropic" {
+	// Claude searches back 20 content-block positions from each cache breakpoint,
+	// grouping consecutive tool_use/tool_result runs into one position.
+	prompt-cache-lookback 20
 	family "fable" {
 		revision ">=5.1" {
 			// Fable 5.1+ binds signed thinking to the exact preceding conversation.

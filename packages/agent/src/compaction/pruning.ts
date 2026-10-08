@@ -7,6 +7,7 @@ import type { Tokenizer } from "../tokenizer";
 import type { AgentMessage, AgentToolCall } from "../types";
 import type { SessionEntry, SessionMessageEntry } from "./entries";
 import { invalidateMessageCache } from "./message-cache";
+import { type ConvertToLlm, defaultConvertToLlm, getMessageFromEntry } from "./messages";
 import {
 	collectToolCallsById,
 	getToolResultMessage,
@@ -16,7 +17,14 @@ import {
 } from "./tool-protection";
 import { splitReadSelector } from "./utils";
 
-export interface PruneConfig {
+export interface CacheLookbackConfig {
+	/** Block positions the model's cache searches back; undefined when unbounded. */
+	cacheLookbackPositions?: number;
+	/** Count app messages after their provider-bound projection, not their stored shape. */
+	convertToLlm?: ConvertToLlm;
+}
+
+export interface PruneConfig extends CacheLookbackConfig {
 	/** Keep the most recent tool output tokens intact. */
 	protectTokens: number;
 	/** Only prune if total savings meets this threshold. */
@@ -107,7 +115,7 @@ export const USELESS_NOTICE = "[Uneventful result elided]";
  */
 export type SupersedeKeyFn = (toolName: string, args: Record<string, unknown>) => string | undefined;
 
-export interface SupersedePruneConfig {
+export interface SupersedePruneConfig extends CacheLookbackConfig {
 	/** Supersede key function; results sharing a key supersede older ones. */
 	supersedeKey?: SupersedeKeyFn;
 	/** Also prune results flagged useless by their tool. Default false. */
@@ -136,6 +144,99 @@ export interface SupersedePruneConfig {
 
 const DEFAULT_SUFFIX_TOKEN_LIMIT = 8_000;
 const DEFAULT_IDLE_FLUSH_MS = 30 * 60_000;
+
+/**
+ * Positions kept free for the next request's own input (prompt, date/cwd
+ * reminder, attachments) and for request projections the count below does not
+ * model (orphan-result notes, replayed compaction file metadata, tool-change
+ * controls): with Anthropic's 20, stored history gets at most 13.
+ */
+const RESERVED_LOOKBACK_POSITIONS = 6;
+
+type LookbackBlock = "tool_use" | "tool_result" | undefined;
+
+/**
+ * Index of the oldest tool result that can be rewritten while the next request
+ * still reaches a cache entry, given the model's prompt-cache `lookback` in
+ * block positions (a breakpoint counts itself; a run of consecutive `tool_use`
+ * blocks, or of consecutive `tool_result` blocks, is one position). A
+ * conservative estimate, not an exact count: a skipped prune costs its tokens,
+ * a missed lookup the whole cache.
+ *
+ * Each request writes its tail cache entry at its last block, so rewriting a
+ * result invalidates every entry from its issuing assistant turn on, and once a
+ * request has 15 user turns its other breakpoint sits on an older decimation
+ * checkpoint. The next request's tail breakpoint then reaches the newest
+ * surviving entry, which ends the message before the issuing turn, only when
+ * the issuing turn, its tool-result batch, everything after and the next input
+ * fit in the lookback window; otherwise the lookup falls back to that
+ * checkpoint and the whole conversation since is re-written, not the small
+ * suffix the token limits budget for. Each entry is projected through
+ * `convertToLlm` and counted the way the Anthropic request converter emits it.
+ */
+function cacheLookbackFloor(
+	entries: readonly SessionEntry[],
+	start: number,
+	lookback: number | undefined,
+	convertToLlm: ConvertToLlm,
+): number {
+	if (lookback === undefined) return start;
+	let positions = RESERVED_LOOKBACK_POSITIONS;
+	let later: LookbackBlock;
+	let runHoistsImages = false;
+	let newerIsAssistant = false;
+	const add = (block: LookbackBlock): void => {
+		if (block === undefined || block !== later) positions++;
+		later = block;
+	};
+	let floor = entries.length;
+	for (let i = entries.length - 1; i >= start; i--) {
+		const message = getMessageFromEntry(entries[i]);
+		const sent = message === undefined ? [] : convertToLlm([message]);
+		for (let m = sent.length - 1; m >= 0; m--) {
+			const llm = sent[m];
+			if (llm.role === "toolResult") {
+				if (later !== "tool_result") runHoistsImages = false;
+				add("tool_result");
+				// Anthropic rejects images in error results, so the converter moves
+				// them after the result run behind one explanatory text block.
+				let images = 0;
+				if (llm.isError) {
+					for (const block of llm.content) if (block.type === "image") images++;
+				}
+				if (images > 0) {
+					positions += runHoistsImages ? images : images + 1;
+					runHoistsImages = true;
+				}
+				newerIsAssistant = false;
+			} else if (llm.role === "assistant") {
+				// The converter pads consecutive assistant turns with a user turn and
+				// drops assistant images, blank text, and turns left empty.
+				let pad = newerIsAssistant;
+				for (let b = llm.content.length - 1; b >= 0; b--) {
+					const block = llm.content[b];
+					if (block.type === "image" || (block.type === "text" && block.text.trim().length === 0)) continue;
+					if (pad) {
+						add(undefined);
+						pad = false;
+					}
+					add(block.type === "toolCall" ? "tool_use" : undefined);
+					newerIsAssistant = true;
+				}
+			} else {
+				// The converter drops blank user/developer turns.
+				const blocks =
+					typeof llm.content === "string" ? (llm.content.trim().length > 0 ? 1 : 0) : llm.content.length;
+				if (blocks === 0) continue;
+				for (let b = blocks; b > 0; b--) add(undefined);
+				newerIsAssistant = false;
+			}
+		}
+		if (positions >= lookback) return floor;
+		if (message?.role === "assistant") floor = i;
+	}
+	return start;
+}
 
 function createPrunedNotice(tokens: number): string {
 	return `[Output truncated - ${tokens} tokens]`;
@@ -309,13 +410,19 @@ export function pruneSupersededToolResults(
 		toPrune = candidates.filter(candidate => candidate.index >= boundaryIndex);
 	} else {
 		const suffixTokenLimit = config.suffixTokenLimit ?? DEFAULT_SUFFIX_TOKEN_LIMIT;
+		const lookbackFloor = cacheLookbackFloor(
+			entries,
+			boundaryIndex,
+			config.cacheLookbackPositions,
+			config.convertToLlm ?? defaultConvertToLlm,
+		);
 		// suffixTokens[i] = estimated tokens of all messages strictly after entry i.
 		// Mutating a candidate re-writes its suffix in the warm cache, so prune only
 		// when that suffix is small (cheap-to-recache tail) and the candidate sits
 		// at/after the compaction boundary.
 		const suffixTokens = computeMessageSuffixTokens(entries, tokenizer);
 		toPrune = candidates.filter(
-			candidate => candidate.index >= boundaryIndex && suffixTokens[candidate.index] <= suffixTokenLimit,
+			candidate => candidate.index >= lookbackFloor && suffixTokens[candidate.index] <= suffixTokenLimit,
 		);
 	}
 	if (toPrune.length === 0) return NOTHING_PRUNED;
@@ -361,6 +468,15 @@ export function pruneToolOutputs(
 
 	const boundaryIndex = resolveBoundaryIndex(entries, config.keepBoundaryId);
 	const cacheWarmSuffixTokens = config.cacheWarmSuffixTokens;
+	const lookbackFloor =
+		cacheWarmSuffixTokens === undefined
+			? boundaryIndex
+			: cacheLookbackFloor(
+					entries,
+					boundaryIndex,
+					config.cacheLookbackPositions,
+					config.convertToLlm ?? defaultConvertToLlm,
+				);
 	// All-message suffix per index, only when the cache guard is armed.
 	const messageSuffix =
 		cacheWarmSuffixTokens === undefined ? undefined : computeMessageSuffixTokens(entries, tokenizer);
@@ -385,7 +501,9 @@ export function pruneToolOutputs(
 		// before any prune decision, so superseded/useless cannot reach a deep,
 		// still-cached copy; compaction/shake reclaim those when they rebuild.
 		const inWarmPrefix =
-			messageSuffix !== undefined && cacheWarmSuffixTokens !== undefined && messageSuffix[i] > cacheWarmSuffixTokens;
+			messageSuffix !== undefined &&
+			cacheWarmSuffixTokens !== undefined &&
+			(messageSuffix[i] > cacheWarmSuffixTokens || i < lookbackFloor);
 		if (inWarmPrefix || i < boundaryIndex) {
 			accumulatedTokens += tokens;
 			continue;

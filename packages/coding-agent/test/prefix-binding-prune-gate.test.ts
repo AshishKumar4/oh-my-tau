@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { SUPERSEDED_NOTICE } from "@oh-my-pi/pi-agent-core/compaction/pruning";
-import type { AssistantMessage, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent, Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -75,7 +76,7 @@ function toolResult(toolCallId: string, text: string, timestamp: number): ToolRe
 	};
 }
 
-function newSession(model: Model): AgentSession {
+function newSession(model: Model, shortTurns = 0, attachImages = false): AgentSession {
 	const sessionManager = SessionManager.inMemory();
 	const now = Date.now();
 	sessionManager.appendMessage({ role: "user", content: "Read the file twice.", timestamp: now - 500 });
@@ -87,6 +88,36 @@ function newSession(model: Model): AgentSession {
 		),
 	);
 	sessionManager.appendMessage(toolResult("read-old", OLD_RESULT, now - 350));
+	for (let turn = 0; turn < shortTurns; turn++) {
+		const id = `small-${turn}`;
+		sessionManager.appendMessage(
+			assistant(model, [{ type: "toolCall", id, name: "bash", arguments: { command: "true" } }], now - 340),
+		);
+		sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: id,
+			toolName: "bash",
+			content: [{ type: "text", text: "ok" }],
+			isError: false,
+			timestamp: now - 330,
+		});
+	}
+	if (attachImages) {
+		const image: ImageContent = {
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6ZQAAAABJRU5ErkJggg==",
+			mimeType: "image/png",
+			type: "image",
+		};
+		sessionManager.appendMessage({
+			role: "fileMention",
+			files: [
+				{ path: "notes.md", content: "short notes" },
+				{ path: "first.png", content: "", image },
+				{ path: "second.png", content: "", image },
+			],
+			timestamp: now - 320,
+		});
+	}
 	sessionManager.appendMessage(
 		assistant(
 			model,
@@ -135,6 +166,38 @@ describe("prefix-bound stale-result pruning", () => {
 
 	afterEach(async () => {
 		for (const session of sessions.splice(0)) await session.dispose();
+	});
+
+	it("keeps a warm Claude prefix behind many short tool turns while an unbounded provider prunes it", async () => {
+		const claude = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!claude) throw new Error("Expected bundled Claude model");
+		const cached = newSession(claude, 12);
+		const control = newSession(createModel(), 12);
+		sessions.push(cached, control);
+
+		await runMaintenance(cached);
+		await runMaintenance(control);
+
+		expect(oldResultText(cached)).toBe(OLD_RESULT);
+		expect(oldResultText(control)).toBe(SUPERSEDED_NOTICE);
+		const persisted = cached.sessionManager
+			.buildSessionContext()
+			.messages.find(message => message.role === "toolResult" && message.toolCallId === "read-old");
+		expect(persisted).toMatchObject({ content: [{ type: "text", text: OLD_RESULT }] });
+	});
+
+	it("counts split file-mention image projections before deciding a warm read can be pruned", async () => {
+		const claude = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!claude) throw new Error("Expected bundled Claude model");
+		const withoutAttachment = newSession(claude, 4);
+		const withAttachment = newSession(claude, 4, true);
+		sessions.push(withoutAttachment, withAttachment);
+
+		await runMaintenance(withoutAttachment);
+		await runMaintenance(withAttachment);
+
+		expect(oldResultText(withoutAttachment)).toBe(SUPERSEDED_NOTICE);
+		expect(oldResultText(withAttachment)).toBe(OLD_RESULT);
 	});
 
 	it("keeps a warm superseded read for prefix binding while the control model prunes it", async () => {
