@@ -384,6 +384,17 @@ describe("error-id classification", () => {
 		expect(AIError.is(responsesId, AIError.Flag.StaleResponsesItem)).toBe(true);
 	});
 
+	it("classifies a Codex native-lane refusal as a stale Responses replay", () => {
+		const text =
+			"Codex error event: The experimental native turn lane cannot accept stateful WebSocket messages while a native turn is running. Start a new independent response.create turn instead. (code=unsupported_native_inflight_message)";
+		const codexId = AIError.classify(new Error(text), "openai-codex-responses");
+		expect(AIError.is(codexId, AIError.Flag.StaleResponsesItem)).toBe(true);
+		expect(AIError.retriable(codexId)).toBe(true);
+		expect(AIError.is(AIError.classify(new Error(text), "anthropic-messages"), AIError.Flag.StaleResponsesItem)).toBe(
+			false,
+		);
+	});
+
 	it("walks causes and preserves carried ids", () => {
 		const inner = AIError.attach(new Error("inner"), AIError.create(AIError.Flag.ThinkingLoop));
 		const outer = new Error("outer", { cause: inner });
