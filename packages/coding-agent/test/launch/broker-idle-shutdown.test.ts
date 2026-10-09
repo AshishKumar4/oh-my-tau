@@ -17,14 +17,19 @@ function restoreEnv(name: string, value: string | undefined): void {
 	else process.env[name] = value;
 }
 
-function startBroker(projectDir: string, runtimeDir: string, idleGraceMs: number): Promise<void> {
+function startBroker(
+	projectDir: string,
+	runtimeDir: string,
+	idleGraceMs: number,
+	onListening: () => void,
+): Promise<void> {
 	const previousProjectDir = process.env[DAEMON_PROJECT_DIR_ENV];
 	const previousRuntimeDir = process.env[DAEMON_RUNTIME_DIR_ENV];
 	const previousGrace = process.env[DAEMON_IDLE_GRACE_ENV];
 	process.env[DAEMON_PROJECT_DIR_ENV] = projectDir;
 	process.env[DAEMON_RUNTIME_DIR_ENV] = runtimeDir;
 	process.env[DAEMON_IDLE_GRACE_ENV] = String(idleGraceMs);
-	const broker = startDaemonBrokerFromEnvironment();
+	const broker = startDaemonBrokerFromEnvironment({ onListening });
 	restoreEnv(DAEMON_PROJECT_DIR_ENV, previousProjectDir);
 	restoreEnv(DAEMON_RUNTIME_DIR_ENV, previousRuntimeDir);
 	restoreEnv(DAEMON_IDLE_GRACE_ENV, previousGrace);
@@ -41,8 +46,10 @@ describe("daemon broker idle shutdown", () => {
 		const previousTitle = process.title;
 		// Create the client (writes broker.token) before starting the broker, which reads that token.
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 100 });
-		const broker = startBroker(projectDir, runtimeDir, 100);
+		const listening = Promise.withResolvers<void>();
+		const broker = startBroker(projectDir, runtimeDir, 100, listening.resolve);
 		try {
+			await listening.promise;
 			// A persistent daemon that outlives the first idle-shutdown timer (100ms) and then
 			// self-exits (~300ms). restart:"no" so its exit is terminal.
 			const started = await client.request({
