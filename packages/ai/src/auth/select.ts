@@ -3,6 +3,7 @@ import * as AIError from "../error";
 import { getOAuthApiKey, getOAuthProvider } from "../registry/oauth";
 import type { OAuthCredentials, OAuthProvider } from "../registry/oauth/types";
 import type { Provider } from "../types";
+import { isWithinUsageReserve } from "../usage";
 import type { CredentialRankingContext, CredentialRankingStrategy, PlanGate, UsageReport } from "../usage";
 import type { RankingStrategyResolver } from "../usage/registry";
 import type { SessionAffinity } from "./affinity";
@@ -469,7 +470,9 @@ export class CredentialSelector {
 				blocked,
 				blockedUntil,
 				inReserve:
-					reserveFraction !== undefined && remainingFraction !== undefined && remainingFraction <= reserveFraction,
+					reserveFraction !== undefined &&
+					remainingFraction !== undefined &&
+					isWithinUsageReserve(remainingFraction, reserveFraction),
 				reserveMeasured: reserveFraction !== undefined && remainingFraction !== undefined,
 				accountPriority: policy?.priority === undefined || !Number.isFinite(policy.priority) ? 0 : policy.priority,
 				allowanceSpent: remainingFraction === 0,

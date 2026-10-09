@@ -3,7 +3,12 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { AuthStorage, REMOTE_REFRESH_SENTINEL, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import {
+	AuthStorage,
+	type OAuthAccountIdentity,
+	REMOTE_REFRESH_SENTINEL,
+	SqliteAuthCredentialStore,
+} from "@oh-my-pi/pi-ai";
 import {
 	AuthBrokerClient,
 	type AuthBrokerServerHandle,
@@ -13,7 +18,7 @@ import {
 	type SnapshotResponse,
 	startAuthBroker,
 } from "@oh-my-pi/pi-ai/auth-broker";
-import { snapshotResponseSchema } from "@oh-my-pi/pi-ai/auth-broker/wire-schemas";
+import { snapshotResponseSchema, usageResponseSchema } from "@oh-my-pi/pi-ai/auth-broker/wire-schemas";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import type { UsageLimit, UsageProvider, UsageReport } from "@oh-my-pi/pi-ai/usage";
 import * as claudeUsage from "@oh-my-pi/pi-ai/usage/claude";
@@ -27,6 +32,274 @@ function requireLimit(report: UsageReport, id: string): UsageLimit {
 
 const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
 const savedEnv: Partial<Record<(typeof ANTHROPIC_ENV)[number], string | undefined>> = {};
+
+interface LoneReportScenario {
+	name: string;
+	alice: OAuthAccountIdentity;
+	bob: OAuthAccountIdentity;
+	metadata: UsageReport["metadata"];
+	scope?: Pick<UsageLimit["scope"], "accountId" | "projectId">;
+	canFallback: boolean;
+}
+
+const loneReportScenarios: LoneReportScenario[] = [
+	{
+		name: "different emails despite a shared project",
+		alice: { email: "alice@example.test", projectId: "shared-project" },
+		bob: { email: "bob@example.test", projectId: "shared-project" },
+		metadata: { email: " BOB@EXAMPLE.TEST ", projectId: "shared-project" },
+		canFallback: false,
+	},
+	{
+		name: "different account metadata aliases",
+		alice: { accountId: "account-alice" },
+		bob: { accountId: "account-bob" },
+		metadata: { account_id: " ACCOUNT-BOB " },
+		canFallback: false,
+	},
+	{
+		name: "different project metadata aliases",
+		alice: { projectId: "project-alice" },
+		bob: { projectId: "project-bob" },
+		metadata: { project_id: " PROJECT-BOB " },
+		canFallback: false,
+	},
+	{
+		name: "different limit-scoped accounts with whitespace",
+		alice: { accountId: "account-alice" },
+		bob: { accountId: "account-bob" },
+		metadata: {},
+		scope: { accountId: " ACCOUNT-BOB " },
+		canFallback: false,
+	},
+	{
+		name: "different limit-scoped projects with whitespace",
+		alice: { projectId: "project-alice" },
+		bob: { projectId: "project-bob" },
+		metadata: {},
+		scope: { projectId: " PROJECT-BOB " },
+		canFallback: false,
+	},
+	{
+		name: "different members in one organization and account",
+		alice: { email: "alice@example.test", accountId: "shared-account", orgId: "shared-org" },
+		bob: { email: "bob@example.test", accountId: "shared-account", orgId: "shared-org" },
+		metadata: { email: "bob@example.test", accountId: "shared-account", orgId: " SHARED-ORG " },
+		canFallback: false,
+	},
+	{
+		name: "different organizations despite matching base identity",
+		alice: { email: "shared@example.test", accountId: "shared-account", orgId: "personal-org" },
+		bob: { email: "shared@example.test", accountId: "shared-account", orgId: "team-org" },
+		metadata: { email: "shared@example.test", accountId: "shared-account", orgId: "team-org" },
+		canFallback: false,
+	},
+	{
+		name: "an org-scoped account and an org-less report",
+		alice: { email: "shared@example.test", orgId: "team-org" },
+		bob: { email: "shared@example.test" },
+		metadata: { email: "shared@example.test" },
+		canFallback: false,
+	},
+	{
+		name: "an org-less account and an org-scoped report",
+		alice: { email: "shared@example.test" },
+		bob: { email: "shared@example.test", orgId: "team-org" },
+		metadata: { email: "shared@example.test", orgId: "team-org" },
+		canFallback: false,
+	},
+	{
+		name: "an identityless report remains usable",
+		alice: { accountId: "account-alice" },
+		bob: { accountId: "account-bob" },
+		metadata: { planType: "plus" },
+		canFallback: true,
+	},
+	{
+		name: "an org-only credential keeps its lone same-org report",
+		alice: { orgId: "team-org" },
+		bob: { email: "bob@example.test", orgId: "team-org" },
+		metadata: { email: "bob@example.test", orgId: "team-org" },
+		canFallback: true,
+	},
+	{
+		name: "an identityless credential remains usable",
+		alice: {},
+		bob: { email: "bob@example.test" },
+		metadata: { email: "bob@example.test" },
+		canFallback: true,
+	},
+	{
+		name: "disjoint identity fields do not invent a contradiction",
+		alice: { accountId: "account-alice" },
+		bob: { email: "bob@example.test" },
+		metadata: { email: "bob@example.test" },
+		canFallback: true,
+	},
+	{
+		name: "malformed or blank identity fields are not comparable",
+		alice: { email: "alice@example.test", accountId: "account-alice", projectId: "project-alice" },
+		bob: { email: "bob@example.test", accountId: "account-bob", projectId: "project-bob" },
+		metadata: { email: 17, accountId: null, account_id: " ", projectId: [], project_id: " " },
+		scope: { accountId: " ", projectId: " " },
+		canFallback: true,
+	},
+];
+
+describe("broker lone-report identity over HTTP", () => {
+	test.each(loneReportScenarios)(
+		"attributes lone quotas and observed overlays correctly for $name",
+		async scenario => {
+			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "auth-broker-lone-usage-"));
+			const now = Date.now();
+			const bobLimit: UsageLimit = {
+				id: "anthropic:5h",
+				label: "5 Hour",
+				scope: { provider: "anthropic", windowId: "5h", ...scenario.scope },
+				window: { id: "5h", label: "5 Hour", resetsAt: now + 3_600_000 },
+				amount: { unit: "percent", usedFraction: 1 },
+				status: "exhausted",
+			};
+			const requestedAccounts = new Set<string>();
+			const upstream = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch(request) {
+					const bearer = request.headers.get("authorization");
+					if (!bearer) return new Response(null, { status: 401 });
+					requestedAccounts.add(bearer);
+					if (bearer === "Bearer access-alice") return new Response(null, { status: 503 });
+					if (bearer !== "Bearer access-bob") return new Response(null, { status: 401 });
+					return Response.json({
+						generatedAt: now,
+						reports: [{ provider: "anthropic", fetchedAt: now, limits: [bobLimit], metadata: scenario.metadata }],
+					});
+				},
+			});
+			const usageProvider: UsageProvider = {
+				id: "anthropic",
+				async fetchUsage(params, context) {
+					const accessToken = params.credential.accessToken;
+					if (!accessToken) return null;
+					const response = await context.fetch(upstream.url, {
+						headers: { Authorization: `Bearer ${accessToken}` },
+						signal: params.signal,
+					});
+					if (!response.ok) return null;
+					const validated = usageResponseSchema(await response.json());
+					if (validated instanceof type.errors) throw new Error(validated.summary);
+					return validated.reports[0] ?? null;
+				},
+			};
+			let storage: AuthStorage | undefined;
+			let broker: AuthBrokerServerHandle | undefined;
+			let remoteStore: RemoteAuthCredentialStore | undefined;
+			try {
+				storage = await AuthStorage.create(path.join(tempDir, "agent.db"), {
+					usageProviderResolver: provider => (provider === "anthropic" ? usageProvider : undefined),
+				});
+				await storage.credentials.set("anthropic", [
+					{
+						type: "oauth",
+						access: "access-alice",
+						refresh: "refresh-alice",
+						expires: now + 86_400_000,
+						...scenario.alice,
+					},
+					{
+						type: "oauth",
+						access: "access-bob",
+						refresh: "refresh-bob",
+						expires: now + 86_400_000,
+						...scenario.bob,
+					},
+				]);
+				broker = startAuthBroker({
+					storage,
+					bind: "127.0.0.1:0",
+					bearerTokens: ["fixture-bearer"],
+					disableRefresher: true,
+				});
+				const client = new AuthBrokerClient({ url: broker.url, token: "fixture-bearer", maxRetries: 0 });
+				const initial = await client.fetchSnapshot();
+				if (initial.status !== 200) throw new Error("expected broker snapshot");
+				const alice = initial.snapshot.credentials.find(
+					entry => entry.credential.type === "oauth" && entry.credential.access === "access-alice",
+				);
+				const bob = initial.snapshot.credentials.find(
+					entry => entry.credential.type === "oauth" && entry.credential.access === "access-bob",
+				);
+				if (alice?.credential.type !== "oauth" || bob?.credential.type !== "oauth")
+					throw new Error("expected two broker accounts");
+				remoteStore = new RemoteAuthCredentialStore({
+					client,
+					initialSnapshot: initial.snapshot,
+					streamSnapshots: false,
+				});
+				const aliceReport = await remoteStore.getUsageReport("anthropic", alice.credential);
+				if (scenario.canFallback) {
+					if (!aliceReport) throw new Error("expected incomparable lone-report fallback");
+					expect(requireLimit(aliceReport, bobLimit.id).status).toBe("exhausted");
+				} else {
+					expect(aliceReport).toBeNull();
+				}
+				const bobReport = await remoteStore.getUsageReport("anthropic", bob.credential);
+				if (!bobReport) throw new Error("expected Bob's own usage report");
+				expect(requireLimit(bobReport, bobLimit.id).status).toBe("exhausted");
+				expect(requestedAccounts).toEqual(new Set(["Bearer access-alice", "Bearer access-bob"]));
+
+				const overlay: UsageReport = {
+					provider: "anthropic",
+					fetchedAt: Date.now(),
+					limits: [
+						{
+							...bobLimit,
+							scope: {
+								provider: "anthropic",
+								accountId: alice.credential.accountId,
+								projectId: alice.credential.projectId,
+							},
+							amount: { unit: "percent", usedFraction: 0.1 },
+							status: "ok",
+						},
+					],
+					metadata: { ...scenario.alice },
+				};
+				// An anonymous credential has no overlay key; its legacy fallback is still checked above.
+				if (
+					!alice.credential.email &&
+					!alice.credential.accountId &&
+					!alice.credential.projectId &&
+					!alice.credential.orgId
+				) {
+					expect(remoteStore.ingestUsageReport("anthropic", alice.credential, overlay)).toBe(false);
+					return;
+				}
+				expect(remoteStore.ingestUsageReport("anthropic", alice.credential, overlay)).toBe(true);
+				const observedAlice = await remoteStore.getUsageReport("anthropic", alice.credential);
+				if (!observedAlice) throw new Error("expected Alice's observed quota");
+				expect(requireLimit(observedAlice, bobLimit.id).amount.usedFraction).toBe(0.1);
+				const stillBob = await remoteStore.getUsageReport("anthropic", bob.credential);
+				if (!stillBob) throw new Error("expected Bob's quota after Alice's overlay");
+				expect(requireLimit(stillBob, bobLimit.id).status).toBe("exhausted");
+				const aggregate = await remoteStore.fetchUsageReports();
+				expect(aggregate?.map(report => requireLimit(report, bobLimit.id).amount.usedFraction).toSorted()).toEqual(
+					scenario.canFallback ? [0.1] : [0.1, 1],
+				);
+				if (!scenario.canFallback) {
+					const sibling = aggregate?.find(report => requireLimit(report, bobLimit.id).status === "exhausted");
+					expect(sibling?.metadata).toEqual(scenario.metadata);
+				}
+			} finally {
+				remoteStore?.close();
+				await broker?.close();
+				storage?.close();
+				upstream.stop(true);
+				await removeWithRetries(tempDir);
+			}
+		},
+	);
+});
 
 describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 	let tempDir = "";

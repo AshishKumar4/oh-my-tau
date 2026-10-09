@@ -11,6 +11,7 @@ import {
 	ANTHROPIC_OAUTH_GRANT_TTL_MS,
 	type AuthAccountPolicy,
 	type DisabledCredentialSummary,
+	isWithinUsageReserve,
 	type OAuthAccountIdentity,
 	resolveUsedFraction,
 	type UsageHistoryEntry,
@@ -612,9 +613,9 @@ function formatPolicyLine(
 	if (usedFractions.length === 0) {
 		return `policy: priority ${priority} · reserve ${reserveLabel} · reserve unknown`;
 	}
-	const remainingPct = Math.max(0, 1 - Math.max(...usedFractions)) * 100;
-	const state = remainingPct <= reservePct ? "inside reserve" : "eligible";
-	return `policy: priority ${priority} · reserve ${reserveLabel} · ${state} · ${remainingPct.toFixed(1)}% left`;
+	const remainingFraction = Math.max(0, 1 - Math.max(...usedFractions));
+	const state = isWithinUsageReserve(remainingFraction, reservePct / 100) ? "inside reserve" : "eligible";
+	return `policy: priority ${priority} · reserve ${reserveLabel} · ${state} · ${(remainingFraction * 100).toFixed(1)}% left`;
 }
 
 /**

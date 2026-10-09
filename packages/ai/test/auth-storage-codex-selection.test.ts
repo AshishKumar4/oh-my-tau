@@ -319,6 +319,89 @@ function countFor(counts: Map<string, number>, apiKey: string): number {
 	return counts.get(apiKey) ?? 0;
 }
 
+test("reserve-boundary routing respects priority, explicit pins, and manual holds", async () => {
+	const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-reserve-boundary-"));
+	const usedPercentByAccount = new Map([
+		["acct-boundary", 70],
+		["acct-above", 69.999999],
+		["acct-sibling", 50],
+	]);
+	const usageFetch: typeof fetch = Object.assign(
+		async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const url = new URL(input instanceof Request ? input.url : input.toString());
+			if (url.pathname !== "/backend-api/wham/usage") return new Response(null, { status: 404 });
+			const accountId = new Headers(init?.headers).get("ChatGPT-Account-Id");
+			const usedPercent = accountId ? usedPercentByAccount.get(accountId) : undefined;
+			if (usedPercent === undefined) return new Response(null, { status: 503 });
+			return Response.json({
+				plan_type: "plus",
+				rate_limit: {
+					allowed: true,
+					limit_reached: false,
+					primary_window: { used_percent: 10, limit_window_seconds: 18_000, reset_after_seconds: 18_000 },
+					secondary_window: {
+						used_percent: usedPercent,
+						limit_window_seconds: 604_800,
+						reset_after_seconds: 604_800,
+					},
+				},
+			});
+		},
+		{ preconnect: fetch.preconnect },
+	);
+	let storage: AuthStorage | undefined;
+	try {
+		storage = await AuthStorage.create(path.join(tempDir, "agent.db"), {
+			usageFetch,
+			defaultReservePct: 30,
+			accountPolicies: [
+				{ provider: "openai-codex", account: { accountId: "acct-boundary" }, priority: 100 },
+				{ provider: "openai-codex", account: { accountId: "acct-above" }, priority: 50, reservePct: 30 },
+				{ provider: "openai-codex", account: { accountId: "acct-sibling" }, priority: 20, reservePct: 0 },
+			],
+		});
+		await storage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-boundary", "boundary@example.test") },
+			{ type: "oauth", ...createCredential("acct-above", "above@example.test") },
+			{ type: "oauth", ...createCredential("acct-sibling", "sibling@example.test") },
+		]);
+		expect(await storage.keys.get("openai-codex", "boundary-new-session")).toBe("access-acct-above");
+		const health = await storage.health.model("openai-codex", { reserveFraction: 0.3 });
+		expect(health.accounts.map(account => account.state)).toEqual(["reserve", "healthy", "healthy"]);
+
+		const accounts = storage.oauth.accounts("openai-codex");
+		const boundary = accounts.find(account => account.accountId === "acct-boundary");
+		const above = accounts.find(account => account.accountId === "acct-above");
+		const sibling = accounts.find(account => account.accountId === "acct-sibling");
+		if (!boundary || !above || !sibling) throw new Error("expected all reserve accounts");
+		storage.holdCredential("openai-codex", above.credentialId);
+		expect(await storage.keys.get("openai-codex", "boundary-with-held-sibling")).toBe("access-acct-sibling");
+		expect(storage.sessions.pin("openai-codex", "boundary-explicit-pin", boundary.credentialId)).toBe(true);
+		expect(await storage.keys.get("openai-codex", "boundary-explicit-pin")).toBe("access-acct-boundary");
+
+		storage.holdCredential("openai-codex", boundary.credentialId);
+		expect(storage.oauth.identity("openai-codex", "boundary-explicit-pin")?.accountId).toBe("acct-sibling");
+		expect(
+			storage.oauth
+				.accounts("openai-codex", "boundary-explicit-pin")
+				.find(account => account.accountId === "acct-boundary")?.active,
+		).toBe(false);
+		expect(storage.sessions.pin("openai-codex", "boundary-held-pin", boundary.credentialId)).toBe(false);
+		expect((await storage.oauth.accessById("openai-codex", boundary.credentialId))?.ok).toBe(false);
+		expect(await storage.keys.get("openai-codex", "boundary-explicit-pin")).toBe("access-acct-sibling");
+		storage.holdCredential("openai-codex", sibling.credentialId);
+		expect(await storage.oauth.access("openai-codex", "boundary-all-held")).toBeUndefined();
+
+		storage.releaseCredential("openai-codex", boundary.credentialId);
+		expect(await storage.keys.get("openai-codex", "boundary-last-resort")).toBe("access-acct-boundary");
+		storage.releaseCredential("openai-codex", above.credentialId);
+		expect(await storage.keys.get("openai-codex", "boundary-released-sibling")).toBe("access-acct-above");
+	} finally {
+		storage?.close();
+		await removeWithRetries(tempDir);
+	}
+});
+
 function expectExclusivePreference(counts: Map<string, number>, preferred: string, fallback: string): void {
 	expect(countFor(counts, preferred)).toBeGreaterThan(0);
 	expect(countFor(counts, fallback)).toBe(0);
