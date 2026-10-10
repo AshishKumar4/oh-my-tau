@@ -349,11 +349,15 @@ export class IdaWorker {
 		this.#pending.set(id, response);
 		this.#current = { method, startedAt: Date.now() };
 		try {
+			const line = `${JSON.stringify({ id, method, params })}\n`;
 			try {
-				this.#proc.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
-				await this.#proc.stdin.flush();
+				const write = Promise.resolve(this.#proc.stdin.write(line));
+				void write.catch(() => {});
+				await Promise.all([write, this.#proc.stdin.flush()]);
 			} catch (error) {
 				if (this.#exitCode !== null) throw this.#exitError();
+				this.#pending.delete(id);
+				await this.#kill();
 				throw new ToolError(`Failed to send ${method} to the IDA worker for ${this.id}: ${errorMessage(error)}`);
 			}
 

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { BaseKernel, isSignalableProcessGroup, killProcessGroup } from "../../src/eval/kernel-base";
 
 class TestKernel extends BaseKernel {
@@ -15,6 +15,49 @@ class TestKernel extends BaseKernel {
 }
 
 const POSIX = process.platform !== "win32";
+
+describe("BaseKernel broken stdin retirement", () => {
+	test.each(["execution", "control", "sync-control"])(
+		"settles %s while the child is still alive and reaps its kernel",
+		async mode => {
+			const process = Bun.spawn([Bun.argv[0], "--eval", "setInterval(() => {}, 1000)"], {
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+				detached: true,
+			});
+			const kernel = new TestKernel();
+			kernel.setProcess(process);
+			const write = vi.spyOn(process.stdin, "write").mockImplementation(() => {
+				if (mode === "sync-control") throw new Error("EPIPE fixture synchronous write");
+				return Promise.reject(new Error("EPIPE fixture pending write"));
+			});
+			try {
+				if (mode === "execution") {
+					const result = await kernel.execute("fixture payload");
+					expect(result).toMatchObject({
+						status: "error",
+						cancelled: true,
+						kernelKilled: true,
+						error: { name: "TransportError", value: "EPIPE fixture pending write" },
+					});
+				} else
+					await expect(kernel.requestControl("fixture control", undefined, 60_000)).rejects.toThrow(
+						"EPIPE fixture",
+					);
+				expect(kernel.isAlive()).toBe(false);
+				await process.exited;
+				expect(process.signalCode).not.toBeNull();
+			} finally {
+				write.mockRestore();
+				await kernel.shutdown({ timeoutMs: 50 });
+				process.kill("SIGKILL");
+				await process.exited;
+			}
+		},
+		5000,
+	);
+});
 
 /** Ground truth for "does a process group with this leader exist right now?" via the null signal. */
 function processGroupExists(pid: number): boolean {

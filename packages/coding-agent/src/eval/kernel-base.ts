@@ -358,16 +358,21 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 		}
 
 		requestWritten = true;
+		const transportFailed = (error: Error) => {
+			if (!pending.settled) {
+				pending.status = "error";
+				pending.cancelled = true;
+				// A partially sent cell may have run; report uncertain completion when retiring its kernel.
+				pending.kernelKilled = true;
+				pending.error = { name: "TransportError", value: error.message, traceback: [] };
+				finalize();
+			}
+			void this.shutdown();
+		};
 		try {
-			await this.#writeLine(payload);
-		} catch (err) {
-			pending.cancelled = true;
-			pending.error = {
-				name: "TransportError",
-				value: err instanceof Error ? err.message : String(err),
-				traceback: [],
-			};
-			finalize();
+			await this.#writeLine(payload, transportFailed);
+		} catch (error) {
+			transportFailed(error instanceof Error ? error : new Error(String(error), { cause: error }));
 		}
 
 		return promise;
@@ -381,7 +386,10 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 		const deferred = Promise.withResolvers<Frame>();
 		this.#pendingControls.set(id, deferred);
 		try {
-			await this.#writeLine(payload);
+			await this.#writeLine(payload, error => {
+				deferred.reject(error);
+				void this.shutdown();
+			});
 			return await raceControlTimeout(
 				deferred.promise,
 				timeoutMs,
@@ -493,15 +501,22 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 		}
 	}
 
-	async #writeLine(line: string): Promise<void> {
+	async #writeLine(line: string, onWriteFailed?: (error: Error) => void): Promise<void> {
 		if (!this.#stdin) {
 			throw new Error(`${this.#options.languageName} kernel stdin is not open`);
 		}
 		if (this.#options.traceIpc) {
 			logger.debug(`${this.#options.languageName}Kernel send`, { preview: line.slice(0, 120) });
 		}
-		this.#stdin.write(`${line}\n`);
-		this.#stdin.flush();
+		// Keep the existing admission/timer order while observing asynchronous pipe failure.
+		const stdin = this.#stdin;
+		const write = Promise.try(() => stdin.write(`${line}\n`));
+		void write.catch(() => {});
+		void Promise.all([write, Promise.try(() => stdin.flush())]).catch(error => {
+			const failure = error instanceof Error ? error : new Error(String(error), { cause: error });
+			logger.debug(`${this.#options.languageName} kernel stdin write failed`, { error: failure.message });
+			onWriteFailed?.(failure);
+		});
 	}
 
 	#startReader(stream: ReadableStream<Uint8Array>): void {

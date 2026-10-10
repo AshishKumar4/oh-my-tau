@@ -9,7 +9,6 @@ import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
-import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
@@ -505,7 +504,11 @@ export class RpcClient {
 
 		const error = new Error("Client stopped");
 		const child = this.#process;
-		child.kill(undefined, this.options.terminationGraceMs);
+		try {
+			child.kill(undefined, this.options.terminationGraceMs);
+		} catch {
+			/* Already exited; pending requests still need settlement. */
+		}
 		this.#abortController.abort(error);
 		this.#process = null;
 		for (const request of this.#pendingRequests.values()) request.reject(error);
@@ -1483,14 +1486,34 @@ export class RpcClient {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}
-		const stdin = this.#process.stdin;
-		stdin.write(`${JSON.stringify(frame)}\n`);
-		if (!("flush" in stdin)) return;
-		const flushResult = (stdin as FileSink).flush();
-		if (isPromise(flushResult)) {
-			flushResult.catch((err: Error) => {
-				onError?.(err);
-			});
+		const child = this.#process;
+		const stdin = child.stdin;
+		let line: string;
+		try {
+			line = `${JSON.stringify(frame)}\n`;
+		} catch (error) {
+			if (!onError) throw error;
+			onError(error instanceof Error ? error : new Error(String(error), { cause: error }));
+			return;
+		}
+		const failed = (error: Error) => {
+			onError?.(error);
+			if (this.#process === child) void this.stop();
+		};
+		try {
+			const write = stdin.write(line);
+			if (isPromise(write))
+				void write.catch(error =>
+					failed(error instanceof Error ? error : new Error(String(error), { cause: error })),
+				);
+			if (!("flush" in stdin) || typeof stdin.flush !== "function") return;
+			const flush = stdin.flush();
+			if (isPromise(flush))
+				void flush.catch(error =>
+					failed(error instanceof Error ? error : new Error(String(error), { cause: error })),
+				);
+		} catch (error) {
+			failed(error instanceof Error ? error : new Error(String(error), { cause: error }));
 		}
 	}
 

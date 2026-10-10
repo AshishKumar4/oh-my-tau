@@ -516,17 +516,27 @@ export class DapClient {
 	/**
 	 * Framed write to the adapter, bounded by {@link WRITE_MESSAGE_TIMEOUT_MS}
 	 * and by adapter exit. Without this bound a wedged adapter stdin used to
-	 * hang the whole client forever. On timeout or exit-before-flush the client
+	 * hang the whole client forever. On write failure, timeout or exit-before-flush the client
 	 * disposes itself and rethrows.
 	 */
 	async #writeMessage(message: DapRequestMessage | DapResponseMessage): Promise<void> {
 		const content = JSON.stringify(message);
-		this.#writeSink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n`);
-		this.#writeSink.write(content);
-		const flushResult = this.#writeSink.flush();
-		if (!(flushResult instanceof Promise)) return;
+		let write: number | Promise<number>;
+		let flush: number | Promise<number> | undefined;
+		try {
+			write = this.#writeSink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n${content}`);
+			if (write instanceof Promise) void write.catch(() => {});
+			flush = this.#writeSink.flush();
+		} catch (error) {
+			this.#failConnection(error instanceof Error ? error : new Error(String(error), { cause: error }));
+			void this.dispose();
+			throw error;
+		}
+		if (!(write instanceof Promise) && !(flush instanceof Promise)) return;
+		const flushResult = Promise.all([write, flush]);
 
 		if (this.#adapterExited) {
+			void flushResult.catch(() => {});
 			throw new Error(`DAP adapter ${this.adapter.name} exited before write completed`);
 		}
 
@@ -548,6 +558,7 @@ export class DapClient {
 		} catch (error) {
 			// The client is now known-broken. Kick off dispose in the background;
 			// callers will see subsequent sendRequest calls fail fast.
+			this.#failConnection(error instanceof Error ? error : new Error(String(error), { cause: error }));
 			void this.dispose();
 			throw error;
 		} finally {
