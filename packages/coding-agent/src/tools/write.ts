@@ -45,7 +45,7 @@ import { recoverConflictUriPrefix } from "./conflict-detect";
 import { invalidateFsScanAfterWrite } from "./fs-cache-invalidation";
 
 import { outputMeta } from "./output-meta";
-import { formatPathRelativeToCwd, probeLiteralPathExists } from "./path-utils";
+import { formatPathRelativeToCwd, probeLiteralPathExists, specialFileKind } from "./path-utils";
 import { splitPathAndSel } from "@oh-my-pi/pi-tui/tools/read";
 import {
 	enforcePlanModeWrite,
@@ -652,6 +652,11 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 				if (stat.isDirectory()) {
 					continue;
 				}
+				const kind = specialFileKind(stat);
+				if (kind)
+					throw new ToolError(
+						`Cannot write '${candidate.sqlitePath}': it is a ${kind}, not a regular file or directory.`,
+					);
 				if (!(await isSqliteFile(absolutePath))) {
 					sawExistingNonSqlite = true;
 					continue;
@@ -915,6 +920,8 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 			if (target && existing?.isDirectory()) {
 				throw new ToolError(`${target.url.protocol}// URL must resolve to a file: ${path}`);
 			}
+			const kind = existing && specialFileKind(existing);
+			if (kind) throw new ToolError(`Cannot write '${path}': it is a ${kind}, not a regular file or directory.`);
 			// Check if file exists and is auto-generated before overwriting.
 			if (existing) {
 				await assertEditableFile(absolutePath, path, this.session.settings);

@@ -1,4 +1,5 @@
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import { type Api, type FetchImpl, type Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
@@ -11,7 +12,7 @@ import {
 	getImageGenToolsWithRegistry,
 	imageGenTool,
 } from "@oh-my-pi/pi-coding-agent/tools/image-gen";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { removeWithRetries, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const generatedImagePaths: string[] = [];
@@ -100,6 +101,54 @@ function collectPaths(result: CustomToolResult<{ imagePaths: string[] }>): void 
 }
 
 describe("imageGenTool catalog routing", () => {
+	it("refuses a special image target before provider dispatch and still accepts a regular input", async () => {
+		using directory = TempDir.createSync("@pi-image-file-guard-");
+		const input = directory.join("input.png");
+		await Bun.write(
+			input,
+			Buffer.from(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6ZQAAAABJRU5ErkJggg==",
+				"base64",
+			),
+		);
+		const stat = await fs.stat(input);
+		const fileKind = vi.spyOn(stat, "isFile").mockReturnValue(false);
+		const fifoKind = vi.spyOn(stat, "isFIFO").mockReturnValue(true);
+		const statCall = vi.spyOn(fs, "stat").mockResolvedValue(stat);
+		let requests = 0;
+		const selected = catalogModel("openrouter", "guarded-image", "openrouter-images");
+		const ctx = createContext({
+			models: [selected],
+			settings: Settings.isolated({ modelRoles: { image: "openrouter/guarded-image" } }),
+			fetch: async () => {
+				requests++;
+				return imageResponse();
+			},
+		});
+		try {
+			await expect(
+				imageGenTool.execute("refused", { subject: "edit", input: [{ path: input }] }, undefined, ctx),
+			).rejects.toThrow("FIFO");
+			expect(requests).toBe(0);
+			statCall.mockRestore();
+			fifoKind.mockRestore();
+			fileKind.mockRestore();
+			const result = await imageGenTool.execute(
+				"regular",
+				{ subject: "edit", input: [{ path: input }] },
+				undefined,
+				ctx,
+			);
+			collectPaths(result);
+			expect(result.details?.model).toBe("guarded-image");
+			expect(requests).toBe(1);
+		} finally {
+			statCall.mockRestore();
+			fifoKind.mockRestore();
+			fileKind.mockRestore();
+			ctx.modelRegistry.authStorage.close();
+		}
+	});
 	it("registers without resolving credentials", async () => {
 		const registry = createRegistry([]);
 		expect(await getImageGenTools(registry)).toEqual([imageGenTool]);

@@ -827,13 +827,18 @@ export class EditTool implements AgentTool<TInput> {
 			await mkdirAllowingFallback(path.dirname(request.path));
 		}
 
+		let began = false;
 		const diagnostics = await createEditWritethrough(this.session)(
 			request.path,
 			request.content,
 			signal,
 			Bun.file(request.path),
 			request.lspBatchId ? { id: request.lspBatchId, flush: request.flushLsp } : undefined,
-			destination => (destination === request.path ? this.#deferredDiagnostics.begin(request.path) : undefined),
+			destination => {
+				if (destination !== request.path) return undefined;
+				began = true;
+				return this.#deferredDiagnostics.begin(request.path);
+			},
 		);
 
 		if (preWriteBytes !== undefined) {
@@ -855,7 +860,7 @@ export class EditTool implements AgentTool<TInput> {
 		}
 
 		invalidateFsScanAfterWrite(request.path);
-		this.session.bumpFileMutationVersion?.(request.path);
+		if (!began) this.session.bumpFileMutationVersion?.(request.path);
 		return {
 			written: diagnostics.finalContent,
 			diagnosticsJson: diagnostics.diagnostics ? JSON.stringify(diagnostics.diagnostics) : undefined,
