@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import type { Api, Context, Message, Model, ModelSpec } from "@oh-my-pi/pi-ai";
+import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
+import type { Api, AssistantMessage, Context, Message, Model, ModelSpec, ToolCall } from "@oh-my-pi/pi-ai";
 import { clearCustomApis, registerCustomApi } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -20,6 +20,35 @@ describe("date-cwd-reminder", () => {
 	});
 
 	describe("DateCwdReminderInjector", () => {
+		it("preserves retained turns and reminder controls after compaction changes the root", () => {
+			const injector = new DateCwdReminderInjector();
+			const first: Message = { role: "user", content: "first", timestamp: 1 };
+			const retained: Message = { role: "user", content: "retained", timestamp: 2 };
+			const toolTurn = createAssistantMessage("continuing a tool turn");
+			const original = injector.transform(
+				{ systemPrompt: ["system"], messages: [first, retained, toolTurn] },
+				"2026-08-14",
+				"/old",
+			);
+			const live = injector.transform(
+				{ systemPrompt: ["system"], messages: [first, retained, toolTurn] },
+				"2026-08-15",
+				"/new",
+			);
+			const control = live.messages.at(-1);
+			if (!control || control.role !== "developer") throw new Error("Expected an appended reminder control");
+			expect(live.messages.slice(0, original.messages.length)).toEqual(original.messages);
+			const summary: Message = { role: "user", content: "compaction summary", timestamp: 3 };
+			const compacted = injector.transform(
+				{ systemPrompt: ["system"], messages: [summary, retained, toolTurn] },
+				"2026-08-15",
+				"/new",
+			);
+			expect(compacted.messages.slice(1)).toEqual([...original.messages.slice(1), control]);
+			expect(compacted.messages[0]?.content).toBe(
+				`${renderDateCwdReminder("2026-08-15", "/new")}\n\ncompaction summary`,
+			);
+		});
 		it("injects the first reminder without mutating the context", () => {
 			const systemPrompt = ["PROJECT\n<critical>\n- Must act.\n</critical>"];
 			const messages: Message[] = [{ role: "user", content: "hello", timestamp: 1 }, createAssistantMessage("hi")];
@@ -198,6 +227,93 @@ describe("date-cwd reminder on the provider wire", () => {
 			expect(typeof secondFirst.content).toBe(typeof firstUser.content);
 			expect(secondFirst.content).toEqual(firstUser.content);
 		} finally {
+			authStorage.close();
+		}
+	});
+
+	it("keeps sent steering turns stable across midnight during a real tool continuation", async () => {
+		using tempDir = TempDir.createSync("@pi-date-cwd-steer-");
+		await Bun.write(tempDir.join("notes.txt"), "notes");
+		const api = "test-date-cwd-steer";
+		const contexts: Context[] = [];
+		const pushRead = (stream: AssistantMessageEventStream, id: string) => {
+			const toolCall: ToolCall = { type: "toolCall", id, name: "read", arguments: { path: "notes.txt" } };
+			const message: AssistantMessage = {
+				...createAssistantMessage(""),
+				content: [toolCall],
+				stopReason: "toolUse",
+			};
+			stream.push({ type: "start", partial: message });
+			stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: message });
+			stream.push({ type: "done", reason: "toolUse", message });
+		};
+		registerCustomApi(api, (_model, context) => {
+			contexts.push(context);
+			const stream = new AssistantMessageEventStream();
+			const request = contexts.length;
+			queueMicrotask(() => {
+				if (request === 1) {
+					void session.steer("steered");
+					pushRead(stream, "read-first");
+				} else if (request === 2) {
+					setSystemTime(new Date(2026, 7, 15, 0, 1));
+					pushRead(stream, "read-next");
+				} else {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				}
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: "date-cwd-steer",
+			name: "Date cwd steer",
+			api,
+			provider: "managed-primary",
+			baseUrl: "https://api.example.com/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		});
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		authStorage.keys.setRuntime(model.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			model,
+			toolNames: ["read"],
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			taskDepth: 1,
+			agentId: "SubAgent",
+		});
+		sessions.push(session);
+		setSystemTime(new Date(2026, 7, 14, 23, 59));
+		try {
+			await session.sendUserMessage("first");
+			await session.waitForIdle();
+			const before = contexts[1];
+			const after = contexts[2];
+			if (!before || !after) throw new Error("Expected both tool-continuation requests");
+			expect(after.messages.slice(0, before.messages.length)).toEqual(before.messages);
+			expect(after.messages.at(-1)).toMatchObject({
+				role: "developer",
+				content: renderDateCwdReminder("2026-08-15", normalizePromptPath(tempDir.path())),
+			});
+		} finally {
+			setSystemTime();
 			authStorage.close();
 		}
 	});

@@ -58,12 +58,15 @@ export class DateCwdReminderInjector {
 		const firstUser = messages.find((message): message is UserMessage => message.role === "user");
 		if (!firstUser) return messages;
 		if (this.#root !== firstUser) {
+			// A new compaction root must not rewrite reminders on retained turns.
+			const present = new Set<Message>(messages);
+			for (const message of this.#injections.keys()) {
+				if (!present.has(message)) this.#injections.delete(message);
+			}
+			this.#controls = this.#controls.filter(control => present.has(control.anchor));
 			this.#root = firstUser;
 			this.#currentReminder = reminder;
-			this.#injections.clear();
-			this.#controls = [];
-			this.#seen = new WeakSet();
-			if (!messageStartsWithReminder(firstUser, reminder)) {
+			if (!this.#injections.has(firstUser) && !messageStartsWithReminder(firstUser, reminder)) {
 				this.#injections.set(firstUser, injectReminder(firstUser, reminder));
 			}
 		} else if (this.#currentReminder !== reminder) {

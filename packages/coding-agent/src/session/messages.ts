@@ -682,6 +682,10 @@ function wrapSteeringUserMessage(message: SteeringUserMessage): UserMessage {
 	return { ...userMessage, content };
 }
 
+// Per-request transforms track sent turns by identity. Owner edits invalidate
+// the wrapper through the same hook as the LLM conversion cache.
+const steeringWrapperCache = new WeakMap<AgentMessage, UserMessage>();
+
 export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
 	// Wrap EVERY steering message, not just a trailing run. The wire bytes of a
 	// steering message must be a pure function of the message itself, independent
@@ -693,7 +697,11 @@ export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
 	for (let i = 0; i < messages.length; i++) {
 		const message = messages[i];
 		if (!isSteeringUserMessage(message)) continue;
-		const wrappedMessage = wrapSteeringUserMessage(message);
+		let wrappedMessage = steeringWrapperCache.get(message);
+		if (wrappedMessage === undefined) {
+			wrappedMessage = wrapSteeringUserMessage(message);
+			steeringWrapperCache.set(message, wrappedMessage);
+		}
 		if (wrappedMessage === message) continue;
 		if (wrappedMessages === undefined) {
 			wrappedMessages = messages.slice();
@@ -999,6 +1007,7 @@ export function invalidateConvertToLlmArrayCache(messages: AgentMessage[]): void
 }
 
 registerMessageCacheInvalidator(message => {
+	steeringWrapperCache.delete(message);
 	convertCache.delete(message);
 	convertGeneration++;
 });

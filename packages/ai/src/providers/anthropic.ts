@@ -497,8 +497,10 @@ type AnthropicProviderSessionState = ProviderSessionState & {
 	 * this (baseUrl, modelId). Cleared on session close.
 	 */
 	thinkingReplayDisabled: boolean;
-	/** Thinking blocks the API permanently dropped after a prefix mismatch. */
+	/** Thinking blocks stripped after a prefix-binding 400 forced a client-side retry. */
 	prefixDroppedThinkingBlocks: Set<string>;
+	/** Server drops are replayed verbatim; warn once for each reported block. */
+	reportedPrefixDroppedThinking: Set<string>;
 };
 
 function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
@@ -508,12 +510,14 @@ function createAnthropicProviderSessionState(): AnthropicProviderSessionState {
 		replayUnsignedThinkingDisabled: false,
 		thinkingReplayDisabled: false,
 		prefixDroppedThinkingBlocks: new Set(),
+		reportedPrefixDroppedThinking: new Set(),
 		close: () => {
 			state.strictToolsDisabled = false;
 			state.fastModeDisabled = false;
 			state.replayUnsignedThinkingDisabled = false;
 			state.thinkingReplayDisabled = false;
 			state.prefixDroppedThinkingBlocks.clear();
+			state.reportedPrefixDroppedThinking.clear();
 		},
 	};
 	return state;
@@ -529,6 +533,7 @@ function getAnthropicProviderSessionState(
 	const existing = providerSessionState.get(key) as AnthropicProviderSessionState | undefined;
 	if (existing) {
 		existing.prefixDroppedThinkingBlocks ??= new Set();
+		existing.reportedPrefixDroppedThinking ??= new Set();
 		return existing;
 	}
 	const created = createAnthropicProviderSessionState();
@@ -2041,6 +2046,20 @@ function rememberPrefixBindingFailure(
 	return true;
 }
 
+function reportedDropKey(params: MessageCreateParamsStreaming, path: string | undefined): string | undefined {
+	if (path === undefined) return undefined;
+	const match = INPUT_TRANSFORMATION_PATH_PATTERN.exec(path);
+	if (match) {
+		const content = params.messages[Number(match[1])]?.content;
+		const block = Array.isArray(content) ? content[Number(match[2])] : undefined;
+		const key = block ? thinkingReplayKey(block) : undefined;
+		if (key) return key;
+	}
+	return `path:${path}`;
+}
+
+// Server-side drop_block keeps the input prefix cached. Stripping those blocks
+// client-side on the next turn changes that prefix again.
 function applyReportedInputTransformations(
 	output: AssistantMessage,
 	params: MessageCreateParamsStreaming,
@@ -2063,12 +2082,26 @@ function applyReportedInputTransformations(
 	}
 	if (fresh.length === 0) return;
 	output.inputTransformations = [...(output.inputTransformations ?? []), ...fresh];
-	rememberPrefixDroppedThinking(params, fresh, state);
+	let repeated = 0;
 	for (const transformation of fresh) {
 		if (transformation.reason !== "prefix_binding_mismatch") continue;
+		const key = reportedDropKey(params, transformation.path);
+		if (state && key !== undefined) {
+			if (state.reportedPrefixDroppedThinking.has(key)) {
+				repeated++;
+				continue;
+			}
+			state.reportedPrefixDroppedThinking.add(key);
+		}
 		logger.warn("anthropic: dropped thinking block after conversation prefix changed", {
 			model: output.model,
 			path: transformation.path,
+		});
+	}
+	if (repeated > 0) {
+		logger.debug("anthropic: API re-dropped previously reported thinking blocks", {
+			model: output.model,
+			count: repeated,
 		});
 	}
 }
