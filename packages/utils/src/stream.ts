@@ -73,20 +73,32 @@ export async function* readJsonl<T>(stream: ReadableStream<Uint8Array>, signal?:
  * framing loop (see `consume` and `flush`).
  */
 export class ConcatSink {
-	#space?: Buffer;
+	#space: Buffer = Buffer.alloc(0);
 	#length = 0;
 	#skipLeadingLf = false;
 
 	#ensureCapacity(size: number): Buffer {
 		const space = this.#space;
-		if (space && space.length >= size) return space;
-		const nextSize = space ? Math.max(size, space.length * 2) : size;
+		if (space.length >= size) return space;
+		const nextSize = Math.max(size, space.length * 2);
 		const next = Buffer.allocUnsafe(nextSize);
-		if (space && this.#length > 0) {
+		if (this.#length > 0) {
 			space.copy(next, 0, 0, this.#length);
 		}
 		this.#space = next;
 		return next;
+	}
+
+	#releaseCapacity(): void {
+		const space = this.#space;
+		if (space.length <= 1024 * 1024 || this.#length * 4 > space.length) return;
+		if (this.#length === 0) {
+			this.#space = Buffer.alloc(0);
+			return;
+		}
+		const next = Buffer.allocUnsafe(this.#length);
+		space.copy(next, 0, 0, this.#length);
+		this.#space = next;
 	}
 
 	append(chunk: Uint8Array) {
@@ -99,11 +111,10 @@ export class ConcatSink {
 	}
 
 	reset(chunk: Uint8Array) {
+		this.#length = 0;
+		this.#releaseCapacity();
 		const n = chunk.length;
-		if (!n) {
-			this.#length = 0;
-			return;
-		}
+		if (!n) return;
 		const space = this.#ensureCapacity(n);
 		space.set(chunk, 0);
 		this.#length = n;
@@ -119,7 +130,7 @@ export class ConcatSink {
 	 */
 	flush(): Uint8Array | undefined {
 		if (!this.#length) return undefined;
-		return this.#space!.subarray(0, this.#length);
+		return this.#space.subarray(0, this.#length);
 	}
 
 	/** Drop the first `count` buffered bytes, keeping the remainder. */
@@ -127,14 +138,16 @@ export class ConcatSink {
 		if (count <= 0) return;
 		if (count >= this.#length) {
 			this.#length = 0;
-			return;
+		} else {
+			this.#space.copyWithin(0, count, this.#length);
+			this.#length -= count;
 		}
-		this.#space!.copyWithin(0, count, this.#length);
-		this.#length -= count;
+		this.#releaseCapacity();
 	}
 
 	clear() {
 		this.#length = 0;
+		this.#releaseCapacity();
 	}
 
 	/**
@@ -229,13 +242,12 @@ export class ConcatSink {
 		if (error) throw error;
 		if (done) {
 			this.#length = 0;
-			return;
+		} else {
+			const rem = total - read;
+			if (rem < total) space.copyWithin(0, read, total);
+			this.#length = rem;
 		}
-		const rem = total - read;
-		if (rem < total) {
-			space.copyWithin(0, read, total);
-		}
-		this.#length = rem;
+		this.#releaseCapacity();
 	}
 }
 

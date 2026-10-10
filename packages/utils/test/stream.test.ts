@@ -12,6 +12,45 @@ import {
 
 const encoder = new TextEncoder();
 
+describe("long-lived stream frame storage", () => {
+	it("releases a drained large frame while preserving owned lines and fragmented UTF-8 successors", async () => {
+		const sink = new ConcatSink();
+		const large = encoder.encode("frame".repeat(900_000));
+		sink.append(large);
+		const frame = sink.flush();
+		if (!frame) throw new Error("Expected the assembled frame");
+		const retainedFrame = new Uint8Array(frame);
+		sink.reset(frame.subarray(frame.length - 10));
+		expect(new TextDecoder().decode(sink.flush())).toBe("frameframe");
+		sink.reset(new Uint8Array());
+		expect(sink.isEmpty).toBe(true);
+		sink.append(large);
+		sink.consume(large.length - 5);
+		const suffix = sink.flush();
+		if (!suffix) throw new Error("Expected an unconsumed frame suffix");
+		expect(new TextDecoder().decode(suffix)).toBe("frame");
+		expect(suffix.buffer.byteLength).toBeLessThan(large.byteLength);
+		sink.clear();
+		const next = encoder.encode("日本語\nfinal");
+		const lines = [...sink.appendAndFlushLines(next.subarray(0, 2)), ...sink.appendAndFlushLines(next.subarray(2))];
+		expect(lines.map(line => new TextDecoder().decode(line))).toEqual(["日本語"]);
+		expect(new TextDecoder().decode(sink.flush())).toBe("final");
+		sink.reset(encoder.encode("replacement"));
+		expect(new TextDecoder().decode(sink.flush())).toBe("replacement");
+		expect(new TextDecoder().decode(retainedFrame)).toBe("frame".repeat(900_000));
+		expect(lines.map(line => new TextDecoder().decode(line))).toEqual(["日本語"]);
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode(`{"text":"${"x".repeat(2_000_000)}`));
+				controller.enqueue(encoder.encode('"}\n{"text":"next"}\n'));
+				controller.close();
+			},
+		});
+		const parsed = await collectAsync(readJsonl<{ text: string }>(body));
+		expect(parsed.map(item => item.text)).toEqual(["x".repeat(2_000_000), "next"]);
+	});
+});
+
 async function collectAsync<T>(iter: AsyncIterable<T>): Promise<T[]> {
 	const output: T[] = [];
 	for await (const item of iter) output.push(item);

@@ -1,4 +1,5 @@
 import type { HelperDelegate, Template } from "./template";
+import { LRUCache } from "./lru";
 import * as Handlebars from "./template";
 
 export type { HelperDelegate, HelperOptions, Template, TemplateDelegate } from "./template";
@@ -526,15 +527,13 @@ export function registerPartial(name: string, fn: Template): void {
 	handlebars.registerPartial(name, fn);
 }
 
-const compiledTemplateCache = new Map<string, (context: TemplateContext) => string>();
+const compiledTemplateCache = new LRUCache<string, (context: TemplateContext) => string>({ max: 256 });
 
 export function compile(template: string): (context: TemplateContext) => string {
 	// Keyed on the raw template so repeat renders skip parsing.
 	const cached = compiledTemplateCache.get(template);
 	if (cached) return cached;
-	const compiled = handlebars.compile(template, { noEscape: true, strict: false }) as (
-		context: TemplateContext,
-	) => string;
+	const compiled = handlebars.compile<TemplateContext>(template, { noEscape: true, strict: false });
 	compiledTemplateCache.set(template, compiled);
 	return compiled;
 }
