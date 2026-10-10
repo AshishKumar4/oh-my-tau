@@ -4,9 +4,12 @@ import * as path from "node:path";
 import {
 	type AuthCredential,
 	type AuthCredentialStore,
+	parseServiceTier,
+	type ServiceTier,
 	SqliteAuthCredentialStore,
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai";
+import { modelPerfKey } from "@oh-my-pi/pi-catalog/identity/metrics";
 import {
 	AsyncDrain,
 	checkpointWal,
@@ -50,6 +53,7 @@ type StatsMessageRow = {
 	output_tokens: number;
 	duration: number;
 	ttft: number | null;
+	service_tier?: string | null;
 };
 
 /** Per-model running sums accumulated during a backfill walk. */
@@ -97,7 +101,8 @@ export interface ModelPerfStats {
  */
 const MODEL_PERF_DECAY_AT = 256;
 /** meta-table marker set once historical stats.db rows have been imported into model_perf. */
-const MODEL_PERF_BACKFILL_KEY = "model_perf_backfill";
+const MODEL_PERF_BACKFILL_KEY = "model_perf_backfill_v2";
+const MODEL_PERF_BACKFILL_V1_KEY = "model_perf_backfill";
 /**
  * Batch window for deferred model_perf writes. Perf aggregates are advisory, so
  * one transaction per minute replaces one per turn; the timer is unref'd and the
@@ -356,6 +361,7 @@ CREATE TABLE settings (
 			this.#db.run("DELETE FROM model_perf");
 			using clearBackfillStmt = this.#db.prepare("DELETE FROM meta WHERE key = ?");
 			clearBackfillStmt.run(MODEL_PERF_BACKFILL_KEY);
+			clearBackfillStmt.run(MODEL_PERF_BACKFILL_V1_KEY);
 		}
 	}
 
@@ -560,8 +566,8 @@ FROM model_usage_legacy
 	 * logged, never thrown; await the returned promise only to observe the flush.
 	 * @param modelKey - Model key in "provider/modelId" format
 	 */
-	recordModelPerf(modelKey: string, sample: ModelPerfSample): Promise<void> {
-		const row = normalizeModelPerfSample(modelKey, sample);
+	recordModelPerf(modelKey: string, sample: ModelPerfSample, serviceTier?: ServiceTier | null): Promise<void> {
+		const row = normalizeModelPerfSample(modelPerfKey(modelKey, serviceTier), sample);
 		if (!row) return Promise.resolve();
 		return this.#perfDrain.push(row, rows => this.#flushModelPerf(rows));
 	}
@@ -627,6 +633,13 @@ FROM model_usage_legacy
 			using markerStmt = this.#db.prepare("SELECT value FROM meta WHERE key = ?");
 			const marker = markerStmt.get(MODEL_PERF_BACKFILL_KEY);
 			if (marker) return;
+			// Existing aggregates include live, possibly unsynced samples. Never wipe
+			// or re-import those rows merely to add tier-aware accounting.
+			if (markerStmt.get(MODEL_PERF_BACKFILL_V1_KEY)) {
+				using complete = this.#db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)");
+				complete.run(MODEL_PERF_BACKFILL_KEY, "complete");
+				return;
+			}
 			const statsDbPath = getStatsDbPath();
 			if (!fs.existsSync(statsDbPath)) return;
 			void this.backfillModelPerfFromStats(statsDbPath)
@@ -662,8 +675,12 @@ FROM model_usage_legacy
 		const statsDb = new Database(statsDbPath, { readonly: true });
 		try {
 			statsDb.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
+			const hasTier = statsDb
+				.prepare<{ name: string }, []>("PRAGMA table_info(messages)")
+				.all()
+				.some(column => column.name === "service_tier");
 			using select = statsDb.prepare(
-				`SELECT rowid, timestamp, provider, model, output_tokens, duration, ttft
+				`SELECT rowid, timestamp, provider, model, output_tokens, duration, ttft${hasTier ? ", service_tier" : ""}
 FROM messages
 WHERE (timestamp < ?1 OR (timestamp = ?1 AND rowid < ?2))
 	AND timestamp >= ?3
@@ -686,7 +703,7 @@ LIMIT ?4`,
 				cursorTimestamp = last.timestamp;
 				cursorRowid = last.rowid;
 				for (const row of rows) {
-					const key = `${row.provider}/${row.model}`;
+					const key = modelPerfKey(`${row.provider}/${row.model}`, parseServiceTier(row.service_tier));
 					let accum = sums.get(key);
 					if (accum && accum.samples >= MODEL_PERF_DECAY_AT) continue;
 					const normalized = normalizeModelPerfSample(key, {

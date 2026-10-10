@@ -1,4 +1,6 @@
 import type { ModelHubSource } from "@oh-my-pi/pi-tui/overlays/model-hub";
+import { resolveModelServiceTier, shouldSendServiceTier } from "@oh-my-pi/pi-ai";
+import { buildServiceTierByFamily } from "../config/service-tier";
 import { resolveModelRoleValue, rolePriorityDefaults } from "../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo } from "../config/model-roles";
 import type { Settings } from "../config/settings";
@@ -9,7 +11,13 @@ import {
 	cfgModelProviderOrder,
 	cfgModelRoleStorage,
 } from "../config/model-settings";
-import { cfgDefaultThinkingLevel, cfgRetryFallbackChains } from "../session/settings";
+import {
+	cfgDefaultThinkingLevel,
+	cfgRetryFallbackChains,
+	cfgTierOpenai,
+	cfgTierAnthropic,
+	cfgTierGoogle,
+} from "../session/settings";
 
 /** Supply live model-overlay preferences and runtime resolution from the host. */
 export function createModelBrowserSource(settings: Settings): ModelHubSource {
@@ -31,6 +39,17 @@ export function createModelBrowserSource(settings: Settings): ModelHubSource {
 		},
 		get modelPerf() {
 			return settings.getStorage()?.getModelPerf() ?? new Map();
+		},
+		serviceTierFor: model => {
+			const tier = resolveModelServiceTier(
+				buildServiceTierByFamily(
+					cfgTierOpenai.get(settings),
+					cfgTierAnthropic.get(settings),
+					cfgTierGoogle.get(settings),
+				),
+				model,
+			);
+			return tier && shouldSendServiceTier(tier, model) ? tier : undefined;
 		},
 		get disabledProviders() {
 			return cfgDisabledProviders.get(settings);

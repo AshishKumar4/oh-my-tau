@@ -9,6 +9,7 @@
  */
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
+import { modelPerfKey } from "@oh-my-pi/pi-catalog/identity/metrics";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getModelPricingStatus, modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { ModelKind, ModelPricingStatus } from "@oh-my-pi/pi-catalog/types";
@@ -134,6 +135,7 @@ export interface ModelBrowserSource extends ModelRoleLookup {
 	readonly knownRoleIds: readonly string[];
 	readonly mruOrder: readonly string[];
 	readonly modelPerf: ReadonlyMap<string, ModelBrowserPerf>;
+	serviceTierFor?(model: Model): string | undefined;
 	getRoleInfo(role: string): ModelBrowserRoleInfo;
 	defaultRoleChain(role: string): string[];
 	resolveRoleValue(value: string | undefined, models: Model[], roleLookup?: ModelRoleLookup): ResolvedModelRoleValue;
@@ -1255,13 +1257,24 @@ export class ModelBrowser implements Component {
 		return index;
 	}
 
+	#perfFor(item: ModelBrowserItem): { perf: ModelBrowserPerf; tier?: string } | undefined {
+		const tier = this.#settings.serviceTierFor?.(item.model);
+		const key = modelPerfKey(item.selector, tier);
+		if (key !== item.selector) {
+			const measured = this.#perf.get(key);
+			if (measured) return { perf: measured, tier };
+		}
+		const standard = this.#perf.get(item.selector);
+		return standard ? { perf: standard } : undefined;
+	}
+
 	/** Measured TPS/TTFT, falling back to the catalog TPS as an estimated `~118t/s`. */
 	#perfCell(item: ModelBrowserItem, mode: PerfMode): string {
 		if (mode === "off") return "";
-		const perf = this.#perf.get(item.selector);
-		if (perf) {
-			const tps = formatTps(perf.tps);
-			if (mode === "full" && perf.ttftMs !== null) return `${formatTtft(perf.ttftMs)} ${tps}`;
+		const measured = this.#perfFor(item);
+		if (measured) {
+			const tps = `${formatTps(measured.perf.tps)}${measured.tier ? ` ${measured.tier}` : ""}`;
+			if (mode === "full" && measured.perf.ttftMs !== null) return `${formatTtft(measured.perf.ttftMs)} ${tps}`;
 			return tps;
 		}
 		const tps = item.model.tps;
@@ -1350,10 +1363,12 @@ export class ModelBrowser implements Component {
 		if (model.input.includes("image")) facts.push("vision");
 		const intelligence = formatIntelligence(model);
 		if (intelligence) facts.push(intelligence);
-		const perf = this.#perf.get(selected.selector);
-		if (perf) {
-			facts.push(`~${formatTps(perf.tps)}`);
-			if (perf.ttftMs !== null) facts.push(`${formatTtft(perf.ttftMs)} ttft`);
+		const measured = this.#perfFor(selected);
+		if (measured) {
+			const speed = `~${formatTps(measured.perf.tps)}${measured.tier ? ` ${measured.tier}` : ""}`;
+			if (measured.tier) facts.splice(1, 0, speed);
+			else facts.push(speed);
+			if (measured.perf.ttftMs !== null) facts.push(`${formatTtft(measured.perf.ttftMs)} ttft`);
 		} else if (model.tps != null && Number.isFinite(model.tps) && model.tps > 0) {
 			facts.push(`~${formatTps(model.tps)}`);
 		}
@@ -1613,10 +1628,12 @@ export class ModelBrowser implements Component {
 			if (model.input.includes("image")) facts.push("vision");
 			const intelligence = formatIntelligence(model);
 			if (intelligence) facts.push(intelligence);
-			const perf = this.#perf.get(selected.selector);
-			if (perf) {
-				facts.push(`~${formatTps(perf.tps)}`);
-				if (perf.ttftMs !== null) facts.push(`${formatTtft(perf.ttftMs)} ttft`);
+			const measured = this.#perfFor(selected);
+			if (measured) {
+				const speed = `~${formatTps(measured.perf.tps)}${measured.tier ? ` ${measured.tier}` : ""}`;
+				if (measured.tier) facts.unshift(speed);
+				else facts.push(speed);
+				if (measured.perf.ttftMs !== null) facts.push(`${formatTtft(measured.perf.ttftMs)} ttft`);
 			} else if (model.tps != null && Number.isFinite(model.tps) && model.tps > 0) {
 				facts.push(`~${formatTps(model.tps)}`);
 			}
@@ -1728,7 +1745,9 @@ export class ModelBrowser implements Component {
 		const facts: Record<string, TspText | number> = {};
 		const int = model.int != null && Number.isFinite(model.int) ? model.int : undefined;
 		if (int !== undefined) facts.int = String(Math.round(int));
-		const speed = this.#perfCell(item, "tps").replace(/t\/s$/, "");
+		const speed = this.#perfCell(item, "tps")
+			.replace(/\s*t\/s\s*/, " ")
+			.trim();
 		if (speed) facts.speed = speed;
 		if (model.contextWindow) facts.ctx = model.contextWindow;
 		facts.price = pickerPrice(model);
@@ -1890,7 +1909,7 @@ export class ModelBrowser implements Component {
 	modelPreview(item: ModelBrowserItem, mode: "full" | "compact", current: string | undefined): NativeChild[] {
 		const model = item.model;
 		const selector = `${model.provider}/${model.id}`;
-		const perf = this.#perf.get(selector);
+		const measured = this.#perfFor(item);
 		const ctx = model.contextWindow ?? 0;
 		const out = model.maxTokens ?? 0;
 		const overContext = this.isOverContext(item);
@@ -1950,10 +1969,12 @@ export class ModelBrowser implements Component {
 		if (badges.length > 0) children.push(row(badges, { gap: "xs", wrap: true }));
 
 		const speed: string[] = [];
-		if (perf) {
-			speed.push(`${formatTps(perf.tps).replace("t/s", " t/s")}`);
-			if (perf.ttftMs !== null) speed.push(`${formatTtft(perf.ttftMs).replace("s", " s")} TTFT`);
-			speed.push(`${perf.samples} ${perf.samples === 1 ? "sample" : "samples"}`);
+		if (measured) {
+			speed.push(
+				`${formatTps(measured.perf.tps).replace("t/s", " t/s")}${measured.tier ? ` ${measured.tier}` : ""}`,
+			);
+			if (measured.perf.ttftMs !== null) speed.push(`${formatTtft(measured.perf.ttftMs).replace("s", " s")} TTFT`);
+			speed.push(`${measured.perf.samples} ${measured.perf.samples === 1 ? "sample" : "samples"}`);
 		} else if (model.tps != null && Number.isFinite(model.tps) && model.tps > 0) {
 			speed.push(`~${formatTps(model.tps).replace("t/s", " t/s")} (catalog)`);
 		}

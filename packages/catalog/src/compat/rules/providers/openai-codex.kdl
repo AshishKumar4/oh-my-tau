@@ -26,7 +26,15 @@ provider "openai-codex" {
 	// Replaces the Codex provider's handwritten flex/priority pricing fallback.
 	service-tier-cost {
 		flex 0.5
-		priority 2
+		priority 2.5
+	}
+	models "gpt-6-astra" "gpt-6-astra-wm" "gpt-6.1-sol" "gpt-6.1-sol-wm" {
+		// Included usage rates: https://learn.chatgpt.com/docs/agent-configuration/speed
+		service-tier-cost {
+			flex 0.5
+			priority 2.5
+			ultrafast 8
+		}
 	}
 	// Harmony-protocol leak detection/mitigation applies to every Codex model,
 	// current and future; replaces the provider check in harmony-leak.ts.
@@ -71,10 +79,6 @@ provider "openai-codex" {
 			output 50.0
 			cache-read 1.0
 			cache-write 0
-		}
-		service-tier-cost {
-			flex 0.5
-			priority 2.5
 		}
 		limits-patch {
 			context-window 272000

@@ -4,6 +4,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgTierOpenai } from "@oh-my-pi/pi-coding-agent/session/settings";
 import {
 	buildBrowserItems,
 	buildSearchAffinity,
@@ -309,6 +310,50 @@ describe("ModelBrowser search ranking", () => {
 });
 
 describe("ModelBrowser perf display", () => {
+	test("keeps measured tier identity through settings changes and both detail renderers", async () => {
+		await initTheme(false);
+		const model = buildModel({
+			id: "gpt-6-astra",
+			name: "Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			serviceTiers: ["priority", "ultrafast"],
+			cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 8192,
+		});
+		const settings = Settings.isolated({ "tier.openai": "ultrafast" });
+		const browser = new ModelBrowser(createModelBrowserSource(settings));
+		browser.setItems(buildBrowserItems([model]));
+		browser.setPerfStats(
+			new Map([
+				["openai-codex/gpt-6-astra", { samples: 12, tps: 25, ttftMs: 900 }],
+				["openai-codex/gpt-6-astra@ultrafast", { samples: 3, tps: 400, ttftMs: 50 }],
+			]),
+		);
+		for (const width of [70, 120]) {
+			const lines = browser
+				.render(width)
+				.map(line => Bun.stripANSI(line))
+				.join("\n");
+			expect(lines).toContain("400t/s ultrafast");
+			expect(browser.getSelected()?.model).toBe(model);
+		}
+		const native = JSON.stringify(browser.describe());
+		expect(native).toContain("400t/s ultrafast");
+		cfgTierOpenai.set(settings, "none");
+		browser.setPerfStats(new Map([["openai-codex/gpt-6-astra", { samples: 12, tps: 25, ttftMs: 900 }]]));
+		expect(
+			browser
+				.render(120)
+				.map(line => Bun.stripANSI(line))
+				.join("\n"),
+		).toContain("25t/s");
+		expect(JSON.stringify(browser.describe())).not.toContain("ultrafast");
+	});
 	beforeAll(async () => {
 		// render() reads the global theme singleton.
 		await initTheme(false);

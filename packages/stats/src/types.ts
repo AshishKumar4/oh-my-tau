@@ -35,6 +35,8 @@ export interface MessageStats {
 	usage: Usage;
 	/** Which agent produced this message (main agent, task subagent, advisor) */
 	agentType: AgentType;
+	/** Recorded serving tier; legacy rows without that evidence remain null. */
+	serviceTier?: ServiceTier | null;
 	/**
 	 * Ingest refused to price this request: a scheduled (time-based) card with no
 	 * recoverable request timestamp, so `usage.cost.total` of 0 is unknown spend

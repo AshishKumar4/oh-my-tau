@@ -168,6 +168,11 @@ provider "openai" {
 	// 2x input and cache rates, 1.5x output for the full request; cache writes
 	// stay 1.25x the long input rate (25.0). The Codex subscription route stays
 	// exempt (credit-equivalent, free cache writes) — see openai-codex.kdl.
+	models "gpt-6-astra*" "gpt-6.1-sol*" {
+		service-tier-cost {
+			ultrafast 6
+		}
+	}
 	models "gpt-6-astra*" {
 		long-context-cost {
 			input-threshold 272000

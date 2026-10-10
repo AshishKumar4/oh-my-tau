@@ -315,8 +315,21 @@ export function getPriorityPremiumRequests(
 	serviceTier: ServiceTier | null | undefined,
 	model: ServiceTierModel,
 ): number {
-	if (!realizesPriorityServiceTier(serviceTier, model)) return 0;
+	return serviceTier === "priority" ? getPremiumServiceTierRequests(serviceTier, model) : 0;
+}
+
+/** Count a premium request; recorded served tiers do not need discovery metadata. */
+export function getPremiumServiceTierRequests(
+	serviceTier: ServiceTier | null | undefined,
+	model: ServiceTierModel,
+	options?: { served?: boolean },
+): number {
 	const provider = model.provider;
+	if (serviceTier === "ultrafast") {
+		if (provider !== "openai" && provider !== "openai-codex") return 0;
+		return options?.served || shouldSendServiceTier(serviceTier, model) ? 1 : 0;
+	}
+	if (serviceTier !== "priority" || (!options?.served && !realizesPriorityServiceTier(serviceTier, model))) return 0;
 	return provider === "openai" ||
 		provider === "openai-codex" ||
 		provider === "anthropic" ||
@@ -324,6 +337,20 @@ export function getPriorityPremiumRequests(
 		provider === "google-vertex"
 		? 1
 		: 0;
+}
+
+export function parseServiceTier(value: string | null | undefined): ServiceTier | undefined {
+	switch (value) {
+		case "auto":
+		case "default":
+		case "flex":
+		case "scale":
+		case "priority":
+		case "ultrafast":
+			return value;
+		default:
+			return undefined;
+	}
 }
 
 /**
@@ -1218,6 +1245,8 @@ export interface AssistantMessage {
 	model: string;
 	/** Stored credential row that produced this turn; absent for external or unknown keys. */
 	credentialId?: number;
+	/** Tier reported or inferred from the actual sent request, not the current setting. */
+	serviceTier?: ServiceTier;
 	contextSnapshot?: ContextSnapshot;
 	retryRecovery?: AssistantRetryRecovery;
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one

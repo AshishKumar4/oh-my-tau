@@ -58,6 +58,71 @@ function assistantEntry(opts: {
 }
 
 describe("priority service-tier premium-request backfill", () => {
+	it("preserves recorded serving tiers through parsing, SQL persistence and repeated sync", async () => {
+		const entries = [
+			{ id: "served-standard", tier: "default" },
+			{ id: "served-ultrafast", tier: "ultrafast" },
+			{ id: "served-ultrafast-zero", tier: "ultrafast" },
+			{ id: "served-flex", tier: "flex" },
+		].map(({ id, tier }, index) => ({
+			type: "message",
+			id,
+			parentId: null,
+			timestamp: new Date(Date.now() + index).toISOString(),
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "ok" }],
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				model: "gpt-6-astra",
+				serviceTier: tier,
+				stopReason: "stop",
+				timestamp: Date.now() + index,
+				usage: {
+					input: 10,
+					output: 5,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 15,
+					...(id !== "served-ultrafast" ? { premiumRequests: 0 } : {}),
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			},
+		}));
+		const file = await writeSession("--tmp--tier-proj", "tier-evidence.jsonl", {
+			lines: [
+				{ type: "session", version: 1, id: "tiers", timestamp: new Date().toISOString(), cwd: "/tmp/tier-proj" },
+				{
+					type: "service_tier_change",
+					id: "configured",
+					timestamp: new Date().toISOString(),
+					serviceTier: "priority",
+				},
+				...entries,
+			],
+		});
+		await syncAllSessions();
+		const actual = getRecentRequests(20).filter(request => request.sessionFile === file);
+		expect(
+			actual.map(request => [request.entryId, request.serviceTier, request.usage.premiumRequests]).sort(),
+		).toEqual([
+			["served-flex", "flex", 0],
+			["served-standard", "default", 0],
+			["served-ultrafast", "ultrafast", 1],
+			["served-ultrafast-zero", "ultrafast", 0],
+		]);
+		const prior = new Database(getStatsDbPath());
+		prior.run("UPDATE messages SET premium_requests=1 WHERE entry_id IN ('served-standard','served-ultrafast-zero')");
+		prior.run("DELETE FROM file_offsets WHERE session_file=?", [file]);
+		prior.close();
+		await syncAllSessions();
+		expect(
+			getRecentRequests(20)
+				.filter(request => request.sessionFile === file)
+				.map(request => [request.entryId, request.serviceTier, request.usage.premiumRequests])
+				.sort(),
+		).toEqual(actual.map(request => [request.entryId, request.serviceTier, request.usage.premiumRequests]).sort());
+	});
 	it("derives premium_requests from service_tier_change entries for providers that honor priority", async () => {
 		await writeSession("--tmp--proj", "01.jsonl", {
 			lines: [
@@ -120,7 +185,7 @@ describe("priority service-tier premium-request backfill", () => {
 		const raw = new Database(getStatsDbPath());
 		raw.exec("DELETE FROM messages");
 		raw.exec("DELETE FROM file_offsets");
-		raw.exec("DELETE FROM meta WHERE key = 'premium_requests_priority_v1'");
+		raw.exec("DELETE FROM meta WHERE key = 'premium_requests_priority_v2'");
 		raw.prepare(
 			`INSERT INTO messages (
 				session_file, entry_id, folder, model, provider, api, timestamp,

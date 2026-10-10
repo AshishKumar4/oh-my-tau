@@ -2108,7 +2108,7 @@ describe("openai-codex streaming", () => {
 		expect(result.usage.cost.output).toBeCloseTo(0.000012);
 		expect(result.usage.cost.total).toBeCloseTo(0.000022);
 	});
-	it("bills priority turns at the model's baked serviceTierCost multiplier (gpt-5.5 = 2.5x)", async () => {
+	it("accounts for included Fast usage on explicit and inherited model rate cards", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 
@@ -2150,22 +2150,24 @@ describe("openai-codex streaming", () => {
 			serviceTier: "priority",
 		}).result();
 		// 5 input tokens at $1/MTok * 2.5, 3 output at $2/MTok * 2.5.
-		expect(tieredResult.usage.cost.input).toBeCloseTo(0.0000125);
-		expect(tieredResult.usage.cost.output).toBeCloseTo(0.000015);
+		expect(tieredResult.usage.cost.input).toBeCloseTo(0.0000125, 10);
+		expect(tieredResult.usage.cost.output).toBeCloseTo(0.000015, 10);
+		expect(tieredResult.serviceTier).toBe("priority");
 
-		// Other Codex models inherit the provider-root { flex: 0.5, priority: 2 } rule.
+		// Other Codex models use the same included-usage multiplier.
 		const generic = buildModel({ ...spec, id: "gpt-5.1-codex" });
-		expect(generic.serviceTierCost).toEqual({ flex: 0.5, priority: 2 });
+		expect(generic.serviceTierCost).toEqual({ flex: 0.5, priority: 2.5 });
 		const genericResult = await streamOpenAICodexResponses(generic, context, {
 			fetch: fetchMock,
 			apiKey: token,
 			serviceTier: "priority",
 		}).result();
-		expect(genericResult.usage.cost.input).toBeCloseTo(0.00001);
-		expect(genericResult.usage.cost.output).toBeCloseTo(0.000012);
+		expect(genericResult.usage.cost.input).toBeCloseTo(0.0000125, 10);
+		expect(genericResult.usage.cost.output).toBeCloseTo(0.000015, 10);
+		expect(genericResult.usage.premiumRequests).toBe(1);
 	});
 
-	it("bills a requested priority turn at standard rates when the response reports default", async () => {
+	it("uses the sent Fast tier when the Codex response reports its ambiguous default tier", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 		const sse = `${[
@@ -2196,9 +2198,10 @@ describe("openai-codex streaming", () => {
 				serviceTier: "priority",
 			},
 		).result();
-		// 5 input tokens at $1/MTok and 3 output at $2/MTok, no 2.5x priority multiplier.
-		expect(result.usage.cost.input).toBeCloseTo(0.000005);
-		expect(result.usage.cost.output).toBeCloseTo(0.000006);
+		expect(result.usage.cost.input).toBeCloseTo(0.0000125, 10);
+		expect(result.usage.cost.output).toBeCloseTo(0.000015, 10);
+		expect(result.serviceTier).toBe("priority");
+		expect(result.usage.premiumRequests).toBe(1);
 	});
 
 	it("fails truncated SSE streams that never emit a terminal response event", async () => {
@@ -3847,7 +3850,8 @@ describe("openai-codex streaming", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 		expect(sentRequests[0]?.type).toBe("response.create");
 		expect(sentRequests[0]?.service_tier).toBe("priority");
-		expect(result.usage.premiumRequests).toBeUndefined();
+		expect(result.usage.premiumRequests).toBe(1);
+		expect(result.serviceTier).toBe("priority");
 	});
 
 	it("continues websocket chains across Standard → Fast → Standard service tiers", async () => {

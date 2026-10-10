@@ -1512,7 +1512,7 @@ export interface Model<TApi extends Api = Api> {
 	 * catalog axis (e.g. `{ priority: 2.5 }`). Absent tiers use the API-generic
 	 * defaults.
 	 */
-	serviceTierCost?: Readonly<Partial<Record<"flex" | "priority", number>>>;
+	serviceTierCost?: Readonly<Partial<Record<"flex" | "priority" | "ultrafast", number>>>;
 	/**
 	 * Provider-supplied one-line blurb for this model. Set only when an upstream
 	 * ships one (Devin's `GetCliModelConfigs`); never synthesized locally.

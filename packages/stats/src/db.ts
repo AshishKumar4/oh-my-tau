@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
-import type { Usage } from "@oh-my-pi/pi-ai";
+import { parseServiceTier, type Usage } from "@oh-my-pi/pi-ai";
 import {
 	calculateUncachedInputCost,
 	calculateUsageCost,
@@ -88,7 +88,7 @@ const BACKFILL_COMPLETE = "complete";
 const BACKFILL_PENDING = "pending";
 const USER_MESSAGES_BACKFILL_KEY = "user_messages_v9";
 const USER_MESSAGE_LINKS_REPAIR_KEY = "user_message_links_v1";
-const PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY = "premium_requests_priority_v1";
+const PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY = "premium_requests_priority_v2";
 const AGENT_TYPE_BACKFILL_KEY = "agent_type_v1";
 const FORK_DEDUPE_KEY = "fork_dedupe_v1";
 // v2: tool-name sanitization at ingest (see `sanitizeToolName` in parser.ts)
@@ -158,6 +158,7 @@ export async function initDb(): Promise<Database> {
 			cost_no_cache_input REAL,
 			cost_unpriced INTEGER NOT NULL DEFAULT 0,
 			agent_type TEXT NOT NULL DEFAULT 'main',
+			service_tier TEXT,
 			UNIQUE(session_file, entry_id)
 		);
 
@@ -251,6 +252,9 @@ export async function initDb(): Promise<Database> {
 	}
 	if (!messageColumns.some(column => column.name === "cost_no_cache_input")) {
 		db.run("ALTER TABLE messages ADD COLUMN cost_no_cache_input REAL");
+	}
+	if (!messageColumns.some(column => column.name === "service_tier")) {
+		db.run("ALTER TABLE messages ADD COLUMN service_tier TEXT");
 	}
 	// Rows ingested before this column existed default to 0 (not unpriced), so
 	// their epoch-sentinel zeros read as free until a re-parse rewrites them.
@@ -828,22 +832,24 @@ export function insertMessageStats(stats: Iterable<MessageStatsInput>): number {
 			duration, ttft, stop_reason, error_message,
 			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, premium_requests,
 			cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total, cost_no_cache_input,
-			cost_unpriced, agent_type
+			cost_unpriced, agent_type, service_tier
 		)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 		WHERE NOT EXISTS (
 			SELECT 1 FROM messages
 			WHERE entry_id = ? AND timestamp = ? AND session_file <> ?
 		)
 		ON CONFLICT(session_file, entry_id) DO UPDATE SET
-			premium_requests = MAX(messages.premium_requests, excluded.premium_requests),
+			premium_requests = CASE WHEN excluded.service_tier IS NOT NULL THEN excluded.premium_requests
+				ELSE MAX(messages.premium_requests, excluded.premium_requests) END,
 			cost_input = excluded.cost_input,
 			cost_output = excluded.cost_output,
 			cost_cache_read = excluded.cost_cache_read,
 			cost_cache_write = excluded.cost_cache_write,
 			cost_total = excluded.cost_total,
 			cost_no_cache_input = excluded.cost_no_cache_input,
-			cost_unpriced = excluded.cost_unpriced
+			cost_unpriced = excluded.cost_unpriced,
+			service_tier = excluded.service_tier
 	`);
 
 	let inserted = 0;
@@ -877,6 +883,7 @@ export function insertMessageStats(stats: Iterable<MessageStatsInput>): number {
 				noCacheInputCost,
 				unpriced ? 1 : 0,
 				s.agentType,
+				s.serviceTier ?? null,
 				// `WHERE NOT EXISTS` binds: skip when a different session_file
 				// already holds this (entry_id, timestamp).
 				s.entryId,
@@ -941,6 +948,7 @@ function rowToMessageStats(row: any): MessageStats {
 			},
 		},
 		agentType: (row.agent_type as AgentType) ?? "main",
+		serviceTier: typeof row.service_tier === "string" ? (parseServiceTier(row.service_tier) ?? null) : null,
 		costUnpriced: row.cost_unpriced === 1,
 	};
 }

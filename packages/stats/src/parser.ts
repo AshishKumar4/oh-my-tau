@@ -4,7 +4,8 @@ import * as path from "node:path";
 import {
 	type AssistantMessage,
 	coerceServiceTierByFamily,
-	getPriorityPremiumRequests,
+	getPremiumServiceTierRequests,
+	parseServiceTier,
 	resolveModelServiceTier,
 	type ServiceTierByFamily,
 	type ToolCall,
@@ -248,8 +249,14 @@ function extractStats(
 		api: msg.api,
 		identity: classifyModel(msg.provider, msg.model, { lenient: true }),
 	};
-	const tier = resolveModelServiceTier(currentServiceTier, model);
-	const derived = recorded > 0 ? recorded : getPriorityPremiumRequests(tier, model);
+	const servedTier = parseServiceTier(msg.serviceTier);
+	const tier = servedTier ?? resolveModelServiceTier(currentServiceTier, model);
+	const derived =
+		servedTier !== undefined && isFiniteCount(rawUsage.premiumRequests)
+			? rawUsage.premiumRequests
+			: recorded > 0
+				? recorded
+				: getPremiumServiceTierRequests(tier, model, { served: servedTier !== undefined });
 	const wellFormed =
 		isFiniteCount(rawUsage.input) &&
 		isFiniteCount(rawUsage.output) &&
@@ -291,6 +298,7 @@ function extractStats(
 		errorMessage: msg.errorMessage ?? null,
 		usage,
 		agentType,
+		serviceTier: servedTier ?? null,
 	};
 }
 

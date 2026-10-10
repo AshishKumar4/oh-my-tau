@@ -162,63 +162,85 @@ const creates = () => ScriptedWebSocket.sent.filter(frame => frame.type === "res
 const steers = () => ScriptedWebSocket.sent.filter(frame => frame.type === "response.steer");
 
 describe("codex live steering", () => {
-	it("steers the streaming response and reads the server's automatic continuation without sending a request", async () => {
-		installSocket((frame, socket) => {
-			if (frame.type === "response.create") {
-				// Stream part of an answer, then wait for the steer.
-				socket.emit({ type: "response.created", response: { id: "resp_1" } }, ...messageFrames("msg_1", "Plan"));
-				return;
-			}
-			socket.emit(
-				{ type: "response.steer.accepted", steer: { id: "steer_1", previous_response_id: "resp_1" } },
+	it.each([false, true])(
+		"keeps the actual originating tier when attaching steering, hook rewrite=%s",
+		async rewrite => {
+			installSocket((frame, socket) => {
+				if (frame.type === "response.create") {
+					// Stream part of an answer, then wait for the steer.
+					socket.emit({ type: "response.created", response: { id: "resp_1" } }, ...messageFrames("msg_1", "Plan"));
+					return;
+				}
+				socket.emit(
+					{ type: "response.steer.accepted", steer: { id: "steer_1", previous_response_id: "resp_1" } },
+					{
+						type: "response.incomplete",
+						response: {
+							id: "resp_1",
+							status: "incomplete",
+							incomplete_details: { reason: "steered" },
+							usage: USAGE,
+							service_tier: "default",
+						},
+					},
+					// The successor the server creates on its own from the queued input.
+					{ type: "response.created", response: { id: "resp_2" } },
+					...messageFrames("msg_2", "Tabs it is"),
+					{
+						type: "response.completed",
+						response: { id: "resp_2", status: "completed", usage: USAGE, service_tier: "default" },
+					},
+				);
+			});
+			const model = buildModel<"openai-codex-responses">({
+				...createGpt6Model(),
+				id: "gpt-6-astra",
+				serviceTiers: ["priority", "ultrafast"],
+				cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+			});
+			const state = new Map<string, ProviderSessionState>();
+			const steering = oneShotSteering("use tabs");
+			const user: UserMessage = { role: "user", content: "Draft a plan", timestamp: Date.now() };
+
+			const first = await streamOpenAICodexResponses(
+				model,
+				{ systemPrompt: SYSTEM, messages: [user] },
 				{
-					type: "response.incomplete",
-					response: {
-						id: "resp_1",
-						status: "incomplete",
-						incomplete_details: { reason: "steered" },
-						usage: USAGE,
+					...options(state, steering.source),
+					serviceTier: "priority",
+					onPayload: payload => {
+						if (rewrite && payload && typeof payload === "object" && "service_tier" in payload)
+							payload.service_tier = "flex";
 					},
 				},
-				// The successor the server creates on its own from the queued input.
-				{ type: "response.created", response: { id: "resp_2" } },
-				...messageFrames("msg_2", "Tabs it is"),
-				{ type: "response.completed", response: { id: "resp_2", status: "completed", usage: USAGE } },
-			);
-		});
-		const model = createGpt6Model();
-		const state = new Map<string, ProviderSessionState>();
-		const steering = oneShotSteering("use tabs");
-		const user: UserMessage = { role: "user", content: "Draft a plan", timestamp: Date.now() };
+			).result();
 
-		const first = await streamOpenAICodexResponses(
-			model,
-			{ systemPrompt: SYSTEM, messages: [user] },
-			options(state, steering.source),
-		).result();
+			expect(steering.settled()).toBe("accepted");
+			expect(first.stopReason).toBe("stop");
+			expect(first.serviceTier).toBe(rewrite ? "flex" : "priority");
+			expect(steers()).toEqual([
+				{
+					type: "response.steer",
+					previous_response_id: "resp_1",
+					input: [{ role: "user", content: [{ type: "input_text", text: "use tabs" }] }],
+				},
+			]);
 
-		expect(steering.settled()).toBe("accepted");
-		expect(first.stopReason).toBe("stop");
-		expect(steers()).toEqual([
-			{
-				type: "response.steer",
-				previous_response_id: "resp_1",
-				input: [{ role: "user", content: [{ type: "input_text", text: "use tabs" }] }],
-			},
-		]);
+			const steerMessage: UserMessage = { role: "user", content: "use tabs", timestamp: Date.now() };
+			const second = await streamOpenAICodexResponses(
+				model,
+				{ systemPrompt: SYSTEM, messages: [user, first, steerMessage] },
+				{ ...options(state), serviceTier: "default" },
+			).result();
 
-		const steerMessage: UserMessage = { role: "user", content: "use tabs", timestamp: Date.now() };
-		const second = await streamOpenAICodexResponses(
-			model,
-			{ systemPrompt: SYSTEM, messages: [user, first, steerMessage] },
-			options(state),
-		).result();
-
-		expect(second.responseId).toBe("resp_2");
-		expect(second.content).toEqual([expect.objectContaining({ type: "text", text: "Tabs it is" })]);
-		expect(creates()).toHaveLength(1);
-		expect(ScriptedWebSocket.instances).toHaveLength(1);
-	});
+			expect(second.responseId).toBe("resp_2");
+			expect(second.serviceTier).toBe(first.serviceTier);
+			expect(second.usage.cost.total).toBeCloseTo(first.usage.cost.total, 10);
+			expect(second.content).toEqual([expect.objectContaining({ type: "text", text: "Tabs it is" })]);
+			expect(creates()).toHaveLength(1);
+			expect(ScriptedWebSocket.instances).toHaveLength(1);
+		},
+	);
 
 	it("returns pending tool output without repeating steering the server already queued", async () => {
 		installSocket((frame, socket) => {

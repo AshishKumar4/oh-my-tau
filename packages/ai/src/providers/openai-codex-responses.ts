@@ -27,6 +27,7 @@ import {
 import * as AIError from "../error";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey, isOfficialCodexApiUrl } from "../stream";
+import { getPremiumServiceTierRequests, parseServiceTier } from "../types";
 import type {
 	Api,
 	AssistantMessage,
@@ -1393,40 +1394,39 @@ function getCodexServiceTierCostMultiplier(
 	model: Pick<Model<"openai-codex-responses">, "serviceTierCost">,
 	serviceTier: ServiceTier | "default" | undefined,
 ): number {
-	// `ultrafast` has no published price (API preview, Codex credits), so it is
-	// shown at 1x rather than an invented multiplier.
-	if (serviceTier !== "flex" && serviceTier !== "priority") return 1;
+	if (serviceTier !== "flex" && serviceTier !== "priority" && serviceTier !== "ultrafast") return 1;
 	return model.serviceTierCost?.[serviceTier] ?? 1;
 }
 
 /**
- * The tier a Codex response was billed at. The response echo is authoritative
- * whenever it reports a tier (the backend may serve a requested priority/flex
- * turn as `default`); the requested tier is used only when the echo is absent.
+ * Codex's default/auto echo does not identify a tier. Use the actual sent tier
+ * for those echoes; an explicit non-default echo remains authoritative.
  */
-function resolveCodexCostServiceTier(res: ServiceTier | undefined, req?: unknown): ServiceTier | "default" | undefined {
-	const served = res ?? req;
-	return served === "flex" || served === "priority" ? served : "default";
+function resolveCodexCostServiceTier(res: ServiceTier | undefined, req?: ServiceTier): ServiceTier {
+	return res !== undefined && res !== "default" && res !== "auto" ? res : (req ?? "default");
 }
 
 function applyCodexServiceTierPricing(
-	model: Pick<Model<"openai-codex-responses">, "serviceTierCost">,
+	model: Pick<Model<"openai-codex-responses">, "provider" | "api" | "identity" | "serviceTierCost">,
 	usage: AssistantMessage["usage"],
 	resTier: ServiceTier | undefined,
-	reqTier: unknown,
-): void {
+	reqTier: ServiceTier | undefined,
+): ServiceTier {
 	const resolvedTier = resolveCodexCostServiceTier(resTier, reqTier);
+	usage.premiumRequests ??= getPremiumServiceTierRequests(resolvedTier, model, { served: true });
 	const multiplier = getCodexServiceTierCostMultiplier(model, resolvedTier);
-	if (multiplier === 1) return;
+	if (multiplier === 1) return resolvedTier;
 	usage.cost.input *= multiplier;
 	usage.cost.output *= multiplier;
 	usage.cost.cacheRead *= multiplier;
 	usage.cost.cacheWrite *= multiplier;
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+	return resolvedTier;
 }
 
 function resetOutputState(output: AssistantMessage): void {
 	output.content.length = 0;
+	delete output.serviceTier;
 	output.usage = {
 		input: 0,
 		output: 0,
@@ -2082,6 +2082,10 @@ async function openCodexWebSocketTransport(
 			liveSteers.flatMap(steer => steer.items),
 		);
 		if (plan.kind === "attach") {
+			const requestBodyForState = structuredCloneJSON(requestContext.transformedBody);
+			// Attachment consumes an existing response; it sends no new tier control.
+			if (websocketState.lastRequest?.service_tier === undefined) delete requestBodyForState.service_tier;
+			else requestBodyForState.service_tier = websocketState.lastRequest.service_tier;
 			recordCodexTurnRequestDiagnostics(websocketState, chainedBody, "websocket", canAppendBeforeRequest);
 			requestContext.rawRequestDump.body = chainedBody;
 			return {
@@ -2091,7 +2095,7 @@ async function openCodexWebSocketTransport(
 					requestSetup.requestSignal,
 					onSseEvent,
 				),
-				requestBodyForState: structuredCloneJSON(requestContext.transformedBody),
+				requestBodyForState,
 				transport: "websocket",
 			};
 		}
@@ -2144,6 +2148,8 @@ async function openCodexWebSocketTransport(
 	} else {
 		requestBodyForState.stream_options = websocketRequest.stream_options;
 	}
+	if (websocketRequest.service_tier === undefined) delete requestBodyForState.service_tier;
+	else requestBodyForState.service_tier = websocketRequest.service_tier;
 	requestContext.rawRequestDump.body = websocketRequest;
 	CODEX_DEBUG &&
 		logger.debug("[codex] codex websocket request", {
@@ -2907,7 +2913,9 @@ class CodexStreamProcessor {
 		const responseId = response && "id" in response && typeof response.id === "string" ? response.id : undefined;
 		const usage = response && "usage" in response ? parseCodexResponseUsage(response.usage) : undefined;
 		const serviceTier =
-			response && "service_tier" in response ? parseCodexServiceTier(response.service_tier) : undefined;
+			response && "service_tier" in response && typeof response.service_tier === "string"
+				? parseServiceTier(response.service_tier)
+				: undefined;
 		const status = response && "status" in response ? parseCodexResponseStatus(response.status) : undefined;
 		const endTurn = response && "end_turn" in response ? response.end_turn : undefined;
 
@@ -2965,7 +2973,13 @@ class CodexStreamProcessor {
 		finalizePendingResponsesToolCalls(output);
 
 		calculateCost(model, output.usage, output.timestamp);
-		applyCodexServiceTierPricing(model, output.usage, serviceTier, runtime.requestBodyForState.service_tier);
+		const sentTier = runtime.requestBodyForState.service_tier;
+		output.serviceTier = applyCodexServiceTierPricing(
+			model,
+			output.usage,
+			serviceTier,
+			parseServiceTier(typeof sentTier === "string" ? sentTier : undefined),
+		);
 		output.stopReason = mapOpenAIResponsesStopReason(steered ? "completed" : status);
 		promoteResponsesToolUseStopReason(
 			output,
@@ -3834,20 +3848,6 @@ function jsonByteLength(value: unknown): number {
 function hashJson(value: unknown): string {
 	const json = JSON.stringify(value);
 	return String(Bun.hash(json === undefined ? "undefined" : json));
-}
-
-function parseCodexServiceTier(value: unknown): ServiceTier | undefined {
-	switch (value) {
-		case "auto":
-		case "default":
-		case "flex":
-		case "scale":
-		case "priority":
-		case "ultrafast":
-			return value;
-		default:
-			return undefined;
-	}
 }
 
 function parseCodexResponseStatus(value: unknown): ResponseStatus | undefined {

@@ -43,11 +43,13 @@ import {
 	type ComputerAction,
 	type ComputerToolCallMetadata,
 	type Context,
+	getPremiumServiceTierRequests,
 	type ImageContent,
 	type Message,
 	type MessageAttribution,
 	type Model,
 	OPENAI_MAX_OUTPUT_TOKENS,
+	parseServiceTier,
 	type ServiceTier,
 	type StopReason,
 	type StreamOptions,
@@ -366,7 +368,8 @@ function getOpenAIResponsesServiceTierCostMultiplier(
 	model: Pick<Model, "serviceTierCost">,
 	tier: string | null | undefined,
 ): number {
-	const resolvedMultiplier = tier === "flex" || tier === "priority" ? model.serviceTierCost?.[tier] : undefined;
+	const resolvedMultiplier =
+		tier === "flex" || tier === "priority" || tier === "ultrafast" ? model.serviceTierCost?.[tier] : undefined;
 	if (resolvedMultiplier !== undefined) return resolvedMultiplier;
 	switch (tier) {
 		case "flex":
@@ -387,23 +390,28 @@ function getOpenAIResponsesServiceTierCostMultiplier(
  * proxy can never skew those costs.
  */
 export function applyOpenAIResponsesServiceTierCost(
-	model: Pick<Model, "provider" | "serviceTierCost">,
+	model: Pick<Model, "provider" | "api" | "identity" | "serviceTierCost">,
 	usage: AssistantMessage["usage"],
 	responseServiceTier: unknown,
 	requestServiceTier: ServiceTier | null | undefined,
-): void {
+): ServiceTier | undefined {
 	if (model.provider !== "openai") return;
 	// The response echo is authoritative when present (OpenAI may downgrade a
 	// requested priority/flex turn to default under load); only fall back to the
 	// requested tier when the response omits the echo entirely.
-	const served = typeof responseServiceTier === "string" ? responseServiceTier : (requestServiceTier ?? undefined);
+	const served =
+		typeof responseServiceTier === "string"
+			? (parseServiceTier(responseServiceTier) ?? "default")
+			: (requestServiceTier ?? "default");
+	usage.premiumRequests ??= getPremiumServiceTierRequests(served, model, { served: true });
 	const multiplier = getOpenAIResponsesServiceTierCostMultiplier(model, served);
-	if (multiplier === 1) return;
+	if (multiplier === 1) return served;
 	usage.cost.input *= multiplier;
 	usage.cost.output *= multiplier;
 	usage.cost.cacheRead *= multiplier;
 	usage.cost.cacheWrite *= multiplier;
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+	return served;
 }
 
 /** Reconcile token-price estimates with a gateway's authoritative account charge. */
@@ -3611,10 +3619,10 @@ export async function processResponsesStream<TApi extends Api>(
 			populateResponsesUsageFromResponse(output, response?.usage);
 			calculateCost(model, output.usage, output.timestamp);
 			applyProviderReportedCost(model, output.usage, response?.usage);
-			applyOpenAIResponsesServiceTierCost(
+			output.serviceTier = applyOpenAIResponsesServiceTierCost(
 				model,
 				output.usage,
-				(response as { service_tier?: unknown } | undefined)?.service_tier,
+				response && typeof response === "object" && "service_tier" in response ? response.service_tier : undefined,
 				options?.requestServiceTier,
 			);
 			output.stopReason = mapOpenAIResponsesStopReason(response?.status);

@@ -2,6 +2,7 @@ import { scheduler } from "node:timers/promises";
 import { $flag, logger, type ServerSentEvent, structuredCloneJSON } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getEnvApiKey } from "../stream";
+import { parseServiceTier } from "../types";
 import type {
 	AssistantMessage,
 	CacheRetention,
@@ -830,7 +831,7 @@ const streamOpenAIResponsesOnce = (
 						onCompleted: () => {
 							sawTerminalResponseEvent = true;
 						},
-						requestServiceTier: options?.serviceTier,
+						requestServiceTier: parseServiceTier(chained.params.service_tier),
 					});
 
 					const localAbortReason = abortTracker.getLocalAbortReason();
