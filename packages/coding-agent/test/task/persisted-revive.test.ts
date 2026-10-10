@@ -649,6 +649,7 @@ describe("persisted subagent revival", () => {
 		const advisedFile = await createPersistedSession(cwd, undefined, undefined, "moonshot/k3");
 		const roleAdvisedFile = await createPersistedSession(cwd, undefined, undefined, "on");
 		const unadvisedFile = await createPersistedSession(cwd);
+		const resolvedFile = await createPersistedSession(cwd, undefined, undefined, "openai/gpt-5.6-sol:high");
 		const captured: Settings[] = [];
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			if (options?.settings) captured.push(options.settings);
@@ -656,19 +657,21 @@ describe("persisted subagent revival", () => {
 		});
 
 		const factory = createFactory(cwd);
-		for (const sessionFile of [advisedFile, roleAdvisedFile, unadvisedFile]) {
+		for (const sessionFile of [advisedFile, roleAdvisedFile, unadvisedFile, resolvedFile]) {
 			const ref = createRef(sessionFile);
 			const reviver = await factory(ref);
 			if (!reviver) throw new Error("Expected a persisted reviver");
 			await reviver(ref);
 		}
 
-		const [advised, roleAdvised, unadvised] = captured;
+		const [advised, roleAdvised, unadvised, resolved] = captured;
 		expect(cfgAdvisorEnabled.get(advised)).toBe(true);
 		expect(advised.getModelRole("advisor")).toBe("moonshot/k3");
 		expect(cfgAdvisorEnabled.get(roleAdvised)).toBe(true);
 		expect(roleAdvised.getModelRole("advisor")).toBeUndefined();
 		expect(cfgAdvisorEnabled.get(unadvised)).toBe(false);
+		expect(cfgAdvisorEnabled.get(resolved)).toBe(true);
+		expect(resolved.getModelRole("advisor")).toBe("openai/gpt-5.6-sol:high");
 	});
 
 	it("restores the persisted custom model role before reopening the session", async () => {

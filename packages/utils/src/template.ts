@@ -226,7 +226,7 @@ function findTagEnd(source: string, start: number, triple: boolean): number {
 
 function parseTemplate(source: string): Node[] {
 	const root: Node[] = [];
-	const stack: { node: BlockNode; target: Node[]; inverted: boolean }[] = [];
+	const stack: { node: BlockNode; target: Node[]; inverted: boolean; chained: boolean }[] = [];
 	let target = root;
 	let cursor = 0;
 	while (cursor < source.length) {
@@ -263,7 +263,7 @@ function parseTemplate(source: string): Node[] {
 				};
 				target.push(nested);
 				target = nested.body;
-				stack.push({ node: nested, target: parentTarget, inverted: false });
+				stack.push({ node: nested, target: parentTarget, inverted: false, chained: true });
 			}
 			continue;
 		}
@@ -277,12 +277,14 @@ function parseTemplate(source: string): Node[] {
 				inverted,
 			};
 			target.push(node);
-			stack.push({ node, target, inverted });
+			stack.push({ node, target, inverted, chained: false });
 			target = node.body;
 			continue;
 		}
 		if (raw.startsWith("/")) {
-			const current = stack.pop();
+			let current = stack.pop();
+			// An else-if branch shares the original block's closing tag.
+			while (current?.chained) current = stack.pop();
 			if (!current || current.node.expression.name !== raw.slice(1).trim())
 				throw new Error(`Parse error: mismatched ${raw}`);
 			if (current.inverted) [current.node.body, current.node.inverse] = [current.node.inverse, current.node.body];

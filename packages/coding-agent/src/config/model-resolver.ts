@@ -1402,6 +1402,12 @@ export interface ResolvedModelRoleValue {
 	warning: string | undefined;
 }
 
+/** Resolve against the spawning owner's roles before a child shadows its own advisor role. */
+export function resolveAgentAdvisorRolePattern(pattern: string, settings?: ModelRoleLookup): string {
+	const expanded = resolveConfiguredModelPatterns(pattern, settings);
+	return expanded.length > 0 ? expanded.join(",") : pattern;
+}
+
 export function resolveModelRoleValue(
 	roleValue: string | undefined,
 	availableModels: Model<Api>[],

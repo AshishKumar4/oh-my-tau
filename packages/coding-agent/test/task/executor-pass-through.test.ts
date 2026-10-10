@@ -12,6 +12,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { parseAgentFields } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
@@ -114,6 +115,25 @@ function createModelRegistry(
 describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("persists the spawning owner's expanded advisor role for later cold revival", async () => {
+		const child = yieldEmittingSession();
+		const journal = SessionManager.inMemory("/tmp");
+		vi.spyOn(child.sessionManager, "appendSessionInit").mockImplementation(config =>
+			journal.appendSessionInit(config),
+		);
+		const opened = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(child));
+		const settings = Settings.isolated({ modelRoles: { advisor: "openai/gpt-5.6-sol:high" } });
+		const outcome = await runSubprocess({ ...baseOptions, agent: { ...baseAgent, advisor: "@advisor" }, settings });
+		expect(outcome.exitCode).toBe(0);
+		const childSettings = opened.mock.calls[0]?.[0]?.settings;
+		expect(childSettings?.getModelRole("advisor")).toBe("openai/gpt-5.6-sol:high");
+		const initialization = journal.getEntries().find(entry => entry.type === "session_init");
+		if (!initialization || initialization.type !== "session_init")
+			throw new Error("Expected persisted session initialization");
+		expect(initialization.advisor).toBe("openai/gpt-5.6-sol:high");
+		expect(settings.getModelRole("advisor")).toBe("openai/gpt-5.6-sol:high");
 	});
 
 	it("forwards rules, extension-root policy, prepared extensions, and preloaded source paths to createAgentSession", async () => {
