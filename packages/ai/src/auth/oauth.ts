@@ -173,6 +173,12 @@ export class OAuthAccounts implements OAuthApi {
 		options: AuthApiKeyOptions | undefined,
 	): Promise<OAuthAccessResolution> {
 		try {
+			if (options?.forceRefresh) {
+				await this.#deps.refresher.refreshById(selection.credentialId, options.signal, {
+					reuseRecentMint: options.refreshReason === "auth-recovery",
+					reason: options.refreshReason,
+				});
+			}
 			const resolved = await this.#deps.selector.tryOAuth(provider, selection, providerKey, undefined, options, {
 				checkUsage: false,
 				allowBlocked: true,

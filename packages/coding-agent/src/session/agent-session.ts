@@ -7567,9 +7567,8 @@ export class AgentSession implements SettingsScope {
 				);
 			}
 
-			// Validate API key
-			const apiKey = await this.#modelRegistry.getApiKey(this.model, this.sessionId);
-			if (!apiKey) {
+			// Resolve credentials on the request path so transient refresh failures can retry.
+			if (!this.#modelRegistry.hasConfiguredAuth(this.model)) {
 				throw new Error(
 					`No API key found for ${this.model.provider}.\n\n` +
 						`Use /login, set an API key environment variable, or create ${getAgentDbPath()}`,
@@ -11582,8 +11581,7 @@ export class AgentSession implements SettingsScope {
 		let summaryDetails: unknown;
 		if (options.summarize && entriesToSummarize.length > 0 && !hookSummary) {
 			const model = this.model!;
-			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
-			if (!apiKey) {
+			if (!this.#modelRegistry.hasConfiguredAuth(model)) {
 				throw new Error(`No API key for ${model.provider}`);
 			}
 			const result = await generateBranchSummary(entriesToSummarize, {

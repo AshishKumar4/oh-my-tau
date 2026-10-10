@@ -60,6 +60,7 @@ export type TryOAuthOptions = {
 	blockScopes?: readonly string[];
 	/** When false, a definitive failure of THIS credential returns undefined instead of falling back to the ranked/round-robin selector (target-only resolution). */
 	allowFallback?: boolean;
+	onTransientRefreshFailure?: (error: Error) => void;
 };
 
 /** Services consulted by CredentialSelector for policy, usage, blocks, refresh, and session affinity. */
@@ -655,6 +656,10 @@ export class CredentialSelector {
 			? candidates.find(candidate => candidate.selection.credentialId === sessionPreferredSelection?.credentialId)
 			: undefined;
 		const preflightFailures = new Set<OAuthCandidate>();
+		let transientRefreshFailure: Error | undefined;
+		const recordTransientRefreshFailure = (error: Error): void => {
+			if (AIError.retriable(AIError.classify(error))) transientRefreshFailure = error;
+		};
 
 		const sessionPreferredCandidate = candidates.findIndex(
 			candidate =>
@@ -723,6 +728,7 @@ export class CredentialSelector {
 				}
 				const credentialId = candidate.selection.credentialId;
 				try {
+					const beforeRefresh = candidate.selection.credential;
 					// Hand the refresher a stale clone (expires:0) so its
 					// not-yet-expired short-circuit doesn't suppress the forced
 					// re-mint; an in-flight peer refresh is still awaited via the
@@ -737,7 +743,6 @@ export class CredentialSelector {
 						options?.signal,
 						force ? options?.refreshReason : undefined,
 					);
-					const beforeRefresh = candidate.selection.credential;
 					const updated = mergeRefreshedCredential(beforeRefresh, refreshedCredentials);
 					if (authCredentialEquals(beforeRefresh, updated)) {
 						// The await may have allowed a peer to replace/remove this row or
@@ -748,7 +753,7 @@ export class CredentialSelector {
 						return;
 					}
 					candidate.selection.credential = updated;
-					const idx = this.#deps.pool.replaceById(provider, credentialId, updated);
+					const idx = this.#deps.pool.replaceById(provider, credentialId, updated, beforeRefresh);
 					if (idx === -1) preflightFailures.add(candidate);
 					else candidate.selection.index = idx;
 				} catch (error) {
@@ -788,6 +793,9 @@ export class CredentialSelector {
 							return;
 						}
 					} else {
+						recordTransientRefreshFailure(
+							error instanceof Error ? error : new Error(String(error), { cause: error }),
+						);
 						if (this.#syncOAuthSelectionForUse(provider, candidate.selection)) {
 							this.#deps.blocks.mark(
 								provider,
@@ -875,11 +883,13 @@ export class CredentialSelector {
 					rankingContext,
 					blockScope,
 					blockScopes,
+					onTransientRefreshFailure: recordTransientRefreshFailure,
 				});
 				if (resolved) return resolved;
 			}
 		}
 
+		if (transientRefreshFailure) throw new AIError.OAuthRefreshUnavailableError(provider, transientRefreshFailure);
 		return undefined;
 	}
 
@@ -992,30 +1002,20 @@ export class CredentialSelector {
 
 		try {
 			let result: { newCredentials: OAuthCredentials; apiKey: string } | null;
+			const expected = selection.credential;
+			const refreshedCredentials = await this.#deps.refresher.refresh(
+				provider,
+				selection.credential,
+				credentialId,
+				options?.signal,
+			);
 			const customProvider = getOAuthProvider(provider);
 			if (customProvider) {
-				const refreshedCredentials = await this.#deps.refresher.refresh(
-					provider,
-					selection.credential,
-					credentialId,
-					options?.signal,
-				);
 				const apiKey = customProvider.getApiKey
 					? customProvider.getApiKey(refreshedCredentials)
 					: refreshedCredentials.access;
 				result = { newCredentials: refreshedCredentials, apiKey };
 			} else {
-				// Refresh first through the broker-aware single-flighted machinery
-				// so transient failures surface as network errors (5-min temp block)
-				// instead of `getOAuthApiKey`'s "expired" precondition error, which
-				// the definitive-failure regex below would otherwise classify as
-				// auth failure and soft-disable a still-valid credential.
-				const refreshedCredentials = await this.#deps.refresher.refresh(
-					provider,
-					selection.credential,
-					credentialId,
-					options?.signal,
-				);
 				const oauthCreds: Record<string, OAuthCredentials> = {
 					[provider]: refreshedCredentials,
 				};
@@ -1024,9 +1024,9 @@ export class CredentialSelector {
 			if (!result) return undefined;
 			const updated = mergeRefreshedCredential(selection.credential, result.newCredentials);
 			if (!this.#syncOAuthSelectionForUse(provider, selection)) return undefined;
-			const idx = this.#deps.pool.replaceById(provider, credentialId, updated);
+			const idx = this.#deps.pool.replaceById(provider, credentialId, updated, expected);
 			if (idx === -1) return undefined;
-			selection.index = idx;
+			if (!this.#syncOAuthSelectionForUse(provider, selection)) return undefined;
 			if ((checkUsage && !allowBlocked) || hasPlanRequirement) {
 				const sameAccount = selection.credential.accountId === updated.accountId;
 				if (!usageChecked || !sameAccount) {
@@ -1091,6 +1091,9 @@ export class CredentialSelector {
 				}
 			} else {
 				// Block temporarily for transient failures (5 minutes)
+				usageOptions.onTransientRefreshFailure?.(
+					error instanceof Error ? error : new Error(String(error), { cause: error }),
+				);
 				if (!this.#syncOAuthSelectionForUse(provider, selection)) return undefined;
 				this.#deps.blocks.mark(
 					provider,

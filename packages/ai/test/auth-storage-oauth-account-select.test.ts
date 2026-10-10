@@ -154,10 +154,20 @@ describe("AuthStorage OAuth account selection", () => {
 		}
 	});
 
-	test("oauth.accessById refreshes only the durable requested row", async () => {
+	test("oauth.accessById force-refreshes only its row and reuses only an explicit recovery mint", async () => {
 		const storage = authStorage;
 		if (!storage) throw new Error("test setup failed");
 		const seen: string[] = [];
+		let mints = 0;
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
+			expect(credential.accountId).toBe("acc-b");
+			return {
+				...credential,
+				access: `mint-${++mints}`,
+				refresh: `refresh-mint-${mints}`,
+				expires: Date.now() + 60 * 60_000,
+			};
+		});
 		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
 			const credential = credentials[provider];
 			if (!credential) return null;
@@ -174,8 +184,22 @@ describe("AuthStorage OAuth account selection", () => {
 		if (!result?.ok) throw new Error("expected ok resolution");
 		expect(result.credentialId).toBe(target.credentialId);
 		expect(result.accountId).toBe("acc-b");
-		expect(result.accessToken).toBe("access-b");
-		expect(seen).toEqual(["access-b"]);
+		expect(result.accessToken).toBe("mint-1");
+		expect(seen).toEqual(["mint-1"]);
+		const recovery = await storage.oauth.accessById(PROVIDER, target.credentialId, {
+			forceRefresh: true,
+			refreshReason: "auth-recovery",
+		});
+		expect(recovery).toMatchObject({ ok: true, credentialId: target.credentialId, accessToken: "mint-1" });
+		expect(mints).toBe(1);
+		const explicit = await storage.oauth.accessById(PROVIDER, target.credentialId, { forceRefresh: true });
+		expect(explicit).toMatchObject({ ok: true, credentialId: target.credentialId, accessToken: "mint-2" });
+		expect(mints).toBe(2);
+		expect(await storage.oauth.accessById(PROVIDER, target.credentialId)).toMatchObject({
+			ok: true,
+			accessToken: "mint-2",
+		});
+		expect(mints).toBe(2);
 	});
 
 	test("resolving the selected account by ID fails without touching siblings", async () => {

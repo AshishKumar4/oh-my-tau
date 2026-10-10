@@ -110,6 +110,10 @@ describe("AuthStorage OAuth refresh race", () => {
 
 	test("does not disable when peer rotates between pre-check and CAS disable", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
+			if (credential.refresh === "stale-refresh") throw new Error("invalid_grant: refresh token revoked");
+			return credential;
+		});
 
 		await authStorage.credentials.set("anthropic", [
 			{
@@ -176,6 +180,7 @@ describe("AuthStorage OAuth refresh race", () => {
 
 	test("still disables when the failure is real (no concurrent rotation)", async () => {
 		if (!authStorage) throw new Error("test setup failed");
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockRejectedValue(new Error("invalid_grant: refresh token revoked"));
 
 		// Single-process scenario: refresh genuinely fails and no peer updated the
 		// row. The credential should still be soft-deleted.
@@ -498,6 +503,79 @@ describe("AuthStorage OAuth refresh race", () => {
 			expect(persisted.access).toBe("access-from-peer");
 		}
 	});
+
+	test.each(["force", "usage"])(
+		"preserves a peer grant adopted after lease release through %s refresh",
+		async mode => {
+			if (!store) throw new Error("test setup failed");
+			const sharedStore = store;
+			const provider = "unit-post-lease-adopted";
+			const storage = new AuthStorage(sharedStore, {
+				usageProviderResolver: candidate =>
+					candidate === provider
+						? {
+								id: provider,
+								supports: () => true,
+								fetchUsage: async () => ({ provider, fetchedAt: Date.now(), limits: [] }),
+							}
+						: undefined,
+			});
+			oauthUtils.registerOAuthProvider({
+				id: provider,
+				name: "Lease fixture",
+				sourceId: "auth-storage-oauth-refresh-race-test",
+				async login() {
+					throw new Error("Login must not run");
+				},
+				async refreshToken(credential) {
+					return { ...credential, access: "our-access", refresh: "our-refresh", expires: Date.now() + 3_600_000 };
+				},
+			});
+			await storage.credentials.set(provider, {
+				type: "oauth",
+				access: "expired",
+				refresh: "original",
+				expires: Date.now() - 60_000,
+				accountId: "same-row",
+			});
+			const row = sharedStore.listAuthCredentials(provider)[0];
+			if (!row || row.credential.type !== "oauth") throw new Error("Expected fixture row");
+			const peer = {
+				...row.credential,
+				access: "peer-access",
+				refresh: "peer-refresh",
+				expires: Date.now() + 3_600_000,
+			};
+			const release = sharedStore.releaseCredentialRefreshLease?.bind(sharedStore);
+			if (!release) throw new Error("Expected lease support");
+			let reloaded: Promise<void> | undefined;
+			vi.spyOn(sharedStore, "releaseCredentialRefreshLease").mockImplementation((id, owner) => {
+				release(id, owner);
+				sharedStore.updateAuthCredential(id, peer);
+				reloaded = storage.credentials.reload();
+			});
+			if (mode === "force") {
+				const snapshot = await storage.oauth.refresh(row.id);
+				expect(snapshot.credential).toMatchObject({ access: "peer-access" });
+				expect(snapshot.credential).not.toHaveProperty("refresh", "peer-refresh");
+			} else {
+				const reports = await storage.usage.reports();
+				if (!reports) throw new Error("Expected fixture usage reports");
+				expect(reports.some(report => report.provider === provider)).toBe(true);
+			}
+			await reloaded;
+			expect(sharedStore.listAuthCredentials(provider)[0]?.credential).toMatchObject({
+				access: "peer-access",
+				refresh: "peer-refresh",
+				accountId: "same-row",
+			});
+			expect(await storage.oauth.accessById(provider, row.id)).toMatchObject({
+				ok: true,
+				accessToken: "peer-access",
+				credentialId: row.id,
+			});
+		},
+	);
 
 	test("returns the targeted OAuth row after a compare-and-set refresh loss", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");

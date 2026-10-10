@@ -1,5 +1,17 @@
 import { attach, create, Flag } from "./flags";
 
+/** Stored OAuth exists, but refreshing it failed temporarily. */
+export class OAuthRefreshUnavailableError extends Error {
+	readonly provider: string;
+
+	constructor(provider: string, cause: Error) {
+		super(`OAuth token refresh failed for provider ${provider}: ${cause.message}`, { cause });
+		this.name = "OAuthRefreshUnavailableError";
+		this.provider = provider;
+		attach(this, create(Flag.Transient));
+	}
+}
+
 /**
  * No API key / credential was available to dispatch a request.
  *

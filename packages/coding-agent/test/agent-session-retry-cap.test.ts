@@ -12,6 +12,7 @@ import type {
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import { resolveApiKeyOnce } from "@oh-my-pi/pi-ai/auth-retry";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createMockModel, type MockResponse, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import * as aiStream from "@oh-my-pi/pi-ai/stream";
@@ -120,6 +121,62 @@ describe("AgentSession retry delay cap", () => {
 	afterAll(() => {
 		authStorage.close();
 		tempDir.removeSync();
+	});
+
+	it("recovers a transient OAuth refresh failure through the normal request retry loop", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected test model");
+		let refreshes = 0;
+		const storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
+			usageProviderResolver: () => undefined,
+			rankingStrategyResolver: () => undefined,
+			refreshOAuthCredential: async (_provider, _id, credential) => {
+				if (++refreshes === 1) throw new Error("fetch failed: ECONNRESET");
+				return {
+					...credential,
+					access: "recovered-access",
+					refresh: "recovered-refresh",
+					expires: Date.now() + 3_600_000,
+				};
+			},
+		});
+		try {
+			await storage.credentials.set("anthropic", {
+				type: "oauth",
+				access: "expired",
+				refresh: "stored",
+				expires: Date.now() - 60_000,
+				accountId: "stable-account",
+			});
+			const registry = new ModelRegistry(storage, path.join(tempDir.path(), "models.yml"));
+			const mock = createMockModel();
+			const keys: string[] = [];
+			const agent = new Agent({
+				getApiKey: request => registry.resolver(request, agent.sessionId),
+				initialState: { model, systemPrompt: ["Test"], messages: [], tools: [] },
+				streamFn: async (request, context, options) => {
+					const key = await resolveApiKeyOnce(options?.apiKey, options?.signal);
+					if (!key) throw new Error("Expected configured OAuth access");
+					keys.push(key);
+					mock.push({ content: ["Recovered"] });
+					return mock.stream(request, context, options);
+				},
+			});
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				modelRegistry: registry,
+				settings: Settings.isolated({ "compaction.enabled": false, "retry.baseDelayMs": 5, "retry.maxRetries": 2 }),
+			});
+			await session.prompt("Continue after a temporary refresh failure");
+			await session.waitForIdle();
+			expect(lastAssistant(session).stopReason).toBe("stop");
+			expect(keys).toEqual(["recovered-access"]);
+			expect(refreshes).toBe(2);
+			expect(storage.oauth.accounts("anthropic").map(account => account.accountId)).toEqual(["stable-account"]);
+		} finally {
+			storage.close();
+		}
 	});
 
 	it("bails immediately when retry-after exceeds retry.maxDelayMs", async () => {

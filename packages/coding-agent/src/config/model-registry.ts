@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { OAuthRefreshUnavailableError } from "@oh-my-pi/pi-ai/error";
 import type { ApiKeyResolver, FetchImpl, ResolvedApiKey, UsageProvider } from "@oh-my-pi/pi-ai";
 import type { AuthApiKeyOptions } from "@oh-my-pi/pi-ai/auth-storage";
 import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
@@ -2967,7 +2968,12 @@ export class ModelRegistry {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<string | undefined> {
-		return (await this.getApiKeyWithCredentialForProvider(provider, sessionId, options))?.apiKey;
+		try {
+			return (await this.getApiKeyWithCredentialForProvider(provider, sessionId, options))?.apiKey;
+		} catch (error) {
+			if (error instanceof OAuthRefreshUnavailableError) return undefined;
+			throw error;
+		}
 	}
 
 	async getApiKeyWithCredentialForProvider(

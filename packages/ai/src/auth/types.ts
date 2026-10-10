@@ -999,6 +999,7 @@ export interface OAuthRefreshByIdOptions {
 	 * refresh tokens repeatedly when a provider rejects every valid bearer.
 	 */
 	reuseRecentMint?: boolean;
+	reason?: OAuthRefreshReason;
 }
 
 /** OAuth login, access, account identity, and refresh operations. */

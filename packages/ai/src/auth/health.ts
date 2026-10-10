@@ -348,7 +348,7 @@ export class CredentialHealth implements HealthApi {
 						const refreshedCredential = mergeRefreshedUsageCredential(initialRequest.credential, refreshed);
 						this.#deps.usage.persistRefreshedCredential(
 							row.provider as Provider,
-							initialRequest.credential,
+							cred,
 							refreshedCredential,
 							row.id,
 						);

@@ -1,6 +1,7 @@
 import type { AgentOptions } from "@oh-my-pi/pi-agent-core";
 import type { OAuthAccessResolution } from "@oh-my-pi/pi-ai";
 import type { ApiKeyResolver } from "@oh-my-pi/pi-ai/auth-retry";
+import type { AuthApiKeyOptions } from "@oh-my-pi/pi-ai/auth-storage";
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
 import type { AuthStorage } from "../session/auth-storage";
 import type { SecurityAccountRef, SecurityAuthRef } from "./contracts";
@@ -117,7 +118,7 @@ export function selectSecurityAuth(
 export async function resolveExactSecurityOAuthAccess(
 	authStorage: AuthStorage,
 	account: SecurityAccountRef,
-	options: { forceRefresh: boolean; signal?: AbortSignal },
+	options: { forceRefresh: boolean; signal?: AbortSignal; refreshReason?: AuthApiKeyOptions["refreshReason"] },
 ): Promise<Extract<OAuthAccessResolution, { ok: true }>> {
 	const resolution = await authStorage.oauth.accessById(account.provider, account.credentialId, options);
 	if (!resolution) throw new Error("The pinned security OAuth credential is unavailable");
@@ -145,6 +146,7 @@ export function createExactSecurityOAuthResolver(
 			if (context.lastChance) return undefined;
 			const resolution = await resolveExactSecurityOAuthAccess(authStorage, account, {
 				forceRefresh: context.error !== undefined,
+				refreshReason: context.error !== undefined ? "auth-recovery" : undefined,
 				signal: context.signal,
 			});
 			return resolution.accessToken;

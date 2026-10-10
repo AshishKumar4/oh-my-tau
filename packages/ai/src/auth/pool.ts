@@ -473,11 +473,12 @@ export class CredentialPool implements CredentialsApi {
 	 *
 	 * Returns the row's current index, or -1 when it was disabled or removed.
 	 */
-	replaceById(provider: string, id: number, credential: AuthCredential): number {
+	replaceById(provider: string, id: number, credential: AuthCredential, expectedCredential?: AuthCredential): number {
 		const entries = this.entries(provider);
 		const index = entries.findIndex(entry => entry.id === id);
-		if (index === -1) return -1;
-		const expected = serializeCredential(provider, entries[index]!.credential);
+		const current = entries[index];
+		if (!current) return -1;
+		const expected = serializeCredential(provider, expectedCredential ?? current.credential);
 		if (
 			expected &&
 			this.#store.tryUpdateAuthCredentialIfMatches &&
