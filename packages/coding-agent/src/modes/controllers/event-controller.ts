@@ -535,13 +535,15 @@ export class EventController {
 	}
 
 	#retractToolCardEntry(toolCallId: string, component: ToolExecutionHandle): void {
-		component.seal();
 		let removeComponent = true;
 		if (component instanceof ReadToolGroupComponent) {
 			removeComponent = component.removeEntry(toolCallId);
-			if (component === this.#lastReadGroup) this.#resetReadGroup();
+			if (removeComponent && component === this.#lastReadGroup) this.#resetReadGroup();
 		}
-		if (removeComponent) this.ctx.chatContainer.removeChild(component);
+		if (removeComponent) {
+			component.seal();
+			this.ctx.chatContainer.removeChild(component);
+		}
 		this.ctx.pendingTools.delete(toolCallId);
 		this.#toolTimelineComponents.delete(toolCallId);
 		this.#clearReadToolCall(toolCallId);
@@ -563,11 +565,17 @@ export class EventController {
 		if (pending && !this.ctx.pendingTools.has(newId)) {
 			this.ctx.pendingTools.delete(oldId);
 			this.ctx.pendingTools.set(newId, pending);
+			if (pending instanceof ToolExecutionComponent) pending.renameToolCall(newId);
 		}
 		const timeline = this.#toolTimelineComponents.get(oldId);
 		if (timeline && !this.#toolTimelineComponents.has(newId)) {
 			this.#toolTimelineComponents.delete(oldId);
 			this.#toolTimelineComponents.set(newId, timeline);
+		}
+		const preview = this.#pendingStreamPreviews.get(oldId);
+		if (preview !== undefined && !this.#pendingStreamPreviews.has(newId)) {
+			this.#pendingStreamPreviews.delete(oldId);
+			this.#pendingStreamPreviews.set(newId, preview);
 		}
 		// The reveal controller is id-keyed; drop the stale target so the loop's
 		// setTarget/bind under the new id owns the paced reveal.
@@ -592,6 +600,45 @@ export class EventController {
 		// by `oldId`. Consume it now that the card owns the final id; the normal
 		// creation path is skipped on a re-key (Codex review on #6881).
 		if (pending) this.#settleHeldCompletionIfPresent(newId, pending);
+	}
+
+	/** A shared streaming card stays with its last owner when finalized IDs split. */
+	#reconcileStreamedToolCallIds(content: AssistantMessage["content"]): void {
+		const finalCounts = new Map<string, number>();
+		const streamedCounts = new Map<string, number>();
+		const keepers = new Map<string, Extract<AssistantMessage["content"][number], { type: "toolCall" }>>();
+		for (const [index, block] of content.entries()) {
+			if (block.type !== "toolCall") continue;
+			finalCounts.set(block.id, (finalCounts.get(block.id) ?? 0) + 1);
+			keepers.set(block.id, block);
+			const prior = this.#streamedToolCallIdByIndex.get(index);
+			if (prior !== undefined) streamedCounts.set(prior, (streamedCounts.get(prior) ?? 0) + 1);
+		}
+		for (const [index, block] of content.entries()) {
+			if (block.type !== "toolCall") continue;
+			const prior = this.#streamedToolCallIdByIndex.get(index);
+			if (prior !== undefined && prior !== block.id) {
+				streamedCounts.set(prior, (streamedCounts.get(prior) ?? 1) - 1);
+				streamedCounts.set(block.id, (streamedCounts.get(block.id) ?? 0) + 1);
+				const staysOwned = (finalCounts.get(prior) ?? 0) > 0 || (streamedCounts.get(prior) ?? 0) > 0;
+				const owner = staysOwned ? keepers.get(prior) : block;
+				const card = this.ctx.pendingTools.get(prior);
+				if (owner && card) {
+					const name = toolRenderName(owner.name, this.ctx.viewSession.getToolByName(owner.name));
+					const readGroup = name === "read" && readArgsCollapseIntoGroup(owner.arguments);
+					const incompatible =
+						card instanceof ReadToolGroupComponent
+							? !readGroup
+							: card instanceof ToolExecutionComponent && (card.toolName !== name || readGroup);
+					if (incompatible) {
+						this.#retractToolCardEntry(prior, card);
+						this.#pendingStreamPreviews.delete(prior);
+					} else if (staysOwned) card.updateArgs(owner.arguments, prior);
+				}
+				if (!staysOwned) this.#migrateStreamedToolCallId(prior, block.id);
+			}
+			this.#streamedToolCallIdByIndex.set(index, block.id);
+		}
 	}
 
 	#inlineReadToolImages(
@@ -1394,17 +1441,10 @@ export class EventController {
 				this.ctx.streamingComponent.setLinkTargets(assistantMessageLinkTargets(timeline.beforeTools, linkTargets));
 				this.ctx.streamingComponent.markTranscriptBlockFinalized();
 			}
+			this.#reconcileStreamedToolCallIds(this.ctx.streamingMessage.content);
 			for (let contentIndex = 0; contentIndex < this.ctx.streamingMessage.content.length; contentIndex++) {
 				const content = this.ctx.streamingMessage.content[contentIndex]!;
 				if (content.type !== "toolCall") continue;
-				// Re-key the live card when a provider rewrites this block's id
-				// across deltas, so the changed id reuses the existing card
-				// instead of spawning a duplicate (#6879).
-				const priorId = this.#streamedToolCallIdByIndex.get(contentIndex);
-				if (priorId !== undefined && priorId !== content.id) {
-					this.#migrateStreamedToolCallId(priorId, content.id);
-				}
-				this.#streamedToolCallIdByIndex.set(contentIndex, content.id);
 				const tool = this.ctx.viewSession.getToolByName(content.name);
 				const renderToolName = toolRenderName(content.name, tool);
 				if (renderToolName === "read") {
@@ -1611,6 +1651,7 @@ export class EventController {
 					assistantMessageLinkTargets(displayTimeline.beforeTools, linkTargets),
 				);
 			}
+			this.#reconcileStreamedToolCallIds(this.ctx.streamingMessage.content);
 			this.ctx.streamingComponent.updateContent(displayTimeline.beforeTools);
 
 			if (this.ctx.streamingMessage.stopReason !== "aborted" && this.ctx.streamingMessage.stopReason !== "error") {

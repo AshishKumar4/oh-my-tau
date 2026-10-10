@@ -40,6 +40,27 @@ export const kStreamingEnvelopeId = Symbol("provider.block.envelopeId");
 /** Marks streamed tool-call arguments that already received an authoritative done payload. */
 export const kStreamingArgumentsDone = Symbol("provider.block.argumentsDone");
 
+/** Exact output-array slot established by the provider's stream-item router. Never persisted as model input. */
+export const kResponsesReplayItem = Symbol("provider.block.responsesReplayItem");
+export interface ResponsesReplayItemLocator {
+	readonly index: number;
+	readonly type: "function_call" | "custom_tool_call" | "computer_call";
+	readonly callId: string;
+	readonly itemId?: string;
+}
+export type ResponsesReplayItemCarrier = object & { [kResponsesReplayItem]?: ResponsesReplayItemLocator };
+
+export function bindResponsesReplayItem(block: ResponsesReplayItemCarrier, index: number, item: object): void {
+	if (!("type" in item) || !("call_id" in item) || typeof item.call_id !== "string") return;
+	if (item.type !== "function_call" && item.type !== "custom_tool_call" && item.type !== "computer_call") return;
+	block[kResponsesReplayItem] = {
+		index,
+		type: item.type,
+		callId: item.call_id,
+		itemId: "id" in item && typeof item.id === "string" ? item.id : undefined,
+	};
+}
+
 /** Classifies Cursor's in-flight tool-call kind without leaking provider-private state. */
 export const kStreamingBlockKind = Symbol("provider.block.kind");
 

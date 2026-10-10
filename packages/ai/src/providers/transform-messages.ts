@@ -31,7 +31,7 @@ const enum ToolCallStatus {
  * `convertAnthropicMessages` (and friends) unchanged, so the `_dupN` suffix
  * MUST not push a normalized id past this bound.
  */
-const MAX_TOOL_CALL_ID_LENGTH = 64;
+export const MAX_TOOL_CALL_ID_LENGTH = 64;
 
 /**
  * OpenAI Responses-family APIs mint composite tool ids (`call_id|item_id`);
@@ -39,7 +39,7 @@ const MAX_TOOL_CALL_ID_LENGTH = 64;
  * ids verbatim as provider correlation tokens), so ONLY these origins may be
  * canonicalized to their `call_` component for pairing.
  */
-function isResponsesFamilyApi(api: Api | undefined): boolean {
+export function isResponsesFamilyApi(api: Api | undefined): boolean {
 	return api === "openai-responses" || api === "openai-codex-responses" || api === "azure-openai-responses";
 }
 
@@ -49,7 +49,7 @@ function isResponsesFamilyApi(api: Api | undefined): boolean {
  * index 0) keeps its full id so unrelated empty-half ids never collapse onto
  * one empty-string bucket.
  */
-function responsesCallComponent(id: string): string {
+export function responsesCallComponent(id: string): string {
 	const pipe = id.indexOf("|");
 	return pipe <= 0 ? id : id.slice(0, pipe);
 }
@@ -131,7 +131,7 @@ function toolCallPairingKey(id: string, originScope: ToolCallOriginScope): strin
 	return originScope.responsesComponents.has(prefix) ? prefix : id;
 }
 
-function appendDuplicateSuffix(originalId: string, suffix: string, maxLength: number): string {
+export function appendDuplicateSuffix(originalId: string, suffix: string, maxLength: number): string {
 	// Responses-family ids are composites (`callId|itemId`): the wire call_id is
 	// the FIRST segment (normalizeResponsesToolCallId splits on `|`), so the
 	// suffix must land on every segment or the duplicate collapses back onto the

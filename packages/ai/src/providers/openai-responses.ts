@@ -3,6 +3,7 @@ import { $flag, logger, type ServerSentEvent, structuredCloneJSON } from "@oh-my
 import * as AIError from "../error";
 import { getEnvApiKey } from "../stream";
 import { parseServiceTier } from "../types";
+import { bindResponsesReplayItem } from "../utils/block-symbols";
 import type {
 	AssistantMessage,
 	CacheRetention,
@@ -823,7 +824,8 @@ const streamOpenAIResponsesOnce = (
 						onFirstToken: () => {
 							if (!firstTokenTime) firstTokenTime = performance.now();
 						},
-						onOutputItemDone: item => {
+						onOutputItemDone: (item, toolCall) => {
+							if (toolCall) bindResponsesReplayItem(toolCall, nativeOutputItems.length, item);
 							// `processResponsesStream` hands over a private clone already; no
 							// second deep copy needed (reasoning items carry multi-KB blobs).
 							nativeOutputItems.push(item as unknown as Record<string, unknown>);

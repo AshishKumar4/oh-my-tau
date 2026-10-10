@@ -3005,7 +3005,7 @@ function getOpenAIResponsesTerminalEvent(event: ResponseStreamEvent): OpenAIResp
 
 export interface ProcessResponsesStreamOptions {
 	onFirstToken?: () => void;
-	onOutputItemDone?: (item: ResponseOutputItem) => void;
+	onOutputItemDone?: (item: ResponseOutputItem, toolCall?: ToolCall) => void;
 	/**
 	 * Called when a terminal `response.completed`, `response.incomplete`, or
 	 * `response.done` event is successfully processed. Only invoked on the
@@ -3492,6 +3492,7 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.output_item.done") {
 			const item = structuredCloneJSON(event.item);
+			let finalizedToolCall: ToolCall | undefined;
 			const entry =
 				item.type === "function_call" || item.type === "custom_tool_call"
 					? lookupOpenItem({ output_index: event.output_index, item_id: item.id ?? item.call_id })
@@ -3556,6 +3557,7 @@ export async function processResponsesStream<TApi extends Api>(
 					// throttled delta parser may have skipped the last partial parse,
 					// leaving block.arguments stale (often `{}`); the emitted toolCall
 					// and the persisted block must agree.
+					block.id = toolCall.id;
 					block.arguments = args;
 					clearStreamingPartialJson(block);
 					contentIndex = contentIndexOf(block);
@@ -3567,6 +3569,7 @@ export async function processResponsesStream<TApi extends Api>(
 					contentIndex = output.content.length - 1;
 				}
 				closeOpenItem(event.output_index, item.id, entry, item.call_id, prefixedFunctionCallItemKey(item.call_id));
+				finalizedToolCall = block ?? toolCall;
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			} else if (item.type === "computer_call") {
 				const block = entry?.block.type === "toolCall" ? entry.block : undefined;
@@ -3588,6 +3591,7 @@ export async function processResponsesStream<TApi extends Api>(
 					contentIndex = output.content.length - 1;
 				}
 				closeOpenItem(event.output_index, item.id, entry, item.call_id);
+				finalizedToolCall = block ?? toolCall;
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			} else if (item.type === "custom_tool_call") {
 				const block = entry?.block.type === "toolCall" ? entry.block : undefined;
@@ -3608,6 +3612,7 @@ export async function processResponsesStream<TApi extends Api>(
 				if (block) {
 					// Persist the final input on the stored block and drop the transient
 					// accumulation buffer, mirroring the function_call branch above.
+					block.id = toolCall.id;
 					block.arguments = { input: rawInput };
 					clearStreamingPartialJson(block);
 					contentIndex = contentIndexOf(block);
@@ -3616,6 +3621,7 @@ export async function processResponsesStream<TApi extends Api>(
 					contentIndex = output.content.length - 1;
 				}
 				closeOpenItem(event.output_index, item.id, entry, item.call_id, prefixedFunctionCallItemKey(item.call_id));
+				finalizedToolCall = block ?? toolCall;
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			} else if (item.type === "web_search_call" && (item.status === undefined || item.status === "completed")) {
 				// A completed provider-hosted web search is progress evidence even when
@@ -3624,7 +3630,7 @@ export async function processResponsesStream<TApi extends Api>(
 			} else if (item.type === "image_generation_call" && item.status === "completed" && item.result) {
 				appendResponsesImageResult(output, stream, item.result);
 			}
-			options?.onOutputItemDone?.(item);
+			options?.onOutputItemDone?.(item, finalizedToolCall);
 		} else if (terminalEvent) {
 			const response = terminalEvent.response;
 			const shouldPromoteIncompleteToolUse =

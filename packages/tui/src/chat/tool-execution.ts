@@ -384,7 +384,7 @@ export class ToolExecutionComponent extends Container {
 	#executionStartedAtNow: number | undefined;
 	// When the call settled (final result or seal), same clock; freezes the native elapsed timer.
 	#executionEndedAtNow: number | undefined;
-	readonly #toolCallId: string | undefined;
+	#toolCallId: string | undefined;
 	readonly #native = new Memo();
 	// LSP diagnostics that arrived after the result (native only), shown in the frame.
 	#lateDiagnostics: readonly FileDiagnosticsResult[] | undefined;
@@ -455,6 +455,15 @@ export class ToolExecutionComponent extends Container {
 
 		this.#updateSpinnerAnimation();
 		this.#updateDisplay();
+	}
+
+	renameToolCall(id: string): void {
+		this.#toolCallId = id;
+		this.invalidate();
+	}
+
+	get toolName(): string {
+		return this.#toolName;
 	}
 
 	updateArgs(args: unknown, _toolCallId?: string): void {
@@ -913,6 +922,7 @@ export class ToolExecutionComponent extends Container {
 		if (this.#toolName === "wait" && this.#isBenignSkip()) return EMPTY_NODE;
 		const dataFirst = cx?.supports("tool") === true;
 		const key = [
+			this.#toolCallId,
 			dataFirst,
 			this.#resultVersion,
 			this.#expanded,

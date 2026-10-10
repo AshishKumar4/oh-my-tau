@@ -3,6 +3,7 @@
  * Transforms to Message[] only at the LLM call boundary.
  */
 import {
+	type Api,
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type ApiKeyResolution,
@@ -17,6 +18,7 @@ import {
 	streamSimple,
 	stripSchemaDescriptions,
 	type ToolCallProviderMetadata,
+	type ToolCall,
 	type ToolChoice,
 	type ToolResultMessage,
 	type ToolResultProviderMetadata,
@@ -33,6 +35,15 @@ import {
 	wrapInbandToolStream,
 } from "@oh-my-pi/pi-ai/dialect";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { mintToolCallId } from "@oh-my-pi/pi-ai/dialect";
+import {
+	appendDuplicateSuffix,
+	isResponsesFamilyApi,
+	responsesCallComponent,
+	MAX_TOOL_CALL_ID_LENGTH,
+} from "@oh-my-pi/pi-ai/providers/transform-messages";
+import { repairResponsesHistoryCallIds } from "@oh-my-pi/pi-ai/utils";
+import { isCursorExecResolved, type ResponsesReplayItemCarrier } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import {
 	type CursorExecResolvedCarrier,
 	copyCursorExecResolved,
@@ -622,6 +633,7 @@ export function agentLoop(
 				...context,
 				messages: [...context.messages, ...prompts],
 			};
+			initializeToolCallIds(currentContext);
 			for (const prompt of prompts) {
 				(prompt as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
 			}
@@ -688,6 +700,7 @@ export function agentLoopContinue(
 		try {
 			const newMessages: AgentMessage[] = [];
 			const currentContext: AgentContext = { ...context, messages: [...context.messages] };
+			initializeToolCallIds(currentContext, unpairedToolCallTail(currentContext.messages));
 
 			stream.push({ type: "agent_start" });
 
@@ -1490,6 +1503,7 @@ async function runLoopBody(
 					}
 				}
 				if (recovered) {
+					ensureUniqueToolCallIds(message, currentContext);
 					message = snapshotAssistantMessage(message);
 					currentContext.messages.push(message);
 					stream.push({ type: "message_start", message: snapshotAssistantMessage(message) });
@@ -2906,16 +2920,65 @@ function formatToolNotFoundMessage(
 	return `Tool ${name} not found. Closest available: ${suggestions.slice(0, MAX_TOOL_NAME_SUGGESTIONS).join(", ")}`;
 }
 
-/**
- * Pre-dispatch phase for every pending tool call on `assistantMessage`, run in
- * call order: intent extraction, argument validation, and the `beforeToolCall`
- * hook. A hook `args` revision is revalidated against the tool schema and
- * written back to `toolCall.arguments`; run before `message_start`/`message_end`
- * (the streamed path) that makes the revision the single source of truth —
- * history, execution events, persistence, provider replay, concurrency
- * scheduling, and `tool.execute` all agree. Failures are recorded per call and
- * surfaced by `executeToolCalls` at the record's scheduled slot.
- */
+const kToolCallIdsRepaired = Symbol("agent-loop.toolCallIdsRepaired");
+type RepairedCallsMessage = AssistantMessage & { [kToolCallIdsRepaired]?: true };
+const dispatchedIdsByContext = new WeakMap<AgentContext, Set<string>>();
+
+function callIdentity(id: string, api: Api): string {
+	return isResponsesFamilyApi(api) ? responsesCallComponent(id) : id;
+}
+
+function initializeToolCallIds(context: AgentContext, resumeTail?: AssistantMessage): void {
+	const ids = new Set<string>();
+	for (const message of context.messages) {
+		if (message.role !== "assistant" || message === resumeTail) continue;
+		for (const block of message.content)
+			if (block.type === "toolCall" && block.id.trim()) ids.add(callIdentity(block.id, message.api));
+	}
+	dispatchedIdsByContext.set(context, ids);
+}
+
+/** Dispatch and native replay must agree before any finalized message is persisted. */
+function ensureUniqueToolCallIds(message: RepairedCallsMessage, context: AgentContext): void {
+	const used = dispatchedIdsByContext.get(context);
+	if (!used) throw new Error("Tool-call identity registry was not initialized for this run");
+	const calls = message.content.filter(block => block.type === "toolCall");
+	if (message[kToolCallIdsRepaired]) {
+		for (const call of calls) used.add(callIdentity(call.id, message.api));
+		return;
+	}
+	for (const call of calls) if (isCursorExecResolved(call)) used.add(callIdentity(call.id, message.api));
+	const reserved = new Set(calls.map(call => callIdentity(call.id, message.api)));
+	const repairs: Array<{ call: ToolCall & ResponsesReplayItemCarrier; id: string }> = [];
+	const claimed = new Set<string>();
+	for (const call of calls) {
+		const key = callIdentity(call.id, message.api);
+		if (isCursorExecResolved(call)) {
+			claimed.add(key);
+			continue;
+		}
+		const malformed = !call.id.trim() || (isResponsesFamilyApi(message.api) && call.id.startsWith("|"));
+		if (!malformed && !used.has(key) && !claimed.has(key)) {
+			claimed.add(key);
+			continue;
+		}
+		let suffix = 0;
+		let id: string;
+		let identity: string;
+		do {
+			id = malformed ? mintToolCallId() : appendDuplicateSuffix(call.id, `_dup${++suffix}`, MAX_TOOL_CALL_ID_LENGTH);
+			identity = callIdentity(id, message.api);
+		} while (used.has(identity) || claimed.has(identity) || reserved.has(identity));
+		repairs.push({ call, id });
+		claimed.add(identity);
+	}
+	repairResponsesHistoryCallIds(message, repairs);
+	for (const repair of repairs) repair.call.id = repair.id;
+	for (const id of claimed) used.add(id);
+	message[kToolCallIdsRepaired] = true;
+}
+
+/** Resolve IDs, tool arguments and hook revisions before persisting or executing a finalized call. */
 async function prepareToolCallDispatch(
 	assistantMessage: AssistantMessage,
 	context: AgentContext,
@@ -2923,6 +2986,7 @@ async function prepareToolCallDispatch(
 	signal: AbortSignal | undefined,
 ): Promise<Map<string, PreparedToolCall>> {
 	const { resolveFallbackTool, suggestFallbackToolNames, intentTracing, beforeToolCall } = config;
+	ensureUniqueToolCallIds(assistantMessage, context);
 	const prepared = new Map<string, PreparedToolCall>();
 	for (const toolCall of assistantMessage.content) {
 		if (toolCall.type !== "toolCall") continue;

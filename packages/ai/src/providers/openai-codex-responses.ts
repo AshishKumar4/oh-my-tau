@@ -28,6 +28,7 @@ import * as AIError from "../error";
 import { parseToolCallArguments, replayableToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey, isOfficialCodexApiUrl } from "../stream";
 import { getPremiumServiceTierRequests, parseServiceTier } from "../types";
+import { bindResponsesReplayItem } from "../utils/block-symbols";
 import type {
 	Api,
 	AssistantMessage,
@@ -862,6 +863,7 @@ class CodexStreamRuntime {
 	currentItem: CodexEventItem | null = null;
 	currentBlock: CodexOutputBlock | null = null;
 	nativeOutputItems: Array<Record<string, unknown>> = [];
+	unmatchedNativeToolCalls = new WeakMap<object, ToolCall>();
 	nativeOutputEntries: CodexOpenItem[] = [];
 	/** Sequential-cutoff summary sections/emitted text, global to the response (indices span reasoning items). */
 	cutoffSummaries: SequentialCutoffSummaryState = createSequentialCutoffSummaryState();
@@ -905,12 +907,19 @@ class CodexStreamRuntime {
 	}
 
 	finalizeNativeOutputItems(): Array<Record<string, unknown>> {
-		if (this.nativeOutputEntries.length === 0) return this.nativeOutputItems;
 		const ordered: Array<Record<string, unknown>> = [];
 		for (const entry of this.nativeOutputEntries) {
-			if (entry.nativeOutputItem) ordered.push(entry.nativeOutputItem);
+			if (entry.nativeOutputItem) {
+				if (entry.block?.type === "toolCall")
+					bindResponsesReplayItem(entry.block, ordered.length, entry.nativeOutputItem);
+				ordered.push(entry.nativeOutputItem);
+			}
 		}
-		ordered.push(...this.nativeOutputItems);
+		for (const item of this.nativeOutputItems) {
+			const block = this.unmatchedNativeToolCalls.get(item);
+			if (block) bindResponsesReplayItem(block, ordered.length, item);
+			ordered.push(item);
+		}
 		this.nativeOutputEntries.length = 0;
 		this.nativeOutputItems = ordered;
 		return ordered;
@@ -2792,7 +2801,10 @@ class CodexStreamProcessor {
 		// function/custom tool items omit `id`; in that case `output_index` still
 		// routes `output_item.done` to the block that received `output_item.added`.
 		const itemId = "id" in item && typeof item.id === "string" ? item.id : "";
-		const entry = (itemId ? runtime.openItems.get(itemId) : null) ?? runtime.openItemForEvent(rawEvent);
+		const byId = itemId ? runtime.openItems.get(itemId) : undefined;
+		const hasRoutingKey = typeof rawEvent.item_id === "string" || typeof rawEvent.output_index === "number";
+		const routed = itemId && !hasRoutingKey ? null : runtime.openItemForEvent(rawEvent);
+		const entry = byId ?? (routed?.item.type === item.type ? routed : null);
 		const nativeOutputItem = item as unknown as Record<string, unknown>;
 		if (entry) entry.nativeOutputItem = nativeOutputItem;
 		else runtime.nativeOutputItems.push(nativeOutputItem);
@@ -2849,6 +2861,7 @@ class CodexStreamProcessor {
 			if (block?.type === "toolCall") {
 				// Persist the authoritative final args on the stored block; the throttled
 				// delta parser may have left block.arguments stale (often `{}`).
+				block.id = toolCall.id;
 				block.arguments = toolCall.arguments;
 				clearStreamingPartialJson(block);
 			}
@@ -2876,6 +2889,7 @@ class CodexStreamProcessor {
 			} else {
 				output.content.push(toolCall);
 				resolvedContentIndex = output.content.length - 1;
+				runtime.unmatchedNativeToolCalls.set(nativeOutputItem, toolCall);
 			}
 			runtime.closeOpenItem(entry);
 			runtime.canSafelyReplayWebsocketOverSse = false;
@@ -2896,6 +2910,7 @@ class CodexStreamProcessor {
 				...(item.namespace ? { namespace: item.namespace } : {}),
 			};
 			if (block?.type === "toolCall") {
+				block.id = toolCall.id;
 				block.arguments = { input: rawInput };
 				clearStreamingPartialJson(block);
 			}
