@@ -8,6 +8,44 @@ use pi_edit::{ApplyRequest, EditError, EditMode, FileOp, UrlResolution, session:
 
 const SOURCE: &str = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n";
 
+#[cfg(unix)]
+#[tokio::test]
+async fn special_targets_and_aliases_fail_before_any_write() {
+	use std::os::unix::{fs::symlink, net::UnixListener};
+	let ws = Workspace::new(EditMode::Sloppy);
+	let fifo = ws.cwd().join("stream");
+	assert!(
+		std::process::Command::new("mkfifo")
+			.arg(&fifo)
+			.status()
+			.expect("mkfifo")
+			.success()
+	);
+	symlink(&fifo, ws.cwd().join("stream-link")).expect("FIFO alias");
+	let socket = UnixListener::bind(ws.cwd().join("socket")).expect("socket");
+	for target in ["stream", "stream-link", "socket"] {
+		let writer = DiskWriter::default();
+		let result = ws
+			.apply_json(&serde_json::json!({"input": sloppy_payload(target)}), &writer)
+			.await;
+		let error = result
+			.expect_err("special file must be rejected")
+			.to_string();
+		assert!(error.contains("not a regular file"), "{target}: {error}");
+		assert!(writer.requests.lock().is_empty());
+	}
+	drop(socket);
+	ws.write("regular.rs", SOURCE);
+	let writer = DiskWriter::default();
+	ws.apply_json(&serde_json::json!({"input": sloppy_payload("regular.rs")}), &writer)
+		.await
+		.expect("regular edit");
+	assert_eq!(
+		ws.read("regular.rs").expect("edited file"),
+		SOURCE.replace("let x = 1;", "let x = 2;")
+	);
+}
+
 fn sloppy_payload(path: &str) -> String {
 	format!("*** Edit File: {path}\n*** Find\n    let x = 1;\n*** Replace\n    let x = 2;\n")
 }

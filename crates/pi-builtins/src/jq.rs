@@ -750,24 +750,11 @@ mod read {
 
 	use super::{Cli, Val};
 
-	/// Load a file through the injected filesystem. Native files are memory
-	/// mapped when possible; everything else is read through the handle.
-	pub fn load_file(
-		fs: &BlockingFs,
-		path: &Path,
-	) -> io::Result<Box<dyn core::ops::Deref<Target = [u8]>>> {
-		let mut file = fs.open(path)?;
-		if let Some(native) = file.native()
-			// SAFETY: the mapping is read-only and dropped before any in-place
-			// replacement of the file; concurrent external truncation is the
-			// same hazard upstream jaq accepts.
-			&& let Ok(mmap) = unsafe { memmap2::Mmap::map(native) }
-		{
-			return Ok(Box::new(mmap));
-		}
+	/// Owned input prevents concurrent truncation from faulting the in-process host.
+	pub fn load_file(fs: &BlockingFs, path: &Path) -> io::Result<Vec<u8>> {
 		let mut bytes = Vec::new();
-		file.read_to_end(&mut bytes)?;
-		Ok(Box::new(bytes))
+		fs.open(path)?.read_to_end(&mut bytes)?;
+		Ok(bytes)
 	}
 
 	pub fn invalid_data(e: impl std::error::Error + Send + Sync + 'static) -> std::io::Error {
@@ -1464,6 +1451,20 @@ mod tests {
 	fn run_jq(args: &[&str], stdin: &str) -> (i32, String, String) {
 		let (code, capture) = run_util::<Jq>(args, stdin, ".");
 		(code, capture.out(), capture.err())
+	}
+
+	#[test]
+	fn loaded_json_survives_file_truncation() {
+		let directory = tempfile::tempdir().expect("fixture directory");
+		let path = directory.path().join("input.json");
+		let json = format!("[{}]", vec!["1"; 8192].join(","));
+		std::fs::write(&path, &json).expect("fixture input");
+		let loaded = super::read::load_file(&pi_vfs::BlockingFs::native(), &path).expect("load");
+		std::fs::File::options().write(true).open(&path).and_then(|file| file.set_len(0)).expect("truncate");
+		assert_eq!(&loaded[..], json.as_bytes());
+		let (exit, output, error) = run_jq(&["length"], std::str::from_utf8(&loaded).expect("fixture JSON"));
+		assert_eq!(exit, 0, "{error}");
+		assert_eq!(output, "8192\n");
 	}
 
 	#[test]

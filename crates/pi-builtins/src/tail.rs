@@ -939,10 +939,6 @@ mod chunks {
 			}
 			Ok(())
 		}
-	
-		pub fn has_data(&self) -> bool {
-			!self.chunks.is_empty()
-		}
 	}
 	
 	/// Works similar to a [`BytesChunk`] but also stores the number of lines
@@ -1328,7 +1324,7 @@ mod follow {
 		//! File handle management for `tail --follow`.
 		use std::{
 			collections::{HashMap, hash_map::Keys},
-			io::{BufReader, Write},
+			io::{BufRead, BufReader, Write},
 			path::{Path, PathBuf},
 		};
 		
@@ -1337,7 +1333,6 @@ mod follow {
 		use crate::tail::{
 			TailResult,
 			args::Settings,
-			chunks::BytesChunkBuffer,
 			paths::{HeaderPrinter, PathExtTail},
 			text,
 		};
@@ -1467,25 +1462,25 @@ mod follow {
 				verbose: bool,
 				writer: &mut impl Write,
 			) -> TailResult<bool> {
-				let mut chunks = BytesChunkBuffer::new(u64::MAX);
+				let Some(reader) = self.get_mut(path).reader.as_mut() else { return Ok(false); };
+				if reader.fill_buf()?.is_empty() { return Ok(false); }
+				if self.needs_header(path, verbose) {
+					let display_name = self.get(path).display_name.clone();
+					self.header_printer.print(display_name.as_str(), writer);
+				}
 				if let Some(reader) = self.get_mut(path).reader.as_mut() {
-					chunks.fill(reader)?;
-				}
-				if chunks.has_data() {
-					if self.needs_header(path, verbose) {
-						let display_name = self.get(path).display_name.clone();
-						self.header_printer.print(display_name.as_str(), writer);
+					loop {
+						let buffer = reader.fill_buf()?;
+						if buffer.is_empty() { break; }
+						writer.write_all(buffer).map_err(crate::tail::map_output_error)?;
+						let length = buffer.len();
+						reader.consume(length);
 					}
-		
-					chunks.print(writer).map_err(crate::tail::map_output_error)?;
-					writer.flush().map_err(crate::tail::map_output_error)?;
-		
-					self.last.replace(path.to_owned());
-					self.update_metadata(path, None);
-					Ok(true)
-				} else {
-					Ok(false)
 				}
+				writer.flush().map_err(crate::tail::map_output_error)?;
+				self.last.replace(path.to_owned());
+				self.update_metadata(path, None);
+				Ok(true)
 			}
 		
 			/// Decide if printing `path` needs a header based on when it was last
@@ -1558,8 +1553,6 @@ mod follow {
 		};
 		
 		use notify::{RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
-		#[cfg(target_os = "linux")]
-		use uucore::signals::ensure_stdout_not_broken;
 		use uucore::display::Quotable;
 		
 		use brush_core::openfiles::OpenFile;
@@ -2269,8 +2262,19 @@ mod follow {
 			}
 		}
 		
+		/// Poll the command-owned pipe, never the hosting process's stdout.
+		#[cfg(unix)]
+		fn stdout_reader_gone(stdout: &OpenFile) -> bool {
+			use nix::{poll::{PollFd, PollFlags, PollTimeout, poll}, sys::stat::{SFlag, fstat}};
+			let Ok(fd) = stdout.try_borrow_as_fd() else { return false; };
+			if !fstat(fd).is_ok_and(|stat| SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT == SFlag::S_IFIFO) { return false; }
+			let mut fds = [PollFd::new(fd, PollFlags::POLLRDBAND)];
+			matches!(poll(&mut fds, PollTimeout::ZERO), Ok(count) if count > 0)
+				&& fds[0].revents().is_none_or(|events| events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL))
+		}
+
 		#[allow(clippy::cognitive_complexity, reason = "preserves upstream follow loop")]
-		pub fn follow(mut observer: Observer, settings: &Settings) -> TailResult<()> {
+		pub fn follow(mut observer: Observer, settings: &Settings, #[cfg(unix)] stdout: &OpenFile) -> TailResult<()> {
 			if observer.files.no_files_remaining(settings) && !observer.files.only_stdin_remaining() {
 				return Err(TailError::message("no files remaining".to_string()));
 			}
@@ -2322,10 +2326,10 @@ mod follow {
 				if observer.watcher_rx.is_none() {
 					// No kernel watcher observes these operands: inspect them
 					// through the provider, sleeping only after an idle pass.
-					if !observer.poll_provider(settings)?
-						&& !sleep_interval(&observer.cancel, settings.sleep_sec)
-					{
-						break;
+					if !observer.poll_provider(settings)? {
+						#[cfg(unix)]
+						if stdout_reader_gone(stdout) { return Ok(()); }
+						if !sleep_interval(&observer.cancel, settings.sleep_sec) { break; }
 					}
 					continue;
 				}
@@ -2369,18 +2373,9 @@ mod follow {
 					Ok(Ok(event)) => {
 						process_event(&mut observer, event, settings, &mut paths)?;
 		
-						// Drain any additional pending events to batch them together.
-						// This prevents redundant headers when multiple inotify events
-						// are queued (e.g., after resuming from SIGSTOP).
-						// Multiple iterations with spin_loop hints give the notify
-						// background thread chances to deliver pending events.
-						for _ in 0..100 {
-							while let Ok(Ok(event)) = observer.watcher_rx.as_mut().unwrap().receiver.try_recv() {
-								process_event(&mut observer, event, settings, &mut paths)?;
-							}
-							// Use both yield and spin hint for broader CPU support
-							std::thread::yield_now();
-							std::hint::spin_loop();
+						// Coalesce already-queued events without delaying later output in a spin loop.
+						while let Ok(Ok(event)) = observer.watcher_rx.as_mut().unwrap().receiver.try_recv() {
+							process_event(&mut observer, event, settings, &mut paths)?;
 						}
 					},
 					Ok(Err(notify::Error { kind: notify::ErrorKind::Io(e), paths }))
@@ -2405,9 +2400,8 @@ mod follow {
 					},
 					Err(mpsc::RecvTimeoutError::Timeout) => {
 						timeout_counter += 1;
-						// Check if stdout pipe is still open
-						#[cfg(target_os = "linux")]
-						if let Ok(false) = ensure_stdout_not_broken() {
+						#[cfg(unix)]
+						if stdout_reader_gone(stdout) {
 							return Ok(());
 						}
 					},
@@ -3393,7 +3387,7 @@ fn uu_tail(settings: &Settings, host: &mut Host) -> TailResult<()> {
 		the input file is not a FIFO, pipe, or regular file, it is unspecified whether or
 		not the -f option shall be ignored.
 		*/
-		follow::follow(observer, settings)?;
+		follow::follow(observer, settings, #[cfg(unix)] &host.stdout)?;
 	}
 
 	Ok(())
@@ -3994,6 +3988,29 @@ mod tests {
 	fn test_forwards_thru_file_zero() {
 		let mut reader = Cursor::new("a\n");
 		assert_eq!(forwards_thru_file(&mut reader, 0, b'\n').unwrap(), 0);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn follow_releases_the_command_after_its_reader_exits() {
+		let directory = tempfile::tempdir().expect("fixture directory");
+		let file = directory.path().join("events.log");
+		fs::write(&file, "ready\n").expect("fixture log");
+		let parsed = Tail::try_parse_from(["tail", "-f", file.to_str().expect("fixture path")]).expect("parse tail");
+		let (mut host, _) = Host::for_test("tail", "", directory.path());
+		let (mut reader, writer) = std::io::pipe().expect("pipe");
+		host.stdout = brush_core::openfiles::OpenFile::from(writer);
+		let cancel = host.cancel_flag();
+		let (done, completion) = std::sync::mpsc::channel();
+		let worker = std::thread::spawn(move || { let exit = parsed.run(&mut host); let _ = done.send(exit); });
+		let mut first = [0; 6];
+		std::io::Read::read_exact(&mut reader, &mut first).expect("initial output");
+		assert_eq!(&first, b"ready\n");
+		drop(reader);
+		let result = completion.recv_timeout(std::time::Duration::from_secs(5));
+		cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+		worker.join().expect("tail thread");
+		assert_eq!(result.expect("tail must finish without another log write"), 0);
 	}
 
 	#[test]

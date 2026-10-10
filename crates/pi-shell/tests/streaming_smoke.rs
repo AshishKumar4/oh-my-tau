@@ -7,8 +7,57 @@ use std::time::{Duration, Instant};
 
 use pi_shell::{
 	cancel::CancelToken,
-	shell::{ShellExecuteOptions, execute_shell},
+	minimizer::MinimizerOptions,
+	shell::{ShellExecuteOptions, ShellRunResult, execute_shell},
 };
+
+#[tokio::test]
+async fn minimized_jq_preserves_the_failure_after_valid_output() {
+	async fn run(command: &str, cwd: Option<String>) -> (ShellRunResult, String) {
+		let (tx, rx) = flume::unbounded::<String>();
+		let collector = tokio::spawn(async move {
+			let mut output = String::new();
+			while let Ok(chunk) = rx.recv_async().await {
+				output.push_str(&chunk);
+			}
+			output
+		});
+		let result = execute_shell(
+			ShellExecuteOptions {
+				command: command.to_owned(),
+				cwd,
+				minimizer: Some(MinimizerOptions { enabled: Some(true), ..Default::default() }),
+				..Default::default()
+			},
+			Some(tx),
+			CancelToken::new(None),
+		)
+		.await
+		.expect("shell request");
+		(result, collector.await.expect("output collector"))
+	}
+	let source = (0..100)
+		.map(|index| format!("{{\"value\":{index}}}\n"))
+		.collect::<String>()
+		+ "not valid json\n";
+	let directory = tempfile::tempdir().expect("fixture directory");
+	std::fs::write(directory.path().join("rows.json"), source).expect("fixture JSON");
+	let (result, output) =
+		run("jq -c . rows.json", Some(directory.path().to_string_lossy().into_owned())).await;
+	assert_ne!(result.exit_code, Some(0));
+	assert!(output.contains("\"value\":99"), "{output}");
+	assert!(
+		output
+			.lines()
+			.last()
+			.is_some_and(|line| line.to_lowercase().contains("error")),
+		"{}",
+		output
+	);
+	let (healthy, output) = run("jq -n 'range(100)'", None).await;
+	assert_eq!(healthy.exit_code, Some(0));
+	assert!(output.starts_with("0\n1\n"));
+}
 
 async fn run_collecting(command: &str) -> (Option<Duration>, Duration, String) {
 	let (tx, rx) = flume::unbounded::<String>();
