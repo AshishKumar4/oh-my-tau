@@ -4705,8 +4705,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #clearTransientModeState(options?: {
 		preserveVibe?: boolean;
 		vibeScopeAlreadySuspended?: boolean;
+		restorePlanModel?: boolean;
 	}): Promise<void> {
 		if (this.planModeEnabled || this.planModePaused) {
+			const previousModel = this.#planModePreviousModelState;
 			this.session.setPlanModeState(undefined);
 			try {
 				const previousPresentation = this.#planModePreviousToolPresentation;
@@ -4728,6 +4730,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.#planModeHasEntered = false;
 				this.#updatePlanModeStatus();
 			}
+			if (options?.restorePlanModel && previousModel) await this.#restorePlanPreviousModel(previousModel);
 		}
 
 		if (this.goalModeEnabled || this.goalModePaused) {
@@ -4789,6 +4792,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#clearTransientModeState({
 			preserveVibe,
 			vibeScopeAlreadySuspended,
+			restorePlanModel: Object.keys(sessionContext.models).length === 0,
 		});
 		await VibeSessionRegistry.global().rehydrate(vibeSession);
 		const goalEnabled = cfgGoalEnabled.get(this.session.settings);

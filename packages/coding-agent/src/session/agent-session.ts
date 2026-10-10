@@ -2549,19 +2549,14 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
-	 * Re-anchor mode state to the session a branch just minted. Branching mints a
-	 * new session id/file (see {@link SessionManager.createBranchedSession}), so
-	 * without this the interactive-mode reconciler keeps the pre-branch vibe owner
-	 * scope and disabling vibe mode trips the stale-scope guard in
-	 * `VibeRuntime.#persistModeExit` (issue #10468). Mirrors the reconcile step
-	 * `switchSession` runs for the same reason. Best-effort: a reconcile failure
-	 * must not roll back an otherwise-successful branch.
+	 * Re-anchor transient mode ownership after a branch or new session. A
+	 * reconciliation failure must not roll back an already committed transition.
 	 */
-	async #reconcileModeAfterBranch(): Promise<void> {
+	async #reconcileModeAfterTransition(): Promise<void> {
 		try {
 			await this.#sessionSwitchReconciler?.();
 		} catch (error) {
-			logger.warn("Failed to reconcile session mode after branch", {
+			logger.warn("Failed to reconcile session mode after transition", {
 				sessionFile: this.sessionFile,
 				error: String(error),
 			});
@@ -9395,6 +9390,7 @@ export class AgentSession implements SettingsScope {
 			this.#advisors.resetSessionState();
 			advisorRecordersDetached = false;
 			this.#reconnectToAgent();
+			await this.#reconcileModeAfterTransition();
 			// Drop the process-lifetime context-file cache so the rebuild re-reads
 			// AGENTS.md and friends from disk: the user may have edited them since
 			// the previous session started, and refreshBaseSystemPrompt() re-runs
@@ -11279,7 +11275,7 @@ export class AgentSession implements SettingsScope {
 
 			this.#advisors.reattachRecorderFeeds();
 			advisorRecordersDetached = false;
-			await this.#reconcileModeAfterBranch();
+			await this.#reconcileModeAfterTransition();
 			return true;
 		} finally {
 			if (advisorRecordersDetached) {
@@ -11395,7 +11391,7 @@ export class AgentSession implements SettingsScope {
 			this.#advisors.resetSessionState();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
 			advisorRecordersDetached = false;
-			await this.#reconcileModeAfterBranch();
+			await this.#reconcileModeAfterTransition();
 
 			return { cancelled: false, sessionFile: this.sessionFile };
 		} finally {

@@ -31,6 +31,7 @@ import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { isLightTheme } from "@oh-my-pi/pi-tui/theme/theme";
 import { JSONC, YAML } from "bun";
 import { invalidate as invalidateCapabilityFsCache } from "../capability/fs";
+import { getCapabilityInfo } from "../capability";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
@@ -1121,19 +1122,32 @@ export class Settings {
 			else targets.set(dir, new Set([name]));
 		};
 		const addFile = (file: string) => {
-			const dir = path.dirname(file);
-			// A missing directory cannot be watched; watch its parent for the
-			// directory's creation instead (the next sync re-arms the real watch).
-			if (fs.existsSync(dir)) addTarget(dir, path.basename(file));
-			else addTarget(path.dirname(dir), path.basename(dir));
-			// Symlinked configs (dotfile managers) change at the link target.
-			let real: string;
-			try {
-				real = fs.realpathSync(file);
-			} catch {
-				return;
+			const absolute = path.resolve(file);
+			let dir = path.parse(absolute).root;
+			let segments = physicalTargetSegments(absolute);
+			let hops = 0;
+			// Watch each physical link, including ancestor/profile links, so retargeting re-arms its new destination.
+			for (let segment = segments.shift(); segment !== undefined; segment = segments.shift()) {
+				if (segment === "" || segment === ".") continue;
+				if (segment === "..") {
+					dir = path.dirname(dir);
+					continue;
+				}
+				const current = path.join(dir, segment);
+				if (segments.length === 0) addTarget(dir, segment);
+				try {
+					if (fs.lstatSync(current).isSymbolicLink()) {
+						addTarget(dir, segment);
+						if (++hops > MAX_SYMLINK_HOPS) return;
+						const target = fs.readlinkSync(current);
+						if (path.isAbsolute(target)) dir = path.parse(target).root;
+						segments = [...physicalTargetSegments(target), ...segments];
+					} else dir = current;
+				} catch {
+					addTarget(dir, segment);
+					return;
+				}
 			}
-			if (real !== file) addTarget(path.dirname(real), path.basename(real));
 		};
 		for (const filename of MAIN_CONFIG_FILENAMES) addFile(path.join(this.#agentDir, filename));
 		const projectCwd = path.resolve(this.#cwd);
@@ -1153,6 +1167,7 @@ export class Settings {
 	#syncFileWatchers(): void {
 		if (!this.#watchingFiles) return;
 		const targets = this.#configWatchTargets();
+		let armed = false;
 		for (const [dir, entry] of this.#fileWatchers) {
 			if (targets.has(dir)) continue;
 			entry.watcher.close();
@@ -1183,7 +1198,10 @@ export class Settings {
 				if (this.#fileWatchers.get(dir)?.watcher === watcher) this.#fileWatchers.delete(dir);
 			});
 			this.#fileWatchers.set(dir, { watcher, names });
+			armed = true;
 		}
+		// Changes between the last load and watch arming may produce no event.
+		if (armed) this.#scheduleWatchReload();
 	}
 
 	#scheduleWatchReload(): void {
@@ -1220,18 +1238,22 @@ export class Settings {
 			clearTimeout(this.#projectSaveTimer);
 			this.#projectSaveTimer = undefined;
 		}
-		if (this.#savePromise) {
-			await this.#savePromise;
+		let globalFailure: Error | undefined;
+		try {
+			if (this.#savePromise) await this.#savePromise;
+			if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) await this.#chainSave();
+		} catch (error) {
+			globalFailure = error instanceof Error ? error : new Error(String(error), { cause: error });
 		}
-		if (this.#projectSavePromise) {
-			await this.#projectSavePromise;
+		try {
+			if (this.#projectSavePromise) await this.#projectSavePromise;
+			if (this.#modifiedProjectModelRoles.size > 0) await this.#saveProjectNow();
+		} catch (error) {
+			if (globalFailure)
+				throw new AggregateError([globalFailure, error], "Global and project settings could not be saved");
+			throw error;
 		}
-		if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) {
-			await this.#chainSave();
-		}
-		if (this.#modifiedProjectModelRoles.size > 0) {
-			await this.#saveProjectNow();
-		}
+		if (globalFailure) throw globalFailure;
 	}
 
 	/**
@@ -1313,7 +1335,11 @@ export class Settings {
 	async #reloadPersistedLayers(mode: PersistedReloadMode): Promise<void> {
 		const keepLastGood = mode === "keep-last-good";
 		for (;;) {
-			await this.flush();
+			try {
+				await this.flush();
+			} catch (error) {
+				logger.warn("Settings: reloading over unsaved changes", { error: String(error) });
+			}
 			const mutationGeneration = this.#persistedMutationGeneration;
 
 			const [globalResult, projectResult, overlayResult] = await Promise.allSettled([
@@ -1332,10 +1358,13 @@ export class Settings {
 
 			const refreshed: LayerRefresh[] = [];
 			if (globalResult.status === "fulfilled") {
-				const { settings, configPath } = globalResult.value;
+				const { configPath } = globalResult.value;
+				const quarantined = this.#configPath !== null && this.#quarantinedYamlTargets.has(this.#configPath);
+				const settings = globalResult.value.settings ?? (quarantined ? structuredClone(this.#global) : {});
+				this.#applyPendingGlobalWrites(settings);
 				refreshed.push({
 					layer: "global",
-					settings: settings ?? {},
+					settings,
 					source: configPath ?? path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]),
 					commit: () => {
 						this.#configPath = configPath;
@@ -1344,6 +1373,7 @@ export class Settings {
 			}
 			if (projectResult.status === "fulfilled") {
 				const project = projectResult.value;
+				this.#applyPendingProjectWrites(project.settings);
 				refreshed.push({
 					layer: "project",
 					settings: project.settings,
@@ -1956,10 +1986,11 @@ export class Settings {
 
 	async #loadYaml(filePath: string): Promise<RawSettings> {
 		const loaded = await this.#loadYamlIfPresentForStartup(filePath);
-		return loaded ?? {};
+		return this.#migrateRawSettings(loaded ?? {});
 	}
 
-	async #loadYamlIfPresent(filePath: string, captureLegacyChangelogVersion = true): Promise<YamlLoadResult> {
+	// Preserve raw aliases until their layer is merged; migrating one project source early changes precedence.
+	async #loadYamlIfPresent(filePath: string): Promise<YamlLoadResult> {
 		let content: string;
 		let generation: YamlContentGeneration;
 		try {
@@ -1987,7 +2018,7 @@ export class Settings {
 		if (parsed === null || parsed === undefined) {
 			return { kind: "loaded", settings: {}, generation };
 		}
-		if (typeof parsed !== "object" || Array.isArray(parsed)) {
+		if (!isRecord(parsed)) {
 			return {
 				kind: "invalid",
 				error: new Error("Settings YAML must contain a mapping at the document root"),
@@ -1996,7 +2027,7 @@ export class Settings {
 		}
 		return {
 			kind: "loaded",
-			settings: this.#migrateRawSettings(parsed as RawSettings, captureLegacyChangelogVersion),
+			settings: parsed,
 			generation,
 		};
 	}
@@ -2312,8 +2343,8 @@ export class Settings {
 			const configPath = path.join(this.#agentDir, filename);
 			const loaded = quarantineInvalid
 				? await this.#loadYamlIfPresentForStartup(configPath)
-				: this.#unwrapYamlLoadResult(configPath, await this.#loadYamlIfPresent(configPath, false));
-			if (loaded) return { settings: loaded, configPath };
+				: this.#unwrapYamlLoadResult(configPath, await this.#loadYamlIfPresent(configPath));
+			if (loaded) return { settings: this.#migrateRawSettings(loaded, quarantineInvalid), configPath };
 		}
 		return {
 			settings: null,
@@ -2350,13 +2381,17 @@ export class Settings {
 		invalidateCapabilityFsCache(path.join(projectConfigDir, "settings.json"));
 		invalidateCapabilityFsCache(path.join(discoveryCwd, ".claude", "settings.json"));
 		for (const sourcePath of this.#projectSourcePaths) invalidateCapabilityFsCache(sourcePath);
+		const nativeProject = quarantineInvalid
+			? ((await this.#loadYamlIfPresentForStartup(projectConfigPath)) ?? {})
+			: (this.#unwrapYamlLoadResult(projectConfigPath, await this.#loadYamlIfPresent(projectConfigPath)) ??
+				(this.#quarantinedYamlTargets.has(projectConfigPath) ? structuredClone(this.#projectFileSettings) : {}));
 		let shellPathSource: string | undefined;
 		let merged: RawSettings = {};
 		const sourcePaths: string[] = [];
 		let rejectedWarnings: string[] | undefined;
 		let warningsSeen = this.#projectSettingsWarningsSeen;
 		try {
-			const result = await loadCapability(settingsCapability.id, { cwd: discoveryCwd });
+			const result = await loadCapability<SettingsCapabilityItem>(settingsCapability.id, { cwd: discoveryCwd });
 			// `loadCapability` aggregates warnings across every level, but this
 			// method only merges project items — user-level parse failures belong
 			// to the global layer and would misattribute here. Warnings embed
@@ -2375,12 +2410,35 @@ export class Settings {
 			} else {
 				for (const warning of newWarnings) logger.warn(`Settings: ${warning}`);
 				warningsSeen = new Set(projectWarnings);
-				for (const item of result.items as SettingsCapabilityItem[]) {
-					if (item.level === "project") {
-						merged = this.#deepMerge(merged, dropSettingsGroupShadows(item.data as RawSettings, item.path));
-						sourcePaths.push(item.path);
-						if (Object.hasOwn(item.data, "shellPath")) shellPathSource = item.path;
+				const isNativeFile = (item: SettingsCapabilityItem) =>
+					item._source.provider === "native" && item.path === path.resolve(projectConfigPath);
+				const items = result.items.filter(item => item.level === "project");
+				if (this.#quarantinedYamlTargets.has(projectConfigPath) && !items.some(isNativeFile)) {
+					const providers = getCapabilityInfo(settingsCapability.id)?.providers ?? [];
+					const nativeIndex = providers.findIndex(provider => provider.id === "native");
+					const native = providers[nativeIndex];
+					if (native?.enabled) {
+						// Reinsert only this file at its normal provider position. Other sources still refresh and override it normally.
+						const position = items.findIndex(
+							item => providers.findIndex(provider => provider.id === item._source.provider) > nativeIndex,
+						);
+						items.splice(position < 0 ? items.length : position, 0, {
+							path: path.resolve(projectConfigPath),
+							data: nativeProject,
+							level: "project",
+							_source: {
+								provider: native.id,
+								providerName: native.displayName,
+								path: path.resolve(projectConfigPath),
+								level: "project",
+							},
+						});
 					}
+				}
+				for (const item of items) {
+					merged = this.#deepMerge(merged, dropSettingsGroupShadows(item.data, item.path));
+					sourcePaths.push(item.path);
+					if (Object.hasOwn(item.data, "shellPath")) shellPathSource = item.path;
 				}
 			}
 		} catch {
@@ -2391,17 +2449,16 @@ export class Settings {
 		if (rejectedWarnings) {
 			throw new Error(`Project settings failed to parse: ${rejectedWarnings.join("; ")}`);
 		}
-		const nativeProject = quarantineInvalid
-			? await this.#loadYaml(projectConfigPath)
-			: (this.#unwrapYamlLoadResult(projectConfigPath, await this.#loadYamlIfPresent(projectConfigPath, false)) ??
-				{});
-		const nativeModelRoles = getByPath(nativeProject, ["modelRoles"]);
+		const nativeModelRoles = getByPath(this.#migrateRawSettings(structuredClone(nativeProject), quarantineInvalid), [
+			"modelRoles",
+		]);
 		if (nativeModelRoles !== undefined) {
 			merged = this.#deepMerge(merged, { modelRoles: nativeModelRoles });
 		}
+		const fileSettings = structuredClone(nativeProject);
 		return {
 			settings: this.#migrateRawSettings(merged, quarantineInvalid),
-			fileSettings: structuredClone(nativeProject),
+			fileSettings,
 			shellPathSource,
 			sourcePaths,
 			warningsSeen,
@@ -3544,8 +3601,9 @@ export class Settings {
 				// malformed file aside, recover from its last in-memory state
 				// rather than recreating the config from only the pending path.
 				const loaded = await this.#loadYamlIfPresentForWriteLocked(configPath, writePath);
-				const current =
-					loaded.settings ?? (this.#quarantinedYamlTargets.has(configPath) ? structuredClone(this.#global) : {});
+				const current = this.#migrateRawSettings(
+					loaded.settings ?? (this.#quarantinedYamlTargets.has(configPath) ? structuredClone(this.#global) : {}),
+				);
 				let shouldWrite = false;
 				const writtenPaths: (readonly string[])[] = [];
 
@@ -3708,26 +3766,37 @@ export class Settings {
 	 * Notifies every setting whose effective value changed.
 	 */
 	#adoptSavedGlobal(saved: RawSettings, source: string): void {
-		if (this.#modifiedGlobalModelRoles.size > 0) {
-			const liveRoles = getByPath(this.#global, ["modelRoles"]);
-			const savedRoles = getByPath(saved, ["modelRoles"]);
-			const roles: Record<string, unknown> = isRecord(savedRoles) ? savedRoles : {};
-			for (const role of this.#modifiedGlobalModelRoles) {
-				if (isRecord(liveRoles) && Object.hasOwn(liveRoles, role)) roles[role] = liveRoles[role];
-				else delete roles[role];
-			}
-			setByPath(saved, ["modelRoles"], roles);
-		}
-		for (const segments of this.#modified.values()) {
-			const value = getByPath(this.#global, segments);
-			if (value === undefined) deleteByPath(saved, segments);
-			else setByPath(saved, segments, value);
-		}
+		this.#applyPendingGlobalWrites(saved);
 		if (!this.#acceptsLayers({ ...this.#ownLayers(), global: saved }, source)) return;
 		const previous = this.#snapshot();
 		this.#global = saved;
 		this.#rebuildMerged();
 		this.#fireChangesSince(previous);
+	}
+
+	#applyPendingGlobalWrites(target: RawSettings): void {
+		if (this.#modifiedGlobalModelRoles.size > 0) {
+			const liveRoles = getByPath(this.#global, ["modelRoles"]);
+			const targetRoles = getByPath(target, ["modelRoles"]);
+			const roles = isRecord(targetRoles) ? targetRoles : {};
+			for (const role of this.#modifiedGlobalModelRoles) {
+				if (isRecord(liveRoles) && Object.hasOwn(liveRoles, role)) roles[role] = liveRoles[role];
+				else delete roles[role];
+			}
+			setByPath(target, ["modelRoles"], roles);
+		}
+		for (const segments of this.#modified.values()) {
+			const value = getByPath(this.#global, segments);
+			if (value === undefined) deleteByPath(target, segments);
+			else setByPath(target, segments, value);
+		}
+	}
+
+	#applyPendingProjectWrites(target: RawSettings): void {
+		const liveRoles = getByPath(this.#project, ["modelRoles"]);
+		for (const role of this.#modifiedProjectModelRoles) {
+			setByPath(target, ["modelRoles", role], isRecord(liveRoles) ? liveRoles[role] : undefined);
+		}
 	}
 
 	#queueProjectSave(): void {
@@ -3761,9 +3830,12 @@ export class Settings {
 			await fs.promises.mkdir(path.dirname(projectConfigPath), { recursive: true });
 			await this.#withYamlWriteLock(projectConfigPath, async writePath => {
 				const loaded = await this.#loadYamlIfPresentForWriteLocked(projectConfigPath, writePath);
-				const projectSettings =
+				const projectSettings = this.#migrateRawSettings(
 					loaded.settings ??
-					(this.#quarantinedYamlTargets.has(projectConfigPath) ? structuredClone(this.#projectFileSettings) : {});
+						(this.#quarantinedYamlTargets.has(projectConfigPath)
+							? structuredClone(this.#projectFileSettings)
+							: {}),
+				);
 
 				const projectRoles = getByPath(this.#project, ["modelRoles"]);
 				for (const role of modifiedModelRoles) {
