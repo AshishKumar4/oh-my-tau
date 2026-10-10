@@ -5182,6 +5182,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// `.api` equality doesn't narrow the generic; the guard makes this cast sound.
 			const codexModel = model as Model<"openai-codex-responses">;
 			if (isOpenAICodexWebSocketPreferred(codexModel, { preferWebsockets: session.preferWebsockets })) {
+				const prewarmOwner = session.sessionId;
+				const prewarmTranscript = sessionManager.getSessionId();
 				void (async () => {
 					try {
 						const codexPrewarmApiKey = options.getApiKey
@@ -5189,7 +5191,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 								// then resolve the result if it is itself an ApiKeyResolver.
 								await resolveApiKeyOnce(await options.getApiKey(codexModel))
 							: await modelRegistry.getApiKey(codexModel, providerSessionId);
-						if (!codexPrewarmApiKey) return;
+						if (
+							!codexPrewarmApiKey ||
+							session.isDisposed ||
+							session.isSessionTransitioning ||
+							session.sessionId !== prewarmOwner ||
+							sessionManager.getSessionId() !== prewarmTranscript
+						)
+							return;
 						// A forked child must warm the socket under the shared root
 						// lineage — WS headers are fixed at handshake, so an unwarmed-
 						// fork connection can never be reused by the real request.

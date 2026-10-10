@@ -374,6 +374,8 @@ export function coerceServiceTierByFamily(value: unknown): ServiceTierByFamily |
 
 export interface ProviderSessionState {
 	close(): void;
+	/** Release one completed routing session without resetting shared provider policy. */
+	releaseSession?(sessionId: string): void;
 }
 
 export interface ProviderResponseMetadata {
