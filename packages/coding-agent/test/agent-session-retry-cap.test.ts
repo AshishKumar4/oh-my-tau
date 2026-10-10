@@ -977,6 +977,153 @@ describe("AgentSession retry delay cap", () => {
 		}
 	});
 
+	it("stays on fallback until the exhausted primary's reported reset", async () => {
+		const primary = getBundledModel("opencode-go", "deepseek-v4-flash");
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary || !fallback) throw new Error("Expected the retry fixture models");
+		const primarySelector = `${primary.provider}/${primary.id}`;
+		const fallbackSelector = `${fallback.provider}/${fallback.id}`;
+		const start = Date.now();
+		const reset = start + 7_200_000;
+		const storage = await createOpencodeStorageWithUsage(
+			{ status: "ok", percent: 12, resetsAtIso: new Date(start + 300_000).toISOString() },
+			{ status: "rate-limited", percent: 100, resetsAtIso: new Date(reset).toISOString() },
+		);
+		try {
+			storage.keys.setRuntime("anthropic", "test-key");
+			const registry = new ModelRegistry(storage, path.join(tempDir.path(), "models.yml"));
+			let now = start;
+			const mock = createMockModel();
+			const requests: string[] = [];
+			const agent = new Agent({
+				getApiKey: model => registry.resolver(model, agent.sessionId),
+				initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					const selector = `${model.provider}/${model.id}`;
+					requests.push(selector);
+					mock.push(
+						selector === primarySelector && now < reset
+							? { throw: "429 quota exceeded for this account" }
+							: { content: ["ok"] },
+					);
+					return mock.stream(model, context, options);
+				},
+			});
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.fallbackChains": { [primarySelector]: [fallbackSelector] },
+				"retry.fallbackRevertPolicy": "cooldown-expiry",
+			});
+			settings.setModelRole("default", primarySelector);
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry: registry,
+			});
+			vi.spyOn(Date, "now").mockImplementation(() => now);
+			await session.prompt("Primary quota is exhausted");
+			await session.waitForIdle();
+			expect(requests).toEqual([primarySelector, fallbackSelector]);
+			now = start + 31 * 60_000;
+			await session.prompt("Continue before reset");
+			await session.waitForIdle();
+			expect(requests).toEqual([primarySelector, fallbackSelector, fallbackSelector]);
+			now = reset + 60_000;
+			await session.prompt("Continue after reset");
+			await session.waitForIdle();
+			expect(requests).toEqual([primarySelector, fallbackSelector, fallbackSelector, primarySelector]);
+		} finally {
+			storage.close();
+		}
+	});
+
+	it("returns to a free sibling account without waiting for the spent account's long reset", async () => {
+		const primary = getBundledModel("opencode-go", "deepseek-v4-flash");
+		const fallback = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary || !fallback) throw new Error("Expected the retry fixture models");
+		const primarySelector = `${primary.provider}/${primary.id}`;
+		const fallbackSelector = `${fallback.provider}/${fallback.id}`;
+		const start = Date.now();
+		let now = start;
+		let spent: string | undefined;
+		const usageFetch = Object.assign(
+			async (_url: string | URL | Request, init?: RequestInit) => {
+				const exhausted =
+					spent !== undefined && new Headers(init?.headers).get("authorization") === `Bearer ${spent}`;
+				const window = (percent: number) => ({
+					status: percent === 100 ? "rate-limited" : "ok",
+					percent,
+					resetsAt: new Date(start + 2 * 24 * 3_600_000).toISOString(),
+				});
+				return Response.json({
+					usage: { rolling: window(12), weekly: window(exhausted ? 100 : 20), monthly: window(8) },
+				});
+			},
+			{ preconnect() {} },
+		);
+		const storage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
+			usageProviderResolver: provider => (provider === "opencode-go" ? opencodeGoUsageProvider : undefined),
+			usageFetch,
+		});
+		try {
+			await storage.credentials.reload();
+			await storage.credentials.set("opencode-go", [
+				{ type: "api_key", key: "key-a" },
+				{ type: "api_key", key: "key-b" },
+			]);
+			storage.keys.setRuntime("anthropic", "test-key");
+			const registry = new ModelRegistry(storage, path.join(tempDir.path(), "models.yml"));
+			const mock = createMockModel();
+			const requests: string[] = [];
+			const keys: string[] = [];
+			const agent = new Agent({
+				getApiKey: model => registry.resolver(model, agent.sessionId),
+				initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: async (model, context, options) => {
+					const selector = `${model.provider}/${model.id}`;
+					requests.push(selector);
+					if (selector === primarySelector) {
+						const key = resolveInitialApiKey(options?.apiKey);
+						keys.push(key);
+						if (spent === undefined) {
+							spent = key;
+							await storage.usage.invalidate("opencode-go");
+						}
+						mock.push(key === spent ? { throw: "429 quota exceeded for this account" } : { content: ["ok"] });
+					} else mock.push({ content: ["ok"] });
+					return mock.stream(model, context, options);
+				},
+			});
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.maxRetries": 0,
+				"retry.fallbackChains": { [primarySelector]: [fallbackSelector] },
+				"retry.fallbackRevertPolicy": "cooldown-expiry",
+			});
+			settings.setModelRole("default", primarySelector);
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry: registry,
+			});
+			vi.spyOn(Date, "now").mockImplementation(() => now);
+			await session.prompt("Account A is exhausted");
+			await session.waitForIdle();
+			expect(requests).toEqual([primarySelector, fallbackSelector]);
+			now = start + 31 * 60_000;
+			await session.prompt("Account B is available");
+			await session.waitForIdle();
+			expect(requests).toEqual([primarySelector, fallbackSelector, primarySelector]);
+			expect(keys.at(-1)).not.toBe(spent);
+		} finally {
+			storage.close();
+		}
+	});
+
 	it("keeps a sibling session's longer stored block over a short report reset", async () => {
 		// Contract: the stored credential block merges every mark call for
 		// the shared credential (longest-wins). When an earlier

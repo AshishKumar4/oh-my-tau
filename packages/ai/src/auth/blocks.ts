@@ -154,7 +154,8 @@ export class CredentialBlocks implements BlocksApi {
 			const scope = separator < 0 ? "" : backoffKey.slice(separator + 1);
 			try {
 				const persisted = this.#deps.store.getCredentialBlock(credentialId, providerKey, scope);
-				if (persisted === undefined) {
+				// Longest-wins upserts cannot shorten a row; a shorter row superseded our old mirror.
+				if (persisted === undefined || persisted < block.until) {
 					this.#deleteCredentialBackoff(backoffKey, credentialId);
 					return undefined;
 				}

@@ -230,6 +230,47 @@ function prepareV6BlockSchema(db: Database): void {
 }
 
 describe("AuthStorage credential block persistence", () => {
+	it("retains a sibling's shorter replacement cooldown without releasing manual holds", async () => {
+		const storeA = await SqliteAuthCredentialStore.open(dbPath);
+		await storeA.saveOAuth(PROVIDER, oauthCredential("active"));
+		await storeA.saveOAuth(PROVIDER, oauthCredential("held"));
+		const rows = storeA.listAuthCredentials(PROVIDER);
+		const active = rows.find(row => row.credential.type === "oauth" && row.credential.accountId === "account-active");
+		const held = rows.find(row => row.credential.type === "oauth" && row.credential.accountId === "account-held");
+		if (!active || !held) throw new Error("Expected both test accounts");
+		const storeB = await SqliteAuthCredentialStore.open(dbPath);
+		const options = { usageProviderResolver: () => undefined, rankingStrategyResolver: () => undefined };
+		const first = new AuthStorage(storeA, options);
+		const sibling = new AuthStorage(storeB, options);
+		try {
+			await first.credentials.reload();
+			await sibling.credentials.reload();
+			first.holdCredential(PROVIDER, held.id);
+			await first.limits.markReached(PROVIDER, "first", {
+				credentialId: active.id,
+				retryAfterMs: 3 * 24 * 60 * 60_000,
+				providerTimed: true,
+			});
+			storeB.deleteCredentialBlock(active.id, PROVIDER_KEY, "");
+			await sibling.limits.markReached(PROVIDER, "sibling", {
+				credentialId: active.id,
+				retryAfterMs: 60_000,
+				providerTimed: true,
+			});
+			const result = await first.limits.markReached(PROVIDER, "first", {
+				credentialId: active.id,
+				retryAfterMs: 60_000,
+				providerTimed: true,
+			});
+			expect(result.blockedUntilMs).toBeLessThan(Date.now() + 120_000);
+			expect(storeA.getCredentialBlock(active.id, PROVIDER_KEY, "")).toBeLessThan(Date.now() + 120_000);
+			expect(first.sessions.pin(PROVIDER, "held-attempt", held.id)).toBe(false);
+			expect(await first.keys.get(PROVIDER, "next")).toBe("access-active");
+		} finally {
+			first.close();
+			sibling.close();
+		}
+	});
 	let tempDir = "";
 	let dbPath = "";
 

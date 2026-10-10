@@ -465,6 +465,50 @@ describe("AuthStorage usage cache: Claude saved resets", () => {
 	});
 });
 
+describe("Claude failed usage refresh recovery", () => {
+	afterEach(() => vi.restoreAllMocks());
+	it("backs off after a rate limit and recovers a fresh report after the failure window", async () => {
+		let now = 1_800_000_000_000;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		vi.spyOn(Math, "random").mockReturnValue(0.5);
+		let requests = 0;
+		const usageFetch = Object.assign(
+			async (input: string | URL | Request) => {
+				const url = new URL(input instanceof Request ? input.url : input.toString());
+				if (url.search === "") requests++;
+				if (requests === 1)
+					return Response.json(
+						{ error: { type: "rate_limit_error", message: "Rate limited" } },
+						{ status: 429, headers: { "retry-after": "0" } },
+					);
+				return Response.json({
+					five_hour: { utilization: 25, resets_at: "2099-09-23T00:00:00Z" },
+					cedar_ember: null,
+					juniper_tide: null,
+				});
+			},
+			{ preconnect() {} },
+		);
+		const storage = new AuthStorage(makeStore([oauthRow(1, "a@example.com")]), {
+			usageFetch,
+			usageProviderResolver: provider => (provider === "anthropic" ? claudeUsage.claudeUsageProvider : undefined),
+		});
+		try {
+			await storage.credentials.reload();
+			expect(anthropicReports(await storage.usage.reports())).toEqual([]);
+			now += 30_000;
+			expect(anthropicReports(await storage.usage.reports())).toEqual([]);
+			expect(requests).toBe(1);
+			now += 31_000;
+			const report = requireAnthropicReport(await storage.usage.reports());
+			expect(requireLimit(report, "anthropic:5h").amount.used).toBe(25);
+			expect(requests).toBe(2);
+		} finally {
+			storage.close();
+		}
+	});
+});
+
 describe("AuthStorage usage cache: explicit invalidation", () => {
 	it("preserves failed-probe cooldown across repeated invalidation and storage recreation", async () => {
 		const row = oauthRow(1, "a@example.com");
@@ -1039,7 +1083,7 @@ describe("AuthStorage usage cache: header ingestion", () => {
 		expect(await storage.usage.reports()).toHaveLength(1);
 		expect(calls).toBe(1);
 
-		now.mockReturnValue(start + 12_501);
+		now.mockReturnValue(start + 75_001);
 		expect(await storage.usage.reports()).toHaveLength(1);
 		expect(calls).toBe(2);
 	});
