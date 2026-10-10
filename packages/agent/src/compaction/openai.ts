@@ -88,12 +88,12 @@ interface NormalizedEstimateValue {
 	imageTokens: number;
 }
 
-function normalizeRemoteCompactionEstimateValue(value: unknown): NormalizedEstimateValue {
+function normalizeRemoteCompactionEstimateValue(value: unknown, dropEncrypted = true): NormalizedEstimateValue {
 	if (Array.isArray(value)) {
 		const normalized: unknown[] = [];
 		let imageTokens = 0;
 		for (const item of value) {
-			const result = normalizeRemoteCompactionEstimateValue(item);
+			const result = normalizeRemoteCompactionEstimateValue(item, dropEncrypted);
 			normalized.push(result.value);
 			imageTokens += result.imageTokens;
 		}
@@ -115,12 +115,22 @@ function normalizeRemoteCompactionEstimateValue(value: unknown): NormalizedEstim
 		// Opaque encrypted reasoning/compaction state: its local base64 size far
 		// exceeds what the provider bills, so it stays out of the fit estimate
 		// (same policy as `MessageCountOptions.excludeEncryptedReasoning`).
-		if (key === "encrypted_content" && typeof item === "string") continue;
-		const result = normalizeRemoteCompactionEstimateValue(item);
+		if (dropEncrypted && key === "encrypted_content" && typeof item === "string") continue;
+		const result = normalizeRemoteCompactionEstimateValue(item, dropEncrypted);
 		normalized[key] = result.value;
 		imageTokens += result.imageTokens;
 	}
 	return { value: normalized, imageTokens };
+}
+
+/** Retained images use their image estimate; opaque stored compaction state still counts as serialized text. */
+export function countResponsesHistoryTokens(
+	items: import("@oh-my-pi/pi-ai").OpenAIResponsesHistoryPayload["items"],
+	tokenizer: Tokenizer,
+): number {
+	const normalized = normalizeRemoteCompactionEstimateValue(items, false);
+	const serialized = stringifyJson(normalized.value);
+	return (serialized === undefined ? 0 : tokenizer.countTokens(serialized)) + normalized.imageTokens;
 }
 
 export interface TrimRemoteCompactionInputResult {

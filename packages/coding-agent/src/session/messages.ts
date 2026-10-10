@@ -14,6 +14,7 @@ import {
 	type HookMessage,
 	type FileMentionMessage,
 	isUserInvokedSkillPrompt,
+	isUserTurnInitiator,
 } from "@oh-my-pi/pi-tui/chat/messages";
 export {
 	SKILL_PROMPT_MESSAGE_TYPE,
@@ -1153,6 +1154,13 @@ function convertOneCached(m: AgentMessage, interruptedNext: boolean): Message[] 
 	for (const message of fragment) copyPerCallContextMessage(message, m);
 	convertCache.set(m, { interruptedNext, fragment });
 	return fragment;
+}
+
+/** A genuine operator turn, selected before provider wire conversion. */
+export function isUserAuthoredMessage(message: AgentMessage): boolean {
+	return message.role === "user"
+		? message.attribution !== "agent"
+		: message.role === "custom" && isUserTurnInitiator(message);
 }
 
 /**

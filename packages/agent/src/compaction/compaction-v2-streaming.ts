@@ -77,6 +77,7 @@ export interface CompactionV2Usage {
 export interface CompactionV2Request {
 	body: OpenAICodexCompactionBody;
 	input: unknown[];
+	retainedUserItems: CompactionV2Request["input"];
 	retainedMessageBudget: number;
 	sessionId?: string;
 	promptCacheKey?: string;
@@ -190,6 +191,7 @@ export function buildCompactionV2Request(
 		sessionId?: string;
 		promptCacheKey?: string;
 		retainedMessageBudget?: number;
+		retainedUserItems?: CompactionV2Request["input"];
 	},
 ): CompactionV2Request {
 	const cacheOptions = { sessionId: options?.sessionId, promptCacheKey: options?.promptCacheKey };
@@ -223,12 +225,15 @@ export function buildCompactionV2RequestFromBody(
 		sessionId?: string;
 		promptCacheKey?: string;
 		retainedMessageBudget?: number;
+		retainedUserItems?: CompactionV2Request["input"];
 	},
 ): CompactionV2Request {
 	const input = Array.isArray(body.input) ? body.input : [];
 	return {
 		body: { ...body, model: resolveCompactionV2Model(model), input },
 		input,
+		retainedUserItems:
+			options?.retainedUserItems ?? input.filter(item => !isRecord(item) || !isContextualUserMessage(item)),
 		retainedMessageBudget: resolveCompactionV2RetainedMessageBudget(options?.retainedMessageBudget),
 		sessionId: options?.sessionId,
 		promptCacheKey: options?.promptCacheKey,
@@ -536,7 +541,7 @@ function finishCompactionV2Collection(
 
 	const compactionItem = state.compactionItems[0];
 	const { replacementHistory, retainedImageCount } = buildCompactionV2ReplacementHistory(
-		request.input,
+		request.retainedUserItems,
 		compactionItem,
 		request.retainedMessageBudget,
 	);
@@ -672,8 +677,7 @@ export function buildCompactionV2ReplacementHistory(
 	retainedMessageBudget = V2_RETAINED_MESSAGE_TOKEN_BUDGET,
 ): { replacementHistory: Array<Record<string, unknown>>; retainedImageCount: number } {
 	const retained = input.filter(
-		(item): item is Record<string, unknown> =>
-			isRecord(item) && isRetainedForCompactionV2(item) && shouldKeepCompactionV2HistoryItem(item),
+		(item): item is Record<string, unknown> => isRecord(item) && isRetainedUserMessageForCompactionV2(item),
 	);
 	const replacementHistory = truncateRetainedMessagesForCompactionV2(
 		retained,
@@ -684,17 +688,9 @@ export function buildCompactionV2ReplacementHistory(
 	return { replacementHistory, retainedImageCount };
 }
 
-function isRetainedForCompactionV2(item: Record<string, unknown>): boolean {
-	if (item.type !== "message") return false;
-	const role = stringField(item, "role");
-	return role === "user" || role === "developer" || role === "system";
-}
-
-function shouldKeepCompactionV2HistoryItem(item: Record<string, unknown>): boolean {
-	if (item.type !== "message") return item.type === "compaction";
-	const role = stringField(item, "role");
-	if (role !== "user") return false;
-	return !isContextualUserMessage(item);
+function isRetainedUserMessageForCompactionV2(item: Record<string, unknown>): boolean {
+	const message = item.type === "message" || (item.type === undefined && typeof item.role === "string");
+	return message && item.role === "user";
 }
 
 function isContextualUserMessage(item: Record<string, unknown>): boolean {

@@ -647,6 +647,8 @@ export interface SummaryOptions {
 	initiatorOverride?: MessageAttribution;
 	metadata?: Record<string, unknown>;
 	convertToLlm?: ConvertToLlm;
+	/** Select operator-authored turns before wire conversion erases their origin. */
+	isUserAuthored?: (message: AgentMessage) => boolean;
 	/**
 	 * Optional telemetry handle. When provided, every LLM call emitted during
 	 * compaction is wrapped in an OTEL chat span tagged with
@@ -1583,6 +1585,7 @@ export async function compact(
 		initiatorOverride: options?.initiatorOverride,
 		metadata: options?.metadata,
 		convertToLlm: options?.convertToLlm,
+		isUserAuthored: options?.isUserAuthored,
 		telemetry: options?.telemetry,
 		// Honor /model thinking selection on every fan-out summarizer.
 		// Without this propagation, generateSummary / generateTurnPrefixSummary
@@ -1646,7 +1649,15 @@ export async function compact(
 			previousRemoteCompaction?.provider === model.provider
 				? previousRemoteCompaction.replacementHistory
 				: undefined;
-		const messages = (summaryOptions.convertToLlm ?? defaultConvertToLlm)(remoteMessages);
+		const convertToLlm = summaryOptions.convertToLlm ?? defaultConvertToLlm;
+		const messages = convertToLlm(remoteMessages);
+		const isUserAuthored =
+			summaryOptions.isUserAuthored ??
+			((message: AgentMessage) => message.role === "user" && message.attribution !== "agent");
+		const userMessages = convertToLlm(
+			[...messagesToSummarize, ...turnPrefixMessages, ...recentMessages].filter(isUserAuthored),
+		);
+		const retainedUserItems = [...(previousReplacementHistory ?? [])];
 		const remoteSystemPrompt = summaryOptions.remoteSystemPrompt ?? [SUMMARIZATION_SYSTEM_PROMPT];
 		let codexBody: OpenAICodexCompactionBody | undefined;
 		let remoteHistory: Array<Record<string, unknown>>;
@@ -1686,8 +1697,18 @@ export async function compact(
 			}
 			remoteHistory = stripOpenAIResponsesOutputOnlyStatusesForReplay(nativeInput);
 			codexBody.input = remoteHistory;
+			for (const message of userMessages) {
+				const body = await buildTransformedCodexRequestBody(
+					model,
+					{ messages: [message] },
+					{ responsesLite: model.useResponsesLite },
+				);
+				for (const item of body.input ?? []) if (isRecord(item)) retainedUserItems.push(item);
+			}
 		} else {
 			remoteHistory = buildOpenAiResponsesCompactionInput(messages, model, previousReplacementHistory);
+			for (const message of userMessages)
+				retainedUserItems.push(...buildOpenAiResponsesCompactionInput([message], model, undefined));
 		}
 		if (remoteHistory.length > 0) {
 			try {
@@ -1725,6 +1746,7 @@ export async function compact(
 					sessionId: summaryOptions.sessionId,
 					promptCacheKey: summaryOptions.promptCacheKey,
 					retainedMessageBudget: settings.v2RetainedMessageBudget,
+					retainedUserItems,
 				};
 				const request = codexBody
 					? buildCompactionV2RequestFromBody(model, { ...codexBody, input: trimmed.input }, requestOptions)
@@ -1796,7 +1818,7 @@ export async function compact(
 						),
 					{ signal },
 				);
-				preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, remote);
+				preserveData = withOpenAiRemoteCompactionPreserveData(preserveData, remote);
 				usedRemoteCompaction = true;
 			} catch (err) {
 				// A user/session abort is a cancellation, not a remote failure —

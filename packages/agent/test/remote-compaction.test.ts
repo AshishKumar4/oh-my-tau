@@ -2212,6 +2212,91 @@ describe("compact() remote compaction failure handling", () => {
 		};
 	}
 
+	test("V1 compaction keeps cleaned preserve data rather than restoring foreign native state", async () => {
+		const preparation = makePreparation();
+		preparation.previousPreserveData = {
+			anthropicCompaction: { provider: "anthropic", content: "old summary" },
+			sessionHint: "retain",
+			openaiRemoteCompaction: {
+				provider: "openai",
+				replacementHistory: [{ type: "compaction", encrypted_content: "old" }],
+				compactionItem: { type: "compaction", encrypted_content: "old" },
+			},
+		};
+		const item = { type: "compaction", encrypted_content: "fresh" };
+		const paths: string[] = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				paths.push(`${request.method} ${new URL(request.url).pathname}`);
+				return Response.json({ output: [item] });
+			},
+		});
+		try {
+			const model = makeOpenAiModel({
+				baseUrl: `http://127.0.0.1:${server.port}/v1`,
+				remoteCompaction: { enabled: true, v2StreamingEnabled: false },
+			});
+			const result = await compact(preparation, model, "fixture");
+			expect(paths).toEqual(["POST /v1/responses/compact"]);
+			expect(result.preserveData?.anthropicCompaction).toBeUndefined();
+			expect(result.preserveData?.sessionHint).toBe("retain");
+			expect(result.preserveData?.openaiRemoteCompaction).toEqual({
+				provider: "openai",
+				replacementHistory: [item],
+				compactionItem: item,
+			});
+		} finally {
+			await server.stop(true);
+		}
+	});
+
+	test("V2 retains operator text and prior retained turns without treating wire-role context as authorship", async () => {
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		preparation.previousSummary = "previous generated summary";
+		preparation.messagesToSummarize = [
+			{ role: "user", content: "<environment_context>Operator quoting a literal example", timestamp: 1 },
+			{ role: "user", content: "generated continuation", attribution: "agent", timestamp: 2 },
+			{ role: "user", content: "release skill request", timestamp: 3 },
+		];
+		const model = makeOpenAiModel({ remoteCompaction: { enabled: true, v2StreamingEnabled: true } });
+		let attempt = 0;
+		const fetch: FetchImpl = async () =>
+			sseResponse([
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "compaction", encrypted_content: `compact-${++attempt}` },
+				},
+				{
+					type: "response.completed",
+					response: { usage: { input_tokens: 12, output_tokens: 2, total_tokens: 14 } },
+				},
+			]);
+		const first = await compact(preparation, model, "fixture", undefined, undefined, { fetch });
+		const firstHistory = getCompactionV2PreserveData(first.preserveData)?.replacementHistory;
+		if (!firstHistory) throw new Error("Expected V2 replacement history");
+		const retained = JSON.stringify(firstHistory);
+		expect(retained).toContain("Operator quoting a literal example");
+		expect(retained).toContain("release skill request");
+		expect(retained).not.toContain("generated continuation");
+		expect(retained).not.toContain("previous generated summary");
+		preparation.previousPreserveData = first.preserveData;
+		preparation.previousSummary = first.summary;
+		preparation.messagesToSummarize = [{ role: "user", content: "next operator request", timestamp: 4 }];
+		preparation.recentMessages = [];
+		const next = await compact(preparation, model, "fixture", undefined, undefined, { fetch });
+		const nextHistory = getCompactionV2PreserveData(next.preserveData)?.replacementHistory;
+		if (!nextHistory) throw new Error("Expected successive replacement history");
+		expect(nextHistory.slice(0, firstHistory.length - 1)).toEqual(firstHistory.slice(0, -1));
+		expect(JSON.stringify(nextHistory)).toContain("next operator request");
+		expect(nextHistory.filter(item => item.type === "compaction")).toEqual([
+			{ type: "compaction", encrypted_content: "compact-2" },
+		]);
+	});
+
 	test.each(["v1", "v2", "codex-v2"])(
 		"preserves local summary history when entering native replay (%s)",
 		async protocol => {
