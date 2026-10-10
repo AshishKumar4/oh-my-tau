@@ -3,6 +3,7 @@ import type { AuthCredential, ApiKeyCredential, OAuthCredential } from "./types"
 
 /** Selected stored credential and its pool index. */
 export type CredentialSelection<T extends AuthCredential> = {
+	readonly credentialId: number;
 	credential: T;
 	index: number;
 };

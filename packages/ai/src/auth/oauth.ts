@@ -8,6 +8,7 @@ import type { SessionAffinity } from "./affinity";
 import type { KeyOverrides } from "./cascade";
 import type { AccountPolicies } from "./policy";
 import type { CredentialPool } from "./pool";
+import type { OAuthSelection } from "./rank";
 import type { OAuthRefresher } from "./refresh";
 import type { CredentialSelector } from "./select";
 import type {
@@ -27,11 +28,7 @@ import type {
 	StoredOAuthRefreshResult,
 } from "./types";
 
-type StoredOAuthSelection = {
-	credentialId: number;
-	credential: OAuthCredential;
-	index: number;
-};
+type StoredOAuthSelection = OAuthSelection;
 
 /** Dependencies used by the OAuth account operations. */
 export interface OAuthAccountsDeps {
@@ -176,14 +173,11 @@ export class OAuthAccounts implements OAuthApi {
 		options: AuthApiKeyOptions | undefined,
 	): Promise<OAuthAccessResolution> {
 		try {
-			const resolved = await this.#deps.selector.tryOAuth(
-				provider,
-				{ credential: selection.credential, index: selection.index },
-				providerKey,
-				undefined,
-				options,
-				{ checkUsage: false, allowBlocked: true, allowFallback: false },
-			);
+			const resolved = await this.#deps.selector.tryOAuth(provider, selection, providerKey, undefined, options, {
+				checkUsage: false,
+				allowBlocked: true,
+				allowFallback: false,
+			});
 			if (!resolved) {
 				return {
 					ok: false,

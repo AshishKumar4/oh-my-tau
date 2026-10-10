@@ -12,6 +12,7 @@ import {
 	startAuthBroker,
 } from "@oh-my-pi/pi-ai/auth-broker";
 import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import type { AuthCredential } from "@oh-my-pi/pi-ai/auth/types";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/registry/oauth/types";
 import type { UsageLimit, UsageProvider, UsageReport } from "@oh-my-pi/pi-ai/usage";
@@ -1111,6 +1112,181 @@ describe("AuthStorage codex oauth ranking", () => {
 
 		expect(await authStorage.keys.get("openai-codex", "explicit-reserve-pin")).toBe("api-acct-protected");
 	});
+
+	test.each([false, true])(
+		"honors a blocked explicit pin after preflight reorder=%s without dispensing a held account",
+		async reorder => {
+			if (!authStorage || !store) throw new Error("test setup failed");
+			const storage = authStorage;
+			await storage.credentials.set("openai-codex", [
+				{ type: "oauth", ...createCredential("acct-a", "a@example.com") },
+				{ type: "oauth", ...createCredential("acct-b", "b@example.com") },
+			]);
+			const accounts = storage.oauth.accounts("openai-codex");
+			const accountA = accounts.find(account => account.accountId === "acct-a");
+			const accountB = accounts.find(account => account.accountId === "acct-b");
+			if (!accountA || !accountB) throw new Error("Expected both accounts");
+			const sessionId = "blocked-explicit-pin";
+			await storage.limits.markReached("openai-codex", sessionId, {
+				credentialId: accountB.credentialId,
+				retryAfterMs: 4 * HOUR_MS,
+			});
+			expect(storage.sessions.pin("openai-codex", sessionId, accountB.credentialId)).toBe(true);
+			expect(await storage.keys.get("openai-codex", sessionId)).toBe("api-acct-a");
+			await storage.limits.markReached("openai-codex", sessionId, {
+				credentialId: accountA.credentialId,
+				retryAfterMs: HOUR_MS,
+			});
+			expect(storage.sessions.pin("openai-codex", sessionId, accountB.credentialId)).toBe(true);
+			if (reorder) {
+				const list = store.listAuthCredentials.bind(store);
+				vi.spyOn(store, "listAuthCredentials").mockImplementation(provider => list(provider).reverse());
+			}
+			expect(await storage.keys.get("openai-codex", sessionId)).toBe("api-acct-b");
+			storage.holdCredential("openai-codex", accountB.credentialId);
+			expect(await storage.keys.get("openai-codex", sessionId)).toBe("api-acct-a");
+		},
+	);
+
+	test("preserves an explicit account across concurrent token refresh and storage reorder", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const storage = authStorage;
+		const credentialStore = store;
+		await storage.credentials.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-a", "a@example.com") },
+			{ type: "oauth", ...createCredential("acct-b", "b@example.com") },
+		]);
+		const accounts = storage.oauth.accounts("openai-codex");
+		const accountA = accounts.find(account => account.accountId === "acct-a");
+		const accountB = accounts.find(account => account.accountId === "acct-b");
+		if (!accountA || !accountB) throw new Error("Expected both accounts");
+		const sessionId = "refresh-reorder";
+		await storage.limits.markReached("openai-codex", sessionId, {
+			credentialId: accountA.credentialId,
+			retryAfterMs: HOUR_MS,
+		});
+		await storage.limits.markReached("openai-codex", sessionId, {
+			credentialId: accountB.credentialId,
+			retryAfterMs: 4 * HOUR_MS,
+		});
+		expect(storage.sessions.pin("openai-codex", sessionId, accountB.credentialId)).toBe(true);
+		const started = Promise.withResolvers<void>();
+		for (const row of credentialStore.listAuthCredentials("openai-codex")) {
+			if (row.credential.type === "oauth") {
+				credentialStore.updateAuthCredential(row.id, { ...row.credential, expires: Date.now() + 30_000 });
+			}
+		}
+		await storage.credentials.reload();
+		const release = Promise.withResolvers<void>();
+		const refreshed = new Set<string>();
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
+			refreshed.add(credential.accountId ?? "missing");
+			if (refreshed.size === 2) started.resolve();
+			await release.promise;
+			return { ...credential, access: `renewed-${credential.accountId}`, expires: Date.now() + WEEK_MS };
+		});
+		const resolving = storage.keys.get("openai-codex", sessionId);
+		try {
+			await started.promise;
+			const list = credentialStore.listAuthCredentials.bind(credentialStore);
+			vi.spyOn(credentialStore, "listAuthCredentials").mockImplementation(provider => list(provider).reverse());
+			await storage.credentials.reload();
+			release.resolve();
+			expect(await resolving).toBe("api-acct-b");
+			expect(refreshed).toEqual(new Set(["acct-a", "acct-b"]));
+		} finally {
+			release.resolve();
+			await resolving;
+		}
+	});
+
+	test.each([false, true])(
+		"keeps a valid pinned account after a lower row is disabled, extra sibling=%s",
+		async extra => {
+			if (!authStorage || !store) throw new Error("test setup failed");
+			const storage = authStorage;
+			const fixtureCredentials: AuthCredential[] = [
+				{ type: "oauth", ...createCredential("acct-a", "a@example.com") },
+				{ type: "oauth", ...createCredential("acct-b", "b@example.com") },
+			];
+			if (extra) fixtureCredentials.push({ type: "oauth", ...createCredential("acct-c", "c@example.com") });
+			await storage.credentials.set("openai-codex", fixtureCredentials);
+			const accounts = storage.oauth.accounts("openai-codex");
+			const doomed = accounts.find(account => account.accountId === "acct-a");
+			const pinned = accounts.find(account => account.accountId === "acct-b");
+			if (!doomed || !pinned) throw new Error("Expected fixture accounts");
+			for (const account of accounts)
+				await storage.limits.markReached("openai-codex", "disabled-lower", {
+					credentialId: account.credentialId,
+					retryAfterMs: HOUR_MS,
+				});
+			expect(storage.sessions.pin("openai-codex", "disabled-lower", pinned.credentialId)).toBe(true);
+			const row = store.listAuthCredentials("openai-codex").find(row => row.id === doomed.credentialId);
+			if (!row || row.credential.type !== "oauth") throw new Error("Expected doomed OAuth row");
+			store.updateAuthCredential(row.id, { ...row.credential, expires: Date.now() + 30_000 });
+			await storage.credentials.reload();
+			vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
+				await Promise.resolve();
+				if (credential.accountId === "acct-a") throw new Error("invalid_grant: revoked refresh token");
+				return credential;
+			});
+			expect(await storage.keys.get("openai-codex", "disabled-lower")).toBe("api-acct-b");
+			expect(storage.oauth.accounts("openai-codex").map(account => account.accountId)).not.toContain("acct-a");
+			expect(await storage.keys.get("openai-codex", "disabled-lower")).toBe("api-acct-b");
+		},
+	);
+
+	test.each(["hold", "remove"])(
+		"does not transfer a quota report to a sibling when its row changes during usage: %s",
+		async change => {
+			if (!authStorage || !store) throw new Error("test setup failed");
+			const storage = authStorage;
+			await storage.credentials.set("openai-codex", [
+				{ type: "oauth", ...createCredential("acct-a", "a@example.com") },
+				{ type: "oauth", ...createCredential("acct-b", "b@example.com") },
+			]);
+			const accounts = storage.oauth.accounts("openai-codex");
+			const accountA = accounts.find(account => account.accountId === "acct-a");
+			const accountB = accounts.find(account => account.accountId === "acct-b");
+			if (!accountA || !accountB) throw new Error("Expected fixture accounts");
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			vi.spyOn(usageProvider, "fetchUsage").mockImplementation(async params => {
+				if (params.credential.accountId === "acct-a") {
+					entered.resolve();
+					await release.promise;
+				}
+				return createCodexUsageReport({
+					accountId: params.credential.accountId ?? "missing",
+					primary: { usedFraction: 0.1, resetInMs: 2 * HOUR_MS },
+					secondary: {
+						usedFraction: params.credential.accountId === "acct-a" ? (change === "remove" ? 1 : 0.1) : 0.2,
+						resetInMs: WEEK_MS,
+					},
+				});
+			});
+			const resolving = storage.keys.get("openai-codex", "usage-race");
+			try {
+				await entered.promise;
+				if (change === "hold") storage.holdCredential("openai-codex", accountA.credentialId);
+				else {
+					await store.deleteAuthCredential(accountA.credentialId, "fixture removed during usage");
+					await storage.credentials.reload();
+				}
+				release.resolve();
+				expect(await resolving).toBe("api-acct-b");
+				if (!store.getCredentialBlock) throw new Error("Expected persisted block support");
+				for (const scope of ["", "chat", "spark", "shared"]) {
+					expect(store.getCredentialBlock(accountB.credentialId, "openai-codex:oauth", scope)).toBeUndefined();
+				}
+				expect(storage.sessions.pin("openai-codex", "verify-b", accountB.credentialId)).toBe(true);
+				expect(await storage.keys.get("openai-codex", "verify-b")).toBe("api-acct-b");
+			} finally {
+				release.resolve();
+				await resolving;
+			}
+		},
+	);
 
 	test("keeps a lone reserve account usable when usage is unknown", async () => {
 		if (!store) throw new Error("test setup failed");
