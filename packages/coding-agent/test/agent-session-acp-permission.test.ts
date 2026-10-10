@@ -26,6 +26,9 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryModelRegistry } from "./helpers/agent-session-setup";
+
+const registries: Array<ReturnType<typeof createInMemoryModelRegistry>> = [];
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -147,11 +150,13 @@ async function createSessionWithMockModel(
 		streamFn: mock.stream,
 	});
 
+	const registry = createInMemoryModelRegistry(mock.model.provider);
+	registries.push(registry);
 	const sess = new AgentSession({
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: { getApiKey: () => "test-key" } as never,
+		modelRegistry: registry,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 	});
 	sess.setClientBridge(bridge);
@@ -165,6 +170,7 @@ beforeAll(() => {
 afterEach(async () => {
 	await session?.dispose();
 	session = undefined;
+	for (const registry of registries.splice(0)) registry.authStorage.close();
 });
 
 afterAll(async () => {

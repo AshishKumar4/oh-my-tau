@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
 /**
  * Shared factory for building a minimal mock `AssistantMessage`
@@ -33,4 +35,15 @@ export function createAssistantMessage(text: string): AssistantMessage {
  */
 export function createInMemoryAuthStorage(): AuthStorage {
 	return new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+}
+
+/** Exercise real auth admission and requests without reading local config or persisting catalog data. */
+export function createInMemoryModelRegistry(provider: string): ModelRegistry {
+	const auth = createInMemoryAuthStorage();
+	auth.keys.setRuntime(provider, "test-key");
+	return new ModelRegistry(auth, undefined, {
+		ignoreLocalModelConfig: true,
+		cacheDbPath: ":memory:",
+		settings: Settings.isolated({}),
+	});
 }

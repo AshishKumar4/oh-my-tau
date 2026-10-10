@@ -41,6 +41,7 @@ let scoped: Model[];
 
 beforeEach(async () => {
 	auth = await AuthStorage.create(":memory:");
+	for (const model of models) auth.keys.setRuntime(model.provider, "test-key");
 	registry = new ModelRegistry(auth, "/nonexistent/model-mentions/models.yml");
 	vi.spyOn(registry, "getAvailable").mockReturnValue(models);
 	session = SessionManager.inMemory();
@@ -59,7 +60,6 @@ afterEach(() => {
 
 describe("model mentions", () => {
 	test("only user prompts authorize model agents before dispatch", async () => {
-		vi.spyOn(registry, "getApiKey").mockResolvedValue("test-key");
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model: models[0], systemPrompt: ["Test"], tools: [], messages: [] },
@@ -93,7 +93,6 @@ describe("model mentions", () => {
 	});
 
 	test("child sessions retain parent model agents and reserve their pseudonyms", async () => {
-		vi.spyOn(registry, "getApiKey").mockResolvedValue("test-key");
 		const task = getBundledAgent("task");
 		if (!task) throw new Error("Missing bundled task agent");
 		const inheritedAgent = { ...task, name: "m1", model: ["b/y"] };
@@ -121,7 +120,6 @@ describe("model mentions", () => {
 	});
 
 	test("mid-session tags ride a hidden notice instead of the task description", async () => {
-		vi.spyOn(registry, "getApiKey").mockResolvedValue("test-key");
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model: models[0], systemPrompt: ["Test"], tools: [], messages: [] },

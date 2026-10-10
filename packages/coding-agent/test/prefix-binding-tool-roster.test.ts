@@ -11,6 +11,9 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryModelRegistry } from "./helpers/agent-session-setup";
+
+const registries: Array<ReturnType<typeof createInMemoryModelRegistry>> = [];
 
 function createPrefixBindingModel(): Model<"anthropic-messages"> {
 	return buildModel({
@@ -112,11 +115,13 @@ function newSession(
 			return mock.stream(requestModel, context, streamOptions);
 		},
 	});
+	const registry = createInMemoryModelRegistry(model.provider);
+	registries.push(registry);
 	const session = new AgentSession({
 		agent,
 		sessionManager: options.sessionManager ?? SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "test-key" } as never,
+		modelRegistry: registry,
 		toolRegistry,
 		builtInToolNames: ["read", "bash"],
 		providerPromptCacheKeySource: options.forkPromptCacheKey ? "fork" : undefined,
@@ -150,6 +155,7 @@ describe("prefix-bound tool roster changes", () => {
 
 	afterEach(async () => {
 		for (const session of sessions.splice(0)) await session.dispose();
+		for (const registry of registries.splice(0)) registry.authStorage.close();
 		vi.restoreAllMocks();
 	});
 

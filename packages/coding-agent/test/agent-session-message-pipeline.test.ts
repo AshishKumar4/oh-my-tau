@@ -45,7 +45,7 @@ import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/se
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { createAssistantMessage, createInMemoryModelRegistry } from "./helpers/agent-session-setup";
 
 function createAgent(): Agent {
 	return new Agent({
@@ -102,6 +102,7 @@ describe("AgentSession message pipeline", () => {
 		clearCustomApis();
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
+			if (session.modelRegistry instanceof ModelRegistry) session.modelRegistry.authStorage.close();
 		}
 	});
 
@@ -1962,7 +1963,7 @@ describe("AgentSession message pipeline", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false, "provider.appendOnlyContext": "on" }),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry: createInMemoryModelRegistry(model.provider),
 			rebuildSystemPrompt: async () => ({
 				systemPrompt: remembered
 					? ["base", `static memory instructions\n\n${injected}`]
@@ -2706,7 +2707,7 @@ describe("AgentSession message pipeline", () => {
 				"memory.backend": "mnemopi",
 				"provider.appendOnlyContext": "on",
 			}),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry: createInMemoryModelRegistry(model.provider),
 			rebuildSystemPrompt: async () => ({
 				systemPrompt: remembered
 					? ["base", `static memory instructions\n\n${injected}`]
@@ -2800,7 +2801,7 @@ describe("AgentSession message pipeline", () => {
 				"memory.backend": "mnemopi",
 				"provider.appendOnlyContext": "on",
 			}),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry: createInMemoryModelRegistry(model.provider),
 			rebuildSystemPrompt: async () => ({
 				systemPrompt: remembered
 					? ["base", `static memory instructions\n\n${injected}`]
@@ -2898,7 +2899,7 @@ describe("AgentSession message pipeline", () => {
 				"memory.backend": "mnemopi",
 				"provider.appendOnlyContext": "on",
 			}),
-			modelRegistry: createModelRegistryStub() as never,
+			modelRegistry: createInMemoryModelRegistry(model.provider),
 			rebuildSystemPrompt: async () => ({
 				systemPrompt: remembered
 					? ["base", `static memory instructions\n\n${injected}`]

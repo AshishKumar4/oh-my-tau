@@ -8,6 +8,9 @@ import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createInMemoryModelRegistry } from "./helpers/agent-session-setup";
+
+const registries: Array<ReturnType<typeof createInMemoryModelRegistry>> = [];
 
 // Contract: a per-turn system prompt returned by `before_agent_start`
 // ("Replace the system prompt for this turn") must reach the provider for the
@@ -43,6 +46,7 @@ describe("AgentSession before_agent_start system prompt override", () => {
 			session = undefined;
 		}
 		vi.restoreAllMocks();
+		for (const registry of registries.splice(0)) registry.authStorage.close();
 	});
 
 	/**
@@ -60,11 +64,14 @@ describe("AgentSession before_agent_start system prompt override", () => {
 	): { session: AgentSession; systemPrompts: string[][] } {
 		const mock = createMockModel({ responses });
 		const systemPrompts: string[][] = [];
+		const model = createModel();
+		const registry = createInMemoryModelRegistry(model.provider);
+		registries.push(registry);
 
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: {
-				model: createModel(),
+				model,
 				systemPrompt: ["initial-base"],
 				tools: [],
 				messages: [],
@@ -80,7 +87,7 @@ describe("AgentSession before_agent_start system prompt override", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
-			modelRegistry: { getApiKey: async () => "test-key" } as never,
+			modelRegistry: registry,
 			extensionRunner: {
 				emitBeforeAgentStart: async () => ({ systemPrompt: [OVERRIDE] }),
 				emit: async () => undefined,

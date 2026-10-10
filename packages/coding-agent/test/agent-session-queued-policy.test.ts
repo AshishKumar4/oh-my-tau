@@ -5,7 +5,6 @@ import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-cor
 import type { Context, ImageContent } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
@@ -29,10 +28,11 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SessionProviderBoundary } from "@oh-my-pi/pi-coding-agent/session/session-provider-boundary";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createAssistantMessage } from "./helpers/agent-session-setup";
+import { createAssistantMessage, createInMemoryModelRegistry } from "./helpers/agent-session-setup";
 
 import { cfgMnemopiInjectionTokenLimit } from "@oh-my-pi/pi-coding-agent/mnemopi/settings";
 
+const registries: Array<ReturnType<typeof createInMemoryModelRegistry>> = [];
 const BASE = ["base identity", "base tools"];
 
 function extension(name: string, handler: (event: BeforeAgentStartEvent) => Promise<unknown>): Extension {
@@ -60,6 +60,7 @@ describe("queued user delivery policy", () => {
 
 	afterEach(async () => {
 		await session?.dispose();
+		for (const registry of registries.splice(0)) registry.authStorage.close();
 		for (const dir of tempDirs.splice(0)) dir.removeSync();
 		vi.restoreAllMocks();
 	});
@@ -74,8 +75,6 @@ describe("queued user delivery policy", () => {
 		const events: BeforeAgentStartEvent[] = [];
 		const delivered: AgentMessage[] = [];
 		const manager = SessionManager.inMemory();
-		// Only credential lookup is needed; requests use the local scripted provider.
-		const registry = { getApiKey: async () => "test-key" } as unknown as ModelRegistry;
 		let beforePrepare: (() => Promise<void>) | undefined;
 		const extensions = [
 			extension("policy", async event => {
@@ -96,7 +95,6 @@ describe("queued user delivery policy", () => {
 				options.policy === false ? undefined : { systemPrompt: [...event.systemPrompt, "independent policy"] },
 			),
 		];
-		const runner = new ExtensionRunner(extensions, new ExtensionRuntime(), manager.getCwd(), manager, registry);
 		const model = buildModel({
 			id: "mock",
 			name: "mock",
@@ -109,6 +107,9 @@ describe("queued user delivery policy", () => {
 			contextWindow: 8192,
 			maxTokens: 2048,
 		});
+		const registry = createInMemoryModelRegistry(model.provider);
+		registries.push(registry);
+		const runner = new ExtensionRunner(extensions, new ExtensionRuntime(), manager.getCwd(), manager, registry);
 		const agent = new Agent({
 			initialState: { model, systemPrompt: BASE, tools: options.tools ?? [], messages: [] },
 			getApiKey: () => "test-key",
