@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -41,7 +42,7 @@ export function createInMemoryAuthStorage(): AuthStorage {
 export function createInMemoryModelRegistry(provider: string): ModelRegistry {
 	const auth = createInMemoryAuthStorage();
 	auth.keys.setRuntime(provider, "test-key");
-	return new ModelRegistry(auth, undefined, {
+	return new ModelRegistry(auth, path.join(import.meta.dir, "fixture-models.yml"), {
 		ignoreLocalModelConfig: true,
 		cacheDbPath: ":memory:",
 		settings: Settings.isolated({}),
