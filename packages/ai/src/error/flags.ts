@@ -248,6 +248,12 @@ function isCodexChatGPTAccountPolicyText(
 const STALE_RESPONSE_ITEM_PATTERNS = [/\bItem with id ['"][^'"]+['"] not found\.?/i, /previous[ _]?response/i] as const;
 const STALE_RESPONSE_ITEM_DETAIL_PATTERN = /not[ _]?found|invalid|expired|stale|zero[ _-]?data[ _-]?retention/i;
 /**
+ * Codex refuses a stateful socket message (a steer) while its native turn lane is still running, and asks for "a new
+ * independent response.create turn instead": the same recovery as a stale item, a reset provider session and a fresh
+ * same-model request. 343 refusals in omp sessions to 2026-10-09: 325 next attempts on the same model succeeded.
+ */
+const CODEX_NATIVE_INFLIGHT_PATTERN = /\bunsupported_native_inflight_message\b/;
+/**
  * Local llama.cpp / Ollama deterministic tool-call argument JSON parse failure.
  * The model emitted invalid JSON in a tool call and the server returned HTTP 500
  * with this exact text — replaying the same prompt yields the same malformed
@@ -471,7 +477,8 @@ function isAuthFailureText(text: string): boolean {
 function isStaleResponsesText(text: string): boolean {
 	return (
 		STALE_RESPONSE_ITEM_PATTERNS[0].test(text) ||
-		(STALE_RESPONSE_ITEM_PATTERNS[1].test(text) && STALE_RESPONSE_ITEM_DETAIL_PATTERN.test(text))
+		(STALE_RESPONSE_ITEM_PATTERNS[1].test(text) && STALE_RESPONSE_ITEM_DETAIL_PATTERN.test(text)) ||
+		CODEX_NATIVE_INFLIGHT_PATTERN.test(text)
 	);
 }
 
