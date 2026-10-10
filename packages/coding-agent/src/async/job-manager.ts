@@ -1,5 +1,6 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
+import { getRenderedEnvelope, withRenderedEnvelope } from "../harness/content";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 
@@ -411,6 +412,7 @@ export class AsyncJobManager {
 				});
 				job.endTime = Date.now();
 				const text = typeof outcome === "string" ? outcome : outcome.text;
+				if (typeof outcome !== "string") withRenderedEnvelope(job, getRenderedEnvelope(outcome, text));
 				const structured = typeof outcome === "string" ? undefined : outcome.structured;
 				if (structured) job.structured = structured;
 				if (job.status === "cancelled") {
@@ -424,6 +426,7 @@ export class AsyncJobManager {
 				job.endTime = Date.now();
 				if (error instanceof AsyncJobError && error.structured) job.structured = error.structured;
 				const errorText = error instanceof Error ? error.message : String(error);
+				if (error instanceof Error) withRenderedEnvelope(job, getRenderedEnvelope(error, errorText));
 				job.errorText = errorText;
 				if (job.status !== "cancelled") {
 					job.status = "failed";
@@ -1061,16 +1064,19 @@ export class AsyncJobManager {
 			nextAttemptAt: Date.now(),
 			ownerId: job?.ownerId,
 			jobSnapshot: job
-				? {
-						type: job.type,
-						status: job.status,
-						startTime: job.startTime,
-						endTime: job.endTime,
-						label: job.label,
-						structured: job.structured,
-						agentId: job.agentId,
-						latestDetails: job.latestDetails,
-					}
+				? withRenderedEnvelope(
+						{
+							type: job.type,
+							status: job.status,
+							startTime: job.startTime,
+							endTime: job.endTime,
+							label: job.label,
+							structured: job.structured,
+							agentId: job.agentId,
+							latestDetails: job.latestDetails,
+						},
+						getRenderedEnvelope(job, text),
+					)
 				: undefined,
 		});
 		this.#ensureDeliveryLoop();
@@ -1200,20 +1206,23 @@ export class AsyncJobManager {
 	#reconstructEvictedJob(delivery: AsyncJobDelivery): AsyncJob | undefined {
 		const snapshot = delivery.jobSnapshot;
 		if (!snapshot) return undefined;
-		return {
-			id: delivery.jobId,
-			type: snapshot.type,
-			status: snapshot.status,
-			startTime: snapshot.startTime,
-			endTime: snapshot.endTime,
-			label: snapshot.label,
-			abortController: new AbortController(),
-			promise: Promise.resolve(),
-			resultText: delivery.text,
-			structured: snapshot.structured,
-			agentId: snapshot.agentId,
-			latestDetails: snapshot.latestDetails,
-		};
+		return withRenderedEnvelope(
+			{
+				id: delivery.jobId,
+				type: snapshot.type,
+				status: snapshot.status,
+				startTime: snapshot.startTime,
+				endTime: snapshot.endTime,
+				label: snapshot.label,
+				abortController: new AbortController(),
+				promise: Promise.resolve(),
+				resultText: delivery.text,
+				structured: snapshot.structured,
+				agentId: snapshot.agentId,
+				latestDetails: snapshot.latestDetails,
+			},
+			getRenderedEnvelope(snapshot, delivery.text),
+		);
 	}
 
 	#queueDelivery(delivery: AsyncJobDelivery): void {

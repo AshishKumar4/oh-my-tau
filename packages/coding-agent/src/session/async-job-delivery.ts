@@ -9,6 +9,7 @@
  * every completion — regardless of owner — into the first top-level session.
  */
 import { prompt } from "@oh-my-pi/pi-utils";
+import { escapeHarnessText, getRenderedEnvelope } from "../harness/content";
 import type { AsyncJob, AsyncJobType } from "../async";
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
@@ -132,7 +133,15 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 	};
 	const text = prompt.render(asyncResultTemplate, {
 		multiple: jobs.length > 1,
-		jobs,
+		jobs: jobs.map((job, index) => ({
+			...job,
+			jobId: escapeHarnessText(job.jobId),
+			agentUrlId: escapeHarnessText(job.agentUrlId),
+			label: job.label === undefined ? undefined : escapeHarnessText(job.label),
+			result: getRenderedEnvelope(entries[index].job, job.result) ?? escapeHarnessText(job.result),
+			schemaError: job.schemaError === undefined ? undefined : escapeHarnessText(job.schemaError),
+			structuredJson: job.structuredJson === undefined ? undefined : escapeHarnessText(job.structuredJson),
+		})),
 	});
 	const images = entries.flatMap(entry => entry.job?.latestDetails?.images ?? []);
 	return {

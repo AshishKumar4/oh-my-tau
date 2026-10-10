@@ -1,5 +1,7 @@
 import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { prompt } from "@oh-my-pi/pi-utils";
+import { escapeExpression } from "@oh-my-pi/pi-utils/template";
+import { escapeHarnessText, getRenderedEnvelope, withRenderedEnvelope } from "../harness/content";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { harnessToolRefs } from "../harness/manifest";
 import parentIrcSteerTemplate from "../prompts/steering/parent-irc.md" with { type: "text" };
@@ -159,14 +161,19 @@ export class IrcBridge {
 					queue.remaining.push(record);
 					continue;
 				}
-				messages.push({
-					id,
-					from,
-					to: agentId,
-					body,
-					ts: record.timestamp,
-					...(typeof replyTo === "string" ? { replyTo } : {}),
-				});
+				messages.push(
+					withRenderedEnvelope(
+						{
+							id,
+							from,
+							to: agentId,
+							body,
+							ts: record.timestamp,
+							...(typeof replyTo === "string" ? { replyTo } : {}),
+						},
+						getRenderedEnvelope(details, body),
+					),
+				);
 			}
 		}
 		this.#interrupts = remainingInterrupts;
@@ -183,25 +190,30 @@ export class IrcBridge {
 		// back to the sender (task executor `relayWakeTurnOutput`); the main
 		// agent and mid-turn asides have no such relay.
 		const relayOnStop = !streaming && !planModeIdle && msg.to !== MAIN_AGENT_ID && msg.wakeRelay !== true;
+		const rendered = getRenderedEnvelope(msg, msg.body);
+		const body = rendered ?? escapeHarnessText(msg.body);
 		const record: CustomMessage = {
 			role: "custom",
 			customType: "irc:incoming",
 			content: prompt.render(ircIncomingTemplate, {
-				from: msg.from,
-				message: msg.body,
-				replyTo: msg.replyTo ?? "",
+				from: escapeExpression(msg.from),
+				message: body,
+				replyTo: escapeExpression(msg.replyTo ?? ""),
 				interrupting: streaming,
 				relayOnStop,
 				toolRefs: this.#host.toolRefs?.() ?? harnessToolRefs(undefined),
 			}),
 			display: true,
-			details: {
-				id: msg.id,
-				from: msg.from,
-				message: msg.body,
-				...(msg.replyTo ? { replyTo: msg.replyTo } : {}),
-				...(msg.wakeRelay ? { wakeRelay: true } : {}),
-			},
+			details: withRenderedEnvelope(
+				{
+					id: msg.id,
+					from: msg.from,
+					message: msg.body,
+					...(msg.replyTo ? { replyTo: msg.replyTo } : {}),
+					...(msg.wakeRelay ? { wakeRelay: true } : {}),
+				},
+				rendered,
+			),
 			attribution: "agent",
 			timestamp: msg.ts,
 		};
@@ -211,7 +223,7 @@ export class IrcBridge {
 			if (recipientParentId === msg.from) {
 				this.#host.agent.steer({
 					role: "user",
-					content: prompt.render(parentIrcSteerTemplate, { from: msg.from, message: msg.body }),
+					content: prompt.render(parentIrcSteerTemplate, { from: escapeExpression(msg.from), message: body }),
 					attribution: "agent",
 					timestamp: msg.ts,
 					steering: true,

@@ -6,6 +6,8 @@
  * preview, `agent://` pointer) regardless of which path delivered it.
  */
 import { prompt } from "@oh-my-pi/pi-utils";
+import { escapeExpression } from "@oh-my-pi/pi-utils/template";
+import { escapeHarnessText, getRenderedEnvelope } from "../harness/content";
 import { harnessToolRefs } from "../harness/manifest";
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import { AgentRegistry } from "../registry/agent-registry";
@@ -71,14 +73,14 @@ export function formatTaskResultSummary(
 	const refStatus = AgentRegistry.global().get(result.id)?.status;
 	const resumable = result.aborted && !result.isolated && (refStatus === "idle" || refStatus === "parked");
 	return prompt.render(taskSummaryTemplate, {
-		agentName: result.agent,
-		id: result.id,
+		agentName: escapeExpression(result.agent),
+		id: escapeExpression(result.id),
 		status,
 		duration: formatDuration(options.totalDurationMs),
-		abortReason: result.aborted ? result.abortReason : undefined,
-		error,
+		abortReason: result.aborted && result.abortReason ? escapeHarnessText(result.abortReason) : undefined,
+		error: error === undefined ? undefined : escapeHarnessText(error),
 		resumable,
-		preview,
+		preview: escapeHarnessText(preview),
 		truncated,
 		meta: result.outputMeta
 			? {
@@ -86,7 +88,9 @@ export function formatTaskResultSummary(
 					charSize: formatBytes(result.outputMeta.charCount),
 				}
 			: undefined,
-		mergeSummary: options.mergeSummary ?? "",
+		mergeSummary:
+			getRenderedEnvelope(options, options.mergeSummary ?? "")?.toString() ??
+			escapeHarnessText(options.mergeSummary ?? ""),
 		toolRefs: options.toolRefs ?? harnessToolRefs(undefined),
 	});
 }

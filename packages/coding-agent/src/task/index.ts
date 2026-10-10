@@ -25,6 +25,8 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env, logger, prompt } from "@oh-my-pi/pi-utils";
+import { SafeString } from "@oh-my-pi/pi-utils/template";
+import { escapeHarnessText, getRenderedEnvelope, withRenderedEnvelope } from "../harness/content";
 import type { ToolSession } from "..";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
@@ -206,9 +208,26 @@ function renderDescription(template: string, options: TaskDescriptionOptions): s
 
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
 	return {
-		content: [{ type: "text", text }],
+		content: [{ type: "text", text: escapeHarnessText(text) }],
 		details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
 	};
+}
+
+function appendTaskNotice(
+	result: AgentToolResult<TaskToolDetails>,
+	notice: SafeString,
+): AgentToolResult<TaskToolDetails> {
+	let text: string | undefined;
+	const content = result.content.map(part => {
+		if (text !== undefined || part.type !== "text") return part;
+		text = `${getRenderedEnvelope(result, part.text) ?? escapeHarnessText(part.text)}\n\n${notice}`;
+		return { ...part, text };
+	});
+	if (text === undefined) {
+		text = notice.toString();
+		content.push({ type: "text", text });
+	}
+	return withRenderedEnvelope({ ...result, content }, new SafeString(text));
 }
 
 /**
@@ -408,12 +427,12 @@ function mergeSyncPayloads(
 		const payload = payloads[position];
 		const { item, index } = spawns[position];
 		if (!payload) {
-			contentParts.push(`Task ${item.name?.trim() || `#${index + 1}`}: cancelled before start.`);
+			contentParts.push(`Task ${escapeHarnessText(item.name?.trim() || `#${index + 1}`)}: cancelled before start.`);
 			continue;
 		}
 		projectAgentsDir ??= payload.details?.projectAgentsDir ?? null;
 		const text = payload.content.find(part => part.type === "text")?.text;
-		if (text) contentParts.push(text);
+		if (text) contentParts.push(getRenderedEnvelope(payload, text)?.toString() ?? escapeHarnessText(text));
 		for (const result of payload.details?.results ?? []) {
 			results.push({ ...result, index });
 			if (result.usage) {
@@ -1060,16 +1079,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				fork,
 			);
 			if (!advisory) return result;
-			let appended = false;
-			const content = result.content.map(part => {
-				if (!appended && part.type === "text" && typeof part.text === "string") {
-					appended = true;
-					return { ...part, text: `${part.text}\n\n${advisory}` };
-				}
-				return part;
-			});
-			if (!appended) content.push({ type: "text", text: advisory });
-			return { ...result, content };
+			return appendTaskNotice(result, new SafeString(advisory));
 		}
 
 		// Coordination only makes sense for spawns that keep running after this
@@ -1094,16 +1104,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// in-place edit on a shared/cached AgentToolResult would be a hidden trap.
 		const withAdvisory = (result: AgentToolResult<TaskToolDetails>): AgentToolResult<TaskToolDetails> => {
 			if (!advisory) return result;
-			let appended = false;
-			const content = result.content.map(part => {
-				if (!appended && part.type === "text" && typeof part.text === "string") {
-					appended = true;
-					return { ...part, text: `${part.text}\n\n${advisory}` };
-				}
-				return part;
-			});
-			if (!appended) content.push({ type: "text", text: advisory });
-			return { ...result, content };
+			return appendTaskNotice(result, new SafeString(advisory));
 		};
 		const outputManager = this.#outputManager();
 		const callStartedAt = Date.now();
@@ -1218,7 +1219,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				content: [
 					{
 						type: "text",
-						text: `Failed to start background task job${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.join("; ")}`,
+						text: `Failed to start background task job${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.map(escapeHarnessText).join("; ")}`,
 					},
 				],
 				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
@@ -1227,7 +1228,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		const scheduleFailureSummary =
 			failedSchedules.length > 0
-				? ` Failed to schedule ${failedSchedules.length} spawn${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.join("; ")}.`
+				? ` Failed to schedule ${failedSchedules.length} spawn${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.map(escapeHarnessText).join("; ")}.`
 				: "";
 		const toolRefs = sessionToolRefs(this.session);
 		const guidance = prompt
@@ -1245,10 +1246,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					singleCall: spawns.length === 1,
 					showListing: mixed || spawns.length > 1,
 					count: started.length,
-					agentId: started[0]?.agentId,
-					jobId: started[0]?.jobId,
-					agentLabel,
-					started,
+					agentId: started[0] ? escapeHarnessText(started[0].agentId) : undefined,
+					jobId: started[0] ? escapeHarnessText(started[0].jobId) : undefined,
+					agentLabel: escapeHarnessText(agentLabel),
+					started: started.map(item => ({
+						agentId: escapeHarnessText(item.agentId),
+						jobId: escapeHarnessText(item.jobId),
+					})),
 					scheduleFailureSummary,
 					guidance,
 				})
@@ -1347,13 +1351,18 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const spawnedSummary = started.length > 0 ? renderSpawnFeedback(true) : scheduleFailureSummary.trim();
-		const text = [merged.contentParts.join("\n\n"), spawnedSummary]
-			.filter(section => section.trim().length > 0)
-			.join("\n\n");
-		return withAdvisory({
-			content: [{ type: "text", text: text.length > 0 ? text : "No results." }],
-			details: buildAsyncDetails(),
-		});
+		const text =
+			[merged.contentParts.join("\n\n"), spawnedSummary].filter(section => section.trim().length > 0).join("\n\n") ||
+			"No results.";
+		return withAdvisory(
+			withRenderedEnvelope(
+				{
+					content: [{ type: "text", text }],
+					details: buildAsyncDetails(),
+				},
+				new SafeString(text),
+			),
+		);
 	}
 
 	/**
@@ -1398,7 +1407,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const isolated = spawnParams.isolated === true;
 			const ref = aborted ? AgentRegistry.global().get(agentId) : undefined;
 			return `\n\n${prompt.render(taskFollowUpTemplate, {
-				agentId,
+				agentId: escapeHarnessText(agentId),
 				aborted,
 				isolated,
 				ircEnabled,
@@ -1535,13 +1544,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						? `Background task ${agentId} failed.`
 						: `Background task ${agentId} complete.`;
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
-					const deliveryText = `${finalText}${await buildFollowUpHint(singleResult?.aborted === true)}`;
+					const deliveryText = `${getRenderedEnvelope(result, finalText) ?? escapeHarnessText(finalText)}${await buildFollowUpHint(singleResult?.aborted === true)}`;
 					const structured = singleResult?.structuredOutput;
 					if (resultFailed) {
 						// Mark the job itself failed; the failed agent stays interrogable.
-						throw new TaskJobError(deliveryText, structured);
+						throw withRenderedEnvelope(new TaskJobError(deliveryText, structured), new SafeString(deliveryText));
 					}
-					return structured ? { text: deliveryText, structured } : deliveryText;
+					return withRenderedEnvelope({ text: deliveryText, structured }, new SafeString(deliveryText));
 				} catch (error) {
 					if (error instanceof TaskJobError) {
 						throw error;
@@ -1553,7 +1562,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
 					const message = error instanceof Error ? error.message : String(error);
 					const hint = AgentRegistry.global().get(agentId) ? await buildFollowUpHint(false) : "";
-					throw new TaskJobError(`${message}${hint}`);
+					const text = `${escapeHarnessText(message)}${hint}`;
+					throw withRenderedEnvelope(new TaskJobError(text), new SafeString(text));
 				}
 			},
 			{
@@ -1634,16 +1644,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		});
 
 		const merged = mergeSyncPayloads(spawns, payloads);
-		return {
-			content: [{ type: "text", text: merged.contentParts.join("\n\n") }],
-			details: {
-				projectAgentsDir: merged.projectAgentsDir,
-				results: merged.results,
-				totalDurationMs: Date.now() - startTime,
-				usage: merged.usage,
-				outputPaths: merged.outputPaths,
+		const text = merged.contentParts.join("\n\n");
+		return withRenderedEnvelope(
+			{
+				content: [{ type: "text", text }],
+				details: {
+					projectAgentsDir: merged.projectAgentsDir,
+					results: merged.results,
+					totalDurationMs: Date.now() - startTime,
+					usage: merged.usage,
+					outputPaths: merged.outputPaths,
+				},
 			},
-		};
+			new SafeString(text),
+		);
 	}
 
 	/**
@@ -1808,7 +1822,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				? { ...settled, error: settled.error ?? (cause instanceof Error ? cause.message : message) }
 				: undefined;
 			return {
-				content: [{ type: "text", text: `Task execution failed: ${message}` }],
+				content: [{ type: "text", text: `Task execution failed: ${escapeHarnessText(message)}` }],
 				isError: true,
 				details: {
 					projectAgentsDir: null,
@@ -1829,22 +1843,31 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		totalDurationMs: number,
 		mergeSummary: string,
 	): AgentToolResult<TaskToolDetails> {
-		const summary = formatTaskResultSummary(result, {
-			totalDurationMs,
-			mergeSummary,
-			toolRefs: sessionToolRefs(this.session),
-		});
+		const summary = formatTaskResultSummary(
+			result,
+			withRenderedEnvelope(
+				{
+					totalDurationMs,
+					mergeSummary,
+					toolRefs: sessionToolRefs(this.session),
+				},
+				new SafeString(mergeSummary),
+			),
+		);
 
-		return {
-			content: [{ type: "text", text: summary }],
-			details: {
-				projectAgentsDir,
-				results: [result],
-				totalDurationMs,
-				usage: result.usage,
-				outputPaths: result.outputPath ? [result.outputPath] : undefined,
+		return withRenderedEnvelope(
+			{
+				content: [{ type: "text", text: summary }],
+				details: {
+					projectAgentsDir,
+					results: [result],
+					totalDurationMs,
+					usage: result.usage,
+					outputPaths: result.outputPath ? [result.outputPath] : undefined,
+				},
 			},
-		};
+			new SafeString(summary),
+		);
 	}
 }
 

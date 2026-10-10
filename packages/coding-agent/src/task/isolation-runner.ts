@@ -20,6 +20,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { escapeHarnessText } from "../harness/content";
 import type * as natives from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { prompt } from "@oh-my-pi/pi-utils";
@@ -81,7 +82,14 @@ export interface IsolationSummaryContext {
  * follows.
  */
 export function renderIsolationSummary(context: IsolationSummaryContext): string {
-	return `\n\n${prompt.render(isolationSummaryTemplate, { ...context })}`;
+	return `\n\n${prompt.render(isolationSummaryTemplate, {
+		...context,
+		branchName: context.branchName === undefined ? undefined : escapeHarnessText(context.branchName),
+		rootPatchPath: context.rootPatchPath === undefined ? undefined : escapeHarnessText(context.rootPatchPath),
+		nestedPatchPaths: context.nestedPatchPaths?.map(escapeHarnessText),
+		error: context.error === undefined ? undefined : escapeHarnessText(context.error),
+		conflict: context.conflict === undefined ? undefined : escapeHarnessText(context.conflict),
+	})}`;
 }
 
 /** Record artifact locations for `agent://` and mark the result as an isolated run. */
@@ -674,7 +682,9 @@ export async function mergeIsolatedChanges(opts: IsolationMergeOptions): Promise
 
 			let summary: string;
 			if (changesApplied) {
-				summary = hadAnyChanges ? `\n\nMerged branch: ${result.branchName}` : "\n\nNo changes to apply.";
+				summary = hadAnyChanges
+					? `\n\nMerged branch: ${escapeHarnessText(result.branchName)}`
+					: "\n\nNo changes to apply.";
 			} else {
 				// The nested patches are skipped when the branch did not merge; name
 				// their files so the parent can recover them alongside the branch.
@@ -804,7 +814,7 @@ export async function applyEligibleNestedPatches(opts: NestedPatchApplyOptions):
 	try {
 		const warnings = await applyNestedPatches(repoRoot, nestedPatches, commitMessage);
 		if (warnings.length === 0) return "";
-		return `\n\n<system-notification>${warnings.join("\n")}</system-notification>`;
+		return `\n\n<system-notification>${warnings.map(escapeHarnessText).join("\n")}</system-notification>`;
 	} catch (applyErr) {
 		// Nested patch failures are non-fatal to the parent merge, but the patch
 		// files are the only surviving copy of that work — name them.

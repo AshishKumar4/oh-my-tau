@@ -11,6 +11,8 @@ import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } f
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { SUBAGENT_CONTEXT_TAG } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
+import { SafeString } from "@oh-my-pi/pi-utils/template";
+import { escapeHarnessText, withRenderedEnvelope } from "../harness/content";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
@@ -2925,13 +2927,19 @@ async function relayLaneRunEnd(end: LaneRunEnd, records: AgentMessage[], startTi
 		// the waker exactly as before — one message later. So the failure lane
 		// always notifies, flavoured to acknowledge the earlier message.
 		if (alreadyMessaged && !failed && source.from !== toldParent) continue;
-		const receipt = await bus.send({
-			from: end.id,
-			to: source.from,
-			body: buildWakeRelayBody({ ...end, alreadyMessaged }),
-			replyTo: source.messageId,
-			wakeRelay: true,
-		});
+		const body = buildWakeRelayBody({ ...end, alreadyMessaged });
+		const receipt = await bus.send(
+			withRenderedEnvelope(
+				{
+					from: end.id,
+					to: source.from,
+					body,
+					replyTo: source.messageId,
+					wakeRelay: true,
+				},
+				new SafeString(body),
+			),
+		);
 		if (receipt.outcome === "failed") {
 			logger.warn("IRC wake-turn relay failed", { from: end.id, to: source.from, error: receipt.error });
 		}
@@ -2952,7 +2960,7 @@ async function relayLaneRunEnd(end: LaneRunEnd, records: AgentMessage[], startTi
  * branch, which the observer seam cannot drive.
  */
 export function buildWakeRelayBody(args: LaneRunOutcome & { alreadyMessaged: boolean }): string {
-	const transcript = `See history://${args.id} for details.`;
+	const transcript = `See history://${escapeHarnessText(args.id)} for details.`;
 	// Computed once, above the completed/failed split: a turn that yielded a
 	// result before failing must be reported, never contradicted.
 	const summary =
@@ -2961,9 +2969,9 @@ export function buildWakeRelayBody(args: LaneRunOutcome & { alreadyMessaged: boo
 			: undefined;
 
 	const headline = args.error
-		? `Wake turn failed: ${args.error}.`
+		? `Wake turn failed: ${escapeHarnessText(args.error)}.`
 		: args.aborted
-			? `Wake turn was cancelled${args.abortReason?.trim() ? `: ${args.abortReason.trim()}` : ""}.`
+			? `Wake turn was cancelled${args.abortReason?.trim() ? `: ${escapeHarnessText(args.abortReason.trim())}` : ""}.`
 			: undefined;
 	if (headline) {
 		if (summary) {
@@ -2977,11 +2985,11 @@ export function buildWakeRelayBody(args: LaneRunOutcome & { alreadyMessaged: boo
 
 	// Completed lane. `alreadyMessaged` completed turns were filtered upstream
 	// (their answer would duplicate what the agent already sent).
-	const answer = summary ?? args.turnText.trim();
+	const answer = summary ?? escapeHarnessText(args.turnText.trim());
 	if (answer) return answer;
 	if (args.finalizeError) {
 		const message = args.finalizeError instanceof Error ? args.finalizeError.message : String(args.finalizeError);
-		return `Wake turn failed to finalize: ${message}. No answer was produced. ${transcript}`;
+		return `Wake turn failed to finalize: ${escapeHarnessText(message)}. No answer was produced. ${transcript}`;
 	}
 	return `Wake turn produced no output. ${transcript}`;
 }
@@ -3330,7 +3338,8 @@ function openWakeRun(
 						// The relay already answered: settle without an async-result delivery.
 						manager.acknowledgeDeliveries([jobId]);
 						if (end.error !== undefined || end.aborted || end.finalizeError !== undefined) {
-							throw new Error(buildWakeRelayBody({ ...end, alreadyMessaged: false }));
+							const body = buildWakeRelayBody({ ...end, alreadyMessaged: false });
+							throw withRenderedEnvelope(new AsyncJobError(body), new SafeString(body));
 						}
 						return `${id} answered by message and recorded no result.`;
 					}
@@ -3345,9 +3354,9 @@ function openWakeRun(
 					});
 					const structured = end.result.structuredOutput;
 					if (end.result.aborted || end.result.exitCode !== 0 || end.result.error !== undefined) {
-						throw new AsyncJobError(text, structured);
+						throw withRenderedEnvelope(new AsyncJobError(text, structured), new SafeString(text));
 					}
-					return structured ? { text, structured } : { text };
+					return withRenderedEnvelope({ text, structured }, new SafeString(text));
 				},
 				{ id, agentId: id, ownerId },
 			);
