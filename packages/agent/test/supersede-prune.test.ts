@@ -137,31 +137,35 @@ const anthropicModel = buildModel({
 	maxTokens: 8_192,
 });
 
-describe("readToolSupersedeKey", () => {
-	test("bare path keys on itself; non-read and non-string paths are exempt", () => {
-		expect(readToolSupersedeKey("read", { path: "src/foo.ts" })).toBe("src/foo.ts");
-		expect(readToolSupersedeKey("bash", { path: "src/foo.ts" })).toBeUndefined();
-		expect(readToolSupersedeKey("read", { path: 42 })).toBeUndefined();
-		expect(readToolSupersedeKey("read", {})).toBeUndefined();
-	});
+describe("supersede view isolation", () => {
+	test.each(["raw", "conflicts", "2-4:raw"])(
+		"retains %s through a bare read and replaces it only on the same view",
+		selector => {
+			const [oldCall, oldResult] = readPair(`src/foo.ts:${selector}`, FILE_CONTENT, T0);
+			const [plainCall, plainResult] = readPair("src/foo.ts", FILE_CONTENT, T0 + 1000);
+			const history: SessionEntry[] = [oldCall, oldResult, plainCall, plainResult];
+			const retained = resultText(oldResult);
+			expect(pruneSupersededToolResults(history, tokenizer, cfg({ now: T0 + 1000 })).prunedCount).toBe(0);
+			expect(resultText(oldResult)).toBe(retained);
+			const [newCall, newResult] = readPair(`src/foo.ts:${selector}`, FILE_CONTENT, T0 + 2000);
+			history.push(newCall, newResult);
+			const changed = pruneSupersededToolResults(history, tokenizer, cfg({ now: T0 + 2000 }));
+			expect(changed.prunedCount).toBe(1);
+			expect(resultMessage(oldResult).prunedAt).toBeDefined();
+			expect(resultMessage(plainResult).prunedAt).toBeUndefined();
+			changed.undo();
+			expect(resultText(oldResult)).toBe(retained);
+		},
+	);
 
-	test("URL/internal schemes are exempt", () => {
-		expect(readToolSupersedeKey("read", { path: "skill://react" })).toBeUndefined();
-		expect(readToolSupersedeKey("read", { path: "https://example.com/page" })).toBeUndefined();
-	});
-
-	test("strips trailing selectors into a \\u0000-separated key", () => {
-		expect(readToolSupersedeKey("read", { path: "src/foo.ts:50-200" })).toBe("src/foo.ts\u000050-200");
-		expect(readToolSupersedeKey("read", { path: "src/foo.ts:raw" })).toBe("src/foo.ts\u0000raw");
-		expect(readToolSupersedeKey("read", { path: "src/foo.ts:conflicts" })).toBe("src/foo.ts\u0000conflicts");
-		expect(readToolSupersedeKey("read", { path: "src/foo.ts:2-4:raw" })).toBe("src/foo.ts\u00002-4:raw");
-		expect(readToolSupersedeKey("read", { path: "src/foo.ts:5-16,960-973" })).toBe("src/foo.ts\u00005-16,960-973");
-		expect(readToolSupersedeKey("read", { path: "src/foo.ts:50+150" })).toBe("src/foo.ts\u000050+150");
-	});
-
-	test("does not strip non-selector colon segments", () => {
-		expect(readToolSupersedeKey("read", { path: "db.sqlite:users" })).toBe("db.sqlite:users");
-		expect(readToolSupersedeKey("read", { path: "db.sqlite:users:42" })).toBe("db.sqlite:users\u000042");
+	test.each(["skill://react", "https://example.com/page"])("does not supersede repeated resource %s", resource => {
+		const [oldCall, oldResult] = readPair(resource, FILE_CONTENT, T0);
+		const [newCall, newResult] = readPair(resource, FILE_CONTENT, T0 + 1000);
+		expect(
+			pruneSupersededToolResults([oldCall, oldResult, newCall, newResult], tokenizer, cfg({ now: T0 + 1000 }))
+				.prunedCount,
+		).toBe(0);
+		expect(resultMessage(oldResult).prunedAt).toBeUndefined();
 	});
 });
 

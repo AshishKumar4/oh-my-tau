@@ -15,7 +15,7 @@ import {
 	isSkillReadToolResult,
 	type ProtectedToolMatcher,
 } from "./tool-protection";
-import { splitReadSelector } from "./utils";
+import { isAlternateFormReadSelector, splitReadSelector } from "./utils";
 
 export interface CacheLookbackConfig {
 	/** Block positions the model's cache searches back; undefined when unbounded. */
@@ -38,6 +38,8 @@ export interface PruneConfig extends CacheLookbackConfig {
 	 * unchanged.
 	 */
 	supersedeKey?: SupersedeKeyFn;
+	/** Whether a successful parent-key result contains its complete target. */
+	supersedeComplete?: SupersedeCompleteFn;
 	/** Useless-flagged results bypass the protect window (see {@link USELESS_NOTICE}). Default true. */
 	pruneUseless?: boolean;
 	/**
@@ -108,16 +110,20 @@ export const USELESS_NOTICE = "[Uneventful result elided]";
 
 /**
  * Maps a tool call to a supersede key. Results sharing a key form a group in
- * which every result except the newest is a supersede candidate. A key `K`
- * additionally supersedes keys with prefix `K + "\u0000"` (selector-free read
- * supersedes selector-carrying reads of the same base path). Return
- * `undefined` to exempt a call from supersede grouping.
+ * which a successful newer result supersedes earlier results. A complete
+ * parent key also covers keys with prefix `K + "\u0000"`. Incomplete parent
+ * views retain possibly stale detail until a complete or same-selector read.
+ * Return `undefined` to exempt a call from supersede grouping.
  */
 export type SupersedeKeyFn = (toolName: string, args: Record<string, unknown>) => string | undefined;
+
+export type SupersedeCompleteFn = (message: ToolResultMessage) => boolean;
 
 export interface SupersedePruneConfig extends CacheLookbackConfig {
 	/** Supersede key function; results sharing a key supersede older ones. */
 	supersedeKey?: SupersedeKeyFn;
+	/** Incomplete parent views keep earlier ranges; same-selector successful reads remain newest-wins. */
+	supersedeComplete?: SupersedeCompleteFn;
 	/** Also prune results flagged useless by their tool. Default false. */
 	pruneUseless?: boolean;
 	/** Prune a candidate now when all messages after it total at most this many estimated tokens. Default 8 000. */
@@ -297,39 +303,55 @@ interface SupersedeCandidate {
 	notice: string;
 }
 
+interface NewerResults {
+	success: boolean;
+	complete: boolean;
+}
+
 /**
  * Collect superseded tool results: for every unpruned, unprotected tool result
  * whose paired call resolves a supersede key, a LATER result with the same key
- * — or with a key that is the `"\u0000"`-prefix parent of this one — marks it
- * superseded. Returned in message order.
+ * — or a complete parent-key result — marks it superseded. Failed results
+ * replace only earlier failures. Returned in message order.
  */
 function collectSupersededResults(
 	entries: readonly SessionEntry[],
 	tokenizer: Tokenizer,
 	toolCallsById: ReadonlyMap<string, AgentToolCall>,
 	supersedeKey: SupersedeKeyFn,
+	supersedeComplete: SupersedeCompleteFn | undefined,
 	protectedTools: readonly ProtectedToolMatcher[],
 ): SupersedeCandidate[] {
 	const candidates: SupersedeCandidate[] = [];
-	const seenKeys = new Set<string>();
+	const newerByKey = new Map<string, NewerResults>();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
+		if (entry.type !== "message") continue;
 		const message = getToolResultMessage(entry);
 		if (!message || message.prunedAt !== undefined) continue;
 		const toolCall = toolCallsById.get(message.toolCallId);
 		if (!toolCall) continue;
 		if (isProtectedToolResult(message, toolCall, protectedTools)) continue;
-		const key = supersedeKey(toolCall.name, toolCall.arguments as Record<string, unknown>);
+		const key = supersedeKey(toolCall.name, toolCall.arguments);
 		if (key === undefined) continue;
 		const separator = key.indexOf("\u0000");
-		const superseded = seenKeys.has(key) || (separator >= 0 && seenKeys.has(key.slice(0, separator)));
-		seenKeys.add(key);
+		const sameKey = newerByKey.get(key);
+		const parent = separator >= 0 ? newerByKey.get(key.slice(0, separator)) : undefined;
+		const superseded = message.isError
+			? sameKey !== undefined || parent?.success === true
+			: sameKey?.success === true || parent?.complete === true;
+		const newer = sameKey ?? { success: false, complete: false };
+		if (!message.isError && !newer.success) {
+			newer.success = true;
+			newer.complete = supersedeComplete?.(message) ?? true;
+		}
+		newerByKey.set(key, newer);
 		if (!superseded) continue;
 		candidates.push({
-			entry: entry as SessionMessageEntry,
+			entry,
 			message,
 			index: i,
-			tokens: tokenizer.countMessage(message as AgentMessage),
+			tokens: tokenizer.countMessage(message),
 			notice: SUPERSEDED_NOTICE,
 		});
 	}
@@ -379,7 +401,14 @@ export function pruneSupersededToolResults(
 ): PruneResult {
 	const toolCallsById = collectToolCallsById(entries);
 	const candidates = config.supersedeKey
-		? collectSupersededResults(entries, tokenizer, toolCallsById, config.supersedeKey, config.protectedTools)
+		? collectSupersededResults(
+				entries,
+				tokenizer,
+				toolCallsById,
+				config.supersedeKey,
+				config.supersedeComplete,
+				config.protectedTools,
+			)
 		: [];
 	if (config.pruneUseless) {
 		const exclude = new Set(candidates.map(candidate => candidate.message));
@@ -448,9 +477,14 @@ export function pruneToolOutputs(
 	const toolCallsById = collectToolCallsById(entries);
 	const supersededMessages = config.supersedeKey
 		? new Set(
-				collectSupersededResults(entries, tokenizer, toolCallsById, config.supersedeKey, config.protectedTools).map(
-					candidate => candidate.message,
-				),
+				collectSupersededResults(
+					entries,
+					tokenizer,
+					toolCallsById,
+					config.supersedeKey,
+					config.supersedeComplete,
+					config.protectedTools,
+				).map(candidate => candidate.message),
 			)
 		: undefined;
 	const uselessMessages =
@@ -558,10 +592,8 @@ export function pruneToolOutputs(
  * selector stripped (the read tool's own splitter grammar via
  * {@link splitReadSelector}, e.g. `src/foo.ts:50-200`, `:2-4:raw`).
  * Internal/URL-scheme paths (`skill://…`, `https://…`) are exempt.
- * Selector-free reads key on the bare path; selector-carrying reads key on
- * `path + "\u0000" + selector`, so two reads collide only when the newer is
- * selector-free or the selectors are identical (the pass's prefix rule lets a
- * bare-path read supersede selector-carrying reads of the same file).
+ * Complete bare reads cover range selectors. Alternate raw/conflicts forms
+ * remain separate and are replaced only by a matching selector.
  */
 export function readToolSupersedeKey(toolName: string, args: Record<string, unknown>): string | undefined {
 	if (toolName !== "read") return undefined;
@@ -569,5 +601,6 @@ export function readToolSupersedeKey(toolName: string, args: Record<string, unkn
 	if (typeof path !== "string" || path.length === 0) return undefined;
 	if (path.includes("://")) return undefined;
 	const { path: base, sel } = splitReadSelector(path);
-	return sel === undefined ? base : `${base}\u0000${sel}`;
+	if (sel === undefined) return base;
+	return `${base}${isAlternateFormReadSelector(sel) ? "\u0001" : "\u0000"}${sel}`;
 }

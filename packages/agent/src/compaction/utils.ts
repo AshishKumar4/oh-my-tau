@@ -38,6 +38,7 @@ const RANGE_LIST_SRC = `${RANGE_CHUNK_SRC}(?:,${RANGE_CHUNK_SRC})*`;
 const READ_SELECTOR_RE = new RegExp(`^(?:${RANGE_LIST_SRC}|raw|conflicts)$`, "i");
 const READ_RANGE_ONLY_RE = new RegExp(`^${RANGE_LIST_SRC}$`, "i");
 const READ_RAW_ONLY_RE = /^raw$/i;
+const READ_ALTERNATE_FORM_RE = /^(?:raw|conflicts)$/i;
 
 /**
  * Split a read-tool path into its base path and trailing selector, mirroring the
@@ -75,6 +76,10 @@ export function splitReadSelector(path: string): { path: string; sel?: string } 
  */
 export function stripReadSelector(path: string): string {
 	return splitReadSelector(path).path;
+}
+
+export function isAlternateFormReadSelector(selector: string): boolean {
+	return selector.split(":").some(part => READ_ALTERNATE_FORM_RE.test(part));
 }
 
 /**
