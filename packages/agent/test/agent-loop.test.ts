@@ -49,6 +49,52 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 const harmonyMitigationModel = createHarmonyMitigationModel();
 
 describe("agentLoop with AgentMessage", () => {
+	it("executes a tool-owned intent-named parameter unchanged while deriving trace intent separately", async () => {
+		const parameters = type({ value: "string", i: "number" }).onUndeclaredKey("reject");
+		const executed: Array<{ value: string; i: number }> = [];
+		const tool: AgentTool<typeof parameters> = {
+			name: "indexed",
+			label: "Indexed",
+			description: "Uses an integer index",
+			parameters,
+			intent: args => `Read ${args.value} at ${args.i}`,
+			async execute(_id, args) {
+				executed.push(args);
+				return { content: [{ type: "text", text: `${args.value}:${args.i}` }] };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [{ type: "toolCall", id: "call-index", name: "indexed", arguments: { value: "record", i: 7 } }],
+				},
+				{ content: ["Done"] },
+			],
+		});
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const stream = agentLoop(
+			[createUserMessage("Read index 7")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter, intentTracing: true },
+			undefined,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			/* drain actual execution */
+		}
+		const messages = await stream.result();
+		expect(executed).toEqual([{ value: "record", i: 7 }]);
+		const assistant = messages.find(message => message.role === "assistant");
+		const call =
+			assistant?.role === "assistant" ? assistant.content.find(block => block.type === "toolCall") : undefined;
+		expect(call).toMatchObject({ arguments: { value: "record", i: 7 }, intent: "Read record at 7" });
+		expect(messages.find(message => message.role === "toolResult")).toMatchObject({
+			toolCallId: "call-index",
+			isError: false,
+			content: [{ type: "text", text: "record:7" }],
+		});
+		expect(mock.calls).toHaveLength(2);
+	});
 	it("should emit events with AgentMessage types", async () => {
 		const context: AgentContext = {
 			systemPrompt: ["You are helpful."],

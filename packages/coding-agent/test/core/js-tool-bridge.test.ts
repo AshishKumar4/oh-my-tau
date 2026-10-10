@@ -50,7 +50,7 @@ function createSession(tools: AgentTool[]): ToolSession {
 }
 
 describe("callSessionTool", () => {
-	it("injects js intent and summarizes text results", async () => {
+	it("summarizes bridged results without injecting harness-only arguments", async () => {
 		const execute = vi.fn().mockResolvedValue({
 			content: [{ type: "text", text: "hello" }],
 		});
@@ -71,7 +71,7 @@ describe("callSessionTool", () => {
 		expect(result).toBe("hello");
 		expect(execute).toHaveBeenCalledWith(
 			expect.stringMatching(/^js-read-/),
-			{ path: "/tmp/demo.txt", [INTENT_FIELD]: "js prelude" },
+			{ path: "/tmp/demo.txt" },
 			undefined,
 			undefined,
 			undefined,
@@ -166,23 +166,24 @@ describe("callSessionTool", () => {
 		expect(execute).not.toHaveBeenCalled();
 	});
 
-	it("preserves caller intent through closed-schema validation", async () => {
-		const tool: AgentTool = {
+	it("removes harness intent before a strict tool executes through the eval bridge", async () => {
+		const schema = type({ "value?": "string" }).onUndeclaredKey("reject");
+		const tool: AgentTool<typeof schema> = {
 			name: "intent",
 			label: "intent",
 			description: "intent tool",
-			parameters: type({ "value?": "string" }).onUndeclaredKey("reject"),
+			parameters: schema,
 			concurrency: "shared",
-			execute: async (_id: string, args: unknown) => ({
-				content: [{ type: "text", text: String((args as Record<string, unknown>)[INTENT_FIELD]) }],
+			execute: async (_id, args) => ({
+				content: [{ type: "text", text: JSON.stringify(schema.assert(args)) }],
 			}),
-		} as unknown as AgentTool;
+		};
 		const result = await callSessionTool(
 			"intent",
 			{ value: "x", [INTENT_FIELD]: "caller intent" },
 			{ session: createSession([tool]) },
 		);
-		expect(result).toBe("caller intent");
+		expect(result).toBe('{"value":"x"}');
 	});
 
 	it("validates and preserves a schema-declared intent field", async () => {
@@ -261,7 +262,7 @@ describe("callSessionTool", () => {
 		expect(execute).not.toHaveBeenCalled();
 	});
 
-	it("preserves harness intent when propertyNames does not open a closed schema", async () => {
+	it("strips harness intent when propertyNames does not open a closed schema", async () => {
 		const tool = createSchemaTool("closed-property-names", {
 			type: "object",
 			properties: { value: {} },
@@ -274,7 +275,7 @@ describe("callSessionTool", () => {
 				{ value: "x", i: "caller intent" },
 				{ session: createSession([tool]) },
 			),
-		).toBe("string:caller intent");
+		).toBe("undefined:undefined");
 	});
 
 	it.each(["const", "enum"] as const)("preserves intent in object-valued %s", async keyword => {
@@ -332,7 +333,7 @@ describe("callSessionTool", () => {
 				{ [INTENT_FIELD]: "caller intent" },
 				{ session: createSession([tool]) },
 			),
-		).toBe("string:caller intent");
+		).toBe("undefined:undefined");
 	});
 
 	it("rejects invalid intent matched by patternProperties", async () => {
@@ -523,14 +524,14 @@ describe("callSessionTool", () => {
 			});
 			expect(
 				await callSessionTool("forbidden-presence", { i: "caller intent" }, { session: createSession([tool]) }),
-			).toBe("string:caller intent");
+			).toBe("undefined:undefined");
 		},
 	);
 
 	it("keeps harness intent out of a false property schema", async () => {
 		const tool = createSchemaTool("false-intent", { type: "object", properties: { i: false } });
 		expect(await callSessionTool("false-intent", { i: "caller intent" }, { session: createSession([tool]) })).toBe(
-			"string:caller intent",
+			"undefined:undefined",
 		);
 	});
 
@@ -541,7 +542,7 @@ describe("callSessionTool", () => {
 		});
 		expect(
 			await callSessionTool("false-pattern-intent", { i: "caller intent" }, { session: createSession([tool]) }),
-		).toBe("string:caller intent");
+		).toBe("undefined:undefined");
 	});
 
 	it("preserves intent constrained by unevaluatedProperties", async () => {
@@ -633,7 +634,7 @@ describe("callSessionTool", () => {
 				{ [INTENT_FIELD]: "caller intent" },
 				{ session: createSession([tool]) },
 			),
-		).toBe("string:caller intent");
+		).toBe("undefined:undefined");
 	});
 
 	it("does not treat a nested intent property as a root tool parameter", async () => {
@@ -654,7 +655,7 @@ describe("callSessionTool", () => {
 				{ wrapper: {}, [INTENT_FIELD]: "caller intent" },
 				{ session: createSession([tool]) },
 			),
-		).toBe("string:caller intent");
+		).toBe("undefined:undefined");
 	});
 
 	it("validates constrained tool-owned intent without supplying a missing optional value", async () => {

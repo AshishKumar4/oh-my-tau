@@ -1,4 +1,4 @@
-import { parseJsonWithRepair } from "@oh-my-pi/pi-utils";
+import { isRecord, parseJsonWithRepair } from "@oh-my-pi/pi-utils";
 import type { ToolCall } from "../types";
 
 /** Final arguments must not reuse the streaming parser's auto-closed preview. */
@@ -9,6 +9,16 @@ export function parseToolCallArguments(json: string | undefined): ToolCall["argu
 		return parseJsonWithRepair<ToolCall["arguments"]>(json);
 	} catch (error) {
 		return invalidToolCallArguments(json, error);
+	}
+}
+
+/** Replay repaired JSON rather than dropping its call and orphaning the executed result. Valid wire bytes remain unchanged. */
+export function replayableToolCallArguments(raw: string, executed: ToolCall["arguments"]): string {
+	try {
+		JSON.parse(raw);
+		return raw;
+	} catch {
+		return isRecord(executed) && "__parseError" in executed ? raw : JSON.stringify(executed);
 	}
 }
 

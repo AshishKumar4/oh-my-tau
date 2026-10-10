@@ -25,7 +25,7 @@ import {
 	USER_AGENT,
 } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
-import { parseToolCallArguments } from "../utils/tool-call-arguments";
+import { parseToolCallArguments, replayableToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey, isOfficialCodexApiUrl } from "../stream";
 import { getPremiumServiceTierRequests, parseServiceTier } from "../types";
 import type {
@@ -2845,6 +2845,7 @@ class CodexStreamProcessor {
 				arguments: parseToolCallArguments(item.arguments),
 				...(item.namespace ? { namespace: item.namespace } : {}),
 			};
+			item.arguments = replayableToolCallArguments(item.arguments, toolCall.arguments);
 			if (block?.type === "toolCall") {
 				// Persist the authoritative final args on the stored block; the throttled
 				// delta parser may have left block.arguments stale (often `{}`).

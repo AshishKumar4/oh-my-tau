@@ -35,7 +35,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { NO_AUTH_SENTINEL } from "../auth-retry";
 import * as AIError from "../error";
-import { parseToolCallArguments } from "../utils/tool-call-arguments";
+import { parseToolCallArguments, replayableToolCallArguments } from "../utils/tool-call-arguments";
 import {
 	type Api,
 	type AssistantMessage,
@@ -3474,7 +3474,6 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.output_item.done") {
 			const item = structuredCloneJSON(event.item);
-			options?.onOutputItemDone?.(item);
 			const entry =
 				item.type === "function_call" || item.type === "custom_tool_call"
 					? lookupOpenItem({ output_index: event.output_index, item_id: item.id ?? item.call_id })
@@ -3526,6 +3525,7 @@ export async function processResponsesStream<TApi extends Api>(
 					: item.arguments
 						? parseToolCallArguments(item.arguments)
 						: parseToolCallArguments(block?.[kStreamingPartialJson]);
+				item.arguments = replayableToolCallArguments(item.arguments, args);
 				const toolCall: ToolCall = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
@@ -3606,6 +3606,7 @@ export async function processResponsesStream<TApi extends Api>(
 			} else if (item.type === "image_generation_call" && item.status === "completed" && item.result) {
 				appendResponsesImageResult(output, stream, item.result);
 			}
+			options?.onOutputItemDone?.(item);
 		} else if (terminalEvent) {
 			const response = terminalEvent.response;
 			const shouldPromoteIncompleteToolUse =
