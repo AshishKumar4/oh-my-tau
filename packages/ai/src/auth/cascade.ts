@@ -10,6 +10,7 @@ import type { CredentialBlocks } from "./blocks";
 import type { CredentialPool } from "./pool";
 import type { CredentialSelector, OAuthResolutionResult } from "./select";
 import type {
+	ApiKeyCredential,
 	AuthApiKeyOptions,
 	AuthCredential,
 	AuthSource,
@@ -368,20 +369,15 @@ export class KeyCascade implements KeysApi {
 			}
 			return oauthResolved.apiKey;
 		}
-		const loginApiKeySelection = await this.#deps.selector.selectApiKey(
+		const loginApiKey = await this.#resolveStoredApiKey(
 			provider,
 			sessionId,
 			options,
 			credential => credential.source === "login" && !this.isKeylessFallback(provider, credential),
 		);
-		if (loginApiKeySelection) {
-			this.#deps.affinity.record(provider, sessionId, "api_key", loginApiKeySelection.index);
-			const credentialId = onCredentialId
-				? this.#deps.pool.entries(provider)[loginApiKeySelection.index]?.id
-				: undefined;
-			const apiKey = await this.#deps.overrides.resolve(loginApiKeySelection.credential.key);
-			if (apiKey !== undefined && credentialId !== undefined) onCredentialId?.(credentialId);
-			return apiKey;
+		if (loginApiKey) {
+			if (loginApiKey.apiKey !== undefined) onCredentialId?.(loginApiKey.credentialId);
+			return loginApiKey.apiKey;
 		}
 
 		// Past OAuth: the session sticky (if any) is stale — the request authenticates via
@@ -394,21 +390,36 @@ export class KeyCascade implements KeysApi {
 
 		const envKey = getEnvApiKey(provider);
 		if (envKey) return envKey;
-		const apiKeySelection = await this.#deps.selector.selectApiKey(
+		const storedApiKey = await this.#resolveStoredApiKey(
 			provider,
 			sessionId,
 			options,
 			credential => credential.source !== "login",
 		);
-		if (apiKeySelection) {
-			this.#deps.affinity.record(provider, sessionId, "api_key", apiKeySelection.index);
-			const credentialId = onCredentialId ? this.#deps.pool.entries(provider)[apiKeySelection.index]?.id : undefined;
-			const apiKey = await this.#deps.overrides.resolve(apiKeySelection.credential.key);
-			if (apiKey !== undefined && credentialId !== undefined) onCredentialId?.(credentialId);
-			return apiKey;
+		if (storedApiKey) {
+			if (storedApiKey.apiKey !== undefined) onCredentialId?.(storedApiKey.credentialId);
+			return storedApiKey.apiKey;
 		}
 		if (oauthRefreshFailure) throw oauthRefreshFailure;
 		return undefined;
+	}
+
+	async #resolveStoredApiKey(
+		provider: string,
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+		filter: (credential: ApiKeyCredential) => boolean,
+	): Promise<{ apiKey: string | undefined; credentialId: number } | undefined> {
+		const selection = await this.#deps.selector.selectApiKey(provider, sessionId, options, filter);
+		if (!selection) return undefined;
+		let apiKey = await this.#deps.overrides.resolve(selection.credential.key);
+		if (!this.#deps.selector.syncApiKeySelection(provider, selection, filter)) apiKey = undefined;
+		if (apiKey !== undefined) {
+			const recorded = this.#deps.affinity.record(provider, sessionId, "api_key", selection.index);
+			if (sessionId && !recorded) apiKey = undefined;
+		}
+		// An admitted but unresolved source must not silently enable a lower-precedence key.
+		return { apiKey, credentialId: selection.credentialId };
 	}
 
 	/**

@@ -464,14 +464,19 @@ export class CredentialPool implements CredentialsApi {
 		return true;
 	}
 
+	/** Re-list the durable row and derive its current slot after asynchronous work. */
+	syncById(provider: string, id: number): { credential: AuthCredential; index: number } | undefined {
+		this.reloadProvider(provider);
+		const entries = this.entries(provider);
+		const index = entries.findIndex(entry => entry.id === id);
+		const entry = entries[index];
+		return entry ? { credential: entry.credential, index } : undefined;
+	}
+
 	/**
-	 * Persist a refreshed credential by id only while the row still matches this
-	 * process's snapshot. A peer rotation wins the CAS and is reloaded instead of
-	 * being overwritten after this process releases its refresh lease. An
-	 * unchanged credential still runs the CAS check (stores skip rewriting
-	 * identical bytes), so peer rotations are detected without churning the row.
-	 *
-	 * Returns the row's current index, or -1 when it was disabled or removed.
+	 * Persist a refreshed credential while its captured grant still matches.
+	 * A peer rotation wins the CAS and is reloaded instead of overwritten.
+	 * Returns the row's current index, or -1 when disabled or removed.
 	 */
 	replaceById(provider: string, id: number, credential: AuthCredential, expectedCredential?: AuthCredential): number {
 		const entries = this.entries(provider);

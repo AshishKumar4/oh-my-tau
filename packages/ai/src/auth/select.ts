@@ -189,6 +189,7 @@ export class CredentialSelector {
 		blockScope?: string;
 		/** Scopes a block may live under for this request; reads honour all of them. */
 		blockScopes?: readonly string[];
+		filter?: (credential: ApiKeyCredential) => boolean;
 	}): Promise<ApiKeyCandidate[]> {
 		const nowMs = Date.now();
 		const { strategy } = args;
@@ -197,7 +198,7 @@ export class CredentialSelector {
 		const usagePromise: Promise<Array<UsageRankingResult<ApiKeyCredential> | null>> = Promise.all(
 			args.order.map(async idx => {
 				const selection = args.credentials[idx];
-				if (!selection) return null;
+				if (!selection || !this.syncApiKeySelection(args.provider, selection, args.filter)) return null;
 				const blockedUntil = this.#deps.blocks.blockedUntil(
 					args.provider,
 					args.providerKey,
@@ -242,7 +243,13 @@ export class CredentialSelector {
 			const result = usageResults[orderPos];
 			if (!result) continue;
 			const { selection, usage, usageChecked } = result;
-			let { blockedUntil } = result;
+			if (!this.syncApiKeySelection(args.provider, selection, args.filter)) continue;
+			let blockedUntil = this.#deps.blocks.blockedUntil(
+				args.provider,
+				args.providerKey,
+				selection.index,
+				args.blockScopes ?? args.blockScope,
+			);
 			let blocked = blockedUntil !== undefined;
 			const scopedLimits = usage ? scopedUsageLimits(strategy, usage, args.rankingContext) : undefined;
 			if (!blocked && scopedLimits && isUsageLimitReached(scopedLimits)) {
@@ -300,39 +307,66 @@ export class CredentialSelector {
 			});
 
 		if (credentials.length === 0) return undefined;
-		if (credentials.length === 1) return credentials[0];
+		if (credentials.length === 1) {
+			const only = credentials[0];
+			return this.syncApiKeySelection(provider, only, filter) ? only : undefined;
+		}
 
 		const providerKey = providerTypeKey(provider, "api_key");
 		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
-		const fallback = credentials[order[0]];
 		const strategy = this.#deps.strategies(provider);
 		if (!strategy) {
 			for (const idx of order) {
 				const candidate = credentials[idx];
+				if (!this.syncApiKeySelection(provider, candidate, filter)) continue;
 				if (!this.#deps.blocks.isBlocked(provider, providerKey, candidate.index)) {
 					return candidate;
 				}
 			}
-			return fallback;
+		} else {
+			const rankingContext: CredentialRankingContext = {
+				modelId: options?.modelId,
+			};
+			const blockScope = strategy.blockScope?.(rankingContext);
+			const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
+			const candidates = await this.#rankApiKeySelections({
+				providerKey,
+				provider,
+				order,
+				credentials,
+				options,
+				strategy,
+				rankingContext,
+				blockScope,
+				blockScopes,
+				filter,
+			});
+			for (const candidate of candidates) {
+				if (this.syncApiKeySelection(provider, candidate.selection, filter)) return candidate.selection;
+			}
 		}
+		for (const idx of order) {
+			const candidate = credentials[idx];
+			if (this.syncApiKeySelection(provider, candidate, filter)) return candidate;
+		}
+		return undefined;
+	}
 
-		const rankingContext: CredentialRankingContext = {
-			modelId: options?.modelId,
-		};
-		const blockScope = strategy.blockScope?.(rankingContext);
-		const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
-		const candidates = await this.#rankApiKeySelections({
-			providerKey,
-			provider,
-			order,
-			credentials,
-			options,
-			strategy,
-			rankingContext,
-			blockScope,
-			blockScopes,
-		});
-		return candidates[0]?.selection ?? fallback;
+	syncApiKeySelection(
+		provider: string,
+		selection: ApiKeySelection,
+		filter?: (credential: ApiKeyCredential) => boolean,
+	): boolean {
+		const current = this.#deps.pool.syncById(provider, selection.credentialId);
+		if (
+			!current ||
+			current.credential.type !== "api_key" ||
+			!authCredentialEquals(selection.credential, current.credential) ||
+			(filter && !filter(current.credential))
+		)
+			return false;
+		selection.index = current.index;
+		return true;
 	}
 
 	async #rankOAuthSelections(args: {
@@ -894,18 +928,11 @@ export class CredentialSelector {
 	}
 
 	#syncOAuthSelectionForUse(provider: string, selection: OAuthSelection): boolean {
-		const latestRows = this.#deps.store.listAuthCredentials(provider);
-		this.#deps.pool.replace(
-			provider,
-			latestRows.map(row => ({ id: row.id, credential: row.credential })),
-		);
-		const latestIndex = latestRows.findIndex(row => row.id === selection.credentialId);
-		if (latestIndex === -1) return false;
-		const latest = latestRows[latestIndex];
-		if (latest?.credential.type !== "oauth") return false;
-		selection.index = latestIndex;
-		selection.credential = latest.credential;
-		return !this.#deps.blocks.isHeld(provider, latestIndex);
+		const current = this.#deps.pool.syncById(provider, selection.credentialId);
+		if (!current || current.credential.type !== "oauth") return false;
+		selection.index = current.index;
+		selection.credential = current.credential;
+		return !this.#deps.blocks.isHeld(provider, current.index);
 	}
 
 	async #prepareOAuthCredentialForRequest(
