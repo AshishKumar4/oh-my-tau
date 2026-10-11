@@ -24,36 +24,66 @@ export interface AuthKeysCommandArgs {
 	json?: boolean;
 }
 
-/** Read one secret line: hidden keystrokes on a terminal, the first line of piped stdin otherwise. */
+/**
+ * Read one secret line: hidden keystrokes on a terminal, the first line of piped
+ * stdin otherwise. Readline cannot read a line without echoing it, so the
+ * terminal path reads raw bytes itself. Every exit (Enter, Ctrl-C, Escape, EOF,
+ * stream error) runs one cleanup that restores the terminal's previous mode.
+ */
 async function readSecret(prompt: string): Promise<string> {
 	const input = process.stdin;
 	if (!input.isTTY || typeof input.setRawMode !== "function") {
 		const text = await new Response(Bun.stdin.stream()).text();
 		return text.split(/\r?\n/, 1)[0] ?? "";
 	}
-	process.stderr.write(prompt);
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
 	const wasRaw = input.isRaw;
 	const decoder = new TextDecoder();
 	let answer = "";
-	const finish = (done: () => void) => {
+	let settled = false;
+	const settle = (done: () => void) => {
+		if (settled) return;
+		settled = true;
 		input.off("data", onData);
-		input.setRawMode(wasRaw);
-		input.pause();
-		process.stderr.write("\n");
-		done();
+		input.off("end", onClosed);
+		input.off("close", onClosed);
+		input.off("error", onError);
+		// Restoring the terminal is best-effort: a dead TTY can throw or emit
+		// `error` here, and neither may stop the promise from settling.
+		const swallow = () => {};
+		input.on("error", swallow);
+		try {
+			input.setRawMode(wasRaw);
+			input.pause();
+			process.stderr.write("\n");
+		} catch {
+			// The terminal is gone; nothing left to restore.
+		} finally {
+			input.off("error", swallow);
+			done();
+		}
 	};
+	const onClosed = () => settle(() => reject(new Error("stdin closed before a key was entered")));
+	const onError = (error: Error) => settle(() => reject(error));
 	const onData = (chunk: Buffer) => {
 		for (const char of decoder.decode(chunk, { stream: true })) {
-			if (char === "\r" || char === "\n") return finish(() => resolve(answer));
-			if (char === "\u0003" || char === "\u001b") return finish(() => reject(new Error("Cancelled")));
+			if (char === "\r" || char === "\n") return settle(() => resolve(answer));
+			if (char === "\u0003" || char === "\u001b") return settle(() => reject(new Error("cancelled")));
 			if (char === "\u007f" || char === "\b") answer = answer.slice(0, -1);
 			else if (char >= " ") answer += char;
 		}
 	};
-	input.setRawMode(true);
-	input.on("data", onData);
-	input.resume();
+	try {
+		input.on("data", onData);
+		input.once("end", onClosed);
+		input.once("close", onClosed);
+		input.once("error", onError);
+		input.setRawMode(true);
+		process.stderr.write(prompt);
+		input.resume();
+	} catch (error) {
+		settle(() => reject(error));
+	}
 	return promise;
 }
 

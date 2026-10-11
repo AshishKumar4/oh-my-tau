@@ -4,12 +4,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { isAuthRetryableError, resolveApiKeyOnce, resolveRetryKey } from "@oh-my-pi/pi-ai/auth-retry";
 import {
+	type AuthCredentialStore,
 	AuthStorage,
 	type CredentialPoolOrder,
+	maskApiKey,
 	type OAuthCredential,
 	SqliteAuthCredentialStore,
 } from "@oh-my-pi/pi-ai/auth-storage";
 import { registerOAuthProvider } from "@oh-my-pi/pi-ai/registry/oauth";
+import { claudeRankingStrategy } from "@oh-my-pi/pi-ai/usage/claude";
+import { cursorRankingStrategy } from "@oh-my-pi/pi-ai/usage/cursor";
 import { removeWithRetries } from "../../utils/src/temp";
 
 const PROVIDER = "unit-credential-pools";
@@ -189,5 +193,230 @@ describe("provider credential pools", () => {
 
 		expect(await storage.keys.get(PROVIDER)).toBe("key-a");
 		expect(storage.keys.source(PROVIDER)?.kind).toBe("api_key");
+	});
+
+	it("promotes a stored static key to the pool when the same key is added", async () => {
+		await open();
+		await storage.credentials.set(PROVIDER, { type: "api_key", key: "same-key" });
+		expect(storage.credentials.pooledApiKeys(PROVIDER)).toEqual([]);
+
+		await storage.credentials.addApiKey(PROVIDER, "same-key");
+
+		expect(storage.credentials.pooledApiKeys(PROVIDER).map(row => row.credential.key)).toEqual(["same-key"]);
+	});
+
+	it("never shows a whole key, however short or oddly shaped", () => {
+		for (const key of ["secret-", "alpha-beta-", "short", "sk-ant-api03-tinykey"]) {
+			const masked = maskApiKey(key);
+			expect(masked.includes(key)).toBe(false);
+			expect(masked.length).toBeLessThan(key.length);
+		}
+		expect(maskApiKey("sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUV1234")).toBe("sk-ant-…1234");
+	});
+});
+
+describe("provider credential pools with Claude usage scopes", () => {
+	let tempDir = "";
+	let storage: AuthStorage;
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-credential-pools-claude-"));
+		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		storage = new AuthStorage(store, {
+			poolOrders: { anthropic: "api-keys-first" },
+			// No usage endpoint: pooled keys have no report, so health reads them as unknown.
+			usageProviderResolver: () => undefined,
+			rankingStrategyResolver: provider => (provider === "anthropic" ? claudeRankingStrategy : undefined),
+			configValueResolver: async value => value,
+		});
+		await storage.credentials.reload();
+	});
+
+	afterEach(async () => {
+		storage.close();
+		await removeWithRetries(tempDir);
+	});
+
+	it("blocks an out-of-credit key for every model, not only the model that failed", async () => {
+		for (const key of ["sk-ant-api03-keyAAAAAAAAAAAAAAAA1", "sk-ant-api03-keyBBBBBBBBBBBBBBBB2"]) {
+			await storage.credentials.addApiKey("anthropic", key);
+		}
+		const fable = storage.keys.resolver("anthropic", { sessionId: "s1", modelId: "claude-fable-5" });
+		const spent = await resolveApiKeyOnce(fable);
+		await resolveRetryKey(fable, true, creditsExhausted, undefined, spent);
+
+		const opusKey = await storage.keys.get("anthropic", "s2", { modelId: "claude-opus-5-5" });
+		expect(opusKey).toBeDefined();
+		expect(opusKey).not.toBe(spent);
+		expect(storage.limits.pools("anthropic", "claude-opus-5-5")).toEqual([
+			{ kind: "api_key", members: 2, blocked: 1 },
+		]);
+	});
+
+	it("does not read the model as depleted while the other pool can serve", async () => {
+		await storage.credentials.addApiKey("anthropic", "sk-ant-api03-keyAAAAAAAAAAAAAAAA1");
+		await storage.credentials.upsert("anthropic", oauth("max@example.com"));
+		storage.setAccountPolicies({ accountPolicies: [], defaultReservePct: 10, poolOrders: {} });
+		const resolve = storage.keys.resolver("anthropic", { sessionId: "s1", modelId: "claude-opus-5-5" });
+		const subscription = await resolveApiKeyOnce(resolve);
+		expect(subscription).toBe("access-max@example.com");
+		await resolveRetryKey(resolve, true, subscriptionExhausted, undefined, subscription);
+
+		const health = await storage.health.model("anthropic", { modelId: "claude-opus-5-5", reserveFraction: 0.1 });
+
+		expect(health.state).not.toBe("depleted");
+		expect(health.accounts.map(account => account.credentialType).sort()).toEqual(["api_key", "oauth"]);
+	});
+
+	it("counts only entitled subscription accounts as a switch after the keys run out", async () => {
+		await storage.credentials.addApiKey("anthropic", "sk-ant-api03-keyAAAAAAAAAAAAAAAA1");
+		await storage.credentials.upsert("anthropic", { ...oauth("entitled@example.com"), accountId: "acct-entitled" });
+		await storage.credentials.upsert("anthropic", { ...oauth("other@example.com"), accountId: "acct-other" });
+		const entitledIndex = storage.credentials
+			.list("anthropic")
+			.findIndex(row => row.credential.type === "oauth" && row.credential.accountId === "acct-entitled");
+		await storage.limits.markReached("anthropic", undefined, {
+			credentialId: storage.credentials.list("anthropic")[entitledIndex]?.id,
+			retryAfterMs: 3_600_000,
+			modelId: "claude-opus-5-5",
+		});
+
+		const rotation = await storage.limits.rotate("anthropic", "s1", {
+			error: creditsExhausted,
+			modelId: "claude-opus-5-5",
+			accountIds: ["acct-entitled"],
+			apiKey: "sk-ant-api03-keyAAAAAAAAAAAAAAAA1",
+		});
+
+		expect(rotation.switched).toBe(false);
+	});
+
+	it("does not count a static key as a sibling of an exhausted pooled key", async () => {
+		await storage.credentials.set("anthropic", { type: "api_key", key: "sk-ant-api03-staticMIGRATEDkey000" });
+		await storage.credentials.addApiKey("anthropic", "sk-ant-api03-keyAAAAAAAAAAAAAAAA1");
+
+		const rotation = await storage.limits.rotate("anthropic", "s1", {
+			error: creditsExhausted,
+			modelId: "claude-opus-5-5",
+			apiKey: "sk-ant-api03-keyAAAAAAAAAAAAAAAA1",
+		});
+
+		expect(rotation.switched).toBe(false);
+	});
+});
+
+describe("provider credential pools with model-scoped key quotas", () => {
+	let tempDir = "";
+	let storage: AuthStorage;
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-credential-pools-cursor-"));
+		const store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		storage = new AuthStorage(store, {
+			usageProviderResolver: () => undefined,
+			rankingStrategyResolver: provider => (provider === "cursor" ? cursorRankingStrategy : undefined),
+			configValueResolver: async value => value,
+		});
+		await storage.credentials.reload();
+		await storage.credentials.addApiKey("cursor", "cursor-key-AAAAAAAAAAAAAAAAAAAA");
+	});
+
+	afterEach(async () => {
+		storage.close();
+		await removeWithRetries(tempDir);
+	});
+
+	it("keeps a model quota-pool exhaustion scoped to that pool", async () => {
+		await storage.limits.markReached("cursor", undefined, {
+			apiKey: "cursor-key-AAAAAAAAAAAAAAAAAAAA",
+			modelId: "claude-opus-5-5",
+			errorMessage: "429 You have reached your usage limit for other models. Try again in 2 hours.",
+		});
+
+		const blockedOn = (modelId: string) => storage.limits.pools("cursor", modelId)[0]?.blocked;
+		expect(blockedOn("claude-opus-5-5")).toBe(1);
+		expect(blockedOn("composer-2.5")).toBe(0);
+	});
+
+	it("blocks the key for every model when its prepaid balance is used up", async () => {
+		await storage.limits.markReached("cursor", undefined, {
+			apiKey: "cursor-key-AAAAAAAAAAAAAAAAAAAA",
+			modelId: "claude-opus-5-5",
+			errorMessage: "429 Your prepaid balance is used up: Add funds or enable auto top-up",
+		});
+
+		expect(storage.limits.pools("cursor", "composer-2.5")[0]?.blocked).toBe(1);
+	});
+});
+
+const STRICT_PROVIDER = "unit-credential-pools-strict";
+
+registerOAuthProvider({
+	id: STRICT_PROVIDER,
+	name: "Unit credential pools strict",
+	login: async () => ({ access: "", refresh: "", expires: 0 }),
+	refreshToken: async credentials => {
+		if (credentials.access === "oauth-a") throw new Error("invalid_grant: refresh token revoked");
+		return credentials;
+	},
+	getApiKey: credentials => credentials.access,
+});
+
+describe("provider credential pools across a definitive OAuth refresh failure", () => {
+	it("serves a pooled key instead of a blocked subscription when the last usable one dies mid-selection", async () => {
+		const sqlite = await SqliteAuthCredentialStore.open(":memory:");
+		// A remote-broker-shaped store: no refresh leases, and a request hook that
+		// lets the selected token go stale after preflight (an imminent rotation).
+		const store: AuthCredentialStore = {
+			close: () => sqlite.close(),
+			listAuthCredentials: provider => sqlite.listAuthCredentials(provider),
+			updateAuthCredential: (id, credential) => sqlite.updateAuthCredential(id, credential),
+			deleteAuthCredential: (id, cause) => sqlite.deleteAuthCredential(id, cause),
+			tryDisableAuthCredentialIfMatches: (...args) => sqlite.tryDisableAuthCredentialIfMatches(...args),
+			replaceAuthCredentials: (provider, credentials) => sqlite.replaceAuthCredentials(provider, credentials),
+			upsertAuthCredential: (provider, credential) => sqlite.upsertAuthCredential(provider, credential),
+			deleteAuthCredentials: (provider, cause) => sqlite.deleteAuthCredentials(provider, cause),
+			getCache: (key, options) => sqlite.getCache(key, options),
+			setCache: (key, value, expiresAtSec) => sqlite.setCache(key, value, expiresAtSec),
+			cleanExpiredCache: () => sqlite.cleanExpiredCache(),
+			getCredentialBlock: (...args) => sqlite.getCredentialBlock(...args),
+			upsertCredentialBlock: block => sqlite.upsertCredentialBlock(block),
+			deleteCredentialBlock: (...args) => sqlite.deleteCredentialBlock(...args),
+			async prepareForRequest(credentialId) {
+				const row = sqlite.listAuthCredentials(STRICT_PROVIDER).find(entry => entry.id === credentialId);
+				if (row?.credential.type === "oauth" && row.credential.access === "oauth-a") {
+					sqlite.updateAuthCredential(credentialId, { ...row.credential, expires: 0 });
+				}
+				return false;
+			},
+		};
+		const storage = new AuthStorage(store);
+		try {
+			const live = { refresh: "r", expires: Date.now() + 3_600_000 };
+			await storage.credentials.upsert(STRICT_PROVIDER, {
+				type: "oauth",
+				access: "oauth-a",
+				...live,
+				email: "a@example.com",
+			});
+			await storage.credentials.upsert(STRICT_PROVIDER, {
+				type: "oauth",
+				access: "oauth-b",
+				...live,
+				email: "b@example.com",
+			});
+			await storage.credentials.addApiKey(STRICT_PROVIDER, "usable-api-key");
+			const blocked = storage.credentials
+				.list(STRICT_PROVIDER)
+				.find(row => row.credential.type === "oauth" && row.credential.access === "oauth-b");
+			await storage.limits.markReached(STRICT_PROVIDER, undefined, {
+				credentialId: blocked?.id,
+				retryAfterMs: 600_000,
+			});
+
+			expect(await storage.keys.get(STRICT_PROVIDER, "session-1")).toBe("usable-api-key");
+		} finally {
+			storage.close();
+		}
 	});
 });

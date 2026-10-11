@@ -52,7 +52,8 @@ export function credentialDisabledEvent(
 export function authCredentialEquals(left: AuthCredential, right: AuthCredential): boolean {
 	if (left.type !== right.type) return false;
 	if (left.type === "api_key") {
-		return right.type === "api_key" && left.key === right.key;
+		// `source` decides pool membership, so a key promoted to the pool is a change.
+		return right.type === "api_key" && left.key === right.key && left.source === right.source;
 	}
 	if (right.type !== "oauth") return false;
 	return (
@@ -90,7 +91,7 @@ export interface CredentialPoolOptions {
 export class CredentialPool implements CredentialsApi {
 	/** Provider -> credentials cache, populated from store on reload(). */
 	#data: Map<string, StoredCredential[]> = new Map();
-	/** Recent bearer fingerprints resolved for each durable OAuth row; used only for delayed usage-limit attribution. */
+	/** Recent bearer fingerprints resolved for each durable OAuth row: delayed usage-limit attribution and {@link isOAuthBearer}. */
 	#oauthBearerFingerprints: Map<string, Map<number, string[]>> = new Map();
 	#credentialDisabledListeners: Set<(event: CredentialDisabledEvent) => void | Promise<void>> = new Set();
 	/**
@@ -688,6 +689,14 @@ export class CredentialPool implements CredentialsApi {
 		return this.credentials(provider).some(credential => credential.type === "oauth");
 	}
 
+	isOAuthBearer(provider: string, bearer: string): boolean {
+		return this.credentials(provider).some(
+			credential =>
+				credential.type === "oauth" &&
+				(credential.access === bearer || this.idForBearer(provider, bearer) !== undefined),
+		);
+	}
+
 	/**
 	 * Get OAuth credentials for a provider.
 	 */
@@ -820,6 +829,13 @@ export class CredentialPool implements CredentialsApi {
 	 */
 	findIdForUsageCredential(provider: string, previous: UsageCredential): number | undefined {
 		const entries = this.entries(provider);
+		// An API-key usage request belongs to its key row only. It carries no
+		// account identity, so the all-undefined identity match below would pin it
+		// on an identity-less OAuth row and let the key's report heal that row's block.
+		if (previous.type === "api_key") {
+			return entries.find(entry => entry.credential.type === "api_key" && entry.credential.key === previous.apiKey)
+				?.id;
+		}
 		// Broker-backed rows all carry REMOTE_REFRESH_SENTINEL as their refresh
 		// token — it identifies nothing, and comparing it would match the FIRST
 		// OAuth row regardless of which account/org is being refreshed.

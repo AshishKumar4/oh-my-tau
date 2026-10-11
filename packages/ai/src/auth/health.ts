@@ -13,7 +13,7 @@ import type { SessionAffinity } from "./affinity";
 import { credentialBlockScopesForRequest, providerTypeKey } from "./blocks";
 import type { CredentialBlocks } from "./blocks";
 import type { KeyCascade, KeyOverrides } from "./cascade";
-import type { AccountPolicies } from "./policy";
+import { type AccountPolicies, isPoolCredential } from "./policy";
 import type { CredentialPool, StoredCredential } from "./pool";
 import type { OAuthRefresher } from "./refresh";
 import type { AuthCredentialStore } from "./store";
@@ -83,13 +83,16 @@ export class CredentialHealth implements HealthApi {
 	}
 
 	/**
-	 * Inspect the credential pool that {@link getApiKey} would use for one model
+	 * Inspect the credential pools that {@link getApiKey} would use for one model
 	 * without advancing round-robin state or changing session stickiness.
 	 *
-	 * Pool aggregation is deliberately conservative: one healthy sibling makes
-	 * the model healthy, while any unknown sibling prevents a depleted/reserve
+	 * Both stored pools count (OAuth subscriptions and pooled API keys): when the
+	 * first is exhausted, requests fall back to the other, so the model is only as
+	 * depleted as every member of both. Aggregation is deliberately conservative:
+	 * one healthy member makes the model healthy, while any unknown member (a
+	 * pooled key with no usage report, for one) prevents a depleted/reserve
 	 * conclusion. Static runtime/config/env credentials return unknown because
-	 * they bypass the managed account pool.
+	 * they bypass the managed pools.
 	 */
 	async model(provider: Provider, options: ModelUsageHealthOptions): Promise<ModelUsageHealth> {
 		options.signal?.throwIfAborted();
@@ -105,22 +108,14 @@ export class CredentialHealth implements HealthApi {
 			return { state: "unknown", accounts: [] };
 		}
 
-		const stored = this.#deps.pool.entries(provider).map((entry, index) => ({
-			entry,
-			index,
-		}));
-		const oauthPool = stored.filter(({ entry }) => entry.credential.type === "oauth");
-		const apiKeyPool = stored.filter(({ entry }) => entry.credential.type === "api_key");
-		const loginApiKeyPool = apiKeyPool.filter(
-			({ entry }) => entry.credential.type === "api_key" && entry.credential.source === "login",
-		);
-		const pool = origin.kind === "oauth" ? oauthPool : loginApiKeyPool;
+		const pool = this.#deps.pool
+			.entries(provider)
+			.map((entry, index) => ({ entry, index }))
+			.filter(({ entry }) => isPoolCredential(provider, entry.credential));
 		if (pool.length === 0) return { state: "unknown", accounts: [] };
 		const sessionCredential = this.#deps.affinity.get(provider, options.sessionId);
 		const selectedCredentialId =
-			sessionCredential?.type === origin.kind
-				? this.#deps.pool.entries(provider)[sessionCredential.index]?.id
-				: undefined;
+			sessionCredential !== undefined ? this.#deps.pool.entries(provider)[sessionCredential.index]?.id : undefined;
 
 		const rankingContext: CredentialRankingContext = {
 			modelId: options.modelId,
@@ -174,7 +169,8 @@ export class CredentialHealth implements HealthApi {
 					if (options.signal?.aborted) throw error;
 					report = null;
 				}
-				if (planGate) {
+				// Plan tiers gate subscription accounts; an API key is billed per token.
+				if (planGate && credentialType === "oauth") {
 					planEligibilityByCredential.set(entry.id, planGate(report));
 				}
 

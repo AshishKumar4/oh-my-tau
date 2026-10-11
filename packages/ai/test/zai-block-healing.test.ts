@@ -154,4 +154,66 @@ describe("ZAI usage-block healing", () => {
 			"depleted",
 		);
 	});
+
+	it("does not let a healthy pooled key's report heal a blocked identity-less subscription", async () => {
+		// An OAuth row with no account identity, blocked on exhausted credits, and a
+		// pooled API key whose own report is healthy.
+		const rows: StoredAuthCredential[] = [
+			{
+				id: 1,
+				provider: "zai",
+				credential: {
+					type: "oauth",
+					access: "zai-access",
+					refresh: "zai-refresh",
+					expires: Date.now() + 3_600_000,
+				},
+				disabledCause: null,
+			},
+			{
+				id: 2,
+				provider: "zai",
+				credential: { type: "api_key", key: "zai-key", source: "login" },
+				disabledCause: null,
+			},
+		];
+		const blocks = new Map([["1:zai:oauth:", Date.now() + 4 * 24 * 60 * 60_000]]);
+		const store: AuthCredentialStore = {
+			close() {},
+			listAuthCredentials: provider => (provider === undefined || provider === "zai" ? rows : []),
+			updateAuthCredential() {},
+			async deleteAuthCredential() {
+				return false;
+			},
+			tryDisableAuthCredentialIfMatches: () => false,
+			replaceAuthCredentials: async () => rows,
+			upsertAuthCredential: async () => rows,
+			async deleteAuthCredentials() {},
+			getCredentialBlock: (id, providerKey, blockScope) => blocks.get(`${id}:${providerKey}:${blockScope}`),
+			upsertCredentialBlock: block => {
+				blocks.set(`${block.credentialId}:${block.providerKey}:${block.blockScope}`, block.blockedUntilMs);
+			},
+			deleteCredentialBlock: (id, providerKey, blockScope) => {
+				blocks.delete(`${id}:${providerKey}:${blockScope}`);
+			},
+			getCache: () => null,
+			setCache() {},
+			cleanExpiredCache() {},
+		};
+		const usageProvider: UsageProvider = {
+			id: "zai",
+			fetchUsage: async params => (params.credential.type === "api_key" ? report(0.013) : report(1)),
+		};
+		const storage = new AuthStorage(store, {
+			usageProviderResolver: provider => (provider === "zai" ? usageProvider : undefined),
+			rankingStrategyResolver: provider => (provider === "zai" ? zaiRankingStrategy : undefined),
+			configValueResolver: async value => value,
+		});
+		storages.push(storage);
+		await storage.credentials.reload();
+
+		await storage.health.model("zai", { modelId: "glm-5.3", reserveFraction: 0.1 });
+
+		expect(blocks.has("1:zai:oauth:")).toBe(true);
+	});
 });

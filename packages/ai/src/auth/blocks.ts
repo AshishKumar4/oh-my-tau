@@ -34,6 +34,12 @@ export function scopedBackoffKey(providerKey: string, blockScope: string | undef
 export const AUTH_BLOCK_SCOPE = "auth";
 /** Account-policy backoffs apply to every model and survive quota resets. */
 export const ACCOUNT_POLICY_BLOCK_SCOPE = "account-policy";
+/**
+ * The unscoped block every request checks, for a usage limit that stops the
+ * account for every model (exhausted credits, a spend cap), unlike a model
+ * quota window such as `tier:fable`.
+ */
+export const ACCOUNT_WIDE_BLOCK_SCOPE = "";
 const PROTECTED_BLOCK_SCOPES = [AUTH_BLOCK_SCOPE, ACCOUNT_POLICY_BLOCK_SCOPE] as const;
 
 const MODEL_ACCOUNT_POLICY_BLOCK_SCOPE_PREFIX = "model-policy:";
@@ -526,8 +532,10 @@ export class CredentialBlocks implements BlocksApi {
 	 * verdicts via {@link CredentialRankingStrategy.healableBlockScopes}.
 	 */
 	reconcile(provider: Provider, credentialId: number, report: UsageReport): void {
-		const providerKey = providerTypeKey(provider, "oauth");
-		if (!this.#deps.pool.entries(provider).some(entry => entry.id === credentialId)) return;
+		const entry = this.#deps.pool.entries(provider).find(candidate => candidate.id === credentialId);
+		if (!entry) return;
+		// A report heals only its own row's blocks, under that row's credential type.
+		const providerKey = providerTypeKey(provider, entry.credential.type);
 		const strategy = this.#deps.strategies(provider);
 		// Only a live report proves recovery. A broker can serve its retained
 		// last-good report for hours after `/usage` starts failing, and those

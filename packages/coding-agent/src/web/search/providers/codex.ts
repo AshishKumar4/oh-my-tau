@@ -583,6 +583,15 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 		result = await withAuth(
 			keyOrResolver,
 			async accessToken => {
+				// Whichever credential serves (pooled keys fall back to stored OAuth, and a
+				// command-backed key is only a fallback beneath it), refuse any attempt
+				// whose actual bearer is a stored subscription token.
+				if (params.modelRegistry.authStorage.credentials.isOAuthBearer(params.model.provider, accessToken)) {
+					throw new SearchProviderError(
+						"codex",
+						`Refusing to send official Codex OAuth credentials to custom endpoint ${transport.baseUrl}. Configure an API key for provider "${params.model.provider}".`,
+					);
+				}
 				const requestTransport = await resolveCodexSearchTransport(params);
 				return callCodexSearch({ accessToken }, query, {
 					signal: params.signal,

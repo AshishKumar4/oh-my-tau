@@ -853,7 +853,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	async markCredentialSuspect(credentialId: number, opts: { signal?: AbortSignal } = {}): Promise<void> {
 		this.#noteActivity();
-		await this.#refreshThroughBroker(credentialId, opts.signal, "auth-recovery");
+		// Only an OAuth row has a token the broker can refresh; for an API key the
+		// broker refuses `/refresh`, so just pick up any newer snapshot.
+		const entry = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (entry?.credential.type === "oauth") {
+			await this.#refreshThroughBroker(credentialId, opts.signal, "auth-recovery");
+		}
 		this.#maybeRefreshSnapshot("suspect credential refresh");
 	}
 

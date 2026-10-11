@@ -1,6 +1,6 @@
 import { scheduler } from "node:timers/promises";
 import * as AIError from "../error";
-import { isUsageLimitOutcome } from "../error/rate-limit";
+import { isAccountBillingExhaustion, isUsageLimitOutcome } from "../error/rate-limit";
 import { extractProviderRetryHint } from "../utils/retry-after";
 import { HOUR_MS } from "../usage/shared";
 import type { CredentialRankingContext, CredentialRankingStrategy } from "../usage";
@@ -8,6 +8,7 @@ import type { RankingStrategyResolver } from "../usage/registry";
 import { raceSignal } from "./abort";
 import {
 	ACCOUNT_POLICY_BLOCK_SCOPE,
+	ACCOUNT_WIDE_BLOCK_SCOPE,
 	AUTH_BLOCK_SCOPE,
 	DEFAULT_BLOCK_MS,
 	credentialBlockScopesForRequest,
@@ -17,7 +18,7 @@ import {
 import type { CredentialBlocks } from "./blocks";
 import type { KeyOverrides } from "./cascade";
 import type { SessionAffinity } from "./affinity";
-import { type AccountPolicies, isPoolCredential } from "./policy";
+import { type AccountPolicies, isPoolCredential, oauthEntitlementFilter } from "./policy";
 import type { CredentialPool } from "./pool";
 import type { AuthCredentialStore } from "./store";
 import type {
@@ -59,6 +60,8 @@ export type CredentialBlockRouting = {
 	rankingContext: CredentialRankingContext;
 	blockScope: string | undefined;
 	siblingBlockScopes: readonly string[];
+	/** The request model's account entitlements, which cross-pool OAuth candidates must match. */
+	accountIds?: readonly string[];
 };
 
 /** Dependencies for rate-limit marking and credential rotation. */
@@ -154,23 +157,36 @@ export class RateLimits implements LimitsApi {
 	 * siblings, then the provider's other stored pool (OAuth subscriptions or
 	 * pooled API keys). Static or migrated keys stay outside rotation: they serve
 	 * only after both pools, so they cannot mask an exhausted pool.
+	 *
+	 * A cross-pool OAuth candidate must pass the same account filter the strict
+	 * OAuth pass applies: when the model names entitled accounts and one is
+	 * stored, only those count. Otherwise rotation would report a switch the next
+	 * resolve refuses, and the request would retry the exhausted key.
 	 */
 	#rotationCandidates(
 		provider: string,
 		credentialType: AuthCredential["type"],
 		targetIndex: number,
+		accountIds: readonly string[] | undefined,
 	): Array<{ credential: AuthCredential; index: number }> {
-		const failed = this.#deps.pool.entries(provider)[targetIndex]?.credential;
-		const crossPool = failed === undefined || isPoolCredential(provider, failed);
-		const candidates = this.#deps.pool
-			.credentials(provider)
+		const credentials = this.#deps.pool.credentials(provider);
+		const failed = credentials[targetIndex];
+		// A pooled credential rotates only within the pools; a static key is never a
+		// sibling of one, since selection serves it only after both pools are spent.
+		const pooled = failed === undefined || isPoolCredential(provider, failed);
+		const entitled = oauthEntitlementFilter(credentials, accountIds);
+		const eligible = (credential: AuthCredential): boolean =>
+			credential.type === "oauth"
+				? entitled === undefined || entitled(credential)
+				: !pooled || isPoolCredential(provider, credential);
+		const candidates = credentials
 			.map((credential, index) => ({ credential, index }))
 			.filter(
 				entry =>
 					entry.index !== targetIndex &&
 					!this.#deps.blocks.isHeld(provider, entry.index) &&
-					(entry.credential.type === credentialType ||
-						(crossPool && isPoolCredential(provider, entry.credential))),
+					(entry.credential.type === credentialType || pooled) &&
+					eligible(entry.credential),
 			);
 		// Same-pool siblings first: rotation stays in the serving pool while it can.
 		return [
@@ -183,11 +199,13 @@ export class RateLimits implements LimitsApi {
 		credentialType: AuthCredential["type"],
 		modelId: string | undefined,
 		blockScopeOverride?: string,
+		accountIds?: readonly string[],
 	): CredentialBlockRouting {
 		const providerKey = providerTypeKey(provider, credentialType);
 		const strategy = this.#deps.strategies(provider);
 		const rankingContext: CredentialRankingContext = { modelId };
 		const defaultBlockScope = strategy?.blockScope?.(rankingContext);
+		// An empty override writes the unscoped key, which every request checks.
 		const blockScope = blockScopeOverride ?? defaultBlockScope;
 		const requestBlockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, defaultBlockScope);
 		const siblingBlockScopes =
@@ -200,6 +218,7 @@ export class RateLimits implements LimitsApi {
 			rankingContext,
 			blockScope,
 			siblingBlockScopes,
+			accountIds,
 		};
 	}
 	#blockCredentialForRotation(
@@ -247,7 +266,7 @@ export class RateLimits implements LimitsApi {
 				: blockedUntil;
 
 		let retryAtMs: number | undefined;
-		for (const candidate of this.#rotationCandidates(provider, credentialType, targetIndex)) {
+		for (const candidate of this.#rotationCandidates(provider, credentialType, targetIndex, routing.accountIds)) {
 			// Sibling availability must use the same scope set selection reads, or
 			// this reports a sibling as free that selection will then refuse.
 			const candidateRouting =
@@ -302,7 +321,17 @@ export class RateLimits implements LimitsApi {
 		const credentialType = sessionCredential.type;
 		const targetCredentialId = target.id;
 
-		const routing = this.#credentialBlockRouting(provider, credentialType, options?.modelId);
+		const routing = this.#credentialBlockRouting(
+			provider,
+			credentialType,
+			options?.modelId,
+			// Exhausted credits or a spend cap stop the account for every model; a
+			// model quota window (`tier:fable`, Cursor `pool:api`) keeps its own scope.
+			options?.errorMessage !== undefined && isAccountBillingExhaustion(options.errorMessage)
+				? ACCOUNT_WIDE_BLOCK_SCOPE
+				: undefined,
+			options?.accountIds,
+		);
 		const now = Date.now();
 		const requestedBlockedUntilMs = now + (options?.retryAfterMs ?? DEFAULT_BLOCK_MS);
 		let blockedUntil = requestedBlockedUntilMs;
@@ -478,6 +507,8 @@ export class RateLimits implements LimitsApi {
 				retryAfterMs,
 				providerTimed: retryAfterMs !== undefined,
 				modelId: options?.modelId,
+				accountIds: options?.accountIds,
+				errorMessage: message,
 				apiKey: options?.apiKey,
 				credentialId: options?.credentialId,
 				signal: options?.signal,
@@ -509,6 +540,7 @@ export class RateLimits implements LimitsApi {
 				sessionCredential.type,
 				options?.modelId,
 				modelPolicyScope,
+				options?.accountIds,
 			);
 			// Account-wide denials must not inherit a quota scope that healthy usage can heal.
 			routing.blockScope = modelPolicyScope ?? ACCOUNT_POLICY_BLOCK_SCOPE;
@@ -538,7 +570,12 @@ export class RateLimits implements LimitsApi {
 		const providerKey = providerTypeKey(provider, sessionCredential.type);
 		// Snapshot sibling availability before mutating so a soft-deleting
 		// suspect hook can't reindex the answer out from under us.
-		const hasSibling = this.#rotationCandidates(provider, sessionCredential.type, sessionCredential.index).some(
+		const hasSibling = this.#rotationCandidates(
+			provider,
+			sessionCredential.type,
+			sessionCredential.index,
+			options?.accountIds,
+		).some(
 			candidate =>
 				!this.#deps.blocks.isBlocked(
 					provider,

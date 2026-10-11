@@ -2064,7 +2064,12 @@ export class SessionAdvisors {
 			const rotation = await this.#host.modelRegistry.authStorage.limits.rotate(
 				currentModel.provider,
 				advisor.providerSessionId,
-				{ error: message, modelId: currentModel.id, signal },
+				{
+					error: message,
+					modelId: currentModel.id,
+					accountIds: this.#host.modelRegistry.accountIdsForModel(currentModel.provider, currentModel.id),
+					signal,
+				},
 			);
 			if (rotation.switched) return true;
 		}
@@ -2088,6 +2093,8 @@ export class SessionAdvisors {
 					providerTimed: retryAfterMs !== undefined,
 					baseUrl: currentModel.baseUrl,
 					modelId: currentModel.id,
+					accountIds: this.#host.modelRegistry.accountIdsForModel(currentModel.provider, currentModel.id),
+					errorMessage: message,
 					signal,
 				},
 			);

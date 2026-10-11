@@ -752,6 +752,8 @@ export class TurnRecovery {
 						providerTimed: parsedRetryAfterMs !== undefined,
 						baseUrl: activeModel.baseUrl,
 						modelId: activeModel.id,
+						accountIds: this.#host.modelRegistry.accountIdsForModel(activeModel.provider, activeModel.id),
+						errorMessage,
 						// The row that served the failed turn, not the session's current pin:
 						// cross-pool fallback can move the pin between the request and recovery.
 						credentialId: message.provider === activeModel.provider ? message.credentialId : undefined,

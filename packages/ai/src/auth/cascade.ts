@@ -384,6 +384,9 @@ export class KeyCascade implements KeysApi {
 		admitted?: boolean;
 		oauthRefreshFailure?: AIError.OAuthRefreshUnavailableError;
 	}> {
+		// Another process may have added or removed credentials; the pool check
+		// must see them, or a provider whose only account arrived externally reads empty.
+		await this.#deps.pool.adoptExternalChanges();
 		const stored = this.#deps.pool.credentials(provider);
 		const hasOAuth = stored.some(credential => credential.type === "oauth");
 		const hasPooledKeys = stored.some(credential => this.isPooledApiKey(provider, credential));
@@ -418,10 +421,18 @@ export class KeyCascade implements KeysApi {
 			};
 		};
 		// One pool: its own selection ladder (strict, then last resort) is the whole story.
+		// Two pools: each strictly in order, then the preferred pool's last resort.
+		const [preferred, ...rest] = available;
 		const passes: Array<[CredentialPoolKind, boolean]> =
-			available.length < 2
-				? available.map(pool => [pool, false])
-				: [...available.map((pool): [CredentialPoolKind, boolean] => [pool, true]), [available[0]!, false]];
+			preferred === undefined
+				? []
+				: rest.length === 0
+					? [[preferred, false]]
+					: [
+							[preferred, true],
+							...rest.map((pool): [CredentialPoolKind, boolean] => [pool, true]),
+							[preferred, false],
+						];
 		for (const [pool, strict] of passes) {
 			const resolved = await tryPool(pool, strict);
 			if (!resolved) continue;
@@ -517,10 +528,10 @@ export class KeyCascade implements KeysApi {
 	 * Mirrors {@link KeyCascade.get} precedence, highest first:
 	 *   1. Runtime override (`--api-key`).
 	 *   2. Config override (`models.yml` `providers.<name>.apiKey`).
-	 *   3. Stored OAuth credential (never an account on hold).
-	 *   4. API key persisted by a successful `/login`.
+	 *   3–4. The stored pools in `auth.poolOrder`: OAuth accounts (never one on
+	 *        hold) and pooled API keys; subscription-first by default.
 	 *   5. Env var — overrides a stored static api_key (e.g. a stale broker copy).
-	 *   6. Stored api_key credential.
+	 *   6. Stored static api_key credential.
 	 *
 	 * The string is purely informational; consumers must not parse it.
 	 */

@@ -728,3 +728,56 @@ describe("XAI_BASE_URL credential routing agrees across chat, images, and search
 		});
 	}
 });
+
+describe("xAI custom-endpoint guard with pooled API keys", () => {
+	it("never sends a subscription token that a pooled-key fallback served", async () => {
+		const customBaseUrl = "https://xai-proxy.example.test/v1";
+		const registryAuth = createInMemoryAuthStorage();
+		const callerAuth = createInMemoryAuthStorage();
+		try {
+			registryAuth.setAccountPolicies({
+				accountPolicies: [],
+				defaultReservePct: 10,
+				poolOrders: { "xai-oauth": "api-keys-first" },
+			});
+			await registryAuth.credentials.upsert("xai-oauth", {
+				type: "oauth",
+				access: "subscription-token",
+				refresh: "subscription-refresh",
+				expires: Date.now() + 3_600_000,
+				email: "max@example.com",
+			});
+			await registryAuth.credentials.addApiKey("xai-oauth", "xai-pooled-key");
+			await registryAuth.limits.markReached("xai-oauth", undefined, {
+				apiKey: "xai-pooled-key",
+				retryAfterMs: 3_600_000,
+				errorMessage: "insufficient credits",
+			});
+			// The caller's own handle holds only an API key, unlike the registry's pools.
+			await callerAuth.credentials.addApiKey("xai-oauth", "caller-only-key");
+			const registry = new ModelRegistry(registryAuth, undefined, { ignoreLocalModelConfig: true });
+			// A command-backed key only falls back beneath stored OAuth, so it must not exempt the guard.
+			vi.spyOn(registry, "hasCommandBackedApiKey").mockReturnValue(true);
+			const sentBearers: string[] = [];
+			const fetch: FetchImpl = async (_input, init) => {
+				sentBearers.push(new Headers(init?.headers).get("authorization") ?? "");
+				return new Response(JSON.stringify({ id: "r", model: SELECTED_MODEL_ID, output_text: "Answer." }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			};
+
+			await expect(
+				searchXAI({
+					...makeParams(fetch, { model: { ...model, provider: "xai-oauth", baseUrl: customBaseUrl } }),
+					authStorage: callerAuth,
+					modelRegistry: registry,
+				}),
+			).rejects.toThrow("Refusing to send official xAI OAuth credentials");
+			expect(sentBearers).toEqual([]);
+		} finally {
+			registryAuth.close();
+			callerAuth.close();
+		}
+	});
+});

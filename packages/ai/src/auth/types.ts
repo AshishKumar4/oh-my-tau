@@ -35,15 +35,19 @@ export type ApiKeyCredential = {
 	source?: "login";
 };
 
+/** Characters a masked key must keep hidden; shorter keys display as `…` alone. */
+const MASK_MIN_HIDDEN = 12;
+
 /**
  * Display form of an API key: a short vendor prefix plus the last four
- * characters (`sk-ant-…a1b2`). Never reveals more than the first separator
- * group and four trailing characters; short keys show only the trailing four.
+ * characters (`sk-ant-…a1b2`). The prefix and tail show only when at least
+ * {@link MASK_MIN_HIDDEN} characters stay hidden between them, so no accepted
+ * key, however short or oddly shaped, is shown whole.
  */
 export function maskApiKey(key: string): string {
-	const tail = key.length > 8 ? key.slice(-4) : "";
 	const prefix = /^[A-Za-z]{2,8}-(?:[A-Za-z]{2,8}-)?/.exec(key)?.[0] ?? "";
-	return `${prefix}…${tail}`;
+	if (key.length - prefix.length - 4 < MASK_MIN_HIDDEN) return "…";
+	return `${prefix}…${key.slice(-4)}`;
 }
 
 /** Stored OAuth token and provider account identity. */
@@ -749,6 +753,14 @@ export type MarkUsageLimitOptions = {
 	providerTimed?: boolean;
 	baseUrl?: string;
 	modelId?: string;
+	/** The model's account entitlements; see {@link RotateCredentialOptions.accountIds}. */
+	accountIds?: readonly string[];
+	/**
+	 * The provider's failure text. A limit naming the account's billing
+	 * (exhausted credits, a spend cap) blocks the credential for every model
+	 * instead of only the request's quota scope.
+	 */
+	errorMessage?: string;
 	apiKey?: string;
 	credentialId?: number;
 	signal?: AbortSignal;
@@ -758,6 +770,12 @@ export type MarkUsageLimitOptions = {
 export type RotateCredentialOptions = {
 	error?: unknown;
 	modelId?: string;
+	/**
+	 * The model's account entitlements (`AuthApiKeyOptions.accountIds`). When one
+	 * stored OAuth account is entitled, strict selection takes only entitled
+	 * accounts, so rotation counts only those as a switch; otherwise all count.
+	 */
+	accountIds?: readonly string[];
 	apiKey?: string;
 	credentialId?: number;
 	signal?: AbortSignal;
@@ -766,8 +784,9 @@ export type RotateCredentialOptions = {
 /**
  * Outcome of {@link LimitsApi.rotate}.
  *
- * `switched` is `true` when a usable same-type sibling credential is available,
- * so the caller's next resolve hands it out. `afterSiblingWait` is `true` when
+ * `switched` is `true` when a usable sibling credential is available (in the
+ * failed credential's pool, or the provider's other stored pool), so the
+ * caller's next resolve hands it out. `afterSiblingWait` is `true` when
  * no sibling was free at the failure but rotation slept out a sibling's short
  * block (e.g. a Cloud Code Assist capacity 429 that resets in under a second);
  * the freed credential may be one the caller already sent in this request, so
@@ -864,6 +883,13 @@ export interface CredentialsApi {
 	 */
 	hasOAuth(provider: string): boolean;
 	/**
+	 * Whether `bearer` is the access token of one of the provider's stored OAuth
+	 * accounts. Guards that must not send a subscription token somewhere (a custom
+	 * endpoint) check the bearer each attempt actually received: with pooled API
+	 * keys first, a request can still fall back to an OAuth account.
+	 */
+	isOAuthBearer(provider: string, bearer: string): boolean;
+	/**
 	 * Get OAuth credentials for a provider.
 	 */
 	getOAuth(provider: string): OAuthCredential | undefined;
@@ -934,10 +960,11 @@ export interface KeysApi {
 	 * Priority (first match wins):
 	 * 1. Runtime override (CLI --api-key)
 	 * 2. Config override (models.yml `providers.<name>.apiKey`)
-	 * 3. OAuth token from storage (auto-refreshed)
-	 * 4. API key persisted by a successful `/login`
+	 * 3–4. The stored pools in `auth.poolOrder`: OAuth tokens (auto-refreshed) and
+	 *      pooled API keys, subscription-first by default; an exhausted pool falls
+	 *      through to the other
 	 * 5. Environment variable
-	 * 6. Stored API key (e.g. a broker-migrated copy) — last resort, so an explicit env var wins
+	 * 6. Stored static API key (e.g. a broker-migrated copy) — last resort, so an explicit env var wins
 	 */
 	get(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined>;
 	/** Resolve a bearer together with its durable stored credential row id, when known. */
@@ -969,10 +996,10 @@ export interface KeysApi {
 	 * Mirrors {@link AuthStorage.keys.get} precedence, highest first:
 	 *   1. Runtime override (`--api-key`).
 	 *   2. Config override (`models.yml` `providers.<name>.apiKey`).
-	 *   3. Stored OAuth credential (never an account on hold).
-	 *   4. API key persisted by a successful `/login`.
+	 *   3–4. The stored pools in `auth.poolOrder`: OAuth accounts (never one on
+	 *        hold) and pooled API keys; subscription-first by default.
 	 *   5. Env var — overrides a stored static api_key (e.g. a stale broker copy).
-	 *   6. Stored api_key credential.
+	 *   6. Stored static api_key credential.
 	 *
 	 * The string is purely informational; consumers must not parse it.
 	 */

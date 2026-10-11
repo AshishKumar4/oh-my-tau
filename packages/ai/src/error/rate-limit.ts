@@ -457,6 +457,20 @@ export function matchesUsageLimitText(errorMessage: string): boolean {
 }
 
 /**
+ * Whether a usage-limit error names the account's billing (prepaid credits, a
+ * balance, or a spend cap) rather than one model's quota window. That state
+ * holds for every model the credential can call, so its block is account-wide.
+ */
+export function isAccountBillingExhaustion(errorMessage: string): boolean {
+	return (
+		CREDITS_EXHAUSTED_PATTERN.test(errorMessage) ||
+		INSUFFICIENT_BALANCE_PATTERN.test(errorMessage) ||
+		PREPAID_BALANCE_EXHAUSTED_PATTERN.test(errorMessage) ||
+		SPEND_LIMIT_PATTERN.test(errorMessage)
+	);
+}
+
+/**
  * Account-scoped cap phrasing delivered on a 403 (or a statusless Connect
  * trailer): "Reached overall message rate limit", "Your limit will reset in …".
  * Kept separate from {@link matchesUsageLimitText} because the bare wording is

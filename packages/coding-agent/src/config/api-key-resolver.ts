@@ -30,6 +30,8 @@ export interface ApiKeyResolverRegistry {
 		options?: AuthApiKeyOptions,
 	): Promise<ApiKeyResolution>;
 	authStorage: Pick<AuthStorage, "limits">;
+	/** OAuth account ids entitled to a model; rotation counts only these as an OAuth switch. */
+	accountIdsForModel?(provider: string, modelId: string | undefined): readonly string[] | undefined;
 	/**
 	 * Build an {@link ApiKeyResolver} implementing the central a/b/c auth-retry
 	 * policy: initial → resolve; step (b) → force-refresh same account; step (c)
@@ -50,7 +52,7 @@ export interface ApiKeyResolverRegistry {
  * Also usable standalone for structural registries that don't carry the method.
  */
 export function createApiKeyResolver(
-	registry: Pick<ApiKeyResolverRegistry, "getApiKeyWithCredentialForProvider" | "authStorage">,
+	registry: Pick<ApiKeyResolverRegistry, "getApiKeyWithCredentialForProvider" | "authStorage" | "accountIdsForModel">,
 	provider: string,
 	options: ApiKeyResolverOptions = {},
 ): ApiKeyResolver {
@@ -81,6 +83,7 @@ export function createApiKeyResolver(
 			const rotation = await registry.authStorage.limits.rotate(provider, sessionId, {
 				error,
 				modelId,
+				accountIds: registry.accountIdsForModel?.(provider, modelId),
 				signal,
 				apiKey: previousKey,
 			});

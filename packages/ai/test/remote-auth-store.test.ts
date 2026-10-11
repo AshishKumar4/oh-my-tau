@@ -9,6 +9,7 @@ import {
 	REMOTE_REFRESH_SENTINEL,
 	SqliteAuthCredentialStore,
 } from "@oh-my-pi/pi-ai";
+import { resolveApiKeyOnce, resolveRetryKey } from "@oh-my-pi/pi-ai/auth-retry";
 import {
 	AuthBrokerClient,
 	type AuthBrokerServerHandle,
@@ -1482,6 +1483,28 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		if (result.status !== 200) throw new Error("expected snapshot");
 		const entry = result.snapshot.credentials.find(candidate => candidate.provider === "custom-host");
 		expect(entry?.credential).toEqual({ type: "api_key", key: "sk-custom", source: "login" });
+	});
+
+	test("an invalid pooled API key rotates to the next key through the broker", async () => {
+		for (const key of ["pooled-key-revoked", "pooled-key-working"]) {
+			await serverStorage!.credentials.addApiKey("custom-host", key);
+		}
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await brokerClient.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected snapshot");
+		const clientStorage = new AuthStorage(
+			new RemoteAuthCredentialStore({ client: brokerClient, initialSnapshot: initial.snapshot }),
+		);
+		await clientStorage.credentials.reload();
+		const resolve = clientStorage.keys.resolver("custom-host", { sessionId: "s1" });
+		const first = await resolveApiKeyOnce(resolve);
+		const invalidKey = Object.assign(new Error("401 invalid x-api-key"), { status: 401 });
+
+		const next = await resolveRetryKey(resolve, true, invalidKey, undefined, first);
+
+		expect(next).toBeDefined();
+		expect(next).not.toBe(first);
+		clientStorage.close();
 	});
 
 	test("client credentials.remove disables every broker-side credential for the provider (logout)", async () => {

@@ -50,6 +50,25 @@ export function isPoolCredential(provider: string, credential: AuthCredential): 
 }
 
 /**
+ * The model's OAuth account entitlement filter (`AuthApiKeyOptions.accountIds`).
+ * Applies only when at least one stored OAuth account is entitled; otherwise
+ * (no entitlements, or none stored) every account stays eligible. Strict
+ * selection and rotation both use it, so rotation counts exactly the accounts
+ * selection will accept.
+ */
+export function oauthEntitlementFilter(
+	credentials: readonly AuthCredential[],
+	accountIds: readonly string[] | undefined,
+): ((credential: OAuthCredential) => boolean) | undefined {
+	if (!accountIds?.length) return undefined;
+	const entitled = new Set(accountIds);
+	const isEntitled = (credential: OAuthCredential): boolean =>
+		credential.accountId !== undefined && entitled.has(credential.accountId);
+	const anyEntitled = credentials.some(credential => credential.type === "oauth" && isEntitled(credential));
+	return anyEntitled ? isEntitled : undefined;
+}
+
+/**
  * Validated per-account routing policies (priority/reserve), the global reserve
  * fallback, and each provider's stored-pool order.
  */

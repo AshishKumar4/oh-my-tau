@@ -14,7 +14,7 @@ import {
 	providerTypeKey,
 	type CredentialBlocks,
 } from "./blocks";
-import type { AccountPolicies } from "./policy";
+import { type AccountPolicies, oauthEntitlementFilter } from "./policy";
 import { authCredentialEquals, type CredentialPool } from "./pool";
 import {
 	orderUsageRankedCandidates,
@@ -594,12 +594,11 @@ export class CredentialSelector {
 		const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
 		const planGate = strategy?.planGate?.(rankingContext);
 		const hasPlanRequirement = planGate !== undefined;
-		const accountIds = options?.accountIds?.length ? new Set(options.accountIds) : undefined;
-		const enforceAccounts =
-			accountIds !== undefined &&
-			credentials.some(
-				({ credential }) => credential.accountId !== undefined && accountIds.has(credential.accountId),
-			);
+		const entitled = oauthEntitlementFilter(
+			credentials.map(entry => entry.credential),
+			options?.accountIds,
+		);
+		const enforceAccounts = entitled !== undefined;
 		const hasAccountPolicy = credentials.some(
 			({ credential }) => this.#deps.policies.forCredential(provider, credential) !== undefined,
 		);
@@ -925,9 +924,7 @@ export class CredentialSelector {
 		for (const pass of passes) {
 			for (const candidate of pass.allowBlocked ? lastResortCandidates : candidates) {
 				if (preflightFailures.has(candidate)) continue;
-				const candidateAccountId = candidate.selection.credential.accountId;
-				if (pass.enforceAccounts && (candidateAccountId === undefined || !accountIds?.has(candidateAccountId)))
-					continue;
+				if (pass.enforceAccounts && !entitled?.(candidate.selection.credential)) continue;
 				const resolved = await this.tryOAuth(provider, candidate.selection, providerKey, sessionId, options, {
 					checkUsage,
 					allowBlocked: pass.allowBlocked,
@@ -940,6 +937,11 @@ export class CredentialSelector {
 					blockScope,
 					blockScopes,
 					onTransientRefreshFailure: recordTransientRefreshFailure,
+					// A strict pass must stay strict: re-entering resolveOAuth after a
+					// definitive failure would run its last-resort passes and could hand
+					// back a blocked account before the cascade tries the other pool.
+					// This loop already moves on to the next candidate.
+					allowFallback: !strict,
 				});
 				if (resolved) return resolved;
 			}

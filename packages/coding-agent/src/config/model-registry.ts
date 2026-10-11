@@ -2976,6 +2976,12 @@ export class ModelRegistry {
 		}
 	}
 
+	/** OAuth account ids entitled to `modelId` (discovered `accountAccess`); selection and rotation both prefer them. */
+	accountIdsForModel(provider: string, modelId: string | undefined): readonly string[] | undefined {
+		const accountAccess = modelId ? this.find(provider, modelId)?.accountAccess : undefined;
+		return accountAccess && Object.keys(accountAccess);
+	}
+
 	async getApiKeyWithCredentialForProvider(
 		provider: string,
 		sessionId?: string,
@@ -2986,11 +2992,10 @@ export class ModelRegistry {
 		if (this.#isKeylessProvider(provider)) {
 			return { apiKey: kNoAuth };
 		}
-		const accountAccess = options?.modelId ? this.find(provider, options.modelId)?.accountAccess : undefined;
 		return this.authStorage.keys.getWithCredential(provider, sessionId, {
 			baseUrl: options?.baseUrl,
 			modelId: options?.modelId,
-			accountIds: accountAccess && Object.keys(accountAccess),
+			accountIds: this.accountIdsForModel(provider, options?.modelId),
 			forceRefresh: options?.forceRefresh,
 			refreshReason: options?.refreshReason,
 			signal: options?.signal,

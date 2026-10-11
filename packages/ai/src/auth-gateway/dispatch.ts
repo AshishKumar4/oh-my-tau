@@ -154,6 +154,8 @@ async function refreshGatewayApiKeyAfterAuthError(
 			providerTimed: retryAfterMs !== undefined,
 			baseUrl: model.baseUrl,
 			modelId: model.id,
+			accountIds: model.accountAccess && Object.keys(model.accountAccess),
+			errorMessage: message,
 			apiKey: oldKey,
 			signal,
 		});
