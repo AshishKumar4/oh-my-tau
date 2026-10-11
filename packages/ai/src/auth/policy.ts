@@ -1,9 +1,11 @@
+import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import * as AIError from "../error";
 import type {
 	AuthAccountPolicies,
 	AuthAccountPolicy,
 	AuthAccountSelector,
 	AuthCredential,
+	CredentialPoolOrders,
 	OAuthAccountIdentity,
 	OAuthCredential,
 } from "./types";
@@ -19,18 +21,55 @@ export function matchesAuthAccountSelector(selector: AuthAccountSelector, identi
 	);
 }
 
-/** Validated per-account routing policies (priority/reserve) plus the global reserve fallback. */
+/**
+ * True when a stored credential is the provider's KDL `empty-fallback`
+ * keyless-mode marker — what an empty paste at an "Optional: paste API key"
+ * login prompt stores (e.g. `lm-studio-local` for lm-studio). The wire layer
+ * never sends these as a bearer (`isDiscoveryBearerApiKey` strips them), so
+ * auth-status surfaces must not count them either; otherwise the model hub
+ * and `/login` report the provider as authenticated while every request
+ * goes out bare (issue #12281). The credential itself stays stored: `/logout`
+ * can still remove it, and availability treats the provider as keyless.
+ */
+export function isKeylessFallback(provider: string, credential: AuthCredential): boolean {
+	if (credential.type !== "api_key") return false;
+	const login = authPolicyFor(provider)?.login;
+	if (login?.kind !== "api-key") return false;
+	const fallback = login.emptyFallback;
+	return fallback !== undefined && fallback !== "" && credential.key === fallback;
+}
+
+/**
+ * Whether a stored credential belongs to one of the provider's two rotating
+ * pools: an OAuth subscription account, or a pooled API key (`source: "login"`).
+ * Legacy and broker-migrated static keys and keyless-mode markers are outside both pools.
+ */
+export function isPoolCredential(provider: string, credential: AuthCredential): boolean {
+	if (credential.type === "oauth") return true;
+	return credential.source === "login" && !isKeylessFallback(provider, credential);
+}
+
+/**
+ * Validated per-account routing policies (priority/reserve), the global reserve
+ * fallback, and each provider's stored-pool order.
+ */
 export class AccountPolicies {
 	#accountPolicies: AuthAccountPolicies;
 	#defaultReservePct: number;
+	#poolOrders: CredentialPoolOrders;
 
-	constructor(policies: AuthAccountPolicies, defaultReservePct: number | undefined) {
+	constructor(
+		policies: AuthAccountPolicies,
+		defaultReservePct: number | undefined,
+		poolOrders: CredentialPoolOrders = {},
+	) {
 		AccountPolicies.#validateAccountPolicyConfiguration(policies);
 		this.#accountPolicies = policies;
 		this.#defaultReservePct =
 			typeof defaultReservePct === "number" && Number.isFinite(defaultReservePct)
 				? Math.max(0, Math.min(100, defaultReservePct))
 				: DEFAULT_USAGE_RESERVE_PCT;
+		this.#poolOrders = poolOrders;
 	}
 
 	/** Global usage reserve (0–100) for accounts without a per-account `reservePct`. */
@@ -38,20 +77,27 @@ export class AccountPolicies {
 		return this.#defaultReservePct;
 	}
 
+	/** The provider's stored pools in serving order; `subscription-first` unless configured. */
+	poolOrder(provider: string): readonly AuthCredential["type"][] {
+		return this.#poolOrders[provider] === "api-keys-first" ? ["api_key", "oauth"] : ["oauth", "api_key"];
+	}
+
 	/**
-	 * Replace the policy set and global reserve in place (live settings change).
-	 * Validates the configuration and every provider in `storedCredentials` before
-	 * committing; on error the previous policies stay active.
+	 * Replace the policy set, global reserve, and pool orders in place (live
+	 * settings change). Validates the configuration and every provider in
+	 * `storedCredentials` before committing; on error the previous policies stay active.
 	 */
 	replace(
 		policies: AuthAccountPolicies,
 		defaultReservePct: number | undefined,
+		poolOrders: CredentialPoolOrders,
 		storedCredentials: ReadonlyMap<string, readonly AuthCredential[]> = new Map(),
 	): void {
-		const next = new AccountPolicies(policies, defaultReservePct);
+		const next = new AccountPolicies(policies, defaultReservePct, poolOrders);
 		for (const [provider, credentials] of storedCredentials) next.validateFor(provider, credentials);
 		this.#accountPolicies = next.#accountPolicies;
 		this.#defaultReservePct = next.#defaultReservePct;
+		this.#poolOrders = next.#poolOrders;
 	}
 
 	static #validateAccountPolicyConfiguration(accountPolicies: AuthAccountPolicies): void {

@@ -63,7 +63,7 @@ describe("resolveAuthBrokerConfig config discovery", () => {
 		});
 	});
 
-	test("loads account policy config with the configured or default global reserve", async () => {
+	test("loads account policy config with the configured or default global reserve and pool order", async () => {
 		const accountPolicies = [
 			{
 				provider: "anthropic",
@@ -73,21 +73,34 @@ describe("resolveAuthBrokerConfig config discovery", () => {
 		] satisfies AuthAccountPolicies;
 		await Bun.write(
 			path.join(agentDir, "config.yml"),
-			["auth:", `  accountPolicies: ${JSON.stringify(accountPolicies)}`, "retry:", "  usageReservePct: 17", ""].join(
-				"\n",
-			),
+			[
+				"auth:",
+				`  accountPolicies: ${JSON.stringify(accountPolicies)}`,
+				"  poolOrder:",
+				"    anthropic: api-keys-first",
+				"retry:",
+				"  usageReservePct: 17",
+				"",
+			].join("\n"),
 		);
 
 		await expect(loadAuthAccountPolicyConfig({ agentDir })).resolves.toEqual({
 			accountPolicies,
 			defaultReservePct: 17,
+			poolOrders: { anthropic: "api-keys-first" },
 		});
 
 		await Bun.write(path.join(agentDir, "config.yml"), "auth: {}\n");
 		await expect(loadAuthAccountPolicyConfig({ agentDir })).resolves.toEqual({
 			accountPolicies: [],
 			defaultReservePct: DEFAULT_USAGE_RESERVE_PCT,
+			poolOrders: {},
 		});
+
+		await Bun.write(path.join(agentDir, "config.yml"), "auth:\n  poolOrder:\n    anthropic: keys-first\n");
+		await expect(loadAuthAccountPolicyConfig({ agentDir })).rejects.toThrow(
+			"auth.poolOrder.anthropic must be one of subscription-first, api-keys-first",
+		);
 	});
 
 	test("treats an empty or comment-only config.yml as no configuration", async () => {
@@ -98,6 +111,7 @@ describe("resolveAuthBrokerConfig config discovery", () => {
 				await expect(loadAuthAccountPolicyConfig({ agentDir })).resolves.toEqual({
 					accountPolicies: [],
 					defaultReservePct: DEFAULT_USAGE_RESERVE_PCT,
+					poolOrders: {},
 				});
 			});
 		}

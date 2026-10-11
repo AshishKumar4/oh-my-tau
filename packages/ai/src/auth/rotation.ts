@@ -17,10 +17,12 @@ import {
 import type { CredentialBlocks } from "./blocks";
 import type { KeyOverrides } from "./cascade";
 import type { SessionAffinity } from "./affinity";
+import { type AccountPolicies, isPoolCredential } from "./policy";
 import type { CredentialPool } from "./pool";
 import type { AuthCredentialStore } from "./store";
 import type {
 	AuthCredential,
+	CredentialPoolSummary,
 	CredentialRotation,
 	InvalidateCredentialMatchingOptions,
 	LimitsApi,
@@ -68,6 +70,7 @@ export interface RateLimitsDeps {
 	affinity: SessionAffinity;
 	usage: UsageService;
 	strategies: RankingStrategyResolver;
+	policies: AccountPolicies;
 }
 
 /** Usage-limit marking, credential rotation after failures, and bearer-matched invalidation. */
@@ -76,6 +79,32 @@ export class RateLimits implements LimitsApi {
 
 	constructor(deps: RateLimitsDeps) {
 		this.#deps = deps;
+	}
+
+	pools(provider: string, modelId?: string): CredentialPoolSummary[] {
+		const entries = this.#deps.pool.credentials(provider).map((credential, index) => ({ credential, index }));
+		const summaries: CredentialPoolSummary[] = [];
+		for (const kind of this.#deps.policies.poolOrder(provider)) {
+			const routing = this.#credentialBlockRouting(provider, kind, modelId);
+			const members = entries.filter(
+				entry =>
+					entry.credential.type === kind &&
+					isPoolCredential(provider, entry.credential) &&
+					!this.#deps.blocks.isHeld(provider, entry.index),
+			);
+			if (members.length === 0) continue;
+			const deadlines = members.map(entry =>
+				this.#deps.blocks.blockedUntil(provider, routing.providerKey, entry.index, routing.siblingBlockScopes),
+			);
+			const blockedDeadlines = deadlines.filter((deadline): deadline is number => deadline !== undefined);
+			summaries.push({
+				kind,
+				members: members.length,
+				blocked: blockedDeadlines.length,
+				...(blockedDeadlines.length === members.length ? { retryAtMs: Math.min(...blockedDeadlines) } : {}),
+			});
+		}
+		return summaries;
 	}
 
 	async #resolveCredentialTarget(
@@ -118,6 +147,36 @@ export class RateLimits implements LimitsApi {
 		if (explicit) return undefined;
 		const sessionCredential = this.#deps.affinity.get(provider, sessionId);
 		return sessionCredential ? { ...sessionCredential, explicit: false } : undefined;
+	}
+
+	/**
+	 * Credentials a request can rotate to after `targetIndex` fails: its own pool's
+	 * siblings, then the provider's other stored pool (OAuth subscriptions or
+	 * pooled API keys). Static or migrated keys stay outside rotation: they serve
+	 * only after both pools, so they cannot mask an exhausted pool.
+	 */
+	#rotationCandidates(
+		provider: string,
+		credentialType: AuthCredential["type"],
+		targetIndex: number,
+	): Array<{ credential: AuthCredential; index: number }> {
+		const failed = this.#deps.pool.entries(provider)[targetIndex]?.credential;
+		const crossPool = failed === undefined || isPoolCredential(provider, failed);
+		const candidates = this.#deps.pool
+			.credentials(provider)
+			.map((credential, index) => ({ credential, index }))
+			.filter(
+				entry =>
+					entry.index !== targetIndex &&
+					!this.#deps.blocks.isHeld(provider, entry.index) &&
+					(entry.credential.type === credentialType ||
+						(crossPool && isPoolCredential(provider, entry.credential))),
+			);
+		// Same-pool siblings first: rotation stays in the serving pool while it can.
+		return [
+			...candidates.filter(entry => entry.credential.type === credentialType),
+			...candidates.filter(entry => entry.credential.type !== credentialType),
+		];
 	}
 	#credentialBlockRouting(
 		provider: string,
@@ -187,23 +246,19 @@ export class RateLimits implements LimitsApi {
 					blockedUntil)
 				: blockedUntil;
 
-		const remainingCredentials = this.#deps.pool
-			.credentials(provider)
-			.map((credential, index) => ({ credential, index }))
-			.filter(
-				(entry): entry is { credential: AuthCredential; index: number } =>
-					entry.credential.type === credentialType && entry.index !== targetIndex,
-			);
-
 		let retryAtMs: number | undefined;
-		for (const candidate of remainingCredentials) {
+		for (const candidate of this.#rotationCandidates(provider, credentialType, targetIndex)) {
 			// Sibling availability must use the same scope set selection reads, or
 			// this reports a sibling as free that selection will then refuse.
+			const candidateRouting =
+				candidate.credential.type === credentialType
+					? routing
+					: this.#credentialBlockRouting(provider, candidate.credential.type, routing.rankingContext.modelId);
 			const candidateBlockedUntil = this.#deps.blocks.blockedUntil(
 				provider,
-				routing.providerKey,
+				candidateRouting.providerKey,
 				candidate.index,
-				routing.siblingBlockScopes,
+				candidateRouting.siblingBlockScopes,
 			);
 			if (candidateBlockedUntil === undefined)
 				return {
@@ -483,14 +538,14 @@ export class RateLimits implements LimitsApi {
 		const providerKey = providerTypeKey(provider, sessionCredential.type);
 		// Snapshot sibling availability before mutating so a soft-deleting
 		// suspect hook can't reindex the answer out from under us.
-		const hasSibling = this.#deps.pool
-			.credentials(provider)
-			.some(
-				(credential, index) =>
-					credential.type === sessionCredential.type &&
-					index !== sessionCredential.index &&
-					!this.#deps.blocks.isBlocked(provider, providerKey, index),
-			);
+		const hasSibling = this.#rotationCandidates(provider, sessionCredential.type, sessionCredential.index).some(
+			candidate =>
+				!this.#deps.blocks.isBlocked(
+					provider,
+					providerTypeKey(provider, candidate.credential.type),
+					candidate.index,
+				),
+		);
 		const target = this.#deps.pool.entries(provider)[sessionCredential.index];
 		const sticky = this.#deps.affinity.get(provider, sessionId);
 		if (

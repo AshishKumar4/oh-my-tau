@@ -1,3 +1,4 @@
+import { maskApiKey } from "@oh-my-pi/pi-ai";
 import type { OAuthAccountIdentity, StoredAuthCredential } from "../../session/auth-storage";
 
 import type { LogoutAccount } from "@oh-my-pi/pi-tui/overlays/logout-account-selector";
@@ -14,7 +15,7 @@ function nonEmpty(value: string | undefined): string | undefined {
 
 function oauthLabel(row: StoredAuthCredential): string {
 	const credential = row.credential;
-	if (credential.type !== "oauth") return `API key #${row.id}`;
+	if (credential.type !== "oauth") return `API key ${maskApiKey(credential.key)}`;
 	const base =
 		nonEmpty(credential.email) ??
 		nonEmpty(credential.accountId) ??
@@ -29,7 +30,8 @@ function oauthLabel(row: StoredAuthCredential): string {
 
 function oauthDetail(row: StoredAuthCredential, label: string): string {
 	const credential = row.credential;
-	if (credential.type === "api_key") return `stored API key #${row.id}`;
+	if (credential.type === "api_key")
+		return `stored API key #${row.id}${credential.source === "login" ? " (pooled)" : ""}`;
 	const parts: string[] = [];
 	const email = nonEmpty(credential.email);
 	const accountId = nonEmpty(credential.accountId);

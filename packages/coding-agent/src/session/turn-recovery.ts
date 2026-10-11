@@ -752,6 +752,9 @@ export class TurnRecovery {
 						providerTimed: parsedRetryAfterMs !== undefined,
 						baseUrl: activeModel.baseUrl,
 						modelId: activeModel.id,
+						// The row that served the failed turn, not the session's current pin:
+						// cross-pool fallback can move the pin between the request and recovery.
+						credentialId: message.provider === activeModel.provider ? message.credentialId : undefined,
 					},
 				);
 				return {
@@ -767,6 +770,25 @@ export class TurnRecovery {
 			this.#usageLimitOutcomes.set(message, recorded);
 		}
 		return (await recorded).switchedCredential;
+	}
+
+	/**
+	 * Final error for a usage-limit failure that no credential or model could absorb.
+	 * When the provider holds more than one pooled credential, names each pool, how
+	 * many members are exhausted, and when the earliest becomes usable again.
+	 */
+	#poolExhaustedError(errorMessage: string, id: number): string {
+		const model = this.#host.model();
+		if (!model || !AIError.is(id, AIError.Flag.UsageLimit)) return errorMessage;
+		const pools = this.#host.modelRegistry.authStorage.limits.pools(model.provider, model.id);
+		const members = pools.reduce((total, pool) => total + pool.members, 0);
+		if (members < 2 || pools.some(pool => pool.retryAtMs === undefined)) return errorMessage;
+		const label = { oauth: "subscription", api_key: "API key" } as const;
+		const summary = pools
+			.map(pool => `${pool.members} ${label[pool.kind]}${pool.members === 1 ? "" : "s"}`)
+			.join(" and ");
+		const retryAt = new Date(Math.min(...pools.map(pool => pool.retryAtMs ?? Number.POSITIVE_INFINITY)));
+		return `Every ${model.provider} credential is exhausted (${summary}). The earliest becomes usable again at ${retryAt.toLocaleString()}. Last error: ${errorMessage}`;
 	}
 
 	/** Prompts after transient overlap with a prior agent run. */
@@ -2634,14 +2656,15 @@ export class TurnRecovery {
 		if (retryBudgetExhausted) {
 			if (!switchedModel && !switchedCredential) {
 				const attempt = this.#retryAttempt - 1;
-				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
+				const finalError = this.#poolExhaustedError(errorMessage, id);
+				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${finalError}`;
 				await this.persistTerminalEmptyErrorTurn(message);
 				const retryErrors = await this.#markPendingRetryErrors({ status: "superseded" });
 				await this.#host.emitSessionEvent({
 					type: "auto_retry_end",
 					success: false,
 					attempt,
-					finalError: errorMessage,
+					finalError,
 					retryErrors,
 				});
 				this.#clearPendingRetryErrors();
@@ -2735,7 +2758,7 @@ export class TurnRecovery {
 				type: "auto_retry_end",
 				success: false,
 				attempt,
-				finalError: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
+				finalError: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${this.#poolExhaustedError(errorMessage, id)}`,
 			});
 			this.#clearPendingRetryErrors();
 			this.resolveRetry();

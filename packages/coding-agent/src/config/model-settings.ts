@@ -3,7 +3,8 @@
  * settings-panel order; `config/all-settings.ts` registers every domain.
  */
 import { register, type SettingValueOf } from "./registry";
-import type { AuthAccountPolicies } from "@oh-my-pi/pi-ai/auth-storage";
+import { parseCredentialPoolOrders } from "@oh-my-pi/pi-ai/auth-broker/discover";
+import type { AuthAccountPolicies, CredentialPoolOrders } from "@oh-my-pi/pi-ai/auth-storage";
 import type { cfgDefaultThinkingLevel } from "../session/settings";
 
 /** Display metadata for one model tag. */
@@ -33,6 +34,7 @@ const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const EMPTY_MODEL_PRESETS_RECORD: Record<string, ModelPreset> = {};
 const EMPTY_AUTH_ACCOUNT_POLICIES: AuthAccountPolicies = [];
+const EMPTY_CREDENTIAL_POOL_ORDERS: CredentialPoolOrders = {};
 
 // Auth broker — credentials proxied through a remote `omp auth-broker serve`
 // host. Hidden from the UI; populate via env vars or hand-edited config.yml. Env takes
@@ -58,6 +60,20 @@ export const cfgAuthAccountPolicies = register({
 	id: "auth.accountPolicies",
 	type: "array",
 	default: EMPTY_AUTH_ACCOUNT_POLICIES,
+});
+
+/**
+ * Per-provider order of stored credential pools: OAuth subscription accounts and
+ * pooled API keys (`omp auth keys add`). The default serves subscriptions first and
+ * falls back to keys once every subscription is exhausted; `api-keys-first`
+ * reverses it. Edited through `omp config set` or config.yml, like `auth.accountPolicies`.
+ */
+export const cfgAuthPoolOrder = register({
+	id: "auth.poolOrder",
+	type: "record",
+	default: EMPTY_CREDENTIAL_POOL_ORDERS,
+	validate: parseCredentialPoolOrders,
+	normalize: parseCredentialPoolOrders,
 });
 
 export const cfgEnabledModels = register({

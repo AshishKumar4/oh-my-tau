@@ -41,6 +41,7 @@ import type {
 	AuthApiKeyOptions,
 	AuthCredential,
 	AuthStorageOptions,
+	CredentialPoolOrders,
 	BlocksApi,
 	CredentialsApi,
 	HealthApi,
@@ -90,7 +91,11 @@ export class AuthStorage {
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
 		this.#options = options;
 		this.#overrides = new KeyOverrides(options.configValueResolver);
-		this.#policies = new AccountPolicies(options.accountPolicies ?? [], options.defaultReservePct);
+		this.#policies = new AccountPolicies(
+			options.accountPolicies ?? [],
+			options.defaultReservePct,
+			options.poolOrders,
+		);
 		this.#modules = this.#compose(store, options.sourceLabel);
 		if (options.onCredentialDisabled) this.#modules.pool.onDisabled(options.onCredentialDisabled);
 	}
@@ -134,15 +139,19 @@ export class AuthStorage {
 
 	/**
 	 * Apply new account routing policy (live `auth.accountPolicies` /
-	 * `retry.usageReservePct` change). Throws a configuration error, leaving the
-	 * active policy untouched, when the policy is malformed or does not match the
-	 * stored OAuth accounts.
+	 * `retry.usageReservePct` / `auth.poolOrder` change). Throws a configuration
+	 * error, leaving the active policy untouched, when the policy is malformed or
+	 * does not match the stored OAuth accounts.
 	 */
-	setAccountPolicies(config: { accountPolicies: AuthAccountPolicies; defaultReservePct: number }): void {
+	setAccountPolicies(config: {
+		accountPolicies: AuthAccountPolicies;
+		defaultReservePct: number;
+		poolOrders: CredentialPoolOrders;
+	}): void {
 		const pool = this.#modules.pool;
 		const stored = new Map<string, AuthCredential[]>();
 		for (const provider of pool.providers()) stored.set(provider, pool.credentials(provider));
-		this.#policies.replace(config.accountPolicies, config.defaultReservePct, stored);
+		this.#policies.replace(config.accountPolicies, config.defaultReservePct, config.poolOrders, stored);
 	}
 
 	/**
@@ -219,13 +228,14 @@ export class AuthStorage {
 			refresher,
 			strategies,
 		});
-		const limits = new RateLimits({ store, pool, overrides, blocks, affinity, usage, strategies });
+		const limits = new RateLimits({ store, pool, overrides, blocks, affinity, usage, strategies, policies });
 		const keys = new KeyCascade({
 			pool,
 			overrides,
 			selector,
 			affinity,
 			blocks,
+			policies,
 			rotate: (provider, sessionId, rotateOptions) => limits.rotate(provider, sessionId, rotateOptions),
 			sourceLabel,
 		});

@@ -249,7 +249,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// Build a broker-backed AuthStorage — same pattern as discoverAuthStorage()
 	// in sdk.ts. The gateway never touches local SQLite.
 	const accountPool = await loadAuthBrokerAccountPool();
-	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig();
+	const { accountPolicies, defaultReservePct, poolOrders } = await loadEffectiveAuthAccountPolicyConfig();
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
 	const store = new RemoteAuthCredentialStore({
@@ -265,6 +265,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		sourceLabel: `broker ${brokerConfig.url}`,
 		accountPolicies,
 		defaultReservePct,
+		poolOrders,
 	});
 	await storage.credentials.reload();
 
@@ -723,7 +724,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	}
 
 	const accountPool = await loadAuthBrokerAccountPool();
-	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig();
+	const { accountPolicies, defaultReservePct, poolOrders } = await loadEffectiveAuthAccountPolicyConfig();
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
 	const store = new RemoteAuthCredentialStore({
@@ -735,6 +736,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		sourceLabel: `broker ${brokerConfig.url}`,
 		accountPolicies,
 		defaultReservePct,
+		poolOrders,
 	});
 	try {
 		await storage.credentials.reload();

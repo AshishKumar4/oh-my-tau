@@ -1,7 +1,7 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-credential-store";
 import type { BlockStoreHealth } from "./blocks";
-import type { AccountPolicies } from "./policy";
+import { type AccountPolicies, isPoolCredential } from "./policy";
 import type { AuthCredentialStore } from "./store";
 import { REMOTE_REFRESH_SENTINEL } from "./types";
 import type {
@@ -141,8 +141,11 @@ export class CredentialPool implements CredentialsApi {
 		return rows;
 	}
 
-	/** Persist a login-entered API key. */
-	async storeLoginApiKey(provider: string, key: string): Promise<void> {
+	/**
+	 * Add one API key to the provider's key pool (`source: "login"`). Distinct keys
+	 * are appended; re-adding a stored key reuses its row. Returns the stored row.
+	 */
+	async addApiKey(provider: string, key: string): Promise<StoredAuthCredential> {
 		const credential: ApiKeyCredential = { type: "api_key", key, source: "login" };
 		const stored = await this.#store.upsertAuthCredential(provider, credential);
 		this.replace(
@@ -150,6 +153,17 @@ export class CredentialPool implements CredentialsApi {
 			stored.map(entry => ({ id: entry.id, credential: entry.credential })),
 		);
 		this.reset(provider);
+		const row = stored.find(entry => entry.credential.type === "api_key" && entry.credential.key === key);
+		if (!row) throw new Error(`API key for ${provider} was not stored`);
+		return row;
+	}
+
+	pooledApiKeys(provider: string): Array<StoredAuthCredential & { credential: ApiKeyCredential }> {
+		return this.entries(provider).flatMap(entry =>
+			entry.credential.type === "api_key" && isPoolCredential(provider, entry.credential)
+				? [{ id: entry.id, provider, credential: entry.credential, disabledCause: null }]
+				: [],
+		);
 	}
 
 	/**

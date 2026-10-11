@@ -462,6 +462,64 @@ describe("AgentSession retry delay cap", () => {
 		expect(session.isRetrying).toBe(false);
 	});
 
+	it("names every exhausted credential pool when the subscription and pooled keys are all spent", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+		authStorage.keys.removeRuntime("anthropic");
+		await authStorage.credentials.upsert("anthropic", {
+			type: "oauth",
+			access: "oauth-max-access",
+			refresh: "oauth-max-refresh",
+			expires: Date.now() + 3_600_000,
+			email: "max@example.com",
+		});
+		for (const key of ["sk-ant-api03-poolkeyone", "sk-ant-api03-poolkeytwo"]) {
+			await authStorage.credentials.addApiKey("anthropic", key);
+		}
+
+		const servedKeys: string[] = [];
+		const agent = new Agent({
+			getApiKey: requestedModel => modelRegistry.resolver(requestedModel, session?.sessionId),
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => {
+				const bearer = resolveInitialApiKey(options?.apiKey);
+				servedKeys.push(bearer);
+				const error = bearer.startsWith("oauth-")
+					? "429 usage limit reached for your plan. Try again in 158 min."
+					: '400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}';
+				return createMockModel({ handler: () => ({ throw: error }) }).stream(requestedModel, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.modelFallback": false,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		mockSchedulerWaitWithClock();
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Spend every credential");
+		await session.waitForIdle();
+
+		expect(new Set(servedKeys)).toEqual(
+			new Set(["oauth-max-access", "sk-ant-api03-poolkeyone", "sk-ant-api03-poolkeytwo"]),
+		);
+		expect(servedKeys[0]).toBe("oauth-max-access");
+		expect(retryEndEvents.at(-1)).toMatchObject({ success: false });
+		expect(retryEndEvents.at(-1)?.finalError).toContain(
+			"Every anthropic credential is exhausted (1 subscription and 2 API keys)",
+		);
+		expect(session.isRetrying).toBe(false);
+	});
+
 	it("still fails fast on a long transient retry-after when retry.waitForUsageReset is set", async () => {
 		// Contract: the opt-in covers provider-stated *usage-limit* resets
 		// only — a long transient retry-after (server overload, no quota

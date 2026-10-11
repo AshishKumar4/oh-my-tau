@@ -24,12 +24,27 @@ import type {
 /** Default remaining quota protected for accounts without an explicit policy override. */
 export const DEFAULT_USAGE_RESERVE_PCT = 10;
 
-/** Stored API key used by credential selection. */
+/**
+ * Stored API key used by credential selection. `source: "login"` marks a key in
+ * the provider's key pool (entered through `/login` or `omp auth keys add`);
+ * keys without it are legacy or broker-migrated static copies.
+ */
 export type ApiKeyCredential = {
 	type: "api_key";
 	key: string;
 	source?: "login";
 };
+
+/**
+ * Display form of an API key: a short vendor prefix plus the last four
+ * characters (`sk-ant-…a1b2`). Never reveals more than the first separator
+ * group and four trailing characters; short keys show only the trailing four.
+ */
+export function maskApiKey(key: string): string {
+	const tail = key.length > 8 ? key.slice(-4) : "";
+	const prefix = /^[A-Za-z]{2,8}-(?:[A-Za-z]{2,8}-)?/.exec(key)?.[0] ?? "";
+	return `${prefix}…${tail}`;
+}
 
 /** Stored OAuth token and provider account identity. */
 export type OAuthCredential = {
@@ -66,6 +81,16 @@ export interface AuthAccountPolicy {
 
 /** Read-only set of per-account routing policies. */
 export type AuthAccountPolicies = readonly AuthAccountPolicy[];
+
+/**
+ * Order in which a provider's stored credential pools serve requests.
+ * `subscription-first` (default) uses stored OAuth subscription accounts, then
+ * stored API keys once no subscription is usable; `api-keys-first` reverses it.
+ */
+export type CredentialPoolOrder = "subscription-first" | "api-keys-first";
+
+/** Provider id → pool order; providers absent here use `subscription-first`. */
+export type CredentialPoolOrders = Readonly<Record<string, CredentialPoolOrder>>;
 
 /**
  * Cascade leg that supplies a provider's active credential, highest precedence
@@ -343,6 +368,8 @@ export type AuthStorageOptions = {
 	accountPolicies?: AuthAccountPolicies;
 	/** Global reserve fallback for accounts without a matching reservePct policy. */
 	defaultReservePct?: number;
+	/** Per-provider order of the stored OAuth and API-key pools (`auth.poolOrder`). */
+	poolOrders?: CredentialPoolOrders;
 	usageFetch?: typeof fetch;
 	usageRequestTimeoutMs?: number;
 	usageLogger?: UsageLogger;
@@ -856,6 +883,19 @@ export interface CredentialsApi {
 	 */
 	upsert(provider: string, credential: AuthCredential): Promise<AuthCredentialSnapshotEntry[]>;
 	/**
+	 * Add one API key to the provider's key pool. Distinct keys are appended
+	 * alongside existing keys and OAuth accounts; re-adding a stored key reuses
+	 * its row. Pooled keys serve in `auth.poolOrder` with the provider's OAuth
+	 * accounts and rotate when a key fails. Resolves with the stored row.
+	 */
+	addApiKey(provider: string, key: string): Promise<StoredAuthCredential>;
+	/**
+	 * The provider's pooled API keys (rows added through `addApiKey` or `/login`),
+	 * in storage order. Excludes legacy or broker-migrated static keys and
+	 * keyless-mode markers, which do not rotate with the pool.
+	 */
+	pooledApiKeys(provider: string): Array<StoredAuthCredential & { credential: ApiKeyCredential }>;
+	/**
 	 * Remove credential for a provider.
 	 */
 	remove(provider: string): Promise<void>;
@@ -1236,8 +1276,23 @@ export interface HealthApi {
 	check(options?: CheckCredentialsOptions): Promise<CredentialHealthResult[]>;
 }
 
+/** Size and current availability of one stored pool (OAuth subscriptions or pooled API keys). */
+export interface CredentialPoolSummary {
+	kind: AuthCredential["type"];
+	members: number;
+	/** Members with an active temporary block (usage, credits, or auth backoff). */
+	blocked: number;
+	/** Earliest block expiry among blocked members, when every member is blocked. */
+	retryAtMs?: number;
+}
+
 /** Usage-limit blocking and credential rotation operations. */
 export interface LimitsApi {
+	/**
+	 * The provider's stored pools in serving order (`auth.poolOrder`), each with
+	 * its member and blocked counts for `modelId`. Pools without members are omitted.
+	 */
+	pools(provider: string, modelId?: string): CredentialPoolSummary[];
 	/**
 	 * Marks the current session's credential as temporarily blocked due to usage limits.
 	 * Uses usage reports to determine accurate reset time when available.

@@ -292,11 +292,20 @@ export class CredentialSelector {
 		return orderUsageRankedCandidates(ranked, false);
 	}
 
+	/**
+	 * Select a stored API key. A session keeps the key it last used while that key
+	 * is unblocked, so a pool rotates only when the serving key fails.
+	 *
+	 * `strict` returns only an unblocked key. Without it, an all-blocked pool still
+	 * returns its first key so the caller gets the provider's real error instead of
+	 * a missing key.
+	 */
 	async selectApiKey(
 		provider: string,
 		sessionId: string | undefined,
 		options: AuthApiKeyOptions | undefined,
 		filter?: (credential: ApiKeyCredential) => boolean,
+		strict = false,
 	): Promise<ApiKeySelection | undefined> {
 		const credentials = this.#deps.pool
 			.entries(provider)
@@ -307,28 +316,28 @@ export class CredentialSelector {
 			});
 
 		if (credentials.length === 0) return undefined;
-		if (credentials.length === 1) {
-			const only = credentials[0];
-			return this.syncApiKeySelection(provider, only, filter) ? only : undefined;
+		const providerKey = providerTypeKey(provider, "api_key");
+		const strategy = this.#deps.strategies(provider);
+		const rankingContext: CredentialRankingContext = { modelId: options?.modelId };
+		const blockScope = strategy?.blockScope?.(rankingContext);
+		const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
+		const usable = (candidate: ApiKeySelection): boolean =>
+			this.syncApiKeySelection(provider, candidate, filter) &&
+			!this.#deps.blocks.isBlocked(provider, providerKey, candidate.index, blockScopes);
+
+		const sticky = this.#deps.affinity.get(provider, sessionId);
+		if (sticky?.type === "api_key") {
+			const pinned = credentials.find(candidate => candidate.index === sticky.index);
+			if (pinned && usable(pinned)) return pinned;
 		}
 
-		const providerKey = providerTypeKey(provider, "api_key");
 		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
-		const strategy = this.#deps.strategies(provider);
-		if (!strategy) {
+		if (!strategy || credentials.length === 1) {
 			for (const idx of order) {
 				const candidate = credentials[idx];
-				if (!this.syncApiKeySelection(provider, candidate, filter)) continue;
-				if (!this.#deps.blocks.isBlocked(provider, providerKey, candidate.index)) {
-					return candidate;
-				}
+				if (candidate && usable(candidate)) return candidate;
 			}
 		} else {
-			const rankingContext: CredentialRankingContext = {
-				modelId: options?.modelId,
-			};
-			const blockScope = strategy.blockScope?.(rankingContext);
-			const blockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, blockScope);
 			const candidates = await this.#rankApiKeySelections({
 				providerKey,
 				provider,
@@ -342,12 +351,17 @@ export class CredentialSelector {
 				filter,
 			});
 			for (const candidate of candidates) {
-				if (this.syncApiKeySelection(provider, candidate.selection, filter)) return candidate.selection;
+				if (
+					strict ? usable(candidate.selection) : this.syncApiKeySelection(provider, candidate.selection, filter)
+				) {
+					return candidate.selection;
+				}
 			}
 		}
+		if (strict) return undefined;
 		for (const idx of order) {
 			const candidate = credentials[idx];
-			if (this.syncApiKeySelection(provider, candidate, filter)) return candidate;
+			if (candidate && this.syncApiKeySelection(provider, candidate, filter)) return candidate;
 		}
 		return undefined;
 	}
@@ -542,6 +556,10 @@ export class CredentialSelector {
 	 *    skip it and try every account once; the server is the final arbiter
 	 *    of model access.
 	 *
+	 * `strict` stops after the strict pass, so a blocked or exhausted account is
+	 * never handed out. Cross-pool resolution uses it to fall through to the
+	 * provider's other stored pool before taking any last resort.
+	 *
 	 * Returns both the API key bytes for outbound requests AND the refreshed
 	 * {@link OAuthCredential} so callers needing identity metadata (account id,
 	 * project id, etc.) do not have to dereference the snapshot themselves.
@@ -550,6 +568,7 @@ export class CredentialSelector {
 		provider: string,
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
+		strict = false,
 	): Promise<OAuthResolutionResult | undefined> {
 		await this.#deps.pool.adoptExternalChanges();
 		const credentials = this.#deps.pool
@@ -890,12 +909,15 @@ export class CredentialSelector {
 			allowBlocked: boolean;
 			enforcePlanRequirement: boolean;
 			enforceAccounts: boolean;
-		}> = [
-			{ allowBlocked: false, enforcePlanRequirement, enforceAccounts },
-			{ allowBlocked: true, enforcePlanRequirement, enforceAccounts },
-		];
-		if (enforcePlanRequirement) passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts });
-		if (enforceAccounts) passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts: false });
+		}> = [{ allowBlocked: false, enforcePlanRequirement, enforceAccounts }];
+		if (!strict) {
+			passes.push({ allowBlocked: true, enforcePlanRequirement, enforceAccounts });
+			if (enforcePlanRequirement) {
+				passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts });
+			}
+			if (enforceAccounts)
+				passes.push({ allowBlocked: true, enforcePlanRequirement: false, enforceAccounts: false });
+		}
 		const lastResortCandidates = explicitPin
 			? [explicitPin, ...candidates.filter(candidate => candidate !== explicitPin)]
 			: candidates;

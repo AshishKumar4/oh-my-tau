@@ -22,6 +22,8 @@ import {
 	type AuthCredentialStore,
 	AuthStorage,
 	type AuthStorageOptions,
+	type CredentialPoolOrder,
+	type CredentialPoolOrders,
 	DEFAULT_USAGE_RESERVE_PCT,
 	SqliteAuthCredentialStore,
 } from "../auth-storage";
@@ -49,7 +51,12 @@ export interface DiscoverAuthStorageOptions {
 	/** Programmatic pool for SDK hosts. Takes precedence over the environment file. */
 	accountPool?: AuthBrokerAccountPool;
 	accountPolicies?: AuthAccountPolicies;
-	authStorageOptions?: Omit<AuthStorageOptions, "accountPolicies" | "configValueResolver" | "sourceLabel">;
+	/** Per-provider credential pool order; overrides `auth.poolOrder` from config.yml when set. */
+	poolOrders?: CredentialPoolOrders;
+	authStorageOptions?: Omit<
+		AuthStorageOptions,
+		"accountPolicies" | "poolOrders" | "configValueResolver" | "sourceLabel"
+	>;
 }
 
 /** Path to the local bearer token file. Created by `omp auth-broker token`. */
@@ -85,6 +92,7 @@ interface ConfigSnapshot {
 	token?: string;
 	accountPolicies?: unknown;
 	usageReservePct?: unknown;
+	poolOrder?: unknown;
 }
 
 /**
@@ -186,6 +194,39 @@ function parseAuthAccountPolicies(value: unknown): AuthAccountPolicies {
 	});
 }
 
+const CREDENTIAL_POOL_ORDERS: Record<CredentialPoolOrder, true> = {
+	"subscription-first": true,
+	"api-keys-first": true,
+};
+
+function isCredentialPoolOrder(value: unknown): value is CredentialPoolOrder {
+	return typeof value === "string" && Object.hasOwn(CREDENTIAL_POOL_ORDERS, value);
+}
+
+/**
+ * Parse `auth.poolOrder` (provider id → pool order). Strict: an unknown order or a
+ * malformed provider id is a configuration error, never a silent default.
+ */
+export function parseCredentialPoolOrders(value: unknown): CredentialPoolOrders {
+	if (value === undefined || value === null) return {};
+	if (typeof value !== "object" || Array.isArray(value)) {
+		throw new AIError.ConfigurationError("auth.poolOrder must be a map of provider id to pool order");
+	}
+	const orders: Record<string, CredentialPoolOrder> = {};
+	for (const [provider, order] of Object.entries(value)) {
+		if (provider.length === 0 || provider.trim() !== provider) {
+			throw new AIError.ConfigurationError(`auth.poolOrder has an invalid provider id: ${JSON.stringify(provider)}`);
+		}
+		if (!isCredentialPoolOrder(order)) {
+			throw new AIError.ConfigurationError(
+				`auth.poolOrder.${provider} must be one of ${Object.keys(CREDENTIAL_POOL_ORDERS).join(", ")}`,
+			);
+		}
+		orders[provider] = order;
+	}
+	return orders;
+}
+
 function parseUsageReservePct(value: unknown): number {
 	const reservePct = value === undefined ? DEFAULT_USAGE_RESERVE_PCT : value;
 	if (typeof reservePct !== "number" || !Number.isFinite(reservePct)) {
@@ -222,6 +263,7 @@ async function readConfigYaml(agentDir: string): Promise<ConfigSnapshot> {
 			token: readDottedString(record, "auth.broker.token"),
 			accountPolicies: readDottedValue(record, "auth.accountPolicies"),
 			usageReservePct: readDottedValue(record, "retry.usageReservePct"),
+			poolOrder: readDottedValue(record, "auth.poolOrder"),
 		};
 	}
 	return {};
@@ -230,12 +272,14 @@ async function readConfigYaml(agentDir: string): Promise<ConfigSnapshot> {
 export interface AuthAccountPolicyConfig {
 	accountPolicies: AuthAccountPolicies;
 	defaultReservePct: number;
+	poolOrders: CredentialPoolOrders;
 }
 
 export interface LoadAuthAccountPolicyConfigOptions {
 	agentDir?: string;
 	accountPolicies?: unknown;
 	usageReservePct?: unknown;
+	poolOrder?: unknown;
 }
 
 /** Load and strictly validate account-selection policy configuration, with main-config fallback. */
@@ -243,7 +287,8 @@ export async function loadAuthAccountPolicyConfig(
 	options: LoadAuthAccountPolicyConfigOptions = {},
 ): Promise<AuthAccountPolicyConfig> {
 	const agentDir = options.agentDir ?? getAgentDir();
-	const needsMainConfigFallback = options.accountPolicies === undefined || options.usageReservePct === undefined;
+	const needsMainConfigFallback =
+		options.accountPolicies === undefined || options.usageReservePct === undefined || options.poolOrder === undefined;
 	const snapshot = needsMainConfigFallback ? await readConfigYaml(agentDir) : undefined;
 	return {
 		accountPolicies: parseAuthAccountPolicies(
@@ -252,6 +297,7 @@ export async function loadAuthAccountPolicyConfig(
 		defaultReservePct: parseUsageReservePct(
 			options.usageReservePct === undefined ? snapshot?.usageReservePct : options.usageReservePct,
 		),
+		poolOrders: parseCredentialPoolOrders(options.poolOrder === undefined ? snapshot?.poolOrder : options.poolOrder),
 	};
 }
 
@@ -467,10 +513,11 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 		agentDir,
 		configValueResolver: options.configValueResolver,
 	});
-	const { accountPolicies, defaultReservePct } = await loadAuthAccountPolicyConfig({
+	const { accountPolicies, defaultReservePct, poolOrders } = await loadAuthAccountPolicyConfig({
 		agentDir,
 		accountPolicies: options.accountPolicies,
 		usageReservePct: options.authStorageOptions?.defaultReservePct,
+		poolOrder: options.poolOrders,
 	});
 	const { store, sourceLabel } = await openAuthCredentialStore({
 		brokerConfig,
@@ -485,6 +532,7 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 		sourceLabel,
 		accountPolicies,
 		defaultReservePct,
+		poolOrders,
 	});
 	await storage.credentials.reload();
 	return storage;

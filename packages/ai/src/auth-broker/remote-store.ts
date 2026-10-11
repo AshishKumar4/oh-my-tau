@@ -874,8 +874,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	/**
 	 * Replace-all semantics: disable every active credential for the provider,
-	 * then upload each of the new credentials. Used by API-key login so a new
-	 * key clobbers any previously stored key for the same provider.
+	 * then upload each of the new credentials (the broker upserts them; pooled
+	 * API keys survive OAuth uploads, so input order does not drop keys).
 	 */
 	async replaceAuthCredentials(provider: string, credentials: AuthCredential[]): Promise<StoredAuthCredential[]> {
 		const existing = this.listAuthCredentials(provider);

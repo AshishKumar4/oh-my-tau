@@ -54,11 +54,12 @@ When a provider needs an API key, `omp` resolves it in this order (first match w
 
 1. **Runtime override**: a key supplied for the current process, for example CLI `--api-key`. Never persisted.
 2. **`models.yml` config key**: an `apiKey` pinned on a custom provider, registered as a config-sourced bearer. This deliberately beats stored OAuth, so a key supplied for a custom `baseUrl` or gateway is honored instead of forwarding an upstream OAuth token the proxy would reject.
-3. **Stored OAuth credential**: refreshed when needed; multiple accounts are ranked and rotated automatically. For Anthropic and ChatGPT (Codex), each organization or workspace counts as its own account: one email holding both a Team or Enterprise seat and a personal plan can log in once per subscription (pick the workspace on the browser consent page), and rotation treats them as two accounts.
-4. **Login-sourced stored API key**: an API-key credential saved by a successful `/login`.
-5. **Extension config fallback**: an extension provider registered with both an `apiKey` reference and an OAuth/login flow ranks that reference below stored OAuth and login keys.
-6. **Provider environment variable**: including values loaded from `.env` files (see [the env-var table](#environment-variables-and-env-files)).
-7. **Other stored API key**: for example, a broker-migrated key. This is a last resort so an explicit environment variable wins.
+3. **Stored credential pools**, in the provider's `auth.poolOrder` (see [Credential pools](#credential-pools-subscriptions-and-api-keys)). By default:
+   - **Stored OAuth credentials** come first. They refresh when needed, and multiple accounts are ranked and rotated automatically. For Anthropic and ChatGPT (Codex), each organization or workspace counts as its own account: one email holding both a Team or Enterprise seat and a personal plan can log in once per subscription (pick the workspace on the browser consent page), and rotation treats them as two accounts.
+   - **Pooled API keys** come next: keys saved by `/login` or `omp auth keys add`.
+4. **Extension config fallback**: an extension provider registered with both an `apiKey` reference and an OAuth/login flow ranks that reference below stored OAuth and login keys.
+5. **Provider environment variable**: including values loaded from `.env` files (see [the env-var table](#environment-variables-and-env-files)).
+6. **Other stored API key**: for example, a broker-migrated key. It is outside both pools and serves only as a last resort, so an explicit environment variable wins.
 
 Local credentials live in the active auth store (default: `~/.omp/agent/agent.db`); broker mode uses the configured shared auth broker. Named profiles and Linux XDG layouts can relocate the store. In the default profile, `PI_CODING_AGENT_DIR` overrides the agent directory. See [Settings](./settings.md) and [Secrets and credentials](./secrets.md) for path resolution.
 
@@ -80,6 +81,36 @@ When a model has no credentials, `omp` tells you to run `/login` or set the prov
 For ClinePass, set `CLINE_API_KEY` or run `/login cline-pass` to open the Cline dashboard and validate a newly created API key against `/users/me`, without a completion probe or subscription-quota charge. OMP refreshes membership from Cline's public recommended-models endpoint and bundles reviewed Cline metadata for offline startup. New live IDs are enriched from upstream references or use conservative metadata without invented reasoning controls. `omp usage` reports five-hour, weekly, and monthly quota windows. Free-tier models are marked `(free)` and use the same key; subscription models show API-equivalent reference pricing, while streamed gateway cost is authoritative for the actual charge. Requests mirror Cline CLI client headers and a stable per-session task ID; reasoning controls remain model-specific.
 
 For Command Code, set `COMMAND_CODE_API_KEY` or run `/login commandcode`; login checks the key against Command Code's `/alpha/whoami` endpoint and rejects it only on a 401, as the Command Code CLI does, so a 403 or an unreachable check keeps the key. Claude models use the Anthropic Messages endpoint, the ten GPT models use the OpenAI Responses endpoint, and every other model uses Chat Completions, the same split the Command Code CLI uses. Thinking levels, image input, output limits, and prices follow the Command Code CLI's model registry; Claude Sonnet 5.5, which that registry does not list yet, takes them from Anthropic's catalog. The GPT models can run hosted web search, but not hosted image generation, which Command Code does not serve. TypeSafe's `typesafe/jev` decision model is available to the `judge` role. `omp usage`, `/usage`, and the status line show the credit balance, plus the five-hour and weekly windows on plans that have them. These figures come from the account endpoints the Command Code CLI uses; the Provider API docs do not document them.
+
+### Credential pools: subscriptions and API keys
+
+A provider can hold two pools of stored credentials:
+
+- **Subscriptions**: OAuth accounts from `/login` or `omp login`.
+- **Pooled API keys**: any number of keys from `omp auth keys add` or an API-key `/login`. Each key may bill a different account or organization.
+
+`auth.poolOrder` picks which pool serves first, per provider:
+
+```yaml
+# ~/.omp/agent/config.yml
+auth:
+  poolOrder:
+    anthropic: api-keys-first # default: subscription-first
+```
+
+The other pool takes over only after every credential in the first pool is exhausted or failing. A subscription login does not remove pooled keys, and adding a key does not remove subscriptions. You keep the same model ID, for example `anthropic/claude-opus-5-5`. The credential decides which allowance pays.
+
+API keys rotate when a request fails, not before. A session keeps its key while the key works. It moves to the next key when the provider reports that the key is out of credits, over its spend limit, or invalid. A per-minute rate limit waits and retries on the same key. OMP cannot read a key's prepaid balance, so it learns about exhaustion from the failing request. An exhausted key returns to the pool when its block expires; adding credits does not unblock it earlier. When every credential in both pools is exhausted, the error says so and names the earliest time one becomes usable again.
+
+Manage pooled keys from the terminal. `add` reads the key from a hidden prompt or from piped stdin, never from the command line; keys only ever display masked.
+
+```sh
+omp auth keys add anthropic      # repeat once per key
+omp auth keys list anthropic     # masked keys, pool order, exhausted count
+omp auth keys remove anthropic 12
+```
+
+`/logout` also lists pooled keys with their masked form. A `models.yml` `apiKey` or a CLI `--api-key` pins one key for every request instead, ahead of both pools.
 
 ### Pinning a key in `models.yml`
 

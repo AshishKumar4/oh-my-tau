@@ -26,10 +26,12 @@ const ACCOUNT_RATE_LIMIT_PATTERN =
 const INSUFFICIENT_BALANCE_PATTERN = /insufficient.?balance/i;
 // Prepaid-credit exhaustion phrased around the credit balance rather than a
 // quota: Anthropic "This request would exceed your available credits given
-// your current in-flight requests" (402), OpenRouter "Insufficient credits",
-// "credits exhausted". Account-local, so rotate to a sibling credential.
+// your current in-flight requests" (402) and "Your credit balance is too low to
+// access the Anthropic API" (400 invalid_request_error), OpenRouter
+// "Insufficient credits", "credits exhausted". Account-local, so rotate to a
+// sibling credential.
 const CREDITS_EXHAUSTED_PATTERN =
-	/\b(?:exceed\w*|insufficient|not enough)\b[^\n]{0,40}\bcredits?\b|\bcredits?\b[^\n]{0,40}\b(?:exhausted|depleted)\b/i;
+	/\b(?:exceed\w*|insufficient|not enough)\b[^\n]{0,40}\bcredits?\b|\bcredits?\b[^\n]{0,40}\b(?:exhausted|depleted)\b|\bcredit balance is too low\b/i;
 // Anthropic subscription entitlement wall: "Usage credits are required for this
 // model" with `error_code: credits_required`. The account cannot serve the model
 // at all, so rotate to a sibling rather than backing off on this one. Bounded to

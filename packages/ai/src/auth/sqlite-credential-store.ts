@@ -1346,9 +1346,12 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				identityKey: resolveRowCredentialIdentityKey(providerName, row),
 			}));
 
+			// An OAuth login supersedes legacy and migrated static keys, which would
+			// otherwise shadow it. Pooled keys (`source: "login"`) are a deliberate
+			// second pool that serves alongside OAuth, so they survive.
 			if (item.type === "oauth") {
 				for (const row of existing) {
-					if (row.credential && row.credential.type === "api_key") {
+					if (row.credential?.type === "api_key" && row.credential.source !== "login") {
 						this.#deleteStmt.run("replaced by oauth login", row.id);
 					}
 				}

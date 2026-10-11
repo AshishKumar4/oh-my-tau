@@ -112,4 +112,44 @@ describe("auth-broker migrate (org-only dedupe)", () => {
 		expect(persisted?.refresh).toBe("refresh-rotated");
 		expect(brokerStore!.listAuthCredentials("anthropic")).toHaveLength(1);
 	});
+
+	test("migrates each local pooled API key the broker lacks, once, never printing a raw key", async () => {
+		const brokerKeys = () =>
+			brokerStore!
+				.listAuthCredentials("anthropic")
+				.flatMap(row => (row.credential.type === "api_key" ? [row.credential.key] : []))
+				.sort();
+		// The broker already holds one of the keys; the other two are new to it.
+		await brokerStore!.upsertAuthCredential("anthropic", {
+			type: "api_key",
+			key: "sk-ant-api03-alreadyonbroker000",
+			source: "login",
+		});
+		await brokerStorage!.credentials.reload();
+		const localStore = await SqliteAuthCredentialStore.open(getAgentDbPath());
+		try {
+			for (const key of [
+				"sk-ant-api03-alreadyonbroker000",
+				"sk-ant-api03-firstpooledkey1111",
+				"sk-ant-api03-secondpooledkey222",
+			]) {
+				await localStore.upsertAuthCredential("anthropic", { type: "api_key", key, source: "login" });
+			}
+		} finally {
+			localStore.close();
+		}
+
+		const firstRun = await runMigrateCapturingStdout();
+		expect(firstRun).not.toMatch(/alreadyonbroker|firstpooledkey|secondpooledkey/);
+		expect(brokerKeys()).toEqual([
+			"sk-ant-api03-alreadyonbroker000",
+			"sk-ant-api03-firstpooledkey1111",
+			"sk-ant-api03-secondpooledkey222",
+		]);
+
+		await brokerStorage!.credentials.reload();
+		const secondRun = await runMigrateCapturingStdout();
+		expect(secondRun).toContain("Nothing to migrate");
+		expect(brokerKeys()).toHaveLength(3);
+	});
 });
