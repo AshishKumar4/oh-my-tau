@@ -2,12 +2,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { LoginDialogComponent } from "@oh-my-pi/pi-tui/overlays/login-dialog";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -36,8 +35,14 @@ describe("/login API key entry", () => {
 
 	beforeEach(async () => {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-login-api-key-"));
-		authStorage = await discoverAuthStorage(tempDir);
-		const modelRegistry = new ModelRegistry(authStorage, undefined, { ignoreLocalModelConfig: true });
+		// Opened directly, never through discovery: a configured auth broker must
+		// not receive the test's keys, nor may the user's model cache be touched.
+		authStorage = new AuthStorage(await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db")));
+		await authStorage.credentials.reload();
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"), {
+			ignoreLocalModelConfig: true,
+			cacheDbPath: path.join(tempDir, "models.db"),
+		});
 		// Model discovery is a network seam; the flow under test is credential entry.
 		vi.spyOn(modelRegistry, "refreshProvider").mockResolvedValue(undefined);
 		ctx = createInteractiveModeContext({ session: { modelRegistry, sessionId: "session-1" } });
@@ -96,6 +101,21 @@ describe("/login API key entry", () => {
 		expect(oauthLogin).not.toHaveBeenCalled();
 		expect(ctx.editorContainer.children).toEqual([ctx.editor]);
 		expect(ctx.showError).not.toHaveBeenCalled();
+	});
+
+	it("stores nothing when Esc follows Enter in the same input batch", async () => {
+		ctx.showHookSelector = vi.fn(async () => "Add API key");
+
+		const login = controller.showOAuthSelector("login", "anthropic");
+		const dialog = await dialogShown;
+		dialog.pasteText(CONSOLE_KEY);
+		dialog.handleInput("\r");
+		dialog.handleInput("\x1b");
+		await login;
+
+		expect(authStorage.credentials.list("anthropic")).toEqual([]);
+		expect(presented).toEqual([]);
+		expect(ctx.editorContainer.children).toEqual([ctx.editor]);
 	});
 
 	it("runs the subscription sign-in when the browser option is chosen", async () => {

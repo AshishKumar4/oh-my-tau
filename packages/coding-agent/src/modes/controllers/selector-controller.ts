@@ -1892,6 +1892,9 @@ export class SelectorController {
 		const { dialog, restoreEditor } = this.#openLoginDialog(providerId);
 		try {
 			const key = (await dialog.showPrompt({ message: `Paste an API key for ${providerId}:`, secret: true })).trim();
+			// Enter and Esc in one input batch: the prompt resolved, then the dialog
+			// was cancelled before this continuation ran. The cancel wins.
+			if (dialog.signal.aborted) return false;
 			if (!key) {
 				this.ctx.showStatus("No API key entered");
 				return false;
