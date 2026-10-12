@@ -68,6 +68,7 @@ export function buildProviderDefinition(
 		...(policy.storeAs !== undefined ? { storeCredentialsAs: policy.storeAs } : {}),
 		...(policy.callbackPort !== undefined ? { callbackPort: policy.callbackPort } : {}),
 		...(policy.pasteCode ? { pasteCodeFlow: true } : {}),
+		...(policy.acceptsApiKey ? { acceptsApiKey: true } : {}),
 		...(login ? { login } : {}),
 		...(refreshToken ? { refreshToken } : {}),
 	};

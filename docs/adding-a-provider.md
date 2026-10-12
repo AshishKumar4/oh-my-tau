@@ -122,6 +122,7 @@ authorization-code flow, and `github-copilot.kdl` for a custom flow.
 | `available #false` | Marks the login entry unavailable. |
 | `show-in-login-list #false` | Hides a login flow from the interactive list. |
 | `store-as "id"` | Stores credentials under another provider ID. |
+| `accepts-api-key #true` | The API also takes a plain API key, so `/login` offers "Add API key" (it joins the key pool) next to the browser sign-in. Only valid with a login that issues OAuth tokens. |
 | `callback-port N`, `paste-code #true` | Coding-agent/broker callback metadata; OAuth-code flows derive these from their callback policy unless overridden. |
 | `oauth-token-env "VAR" …` | Dedicated OAuth environment tokens; borrowed API-key aliases do not make this provider automatically available. |
 | `org-scoped-identity #true` | Distinguishes stored accounts by organization as well as identity. |

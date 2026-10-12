@@ -3,6 +3,7 @@ import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, PASTE_CODE_LOGIN_PROVIDERS as PasteCodeLoginProviders, UsageReport } from "@oh-my-pi/pi-ai";
 import type { getOAuthProviders as GetOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
+import { maskApiKey } from "@oh-my-pi/pi-ai/auth-storage";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
 import { Loader, Spacer, Text } from "@oh-my-pi/pi-tui";
@@ -171,6 +172,9 @@ function loadProviderAuthUi(): ProviderAuthUiModules {
 		OAuthSelectorComponent: require("@oh-my-pi/pi-tui/overlays/oauth-selector.js").OAuthSelectorComponent,
 	};
 }
+
+const LOGIN_WITH_BROWSER = "Sign in with browser";
+const LOGIN_WITH_API_KEY = "Add API key";
 
 const SHADOWING_ROLE_SOURCE: Record<Exclude<SettingProvenance, "global" | "default">, string> = {
 	env: "an environment variable",
@@ -1033,7 +1037,7 @@ export class SelectorController {
 
 	/** /login round-trip for a locked provider; reopen the hub on that provider only after a successful login. */
 	async #loginThenReopenModelHub(providerId: string): Promise<void> {
-		const succeeded = await this.#handleOAuthLogin(providerId);
+		const succeeded = await this.#handleProviderLogin(providerId);
 		if (succeeded) {
 			this.#showModelHub({ initialProviderId: providerId });
 		}
@@ -1827,16 +1831,12 @@ export class SelectorController {
 	}
 
 	/**
-	 * Run the OAuth login flow for `providerId` inside a cancellable
-	 * {@link LoginDialogComponent} that replaces the editor slot. Esc aborts:
-	 * the dialog's abort signal reaches the provider flow, any pending prompt
-	 * rejects, and the editor is restored immediately. Returns true when
-	 * credentials were stored.
+	 * Mount a cancellable {@link LoginDialogComponent} in the editor slot. Esc
+	 * aborts `dialog.signal`, which rejects any pending prompt, and restores the
+	 * editor immediately; `restoreEditor` restores it when the flow ends.
 	 */
-	async #handleOAuthLogin(providerId: string): Promise<boolean> {
-		this.ctx.showStatus(`Logging in to ${providerId}…`);
-		const { LoginDialogComponent, PASTE_CODE_LOGIN_PROVIDERS } = loadProviderAuthUi();
-		const useManualInput = PASTE_CODE_LOGIN_PROVIDERS.has(providerId);
+	#openLoginDialog(providerId: string): { dialog: LoginDialogComponentType; restoreEditor: () => void } {
+		const { LoginDialogComponent } = loadProviderAuthUi();
 		let restored = false;
 		const restoreEditor = () => {
 			if (restored) return;
@@ -1851,7 +1851,7 @@ export class SelectorController {
 			providerId,
 			(_success, message) => {
 				// Fires on Esc: unblock the editor immediately; the aborted flow's
-				// rejection settles the awaited login below.
+				// rejection settles the awaited login.
 				restoreEditor();
 				if (message) this.ctx.showStatus(message);
 			},
@@ -1861,6 +1861,80 @@ export class SelectorController {
 		this.ctx.editorContainer.addChild(dialog);
 		this.ctx.ui.setFocus(dialog);
 		this.ctx.ui.requestRender();
+		return { dialog, restoreEditor };
+	}
+
+	/**
+	 * `/login` for one provider. A provider whose API also accepts a plain API key
+	 * first asks what to add: a browser sign-in (subscription) or a key for its key
+	 * pool. Returns true when a credential was stored.
+	 */
+	async #handleProviderLogin(providerId: string): Promise<boolean> {
+		const provider = loadProviderAuthUi()
+			.getOAuthProviders()
+			.find(entry => entry.id === providerId);
+		if (provider?.acceptsApiKey) {
+			const choice = await this.ctx.showHookSelector(`Log in to ${provider.name}`, [
+				{ label: LOGIN_WITH_BROWSER, description: "Your subscription account" },
+				{ label: LOGIN_WITH_API_KEY, description: "Joins the key pool; keys rotate when one runs out" },
+			]);
+			if (choice === undefined) {
+				this.ctx.showStatus("Login cancelled");
+				return false;
+			}
+			if (choice === LOGIN_WITH_API_KEY) return this.#handleApiKeyLogin(provider.storeCredentialsAs ?? providerId);
+		}
+		return this.#handleOAuthLogin(providerId);
+	}
+
+	/** Read one API key through a masked prompt and add it to the provider's key pool. */
+	async #handleApiKeyLogin(providerId: string): Promise<boolean> {
+		const { dialog, restoreEditor } = this.#openLoginDialog(providerId);
+		try {
+			const key = (await dialog.showPrompt({ message: `Paste an API key for ${providerId}:`, secret: true })).trim();
+			if (!key) {
+				this.ctx.showStatus("No API key entered");
+				return false;
+			}
+			const authStorage = this.ctx.session.modelRegistry.authStorage;
+			const pooledBefore = new Set(authStorage.credentials.pooledApiKeys(providerId).map(row => row.id));
+			const row = await authStorage.credentials.addApiKey(providerId, key);
+			await this.ctx.session.modelRegistry.refreshProvider(providerId, "online");
+			const total = authStorage.credentials.pooledApiKeys(providerId).length;
+			const outcome = pooledBefore.has(row.id) ? "is already pooled for" : "added to";
+			const block = new TranscriptBlock();
+			block.addChild(
+				new Text(
+					theme.fg(
+						"success",
+						`${theme.status.success} API key ${maskApiKey(key)} ${outcome} ${providerId} (${total} pooled key${total === 1 ? "" : "s"})`,
+					),
+					1,
+					0,
+				),
+			);
+			block.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
+			this.ctx.present(block);
+			return true;
+		} catch (error: unknown) {
+			// User-cancelled: the dialog already restored the editor and said so.
+			if (dialog.signal.aborted) return false;
+			this.ctx.showError(`Adding API key failed: ${error instanceof Error ? error.message : String(error)}`);
+			return false;
+		} finally {
+			restoreEditor();
+		}
+	}
+
+	/**
+	 * Run the OAuth login flow for `providerId` inside the login dialog. Esc
+	 * aborts: the dialog's abort signal reaches the provider flow. Returns true
+	 * when credentials were stored.
+	 */
+	async #handleOAuthLogin(providerId: string): Promise<boolean> {
+		this.ctx.showStatus(`Logging in to ${providerId}…`);
+		const useManualInput = loadProviderAuthUi().PASTE_CODE_LOGIN_PROVIDERS.has(providerId);
+		const { dialog, restoreEditor } = this.#openLoginDialog(providerId);
 		try {
 			const identity = await this.ctx.session.modelRegistry.authStorage.oauth.login(providerId as OAuthProvider, {
 				signal: dialog.signal,
@@ -2009,7 +2083,7 @@ export class SelectorController {
 	async showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void> {
 		if (providerId) {
 			if (mode === "login") {
-				await this.#handleOAuthLogin(providerId);
+				await this.#handleProviderLogin(providerId);
 			} else {
 				await this.#showOAuthLogoutAccountSelector(providerId);
 			}
@@ -2037,7 +2111,7 @@ export class SelectorController {
 					selector.stopValidation();
 					done();
 					if (mode === "login") {
-						await this.#handleOAuthLogin(selectedProviderId);
+						await this.#handleProviderLogin(selectedProviderId);
 					} else {
 						await this.#showOAuthLogoutAccountSelector(selectedProviderId);
 					}

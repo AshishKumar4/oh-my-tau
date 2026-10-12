@@ -733,6 +733,9 @@ function provider(node: KdlNodeView): CompiledAuthProvider {
 			case "show-in-login-list":
 				result.showInLoginList = singleBool(child);
 				break;
+			case "accepts-api-key":
+				result.acceptsApiKey = singleBool(child);
+				break;
 			case "store-as":
 				leaf(child, []);
 				result.storeAs = singleString(child);
@@ -788,6 +791,15 @@ function provider(node: KdlNodeView): CompiledAuthProvider {
 			node.file,
 			node.line,
 			`auth "${id}": \`result "api-key"\` needs an OAuth login without refresh`,
+		);
+	}
+	// An API-key login, or a login whose result is already a key, pools that key
+	// itself; the separate "Add API key" choice only fits a token-issuing login.
+	if (result.acceptsApiKey && (!login || login.kind === "api-key" || result.result)) {
+		throw new CompatCompileError(
+			node.file,
+			node.line,
+			`auth "${id}": \`accepts-api-key\` needs a login that issues OAuth tokens`,
 		);
 	}
 	return result as CompiledAuthProvider;

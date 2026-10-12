@@ -359,6 +359,47 @@ describe("auth grammar", () => {
 		expect(compiled.providers[0]?.nativeAuthApis).toEqual(["bedrock-converse-stream", "openai-responses"]);
 	});
 
+	test("accepts-api-key compiles for a token-issuing login and is rejected where a login already yields a key", () => {
+		const oauthLogin = [
+			'\tlogin "oauth-code" {',
+			'\t\tclient-id "aWQ=" encoding="base64"',
+			'\t\tauthorize-url "https://a"',
+			"\t\tpkce #true",
+			'\t\tcallback port=4242 path="/cb"',
+			'\t\ttoken url="https://t" body="json"',
+			"\t}",
+		];
+		const compiled = compileAuth([
+			{
+				file: "auth/x.kdl",
+				text: ['auth "x" {', '\tname "X"', "\taccepts-api-key #true", ...oauthLogin, "\trefresh {}", "}"].join(
+					"\n",
+				),
+			},
+			order("x"),
+		]);
+		expect(compiled.providers[0]?.acceptsApiKey).toBe(true);
+
+		const rejected = [
+			'auth "x" {\n\tname "X"\n\taccepts-api-key #true\n}',
+			'auth "x" {\n\tname "X"\n\taccepts-api-key #true\n\tlogin "api-key" {\n\t\tprompt "Paste"\n\t}\n}',
+			[
+				'auth "x" {',
+				'\tname "X"',
+				"\taccepts-api-key #true",
+				'\tresult "api-key"',
+				...oauthLogin,
+				'\trefresh "none"',
+				"}",
+			].join("\n"),
+		];
+		for (const text of rejected) {
+			expect(() => compileAuth([{ file: "auth/x.kdl", text }, order("x")])).toThrow(
+				/`accepts-api-key` needs a login that issues OAuth tokens/,
+			);
+		}
+	});
+
 	test("auth identity and OAuth env policy preserve explicit false and reject empty token lists", () => {
 		const compiled = compileAuth([
 			{

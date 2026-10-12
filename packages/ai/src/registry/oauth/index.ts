@@ -25,6 +25,7 @@ const builtInOAuthProviders: OAuthProviderInfo[] = PROVIDER_REGISTRY.filter(
 	name: provider.name,
 	available: provider.available ?? true,
 	storeCredentialsAs: provider.storeCredentialsAs,
+	acceptsApiKey: provider.acceptsApiKey,
 }));
 
 const customOAuthProviders = new Map<string, OAuthProviderInterface>();

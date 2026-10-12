@@ -6,6 +6,7 @@
 
 - Added the `codex` harness profile for `openai-codex/gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna`, so `harness.mode: auto` presents the Codex CLI surface on them as it already did on GPT-6 Astra and GPT-5.6 Sol; each surface was verified against a real Codex CLI 0.159.2 request.
 - Added `configuration_update` effort changes for `openai-codex/gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna`, so changing the thinking level mid-session keeps the response chain and the cached prompt instead of resending the whole prompt uncached.
+- Added the `accepts-api-key` auth directive for a provider whose API also takes a plain API key next to its OAuth login; Anthropic declares it
 
 ### Changed
 

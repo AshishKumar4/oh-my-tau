@@ -574,6 +574,11 @@ export interface CompiledAuthProvider {
 	nativeAuthApis?: string[];
 	available?: boolean;
 	showInLoginList?: boolean;
+	/**
+	 * The provider's API also accepts a plain API key alongside the OAuth login,
+	 * so `/login` offers adding one to the provider's key pool.
+	 */
+	acceptsApiKey?: boolean;
 	storeAs?: string;
 	callbackPort?: number;
 	pasteCode?: boolean;

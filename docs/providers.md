@@ -102,7 +102,9 @@ The other pool takes over only after every credential in the first pool is exhau
 
 API keys rotate when a request fails, not before. A session keeps its key while the key works. It moves to the next key when the provider reports that the key is out of credits, over its spend limit, or invalid. A per-minute rate limit waits and retries on the same key. OMP cannot read a key's prepaid balance, so it learns about exhaustion from the failing request. An exhausted key returns to the pool when its block expires; adding credits does not unblock it earlier. When every credential in both pools is exhausted, the error says so and names the earliest time one becomes usable again.
 
-Manage pooled keys from the terminal. `add` reads the key from a hidden prompt or from piped stdin, never from the command line; keys only ever display masked.
+In the TUI, `/login anthropic` asks whether to sign in with the browser or add an API key. "Add API key" takes the key in a masked prompt and adds it to the pool; repeat it once per key.
+
+You can also manage pooled keys from the terminal. `add` reads the key from a hidden prompt or from piped stdin, never from the command line; keys only ever display masked.
 
 ```sh
 omp auth keys add anthropic      # repeat once per key
