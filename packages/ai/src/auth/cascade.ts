@@ -172,6 +172,12 @@ export class KeyCascade implements KeysApi {
 		return stored.length > 0 && stored.every(credential => isKeylessFallback(provider, credential));
 	}
 
+	isOAuthBearer(provider: string, bearer: string): boolean {
+		if (this.#deps.pool.matchesStoredOAuthBearer(provider, bearer)) return true;
+		const oauthTokenEnv = authPolicyFor(provider)?.oauthTokenEnv ?? [];
+		return oauthTokenEnv.some(name => $env[name]?.trim() === bearer);
+	}
+
 	/**
 	 * Env auth that belongs to this provider, not a cross-provider alias.
 	 * A declared OAuth token env list excludes borrowed API-key aliases from

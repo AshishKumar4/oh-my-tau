@@ -417,42 +417,38 @@ export async function searchXAI(params: SearchParams): Promise<SearchResponse> {
 	// params.authStorage may be a divergent caller handle.
 	const authStorage = params.modelRegistry.authStorage;
 	const oauthProvider = params.model.provider === "xai-oauth";
-	// An `XAI_OAUTH_TOKEN` env token is not a stored row, so only its source can
-	// identify it; a configured command-backed key outranks env.
-	const envOAuthToken =
-		oauthProvider &&
-		!params.modelRegistry.hasCommandBackedApiKey(params.model.provider) &&
-		authStorage.keys.source(params.model.provider)?.kind === "env";
-	if (customEndpoint && envOAuthToken) {
-		throw new SearchProviderError(
+	const refuseOAuth = () =>
+		new SearchProviderError(
 			"xai",
 			`Refusing to send official xAI OAuth credentials to custom endpoint ${transport.baseURL}. Configure an API key for provider "xai-oauth".`,
 		);
-	}
+	// OAuth-first auth (stored OAuth or `XAI_OAUTH_TOKEN`) is refused up front; a
+	// configured command-backed key outranks it.
+	const credentialOrigin = authStorage.keys.source(params.model.provider);
+	const officialOAuthOrigin =
+		oauthProvider &&
+		!params.modelRegistry.hasCommandBackedApiKey(params.model.provider) &&
+		(credentialOrigin?.kind === "oauth" || credentialOrigin?.kind === "env");
+	if (customEndpoint && officialOAuthOrigin) throw refuseOAuth();
 	const keyOrResolver = params.modelRegistry.resolver(params.model, params.sessionId);
 	const resultCap = clampNumResults(params.numSearchResults ?? params.limit, DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS);
-	// Which credential serves is decided per attempt: pooled API keys can fall
-	// back to a stored OAuth account, and a command-backed key is only a fallback
-	// beneath stored OAuth. So the guard and authMode follow each actual bearer.
+	// The serving credential can still change per attempt: pooled API keys fall
+	// back to OAuth, and a failed OAuth refresh falls through to `XAI_OAUTH_TOKEN`.
+	// So the guard and authMode also follow each actual bearer.
 	let servedOAuth = false;
 	const response = await withAuth(
 		keyOrResolver,
 		async key => {
-			const oauthBearer =
-				oauthProvider && (envOAuthToken || authStorage.credentials.isOAuthBearer(params.model.provider, key));
-			if (customEndpoint && oauthBearer) {
-				throw new SearchProviderError(
-					"xai",
-					`Refusing to send official xAI OAuth credentials to custom endpoint ${transport.baseURL}. Configure an API key for provider "xai-oauth".`,
-				);
-			}
+			const oauthBearer = oauthProvider && authStorage.keys.isOAuthBearer(params.model.provider, key);
+			if (customEndpoint && oauthBearer) throw refuseOAuth();
 			servedOAuth = oauthBearer;
 			const requestTransport: XAIHttpTransport = {
 				// XAI_BASE_URL never receives official OAuth credentials: neither an OAuth-origin
 				// credential nor an OAuth access-token bearer leaves the bundled endpoint.
-				baseURL: oauthBearer
-					? params.model.baseUrl
-					: (resolveXaiBaseUrl(params.model.provider, params.model.baseUrl, key) ?? params.model.baseUrl),
+				baseURL:
+					officialOAuthOrigin || oauthBearer
+						? params.model.baseUrl
+						: (resolveXaiBaseUrl(params.model.provider, params.model.baseUrl, key) ?? params.model.baseUrl),
 				headers: await params.modelRegistry.resolveModelHeaders(params.model, params.signal),
 			};
 			return callXAIResponses(key, params, requestTransport);

@@ -780,4 +780,45 @@ describe("xAI custom-endpoint guard with pooled API keys", () => {
 			callerAuth.close();
 		}
 	});
+
+	it("never sends an XAI_OAUTH_TOKEN bearer that serves after the pooled keys", async () => {
+		const originalToken = Bun.env.XAI_OAUTH_TOKEN;
+		Bun.env.XAI_OAUTH_TOKEN = "env-subscription-token";
+		const registryAuth = createInMemoryAuthStorage();
+		try {
+			registryAuth.setAccountPolicies({
+				accountPolicies: [],
+				defaultReservePct: 10,
+				poolOrders: { "xai-oauth": "api-keys-first" },
+			});
+			await registryAuth.credentials.addApiKey("xai-oauth", "xai-pooled-key");
+			const registry = new ModelRegistry(registryAuth, undefined, { ignoreLocalModelConfig: true });
+			// Pooled keys come first, so the up-front guard passes. A failed OAuth
+			// refresh then falls through to the env token on a later attempt.
+			expect(registryAuth.keys.source("xai-oauth")?.kind).toBe("api_key");
+			vi.spyOn(registry, "resolver").mockReturnValue(async () => "env-subscription-token");
+			const sentBearers: string[] = [];
+			const fetch: FetchImpl = async (_input, init) => {
+				sentBearers.push(new Headers(init?.headers).get("authorization") ?? "");
+				return new Response(JSON.stringify({ id: "r", model: SELECTED_MODEL_ID, output_text: "Answer." }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			};
+
+			await expect(
+				searchXAI({
+					...makeParams(fetch, {
+						model: { ...model, provider: "xai-oauth", baseUrl: "https://xai-proxy.example.test/v1" },
+					}),
+					modelRegistry: registry,
+				}),
+			).rejects.toThrow("Refusing to send official xAI OAuth credentials");
+			expect(sentBearers).toEqual([]);
+		} finally {
+			if (originalToken === undefined) delete Bun.env.XAI_OAUTH_TOKEN;
+			else Bun.env.XAI_OAUTH_TOKEN = originalToken;
+			registryAuth.close();
+		}
+	});
 });

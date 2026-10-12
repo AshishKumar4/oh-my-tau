@@ -91,7 +91,7 @@ export interface CredentialPoolOptions {
 export class CredentialPool implements CredentialsApi {
 	/** Provider -> credentials cache, populated from store on reload(). */
 	#data: Map<string, StoredCredential[]> = new Map();
-	/** Recent bearer fingerprints resolved for each durable OAuth row: delayed usage-limit attribution and {@link isOAuthBearer}. */
+	/** Recent bearer fingerprints resolved for each durable OAuth row: delayed usage-limit attribution and {@link matchesStoredOAuthBearer}. */
 	#oauthBearerFingerprints: Map<string, Map<number, string[]>> = new Map();
 	#credentialDisabledListeners: Set<(event: CredentialDisabledEvent) => void | Promise<void>> = new Set();
 	/**
@@ -689,7 +689,8 @@ export class CredentialPool implements CredentialsApi {
 		return this.credentials(provider).some(credential => credential.type === "oauth");
 	}
 
-	isOAuthBearer(provider: string, bearer: string): boolean {
+	/** Whether `bearer` is a stored OAuth account's current or recently served access token. */
+	matchesStoredOAuthBearer(provider: string, bearer: string): boolean {
 		return this.credentials(provider).some(
 			credential =>
 				credential.type === "oauth" &&
@@ -832,6 +833,8 @@ export class CredentialPool implements CredentialsApi {
 		// An API-key usage request belongs to its key row only. It carries no
 		// account identity, so the all-undefined identity match below would pin it
 		// on an identity-less OAuth row and let the key's report heal that row's block.
+		// A row holding a key reference (env name, `!command`) does not byte-match its
+		// resolved request, so its block heals only by expiry, never on another row.
 		if (previous.type === "api_key") {
 			return entries.find(entry => entry.credential.type === "api_key" && entry.credential.key === previous.apiKey)
 				?.id;

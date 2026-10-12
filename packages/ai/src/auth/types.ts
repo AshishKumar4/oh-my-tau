@@ -883,13 +883,6 @@ export interface CredentialsApi {
 	 */
 	hasOAuth(provider: string): boolean;
 	/**
-	 * Whether `bearer` is the access token of one of the provider's stored OAuth
-	 * accounts. Guards that must not send a subscription token somewhere (a custom
-	 * endpoint) check the bearer each attempt actually received: with pooled API
-	 * keys first, a request can still fall back to an OAuth account.
-	 */
-	isOAuthBearer(provider: string, bearer: string): boolean;
-	/**
 	 * Get OAuth credentials for a provider.
 	 */
 	getOAuth(provider: string): OAuthCredential | undefined;
@@ -990,6 +983,14 @@ export interface KeysApi {
 	 * `auth: none` endpoint instead of locking it out (issue #12281).
 	 */
 	keyless(provider: string): boolean;
+	/**
+	 * Whether `bearer` is an official OAuth credential for `provider`: a stored
+	 * OAuth account's access token, or a value of the provider's declared
+	 * OAuth-token env var (`XAI_OAUTH_TOKEN`). Guards that must not send a
+	 * subscription token somewhere (a custom endpoint) check the bearer each
+	 * attempt actually received, since pooled API keys can fall back to OAuth.
+	 */
+	isOAuthBearer(provider: string, bearer: string): boolean;
 	/**
 	 * Describe where the active credential for a provider came from.
 	 *

@@ -2578,6 +2578,7 @@ export class TurnRecovery {
 					await this.#host.modelRegistry.authStorage.limits.rotate(currentModel.provider, this.#host.sessionId(), {
 						error: errorMessage,
 						modelId: currentModel.id,
+						accountIds: this.#host.modelRegistry.accountIdsForModel(currentModel.provider, currentModel.id),
 						signal: rotateAbortController.signal,
 					})
 				).switched;
