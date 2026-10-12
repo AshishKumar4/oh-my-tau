@@ -191,6 +191,7 @@ export class AuthStorage {
 				selector.resetRoundRobin(provider);
 				affinity.clearProvider(provider);
 			},
+			onApiKeyAdded: (provider, credentialId) => blocks.clearAll(provider, credentialId),
 		});
 		const refresher = new OAuthRefresher({ store, pool, policies, override: options.refreshOAuthCredential });
 		const usageProviders = options.usageProviderResolver ?? defaultUsageProvider;

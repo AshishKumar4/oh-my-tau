@@ -271,6 +271,8 @@ export interface CompletionProbeInput {
 	provider: Provider;
 	credentialId: number;
 	credential: CompletionProbeCredential;
+	/** The stored credential's request scope, sent as a live request would send it. */
+	credentialScope: CredentialRequestScope | undefined;
 	signal: AbortSignal;
 }
 
@@ -543,6 +545,14 @@ export interface CredentialRequestScope {
 	inferenceRegion?: "global" | "eu" | "us";
 	/** API key: the workspace an Anthropic key that is not scoped to one must name on every request. */
 	workspaceId?: string;
+}
+
+/** The request scope a stored credential's requests carry: an OAuth account's identity, or an API key's workspace. */
+export function credentialRequestScope(credential: AuthCredential): CredentialRequestScope | undefined {
+	if (credential.type === "api_key")
+		return credential.workspaceId ? { workspaceId: credential.workspaceId } : undefined;
+	const { orgId, region, inferenceRegion } = credential;
+	return { orgId, region, inferenceRegion };
 }
 
 /**
@@ -1002,6 +1012,12 @@ export interface KeysApi {
 	 * attempt actually received, since pooled API keys can fall back to OAuth.
 	 */
 	isOAuthBearer(provider: string, bearer: string): boolean;
+	/**
+	 * The request scope of the stored credential whose bearer is `bearer`, for
+	 * callers that hold only the bearer bytes (model discovery, an
+	 * environment override that names a stored key). Unknown bearers have none.
+	 */
+	requestScope(provider: string, bearer: string): CredentialRequestScope | undefined;
 	/**
 	 * Describe where the active credential for a provider came from.
 	 *

@@ -445,12 +445,12 @@ export class CredentialBlocks implements BlocksApi {
 	}
 
 	/**
-	 * Lift any temporary backoff blocks on one credential (across the bare
-	 * `provider:oauth` key and its scoped `\0`-suffixed derivatives). Called
-	 * after a saved reset is redeemed so the just-reset account is immediately
-	 * selectable again instead of being skipped/under-ranked by a stale block
-	 * that `markUsageLimitReached` set for the now-obsolete reset time. A manual
-	 * hold is not a backoff: the store's bulk delete leaves it in place.
+	 * Lift any temporary backoff blocks on one credential (across its bare
+	 * `provider:<type>` key and scoped `\0`-suffixed derivatives). Called after a
+	 * saved reset is redeemed, so the just-reset account is selectable again
+	 * instead of skipped by a block set for the now-obsolete reset time, and
+	 * when a pooled API key is added again, the user's fix for whatever set it
+	 * aside. A manual hold is not a backoff: the store's bulk delete leaves it in place.
 	 */
 	clearAll(provider: string, credentialId: number): void {
 		try {
@@ -463,10 +463,13 @@ export class CredentialBlocks implements BlocksApi {
 			});
 		}
 
-		const providerKey = providerTypeKey(provider, "oauth");
-		const scopedPrefix = `${providerKey}\0`;
-		for (const key of this.#credentialBackoff.keys()) {
-			if (key === providerKey || key.startsWith(scopedPrefix)) this.#deleteCredentialBackoff(key, credentialId);
+		// The row id is unique across credential types; clear both type namespaces for it.
+		for (const type of ["oauth", "api_key"] as const) {
+			const providerKey = providerTypeKey(provider, type);
+			const scopedPrefix = `${providerKey}\0`;
+			for (const key of this.#credentialBackoff.keys()) {
+				if (key === providerKey || key.startsWith(scopedPrefix)) this.#deleteCredentialBackoff(key, credentialId);
+			}
 		}
 	}
 

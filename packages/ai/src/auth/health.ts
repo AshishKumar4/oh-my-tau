@@ -28,7 +28,7 @@ import type {
 } from "./types";
 import { buildRefreshableOauthCredential, mergeRefreshedUsageCredential } from "./usage";
 import type { UsageService } from "./usage";
-import { REMOTE_REFRESH_SENTINEL } from "./types";
+import { credentialRequestScope, REMOTE_REFRESH_SENTINEL } from "./types";
 import { oauthUsageRequest, usageCacheIdentity, usageRequest } from "./usage-cache";
 import type { UsageRequestDescriptor } from "./usage-cache";
 import { isUsageLimitExhausted, reserveUsageLimits, usageReportMetadataValue } from "./usage-report";
@@ -412,6 +412,7 @@ export class CredentialHealth implements HealthApi {
 							provider: row.provider as Provider,
 							credentialId: row.id,
 							credential: probeCred,
+							credentialScope: credentialRequestScope(row.credential),
 							signal: completionSignal,
 						});
 					} catch (error) {

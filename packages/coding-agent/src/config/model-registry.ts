@@ -2223,20 +2223,15 @@ export class ModelRegistry {
 			) {
 				// Residency and workspace belong to the credential selected for discovery,
 				// not another stored one that happens to appear first in the pool.
-				const identity = getOAuthCredentialsForProvider(this.authStorage, descriptor.providerId).find(
-					credential => credential.access === apiKey,
-				);
-				const workspaceId = this.authStorage.credentials
-					.pooledApiKeys(descriptor.providerId)
-					.find(entry => entry.credential.key === apiKey)?.credential.workspaceId;
+				const scope = apiKey ? this.authStorage.keys.requestScope(descriptor.providerId, apiKey) : undefined;
 				const discoveryConfig = {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
 					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
 					fetch: this.#fetch,
-					region: identity?.region,
-					inferenceRegion: identity?.inferenceRegion,
-					orgId: identity?.orgId,
-					workspaceId,
+					region: scope?.region,
+					inferenceRegion: scope?.inferenceRegion,
+					orgId: scope?.orgId,
+					workspaceId: scope?.workspaceId,
 				};
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??

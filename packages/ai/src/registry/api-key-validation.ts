@@ -231,47 +231,53 @@ async function listAnthropicWorkspaces(
 		signal,
 	});
 	if (!response.ok) return undefined;
-	const parsed = workspaceListSchema(await response.json());
+	// A body that is not a workspace list (a proxy page, say) means the same as a refusal: ask.
+	const parsed = workspaceListSchema(await response.json().catch(() => undefined));
 	if (parsed instanceof type.errors) return undefined;
 	return parsed.data.flatMap(({ id, name, archived_at }) => (archived_at ? [] : [{ id, name }]));
 }
 
 /**
- * Settle the workspace an Anthropic API key needs before it is stored. A key
- * scoped to a workspace needs none. A key that is not must name one on every
- * request: its only workspace is used, the user picks among several, and the
- * user enters an ID when the key may not list them. The choice is verified
+ * Settle the workspace an Anthropic API key needs before it is stored. An
+ * explicit `workspaceId` is used as given. Otherwise a key scoped to a
+ * workspace needs none, and a key that is not must name one on every request:
+ * its only workspace is used, the user picks among several, and the user
+ * enters an ID when the key may not list them. A named workspace is verified
  * against the API. Resolves `undefined` when the user cancels; throws for a key
  * or workspace the API rejects.
  */
 export async function resolveAnthropicKeyWorkspace(
 	apiKey: string,
 	prompts: AnthropicWorkspacePrompts,
-	options: { baseUrl: string; signal?: AbortSignal; fetch?: FetchImpl },
+	options: { baseUrl: string; workspaceId?: string; signal?: AbortSignal; fetch?: FetchImpl },
 ): Promise<{ workspaceId?: string } | undefined> {
-	const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
-	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
 	const fetchImpl = options.fetch ?? fetch;
 	const baseUrl = normalizeAnthropicCompatibleBaseUrl(options.baseUrl);
+	// One timeout per request: the prompts may wait on the user far longer.
+	const requestSignal = () =>
+		options.signal
+			? AbortSignal.any([options.signal, AbortSignal.timeout(VALIDATION_TIMEOUT_MS)])
+			: AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
 
-	const probe = await requestAnthropicModels(baseUrl, apiKey, undefined, signal, fetchImpl);
-	if (probe.ok) return {};
-	const error = await createApiKeyValidationError("Anthropic", probe);
-	if (probe.status !== 400 || !isAnthropicWorkspaceDenial(error)) throw error;
+	let workspaceId = options.workspaceId?.trim();
+	if (!workspaceId) {
+		const probe = await requestAnthropicModels(baseUrl, apiKey, undefined, requestSignal(), fetchImpl);
+		if (probe.ok) return {};
+		const error = await createApiKeyValidationError("Anthropic", probe);
+		if (probe.status !== 400 || !isAnthropicWorkspaceDenial(error)) throw error;
 
-	const workspaces = await listAnthropicWorkspaces(baseUrl, apiKey, signal, fetchImpl);
-	const workspaceId = !workspaces?.length
-		? (await prompts.ask())?.trim()
-		: workspaces.length === 1
-			? workspaces[0].id
-			: await prompts.pick(workspaces);
-	if (!workspaceId) return undefined;
+		const workspaces = await listAnthropicWorkspaces(baseUrl, apiKey, requestSignal(), fetchImpl);
+		workspaceId = (
+			!workspaces?.length
+				? await prompts.ask()
+				: workspaces.length === 1
+					? workspaces[0].id
+					: await prompts.pick(workspaces)
+		)?.trim();
+		if (!workspaceId) return undefined;
+	}
 
-	// The prompts may wait on the user far longer than the request timeout.
-	const verifySignal = options.signal
-		? AbortSignal.any([options.signal, AbortSignal.timeout(VALIDATION_TIMEOUT_MS)])
-		: AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
-	const verify = await requestAnthropicModels(baseUrl, apiKey, workspaceId, verifySignal, fetchImpl);
+	const verify = await requestAnthropicModels(baseUrl, apiKey, workspaceId, requestSignal(), fetchImpl);
 	if (!verify.ok) throw await createApiKeyValidationError("Anthropic", verify);
 	return { workspaceId };
 }

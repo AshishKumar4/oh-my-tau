@@ -424,7 +424,7 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 		};
 		return allowAnthropicHeaderOverrides ? mergeHeaders(headers, anthropicHeaderOverrides) : headers;
 	}
-	// The key's own workspace outranks a configured one: it is what that key needs.
+	// The key's own workspace outranks a configured one in any casing: it is what that key needs.
 	const workspaceHeader: Record<string, string> = options.workspaceId
 		? { "anthropic-workspace-id": options.workspaceId }
 		: {};
@@ -436,27 +436,31 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 		// Authorization in `model.headers` still wins.
 		const bearer =
 			incomingAuthorization ?? (options.apiKey !== NO_AUTH_SENTINEL ? `Bearer ${options.apiKey}` : undefined);
-		return {
+		return mergeHeaders(
+			{
+				...modelHeaders,
+				Accept: acceptHeader,
+				...(bearer ? { Authorization: bearer } : {}),
+				...sharedHeaders,
+				...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
+				...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
+				...(incomingApiKey ? { "X-Api-Key": incomingApiKey } : {}),
+			},
+			workspaceHeader,
+		);
+	}
+	return mergeHeaders(
+		{
 			...modelHeaders,
 			Accept: acceptHeader,
-			...(bearer ? { Authorization: bearer } : {}),
 			...sharedHeaders,
 			...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
 			...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
-			...(incomingApiKey ? { "X-Api-Key": incomingApiKey } : {}),
-			...workspaceHeader,
-		};
-	}
-	return {
-		...modelHeaders,
-		Accept: acceptHeader,
-		...sharedHeaders,
-		...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
-		...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
-		...(incomingAuthorization ? { Authorization: incomingAuthorization } : {}),
-		"X-Api-Key": incomingApiKey ?? options.apiKey,
-		...workspaceHeader,
-	};
+			...(incomingAuthorization ? { Authorization: incomingAuthorization } : {}),
+			"X-Api-Key": incomingApiKey ?? options.apiKey,
+		},
+		workspaceHeader,
+	);
 }
 
 type AnthropicCacheControl = NonNullable<TextBlockParam["cache_control"]>;

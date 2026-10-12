@@ -43,17 +43,16 @@ async function readLine(prompt: string): Promise<string> {
 }
 
 /**
- * Settle an Anthropic key's workspace from `--workspace` or terminal prompts.
- * Piped input cannot answer a second question, so it needs `--workspace`.
+ * Settle an Anthropic key's workspace through terminal prompts. Piped input
+ * cannot answer a second question, so it needs `--workspace`.
  */
-function terminalWorkspacePrompts(provider: string, flag: string | undefined): AnthropicWorkspacePrompts {
+function terminalWorkspacePrompts(provider: string): AnthropicWorkspacePrompts {
 	const needFlag = (choices: string): Error =>
 		new Error(
 			`this key is not scoped to a workspace; rerun with --workspace <id> (${choices}): ${APP_NAME} auth keys add ${provider} --workspace <id>`,
 		);
 	return {
 		async pick(workspaces) {
-			if (flag) return flag;
 			if (!process.stdin.isTTY) throw needFlag(`one of ${workspaces.map(workspace => workspace.id).join(", ")}`);
 			const listing = workspaces.map((workspace, index) => `  ${index + 1}. ${workspace.name} (${workspace.id})`);
 			process.stderr.write(
@@ -66,7 +65,6 @@ function terminalWorkspacePrompts(provider: string, flag: string | undefined): A
 			return choice.id;
 		},
 		async ask() {
-			if (flag) return flag;
 			if (!process.stdin.isTTY) throw needFlag(`find it under ${ANTHROPIC_WORKSPACES_URL}`);
 			process.stderr.write(
 				`This key is not scoped to a workspace and may not list them. Find its workspace ID under ${ANTHROPIC_WORKSPACES_URL}.\n`,
@@ -153,8 +151,9 @@ export async function runAuthKeysCommand(args: AuthKeysCommandArgs): Promise<voi
 			if (!key) throw new Error("no API key entered");
 			const scope =
 				provider === "anthropic"
-					? await resolveAnthropicKeyWorkspace(key, terminalWorkspacePrompts(provider, args.workspace?.trim()), {
+					? await resolveAnthropicKeyWorkspace(key, terminalWorkspacePrompts(provider), {
 							baseUrl: buildAnthropicAuthConfig(key).baseUrl,
+							workspaceId: args.workspace,
 						})
 					: {};
 			if (!scope) throw new Error("no workspace chosen; the key was not added");

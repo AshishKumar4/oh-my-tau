@@ -661,14 +661,6 @@ function createStrictCompletionProbe(): CompletionProbe {
 			return { ok: null, reason: `no bearer-compatible probe model bundled for provider ${input.provider}` };
 		}
 		const apiKey = composeProbeApiKey(input.provider, input.credential);
-		const credentialScope =
-			input.credential.type === "oauth"
-				? {
-						orgId: input.credential.orgId,
-						region: input.credential.region,
-						inferenceRegion: input.credential.inferenceRegion,
-					}
-				: undefined;
 		let lastFailure: CredentialCompletionResult | undefined;
 		for (const model of candidates) {
 			if (input.signal.aborted) {
@@ -678,7 +670,7 @@ function createStrictCompletionProbe(): CompletionProbe {
 					modelId: model.id,
 				};
 			}
-			const result = await probeOneModel(model, apiKey, input.signal, credentialScope);
+			const result = await probeOneModel(model, apiKey, input.signal, input.credentialScope);
 			if (result.ok === true) return result;
 			lastFailure = result;
 			if (!RETRYABLE_MODEL_ERROR_RE.test(result.reason ?? "")) {

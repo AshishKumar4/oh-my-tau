@@ -377,7 +377,7 @@ describe("AuthStorage.health.check", () => {
 		const apiKeyRow: StoredAuthCredential = {
 			id: 11,
 			provider: "made-up-provider",
-			credential: { type: "api_key", key: "sk-test-key" },
+			credential: { type: "api_key", key: "sk-test-key", workspaceId: "wrkspc_01PROBEworkspace" },
 			disabledCause: null,
 		};
 		const store = makeStore([apiKeyRow]);
@@ -391,6 +391,8 @@ describe("AuthStorage.health.check", () => {
 			expect(probe).toHaveBeenCalledTimes(1);
 			const [input] = probe.mock.calls[0];
 			expect(input.credential).toEqual({ type: "api_key", apiKey: "sk-test-key" });
+			// The probe sends what a live request sends, workspace included.
+			expect(input.credentialScope).toEqual({ workspaceId: "wrkspc_01PROBEworkspace" });
 			// Usage `ok` stays null (no usage probe configured) but the completion
 			// probe surfaces the real failure.
 			expect(result.ok).toBeNull();

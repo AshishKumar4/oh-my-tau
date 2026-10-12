@@ -83,9 +83,10 @@ interface SeenRequest {
  * workspace the key can use; the subscription token always works.
  */
 function anthropicApi(
-	options: { workspaces?: Array<{ id: string; name: string }>; listable?: boolean } = {},
+	options: { workspaces?: Array<{ id: string; name: string }>; usable?: string[]; listable?: boolean } = {},
 ): FakeAnthropicApi {
 	const workspaces = options.workspaces ?? [{ id: WORKSPACE, name: "Default Workspace" }];
+	const usable = options.usable ?? workspaces.map(workspace => workspace.id);
 	const seen: SeenRequest[] = [];
 	const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 		const request = toRequest(input, init);
@@ -105,9 +106,7 @@ function anthropicApi(
 		if (entry.apiKey !== null) {
 			if (entry.apiKey !== UNSCOPED_KEY) return Response.json({ type: "error" }, { status: 401 });
 			if (entry.workspace === null) return Response.json(WORKSPACE_REQUIRED, { status: 400 });
-			if (!workspaces.some(workspace => workspace.id === entry.workspace)) {
-				return Response.json({ type: "error" }, { status: 403 });
-			}
+			if (!usable.includes(entry.workspace)) return Response.json({ type: "error" }, { status: 403 });
 		}
 		if (url.pathname === "/v1/models") return Response.json({ data: [] });
 		const body = SSE_EVENTS.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
@@ -133,11 +132,12 @@ describe("Anthropic API key workspaces", () => {
 		await removeWithRetries(tempDir);
 	});
 
-	async function ask(api: FakeAnthropicApi): Promise<string> {
+	async function ask(api: FakeAnthropicApi, headers?: Record<string, string>): Promise<string> {
 		let text = "";
 		const stream = streamSimple(model, context, {
 			apiKey: storage.keys.resolver("anthropic", { sessionId: "session-1", modelId: model.id }),
 			fetch: api.fetch,
+			headers,
 		});
 		for await (const event of stream) {
 			if (event.type === "text_delta") text += event.delta;
@@ -198,6 +198,23 @@ describe("Anthropic API key workspaces", () => {
 				.slice(2)
 				.map(entry => entry.authorization),
 		).toEqual([`Bearer ${SUBSCRIPTION}`]);
+
+		// Adding the key again with its workspace is the fix: it serves at once.
+		await storage.credentials.addApiKey("anthropic", UNSCOPED_KEY, { workspaceId: WORKSPACE });
+		expect(await ask(api)).toBe("hi");
+		expect(api.messages().slice(3)).toEqual([
+			expect.objectContaining({ apiKey: UNSCOPED_KEY, workspace: WORKSPACE, authorization: null }),
+		]);
+	});
+
+	it("sends the key's workspace in place of a configured one in any casing", async () => {
+		await storage.credentials.addApiKey("anthropic", UNSCOPED_KEY, { workspaceId: WORKSPACE });
+		const api = anthropicApi();
+
+		expect(await ask(api, { "Anthropic-Workspace-Id": "wrkspc_01CONFIGURED" })).toBe("hi");
+
+		// Two casings would reach the wire joined as "wrkspc_01CONFIGURED, wrkspc_…".
+		expect(api.messages().map(entry => entry.workspace)).toEqual([WORKSPACE]);
 	});
 
 	it("re-adding a stored key replaces its workspace", async () => {
@@ -232,6 +249,30 @@ describe("settling an Anthropic key's workspace", () => {
 				fetch: scopedKeyApi,
 			}),
 		).toEqual({});
+	});
+
+	it("uses an explicit workspace as given, even when the key lists only another", async () => {
+		const api = anthropicApi({
+			workspaces: [{ id: "wrkspc_listed", name: "Default Workspace" }],
+			usable: [WORKSPACE],
+		});
+		expect(
+			await resolveAnthropicKeyWorkspace(UNSCOPED_KEY, neverAsked, {
+				baseUrl: model.baseUrl,
+				workspaceId: WORKSPACE,
+				fetch: api.fetch,
+			}),
+		).toEqual({ workspaceId: WORKSPACE });
+		expect(api.seen.map(entry => [new URL(entry.url).pathname, entry.workspace])).toEqual([
+			["/v1/models", WORKSPACE],
+		]);
+		await expect(
+			resolveAnthropicKeyWorkspace(UNSCOPED_KEY, neverAsked, {
+				baseUrl: model.baseUrl,
+				workspaceId: "wrkspc_listed",
+				fetch: api.fetch,
+			}),
+		).rejects.toThrow(/validation failed \(403\)/);
 	});
 
 	it("asks the user to pick when the key can name several workspaces", async () => {

@@ -10,15 +10,16 @@ import type { CredentialBlocks } from "./blocks";
 import { type AccountPolicies, isKeylessFallback, isPoolCredential } from "./policy";
 import type { CredentialPool } from "./pool";
 import type { CredentialSelector, OAuthResolutionResult } from "./select";
-import type {
-	ApiKeyCredential,
-	AuthApiKeyOptions,
-	AuthCredential,
-	AuthSource,
-	AuthSourceOptions,
-	KeysApi,
-	LimitsApi,
-	CredentialRequestScope,
+import {
+	type ApiKeyCredential,
+	type AuthApiKeyOptions,
+	type AuthCredential,
+	type AuthSource,
+	type AuthSourceOptions,
+	type CredentialRequestScope,
+	credentialRequestScope,
+	type KeysApi,
+	type LimitsApi,
 } from "./types";
 
 /**
@@ -176,6 +177,13 @@ export class KeyCascade implements KeysApi {
 		if (this.#deps.pool.matchesStoredOAuthBearer(provider, bearer)) return true;
 		const oauthTokenEnv = authPolicyFor(provider)?.oauthTokenEnv ?? [];
 		return oauthTokenEnv.some(name => $env[name]?.trim() === bearer);
+	}
+
+	requestScope(provider: string, bearer: string): CredentialRequestScope | undefined {
+		const credential = this.#deps.pool
+			.credentials(provider)
+			.find(stored => (stored.type === "api_key" ? stored.key : stored.access) === bearer);
+		return credential && credentialRequestScope(credential);
 	}
 
 	/**
@@ -421,11 +429,10 @@ export class KeyCascade implements KeysApi {
 				return undefined;
 			}
 			if (!resolved) return undefined;
-			const { orgId, region, inferenceRegion } = resolved.credential;
 			return {
 				apiKey: resolved.apiKey,
 				credentialId: resolved.credentialId,
-				identity: { orgId, region, inferenceRegion },
+				identity: credentialRequestScope(resolved.credential),
 			};
 		};
 		// One pool: its own selection ladder (strict, then last resort) is the whole story.
@@ -445,7 +452,7 @@ export class KeyCascade implements KeysApi {
 			const resolved = await tryPool(pool, strict);
 			if (!resolved) continue;
 			if (resolved.apiKey !== undefined && resolved.credentialId !== undefined) {
-				onCredentialId?.(resolved.credentialId, "identity" in resolved ? resolved.identity : undefined);
+				onCredentialId?.(resolved.credentialId, resolved.identity);
 			}
 			// An admitted key whose reference failed to resolve must not enable a lower-precedence source.
 			return { apiKey: resolved.apiKey, admitted: true, oauthRefreshFailure };
@@ -467,7 +474,6 @@ export class KeyCascade implements KeysApi {
 	): Promise<{ apiKey: string | undefined; credentialId: number; identity?: CredentialRequestScope } | undefined> {
 		const selection = await this.#deps.selector.selectApiKey(provider, sessionId, options, filter, strict);
 		if (!selection) return undefined;
-		const { workspaceId } = selection.credential;
 		let apiKey = await this.#deps.overrides.resolve(selection.credential.key);
 		if (!this.#deps.selector.syncApiKeySelection(provider, selection, filter)) apiKey = undefined;
 		if (apiKey !== undefined) {
@@ -475,7 +481,7 @@ export class KeyCascade implements KeysApi {
 			if (sessionId && !recorded) apiKey = undefined;
 		}
 		// An admitted but unresolved source must not silently enable a lower-precedence key.
-		return { apiKey, credentialId: selection.credentialId, ...(workspaceId ? { identity: { workspaceId } } : {}) };
+		return { apiKey, credentialId: selection.credentialId, identity: credentialRequestScope(selection.credential) };
 	}
 
 	/**

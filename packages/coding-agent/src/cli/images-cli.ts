@@ -1,7 +1,7 @@
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { AuthStorage, type ResolvedApiKey, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { getBundledModels } from "@oh-my-pi/pi-catalog";
 import { $which, type FetchImpl, formatBytes, getAgentDbPath, isEnoent } from "@oh-my-pi/pi-utils";
 import {
@@ -92,7 +92,7 @@ export interface ImagesCliDependencies {
 	readonly openAuthStorage: () => Promise<AuthStorage>;
 	readonly createProviderFileClient: (
 		provider: ProviderFileProvider,
-		credential: string,
+		credential: ResolvedApiKey,
 		fetchImpl: FetchImpl,
 	) => ProviderFileClient | null;
 	readonly queryStatus: (projectDir: string) => Promise<BlobBrokerStatus | null>;
@@ -218,16 +218,16 @@ function defaultResolveConfig(settings: Settings, projectDir: string): ImagesRes
 
 function defaultCreateProviderFileClient(
 	provider: ProviderFileProvider,
-	credential: string,
+	credential: ResolvedApiKey,
 	fetchImpl: FetchImpl,
 ): ProviderFileClient | null {
 	for (const model of getBundledModels(provider)) {
 		const client =
 			provider === "openai"
-				? createOpenAIFileClient(model, credential, fetchImpl)
+				? createOpenAIFileClient(model, credential.apiKey, fetchImpl)
 				: provider === "anthropic"
-					? createAnthropicFileClient(model, credential, fetchImpl)
-					: createGeminiProviderFileClient(model, credential, fetchImpl);
+					? createAnthropicFileClient(model, credential.apiKey, fetchImpl, credential.credentialScope?.workspaceId)
+					: createGeminiProviderFileClient(model, credential.apiKey, fetchImpl);
 		if (client) return client;
 	}
 	return null;
@@ -597,7 +597,11 @@ function credentialValues(storage: AuthStorage, provider: ProviderFileProvider):
 	return values;
 }
 
-async function credentialForEntry(storage: AuthStorage, entry: ProviderFileCacheEntry): Promise<string | undefined> {
+/** The stored credential that uploaded `entry`, with the request scope its requests carry (a key's workspace). */
+async function credentialForEntry(
+	storage: AuthStorage,
+	entry: ProviderFileCacheEntry,
+): Promise<ResolvedApiKey | undefined> {
 	const values = credentialValues(storage, entry.provider);
 	try {
 		const resolved = await storage.keys.get(entry.provider);
@@ -605,7 +609,10 @@ async function credentialForEntry(storage: AuthStorage, entry: ProviderFileCache
 	} catch {
 		// A failed refresh is reported as skipped authentication, never with credential detail.
 	}
-	return values.find(value => hashProviderFileCredential(value) === entry.credentialHash);
+	const apiKey = values.find(value => hashProviderFileCredential(value) === entry.credentialHash);
+	return apiKey === undefined
+		? undefined
+		: { apiKey, credentialScope: storage.keys.requestScope(entry.provider, apiKey) };
 }
 
 async function purgeProviderFiles(
@@ -641,7 +648,7 @@ async function purgeProviderFiles(
 			}
 			try {
 				await client.delete(entry.handle);
-				cache.delete(entry.provider, credential, entry.contentHash);
+				cache.delete(entry.provider, credential.apiKey, entry.contentHash);
 				deleted++;
 			} catch (error) {
 				errors.push(`${entry.provider}: ${safeDetail(error)}`);

@@ -90,6 +90,8 @@ export interface CredentialPoolOptions {
 	blockHealth: BlockStoreHealth;
 	/** Called whenever a provider's credential set changed locally. */
 	onReset: (provider: string) => void;
+	/** Called after an API key is added or added again: it serves at once, whatever set it aside. */
+	onApiKeyAdded: (provider: string, credentialId: number) => void;
 }
 
 /** In-memory credential snapshot over an AuthCredentialStore: CRUD, change detection, events. */
@@ -149,7 +151,8 @@ export class CredentialPool implements CredentialsApi {
 
 	/**
 	 * Add one API key to the provider's key pool (`source: "login"`). Distinct keys
-	 * are appended; re-adding a stored key reuses its row. Returns the stored row.
+	 * are appended; re-adding a stored key reuses its row and lifts its blocks.
+	 * Returns the stored row.
 	 */
 	async addApiKey(provider: string, key: string, options?: { workspaceId?: string }): Promise<StoredAuthCredential> {
 		const credential: ApiKeyCredential = {
@@ -166,6 +169,7 @@ export class CredentialPool implements CredentialsApi {
 		this.reset(provider);
 		const row = stored.find(entry => entry.credential.type === "api_key" && entry.credential.key === key);
 		if (!row) throw new Error(`API key for ${provider} was not stored`);
+		this.#options.onApiKeyAdded(provider, row.id);
 		return row;
 	}
 

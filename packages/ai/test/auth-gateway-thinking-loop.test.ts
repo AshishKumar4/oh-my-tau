@@ -180,4 +180,73 @@ describe("auth-gateway auth retry", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+
+	it("sets aside a key rejected for its workspace for hours and serves the next key", async () => {
+		registerMockApi();
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-workspace-rotation-"));
+		const store = await SqliteAuthCredentialStore.open(path.join(dir, "auth.db"));
+		const storage = new AuthStorage(store);
+		const healthy = await storage.credentials.addApiKey("mock", "healthy-key");
+		await storage.credentials.addApiKey("mock", "unscoped-key");
+		const invalidateSpy = spyOn(storage.limits, "invalidateMatching");
+		const mock = createMockModel({
+			provider: "mock",
+			id: "gateway-workspace-model",
+			handler: (_context, options) => {
+				if (options?.apiKey === "unscoped-key") {
+					throw new ProviderHttpError(
+						"This API key is not scoped to a workspace, so this request must include the anthropic-workspace-id header",
+						400,
+						{ code: "invalid_request_error" },
+					);
+				}
+				return { content: [`ok:${options?.apiKey ?? "missing"}`] };
+			},
+		});
+		const handle = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["gw-test-token"],
+			storage,
+			resolveModel: () => mock.model,
+			version: "test",
+		});
+		try {
+			const ask = async () => {
+				const res = await fetch(`${handle.url}/v1/chat/completions`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json", Authorization: "Bearer gw-test-token" },
+					body: JSON.stringify({
+						model: "gateway-workspace-model",
+						messages: [{ role: "user", content: "hi" }],
+						prompt_cache_key: "gw-workspace-rotation",
+						stream: false,
+					}),
+				});
+				expect(res.status).toBe(200);
+				const body = (await res.json()) as { choices?: Array<{ message?: { content?: string | null } }> };
+				return body.choices?.[0]?.message?.content;
+			};
+
+			for (let turn = 0; turn < 3; turn++) expect(await ask()).toBe("ok:healthy-key");
+
+			// The unscoped key was tried once, then set aside for the next key.
+			expect(mock.calls.map(call => call.options?.apiKey)).toEqual([
+				"unscoped-key",
+				"healthy-key",
+				"healthy-key",
+				"healthy-key",
+			]);
+			expect(invalidateSpy).not.toHaveBeenCalled();
+			// Alone in the pool, the set-aside key reports when it returns: hours away, not a minute.
+			await storage.credentials.removeById("mock", healthy.id);
+			const [keys] = storage.limits.pools("mock", mock.model.id);
+			expect(keys?.blocked).toBe(1);
+			expect(keys?.retryAtMs).toBeGreaterThan(Date.now() + 5 * 60 * 60 * 1000);
+		} finally {
+			invalidateSpy.mockRestore();
+			await handle.close();
+			storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 });

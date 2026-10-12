@@ -116,9 +116,9 @@ omp auth keys remove anthropic 12
 
 An Anthropic key created without a workspace must name one on every request, in the `anthropic-workspace-id` header. Adding a key checks this. A key scoped to a workspace needs nothing more. For a key that is not, OMP lists the workspaces the key can use: it takes the only one, or asks you to pick. When the key may not list workspaces, OMP asks for the ID; find it under [Settings › Workspaces](https://platform.claude.com/settings/workspaces) in the Claude Console. OMP then checks the key against that workspace and stores the workspace with the key. Every request the key serves names it.
 
-Piped input cannot answer a second question, so pass the ID instead: `omp auth keys add anthropic --workspace wrkspc_…`. To change a stored key's workspace, add the same key again.
+`--workspace wrkspc_…` names the workspace directly: OMP checks the key against it and skips the lookup. Piped input cannot answer a second question, so it needs the flag: `omp auth keys add anthropic --workspace wrkspc_…`. To change a stored key's workspace, add the same key again.
 
-A pooled key that Anthropic rejects for its workspace, for example one added before this check, is set aside for six hours, and the next key or a subscription serves. If no credential remains, the error says to add the key again.
+A pooled key that Anthropic rejects for its workspace, for example one added before this check, is set aside for six hours, and the next key or a subscription serves. If no credential remains, the error says to add the key again. Adding a key again, with or without a new workspace, makes it serve at once, whatever had set it aside.
 
 `/logout` also lists pooled keys with their masked form. A `models.yml` `apiKey` or a CLI `--api-key` pins one key for every request instead, ahead of both pools.
 

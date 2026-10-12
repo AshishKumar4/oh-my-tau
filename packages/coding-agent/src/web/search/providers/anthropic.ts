@@ -318,10 +318,15 @@ function parseResponse(response: AnthropicApiResponse): SearchResponse {
 export async function searchAnthropic(params: SearchParams): Promise<SearchResponse> {
 	const registryResolver = params.modelRegistry.resolver(params.model, params.sessionId);
 	const searchApiKey = params.model.provider === "anthropic" ? $env.ANTHROPIC_SEARCH_API_KEY : undefined;
-	const keyOrResolver: ApiKey = searchApiKey
+	// A search key that is also a stored key carries that key's request scope (its workspace).
+	const searchKey = searchApiKey && {
+		apiKey: searchApiKey,
+		credentialScope: params.authStorage.keys.requestScope(params.model.provider, searchApiKey),
+	};
+	const keyOrResolver: ApiKey = searchKey
 		? async context => {
-				if (context.error === undefined && !context.lastChance) return searchApiKey;
-				return (await registryResolver(context)) ?? searchApiKey;
+				if (context.error === undefined && !context.lastChance) return searchKey;
+				return (await registryResolver(context)) ?? searchKey;
 			}
 		: registryResolver;
 	const accountId = params.authStorage.oauth.identity(params.model.provider, params.sessionId)?.accountId;
