@@ -4,7 +4,12 @@
  */
 import { register, type SettingValueOf } from "./registry";
 import { parseCredentialPoolOrders } from "@oh-my-pi/pi-ai/auth-broker/discover";
-import type { AuthAccountPolicies, CredentialPoolOrders } from "@oh-my-pi/pi-ai/auth-storage";
+import {
+	type AuthAccountPolicies,
+	type CredentialPoolOrder,
+	type CredentialPoolOrders,
+	DEFAULT_CREDENTIAL_POOL_ORDER,
+} from "@oh-my-pi/pi-ai/auth-storage";
 import type { cfgDefaultThinkingLevel } from "../session/settings";
 
 /** Display metadata for one model tag. */
@@ -62,11 +67,23 @@ export const cfgAuthAccountPolicies = register({
 	default: EMPTY_AUTH_ACCOUNT_POLICIES,
 });
 
+/** How each pool order reads in `/settings`; keyed by every order so a new one cannot go unlabelled. */
+const CREDENTIAL_POOL_ORDER_LABELS: Record<CredentialPoolOrder, { label: string; description: string }> = {
+	"subscription-first": {
+		label: "Subscriptions first",
+		description: "Subscriptions until all are exhausted, then API keys",
+	},
+	"api-keys-first": {
+		label: "API keys first",
+		description: "API keys until all are exhausted, then subscriptions",
+	},
+};
+
 /**
  * Per-provider order of stored credential pools: OAuth subscription accounts and
- * pooled API keys (`omp auth keys add`). The default serves subscriptions first and
- * falls back to keys once every subscription is exhausted; `api-keys-first`
- * reverses it. Edited through `omp config set` or config.yml, like `auth.accountPolicies`.
+ * pooled API keys (`/login` or `omp auth keys add`). The default serves subscriptions
+ * first and falls back to keys once every subscription is exhausted; `api-keys-first`
+ * reverses it.
  */
 export const cfgAuthPoolOrder = register({
 	id: "auth.poolOrder",
@@ -74,6 +91,19 @@ export const cfgAuthPoolOrder = register({
 	default: EMPTY_CREDENTIAL_POOL_ORDERS,
 	validate: parseCredentialPoolOrders,
 	normalize: parseCredentialPoolOrders,
+	ui: {
+		tab: "providers",
+		group: "Services",
+		label: "Credential Pool Order",
+		description:
+			"Per provider, whether subscription accounts or pooled API keys serve first. The other pool takes over once every credential in the first is exhausted.",
+		options: Object.entries(CREDENTIAL_POOL_ORDER_LABELS).map(([value, { label, description }]) => ({
+			value,
+			label,
+			description,
+		})),
+		defaultOption: DEFAULT_CREDENTIAL_POOL_ORDER,
+	},
 });
 
 export const cfgEnabledModels = register({

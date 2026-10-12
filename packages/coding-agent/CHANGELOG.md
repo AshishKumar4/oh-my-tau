@@ -8,6 +8,7 @@
 - The model hub's Roles view now shows which agents run on each role. A custom role that no agent runs on and that is not in the quick-switch cycle is marked `no agents`, and selecting it explains how to use it: set an agent's model to `@ROLE` in `/agents`
 - A provider can pool any number of API keys alongside its subscription accounts. Add them with `omp auth keys add <provider>` (hidden prompt or piped stdin), see them masked with `omp auth keys list`, and remove one with `omp auth keys remove <provider> <id>`. A session keeps its key while it works and moves to the next key when the provider reports exhausted credits, a spend limit, or an invalid key
 - `/login anthropic` now offers "Add API key" next to the browser sign-in. The key goes in through a masked prompt and joins the provider's key pool
+- `/settings` › Providers › Credential Pool Order sets, per provider, whether subscriptions or pooled API keys serve first; the current session uses the new order from its next request
 - `auth.poolOrder` sets, per provider, whether subscriptions (`subscription-first`, the default) or pooled API keys (`api-keys-first`) serve first. The other pool takes over once every credential in the first is exhausted, and the error names the earliest time a credential frees up when both pools are exhausted
 
 ### Changed

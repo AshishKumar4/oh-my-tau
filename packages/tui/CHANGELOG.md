@@ -9,6 +9,7 @@
 ### Added
 
 - `ModelHubOptions.roleAgents` takes a promise of the agents per role; once it resolves, the Roles view lists the agents on the selected role and marks a custom role nothing uses with a `no agents` badge
+- A record setting whose ui declares `options` and a `defaultOption` edits as a per-provider choice in the settings panel: pick a provider, then one of the options; choosing the default removes that provider's entry
 
 ## [18.4.12] - 2026-10-02
 

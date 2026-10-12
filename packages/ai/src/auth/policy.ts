@@ -9,7 +9,7 @@ import type {
 	OAuthAccountIdentity,
 	OAuthCredential,
 } from "./types";
-import { DEFAULT_USAGE_RESERVE_PCT } from "./types";
+import { DEFAULT_CREDENTIAL_POOL_ORDER, DEFAULT_USAGE_RESERVE_PCT } from "./types";
 
 /** Whether every identity field set on `selector` matches `identity`. */
 export function matchesAuthAccountSelector(selector: AuthAccountSelector, identity: OAuthAccountIdentity): boolean {
@@ -96,9 +96,11 @@ export class AccountPolicies {
 		return this.#defaultReservePct;
 	}
 
-	/** The provider's stored pools in serving order; `subscription-first` unless configured. */
+	/** The provider's stored pools in serving order; {@link DEFAULT_CREDENTIAL_POOL_ORDER} unless configured. */
 	poolOrder(provider: string): readonly AuthCredential["type"][] {
-		return this.#poolOrders[provider] === "api-keys-first" ? ["api_key", "oauth"] : ["oauth", "api_key"];
+		return (this.#poolOrders[provider] ?? DEFAULT_CREDENTIAL_POOL_ORDER) === "api-keys-first"
+			? ["api_key", "oauth"]
+			: ["oauth", "api_key"];
 	}
 
 	/**

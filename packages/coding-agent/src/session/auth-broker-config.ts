@@ -148,7 +148,7 @@ export interface AuthStorageSettingsSync {
 
 /**
  * Keeps a long-lived `authStorage` in step with the auth settings of `scope`:
- * - `auth.accountPolicies` / `retry.usageReservePct` re-apply account routing policy.
+ * - `auth.accountPolicies` / `retry.usageReservePct` / `auth.poolOrder` re-apply account routing policy.
  * - `auth.broker.url` / `auth.broker.token` flush pending writes, re-resolve the
  *   broker with startup precedence (env → config.yml → token file; project layers
  *   never redirect credentials), and swap the credential store in place when the

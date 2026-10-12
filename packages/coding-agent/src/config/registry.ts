@@ -55,6 +55,12 @@ export interface UiString extends UiBase {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
 }
 
+/**
+ * A provider-keyed record whose values are one of `options` edits as a per-provider choice; one
+ * without options has no structured editor. `defaultOption` is what a provider without an entry gets.
+ */
+export type UiRecord = UiBase | (UiBase & { options: ReadonlyArray<SubmenuOption>; defaultOption: string });
+
 export interface UiArray extends UiBase {
 	/** Membership choices. Without options, an array setting has no UI representation (config-file only). */
 	options?: ReadonlyArray<SubmenuOption>;
@@ -163,7 +169,7 @@ export interface RecordDefinition<T = unknown> extends DefinitionBase {
 	type: "record";
 	default: Readonly<Record<string, T>>;
 	env?: SettingEnv<Readonly<Record<string, T>>>;
-	ui?: UiBase;
+	ui?: UiRecord;
 }
 
 /** Any setting definition accepted by {@link register}. */

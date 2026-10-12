@@ -6,7 +6,7 @@
  * from hidden terminal input or piped stdin, never from argv, and are only ever
  * displayed masked.
  */
-import { maskApiKey } from "@oh-my-pi/pi-ai";
+import { DEFAULT_CREDENTIAL_POOL_ORDER, maskApiKey } from "@oh-my-pi/pi-ai";
 import { APP_NAME } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { cfgAuthPoolOrder } from "../config/model-settings";
@@ -134,7 +134,7 @@ export async function runAuthKeysCommand(args: AuthKeysCommandArgs): Promise<voi
 			return;
 		}
 
-		const order = cfgAuthPoolOrder.get(settings)[provider] ?? "subscription-first";
+		const order = cfgAuthPoolOrder.get(settings)[provider] ?? DEFAULT_CREDENTIAL_POOL_ORDER;
 		const pools = storage.limits.pools(provider);
 		const keyPool = pools.find(pool => pool.kind === "api_key");
 		const subscriptions = pools.find(pool => pool.kind === "oauth")?.members ?? 0;

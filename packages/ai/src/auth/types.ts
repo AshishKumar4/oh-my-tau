@@ -93,7 +93,10 @@ export type AuthAccountPolicies = readonly AuthAccountPolicy[];
  */
 export type CredentialPoolOrder = "subscription-first" | "api-keys-first";
 
-/** Provider id → pool order; providers absent here use `subscription-first`. */
+/** The pool order of a provider that `auth.poolOrder` does not list. */
+export const DEFAULT_CREDENTIAL_POOL_ORDER: CredentialPoolOrder = "subscription-first";
+
+/** Provider id → pool order; providers absent here use {@link DEFAULT_CREDENTIAL_POOL_ORDER}. */
 export type CredentialPoolOrders = Readonly<Record<string, CredentialPoolOrder>>;
 
 /**

@@ -89,7 +89,7 @@ A provider can hold two pools of stored credentials:
 - **Subscriptions**: OAuth accounts from `/login` or `omp login`.
 - **Pooled API keys**: any number of keys from `omp auth keys add` or an API-key `/login`. Each key may bill a different account or organization.
 
-`auth.poolOrder` picks which pool serves first, per provider:
+`auth.poolOrder` picks which pool serves first, per provider. In the TUI, open `/settings`, then **Providers › Credential Pool Order**, and pick a provider; the current session uses the new order from its next request. In `config.yml`:
 
 ```yaml
 # ~/.omp/agent/config.yml
