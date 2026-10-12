@@ -1286,8 +1286,8 @@ export class SessionMaintenance {
 					markCommitted,
 				);
 			}
-			const pathEntries = this.#host.sessionManager.getBranch();
-			const preparation = prepareCompaction(pathEntries, effectiveSettings, activeModel, this.#tokenizer);
+			let pathEntries = this.#host.sessionManager.getBranch();
+			let preparation = prepareCompaction(pathEntries, effectiveSettings, activeModel, this.#tokenizer);
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -1323,9 +1323,14 @@ export class SessionMaintenance {
 					hookCompaction = result.compaction;
 					fromExtension = true;
 				} else if (rewrite && rewrite.applied > 0) {
-					// The handler compacted in place; the request is complete without a
-					// boundary, exactly as an automatic pass settles inside the band.
-					return undefined;
+					// The handler compacted in place. Inside the recovery band that
+					// completes the request with no boundary, exactly as an automatic
+					// pass settles there; otherwise the requested method runs over the
+					// rewritten branch, again exactly as an automatic pass escalates.
+					if (this.#compactionCreatedHeadroom()) return undefined;
+					pathEntries = this.#host.sessionManager.getBranch();
+					preparation = prepareCompaction(pathEntries, effectiveSettings, activeModel, this.#tokenizer);
+					if (!preparation) return undefined;
 				}
 			}
 

@@ -497,12 +497,12 @@ export interface SessionBeforeCompactResult {
 	 * messages, assistant and tool entries stay where they are with reduced
 	 * bodies. The host persists the rewrite first; when `compaction` is also
 	 * set, that boundary is committed on top of the rewritten branch.
-	 * Without `compaction`, a rewrite that changed at least one entry is the
-	 * whole answer: manual compaction finishes there with no boundary, and
-	 * automatic maintenance finishes when the freed headroom reaches the
-	 * recovery band, otherwise the configured method runs natively over the
-	 * rewritten branch without consulting the handler again. A rewrite that
-	 * matches no entry is ignored. Ignored entirely when `cancel` is set.
+	 * Without `compaction`, a rewrite that changed at least one entry finishes
+	 * the pass with no boundary when the freed headroom reaches the recovery
+	 * band, for manual and automatic compaction alike; otherwise the selected
+	 * method runs natively over the rewritten branch without consulting the
+	 * handler again. A rewrite that matches no entry is ignored. Ignored
+	 * entirely when `cancel` is set.
 	 */
 	rewrite?: SessionHistoryRewrite[];
 }

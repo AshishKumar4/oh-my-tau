@@ -9,6 +9,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { SessionBeforeCompactResult } from "@oh-my-pi/pi-coding-agent/extensibility/shared-events";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
@@ -180,6 +181,21 @@ describe("AgentSession extension history rewrite", () => {
 			(event): event is Extract<AgentSessionEvent, { type: "auto_compaction_start" | "auto_compaction_end" }> =>
 				event.type === "auto_compaction_start" || event.type === "auto_compaction_end",
 		);
+	}
+
+	/** Anchor the context gauge on a finished turn the provider billed at `contextTokens`. */
+	function anchorUsage(contextTokens: number): void {
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "Done." }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: usage(contextTokens),
+			timestamp: 5,
+		});
+		session.agent.replaceMessages(buildSessionContext(sessionManager.getBranch()).messages);
 	}
 
 	/** Fire a post-turn threshold check billed at `contextTokens` and wait until maintenance settles. */
@@ -395,7 +411,7 @@ describe("AgentSession extension history rewrite", () => {
 	});
 
 	describe("manual compaction", () => {
-		it("resolves undefined when the rewrite alone answers the request", async () => {
+		it("resolves undefined when the rewrite reaches the recovery band", async () => {
 			const { toolResultId } = seedToolTurn(20_000);
 			hookAnswer = () => prunedToolResult(toolResultId);
 			const nativeSummary = mockNativeSummary();
@@ -424,6 +440,31 @@ describe("AgentSession extension history rewrite", () => {
 			expect(hookCalls.length).toBe(1);
 			expect(nativeSummary).not.toHaveBeenCalled();
 			expect(toolResultText(entryMessage(toolResultId))).toBe(PLACEHOLDER);
+			expect(compactionEntries().length).toBe(1);
+		});
+
+		it("runs the requested method over the rewritten branch when the rewrite stops short of the band", async () => {
+			// Manual and automatic compaction share one contract: a rewrite that
+			// leaves context above the band is progress, not the whole answer.
+			const { toolResultId, userId } = seedToolTurn(20_000);
+			anchorUsage(190_000);
+			hookAnswer = () => prunedToolResult(toolResultId);
+			const nativeSummary = mockNativeSummary();
+
+			const result = await session.compact();
+			if (!result) throw new Error("expected the requested method to commit a boundary");
+
+			expect(result.summary).toBe("native summary");
+			expect(hookCalls.length).toBe(1);
+			expect(nativeSummary).toHaveBeenCalledTimes(1);
+			// The native pass summarized the rewritten branch, not the original.
+			const summarized = nativeSummary.mock.calls[0]?.[0];
+			const sawOriginal = summarized?.messagesToSummarize.some(
+				message => message.role === "toolResult" && toolResultText(message) !== PLACEHOLDER,
+			);
+			expect(sawOriginal).toBe(false);
+			expect(toolResultText(entryMessage(toolResultId))).toBe(PLACEHOLDER);
+			expect(entryMessage(userId).role).toBe("user");
 			expect(compactionEntries().length).toBe(1);
 		});
 
