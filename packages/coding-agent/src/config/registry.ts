@@ -830,6 +830,11 @@ export function lookup(id: string): AnySetting | undefined {
 	return byId.get(id);
 }
 
+/** Narrows a string-keyed handle to a record setting, whose `setEntry` writes one entry checked at runtime. */
+export function isRecordSetting(setting: AnySetting): setting is Setting<Readonly<Record<string, unknown>>> {
+	return setting.type === "record";
+}
+
 /** Every registered setting, in declaration order. */
 export function all(): readonly AnySetting[] {
 	return ordered;

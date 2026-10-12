@@ -158,8 +158,13 @@ export interface SettingsHost {
 	 * variable, that configures the setting still applies; otherwise the default does.
 	 */
 	unset(path: string): void;
+	/**
+	 * Persists one entry of record setting `path` to the global config; `undefined` removes it.
+	 * Its other entries, from any layer, stay as they are, so editing one provider never copies
+	 * project-level entries into the global config.
+	 */
+	setEntry(path: string, key: string, value: unknown): void;
 	normalizeProviderLimits(value: unknown): Record<string, number>;
-	validateProviderLimits(value: unknown): Record<string, number>;
 }
 
 /** Primitive value displayed by a settings control. */

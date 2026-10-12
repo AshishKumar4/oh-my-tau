@@ -495,18 +495,18 @@ class ProviderLimitsSubmenu extends Container {
 					return undefined;
 				},
 				onSubmit: value => {
-					const next = { ...limits };
 					const trimmed = value.trim();
-					if (trimmed === "") {
-						delete next[provider];
-					} else {
-						const limit = Number(trimmed);
+					let limit: number | undefined;
+					if (trimmed !== "") {
+						limit = Number(trimmed);
 						if (!Number.isFinite(limit) || limit <= 0) throw new Error("Limit must be a positive number.");
-						next[provider] = Math.max(1, Math.floor(limit));
+						limit = Math.max(1, Math.floor(limit));
 					}
-					const normalized = this.#settings.validateProviderLimits(next);
-					this.#settings.set("providers.maxInFlightRequests", normalized);
-					this.#onChange(normalized);
+					// One entry only: the merged view also holds project-level limits.
+					this.#settings.setEntry("providers.maxInFlightRequests", provider, limit);
+					this.#onChange(
+						this.#settings.normalizeProviderLimits(this.#settings.get("providers.maxInFlightRequests")),
+					);
 					this.#showProviderList();
 					this.#requestRender?.();
 				},
@@ -627,13 +627,9 @@ class ProviderChoiceSubmenu extends Container {
 			selectTheme: getSelectListTheme(),
 			hint: `  ${editorKey("tui.select.confirm")} to save · ${editorKey("tui.select.cancel")} to go back`,
 			onSubmit: choice => {
-				const next = this.#choices();
 				// The default is what an unlisted provider gets, so choosing it removes the entry.
-				if (choice === this.#def.defaultOption) delete next[provider];
-				else next[provider] = choice;
-				if (Object.keys(next).length === 0) this.#settings.unset(this.#def.path);
-				else this.#settings.set(this.#def.path, next);
-				this.#onChange(next);
+				this.#settings.setEntry(this.#def.path, provider, choice === this.#def.defaultOption ? undefined : choice);
+				this.#onChange(this.#choices());
 			},
 			onCancel: () => this.#show(this.#providerList()),
 			requestRender: this.#requestRender,
@@ -1655,14 +1651,8 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	#isChanged(def: SettingDef, currentValue: unknown): boolean {
-		const defaultValue: unknown = def.defaultValue;
-		if (Array.isArray(currentValue) && Array.isArray(defaultValue)) {
-			return (
-				currentValue.length !== defaultValue.length ||
-				currentValue.some((entry, index) => entry !== defaultValue[index])
-			);
-		}
-		return !Object.is(currentValue, defaultValue);
+		// Structural: array and record values reach here as copies of their default, never the same object.
+		return !Bun.deepEquals(currentValue, def.defaultValue);
 	}
 
 	#getSubmenuCurrentValue(path: string, value: unknown): string {
@@ -1906,9 +1896,6 @@ export class SettingsSelectorComponent implements Component {
 			}
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 				throw new Error(`Invalid record JSON for ${path}`);
-			}
-			if (path === "providers.maxInFlightRequests") {
-				parsed = this.#context.settings.validateProviderLimits(parsed);
 			}
 			this.#context.settings.set(path, parsed);
 		} else if (typeof currentValue === "number") {

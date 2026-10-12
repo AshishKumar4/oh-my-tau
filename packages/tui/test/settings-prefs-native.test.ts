@@ -79,8 +79,14 @@ function harness(initial: Record<string, unknown> = {}): Harness {
 		get: path => values.get(path),
 		set: (path, value) => void values.set(path, value),
 		unset: path => void values.set(path, ENTRIES.find(entry => entry.path === path)?.defaultValue),
+		setEntry: (path, key, value) => {
+			const current = values.get(path);
+			const record: Record<string, unknown> = typeof current === "object" && current !== null ? { ...current } : {};
+			if (value === undefined) delete record[key];
+			else record[key] = value;
+			values.set(path, record);
+		},
 		normalizeProviderLimits: () => ({}),
-		validateProviderLimits: () => ({}),
 	};
 	const plugins: PluginSettingsHost = {
 		manager: {

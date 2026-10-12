@@ -11,6 +11,8 @@ import {
 	createAuthStorageSettingsSync,
 } from "@oh-my-pi/pi-coding-agent/session/auth-broker-config";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { cfgProvidersMaxInFlightRequests } from "@oh-my-pi/pi-coding-agent/session/settings";
+import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
 import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -25,43 +27,52 @@ const POOLED_KEY = "sk-ant-api03-POOLEDkeyForSettingsTest0001";
 let state: SettingsTestState | undefined;
 let tempDir: TempDir;
 let agentDir: string;
-let authStorage: AuthStorage;
-let sync: AuthStorageSettingsSync;
+let projectDir: string;
+let authStorage: AuthStorage | undefined;
+let sync: AuthStorageSettingsSync | undefined;
 
 beforeAll(async () => {
 	await initTheme();
 });
 
-beforeEach(async () => {
+beforeEach(() => {
 	state = beginSettingsTest();
 	for (const key of ["OMP_AUTH_BROKER_URL", "OMP_AUTH_BROKER_TOKEN"]) delete process.env[key];
 	tempDir = TempDir.createSync("@pi-settings-pool-order-");
 	agentDir = tempDir.join("agent");
-	const projectDir = tempDir.join("project");
-	for (const dir of [agentDir, projectDir]) fs.mkdirSync(dir, { recursive: true });
-	await Settings.init({ cwd: projectDir, agentDir });
+	projectDir = tempDir.join("project");
+	for (const dir of [agentDir, path.join(projectDir, ".omp")]) fs.mkdirSync(dir, { recursive: true });
+});
 
-	authStorage = new AuthStorage(await SqliteAuthCredentialStore.open(path.join(agentDir, "credentials.db")));
-	await authStorage.credentials.upsert("anthropic", {
+afterEach(() => {
+	sync?.stop();
+	authStorage?.close();
+	sync = undefined;
+	authStorage = undefined;
+	restoreSettingsTestState(state);
+	state = undefined;
+	AgentStorage.close();
+	tempDir.removeSync();
+});
+
+/** Loads settings (with an optional project config) and a live auth storage holding a subscription and a pooled key. */
+async function start(projectConfig?: object): Promise<AuthStorage> {
+	if (projectConfig) await Bun.write(path.join(projectDir, ".omp", "config.yml"), YAML.stringify(projectConfig));
+	await Settings.init({ cwd: projectDir, agentDir });
+	const storage = new AuthStorage(await SqliteAuthCredentialStore.open(path.join(agentDir, "credentials.db")));
+	await storage.credentials.upsert("anthropic", {
 		type: "oauth",
 		access: "subscription-token",
 		refresh: "subscription-refresh",
 		expires: Date.now() + 3_600_000,
 		email: "max@example.com",
 	});
-	await authStorage.credentials.addApiKey("anthropic", POOLED_KEY);
+	await storage.credentials.addApiKey("anthropic", POOLED_KEY);
 	// The running session's link: a /settings change re-applies routing policy live.
-	sync = createAuthStorageSettingsSync(settings, authStorage);
-});
-
-afterEach(() => {
-	sync.stop();
-	authStorage.close();
-	restoreSettingsTestState(state);
-	state = undefined;
-	AgentStorage.close();
-	tempDir.removeSync();
-});
+	sync = createAuthStorageSettingsSync(settings, storage);
+	authStorage = storage;
+	return storage;
+}
 
 function createSelector(): SettingsSelectorComponent {
 	return new SettingsSelectorComponent(
@@ -75,6 +86,21 @@ function createSelector(): SettingsSelectorComponent {
 		},
 		{ onChange: () => {}, onCancel: () => {} },
 	);
+}
+
+const NATIVE_PAGE: DescribeContext = {
+	cols: 120,
+	reduceMotion: false,
+	dark: true,
+	supports: () => true,
+	feature: () => true,
+};
+
+/** How many Providers settings differ from their default, as the native settings page counts them. */
+function providersChanged(selector: SettingsSelectorComponent): number | undefined {
+	const described = selector.describe(NATIVE_PAGE);
+	if (described.k !== "prefs" || !described.p) throw new Error(`described ${described.k}, not prefs`);
+	return described.p.pages.find(page => page.id === "providers")?.changed;
 }
 
 function screen(selector: SettingsSelectorComponent): string {
@@ -91,35 +117,65 @@ async function chooseForAnthropic(selector: SettingsSelectorComponent, steps: st
 	selector.handleInput(ENTER);
 	// The coalesced settings listener delivers the change on the next microtask.
 	await Promise.resolve();
-	await sync.settled();
+	await sync?.settled();
 	return providerList;
 }
 
-it("switching a provider to API keys first in /settings makes the running session serve its pooled key", async () => {
-	expect(await authStorage.keys.get("anthropic")).toBe("subscription-token");
+async function globalConfig(): Promise<unknown> {
+	await settings.flush();
+	return YAML.parse(await Bun.file(path.join(agentDir, "config.yml")).text()) ?? {};
+}
 
-	const providerList = await chooseForAnthropic(createSelector(), DOWN);
+it("switching a provider to API keys first in /settings makes the running session serve its pooled key", async () => {
+	const storage = await start();
+	expect(await storage.keys.get("anthropic")).toBe("subscription-token");
+	const selector = createSelector();
+	// Nothing configured: the empty records match their defaults.
+	expect(providersChanged(selector)).toBeUndefined();
+
+	const providerList = await chooseForAnthropic(selector, DOWN);
 
 	expect(providerList).toContain("anthropic");
 	expect(providerList).toContain("Subscriptions first (default)");
 	expect(cfgAuthPoolOrder.get(settings)).toEqual({ anthropic: "api-keys-first" });
-	expect(await authStorage.keys.get("anthropic")).toBe(POOLED_KEY);
-	await settings.flush();
-	expect(YAML.parse(await Bun.file(path.join(agentDir, "config.yml")).text())).toEqual({
-		auth: { poolOrder: { anthropic: "api-keys-first" } },
-	});
+	expect(providersChanged(selector)).toBe(1);
+	expect(await storage.keys.get("anthropic")).toBe(POOLED_KEY);
+	expect(await globalConfig()).toEqual({ auth: { poolOrder: { anthropic: "api-keys-first" } } });
 });
 
 it("choosing the default order again removes the entry and restores the subscription", async () => {
+	const storage = await start();
 	await chooseForAnthropic(createSelector(), DOWN);
-	expect(await authStorage.keys.get("anthropic")).toBe(POOLED_KEY);
+	expect(await storage.keys.get("anthropic")).toBe(POOLED_KEY);
 
-	const providerList = await chooseForAnthropic(createSelector(), UP);
+	const selector = createSelector();
+	const providerList = await chooseForAnthropic(selector, UP);
 
 	expect(providerList).toContain("API keys first");
 	expect(cfgAuthPoolOrder.get(settings)).toEqual({});
-	expect(await authStorage.keys.get("anthropic")).toBe("subscription-token");
-	await settings.flush();
-	const config: unknown = YAML.parse(await Bun.file(path.join(agentDir, "config.yml")).text());
-	expect(JSON.stringify(config ?? {})).not.toContain("poolOrder");
+	expect(providersChanged(selector)).toBeUndefined();
+	expect(await storage.keys.get("anthropic")).toBe("subscription-token");
+	expect(JSON.stringify(await globalConfig())).not.toContain("anthropic");
+});
+
+it("editing one provider never copies project-level entries into the global config", async () => {
+	await start({ auth: { poolOrder: { zai: "api-keys-first" } }, providers: { maxInFlightRequests: { zai: 2 } } });
+
+	const providerList = await chooseForAnthropic(createSelector(), DOWN);
+	const limits = createSelector();
+	for (const ch of "max in-flight requests") limits.handleInput(ch);
+	limits.handleInput(ENTER); // provider list: anthropic sorts first
+	limits.handleInput(ENTER); // limit field
+	for (const ch of "3") limits.handleInput(ch);
+	limits.handleInput(ENTER);
+
+	// The project's zai entries still apply and show in the panel...
+	expect(providerList).toContain("zai");
+	expect(cfgAuthPoolOrder.get(settings)).toEqual({ anthropic: "api-keys-first", zai: "api-keys-first" });
+	expect(cfgProvidersMaxInFlightRequests.get(settings)).toEqual({ anthropic: 3, zai: 2 });
+	// ...but only the edited anthropic entries reach the global config.
+	expect(await globalConfig()).toEqual({
+		auth: { poolOrder: { anthropic: "api-keys-first" } },
+		providers: { maxInFlightRequests: { anthropic: 3 } },
+	});
 });

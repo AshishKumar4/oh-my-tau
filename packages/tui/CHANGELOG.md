@@ -4,12 +4,14 @@
 
 ### Fixed
 
+- Record settings no longer count as changed in the settings panel while they match their default
+- Editing one provider's in-flight request limit no longer copies project-level limits into the global config
 - The terminal read card shows every text block of a result, so a warning such as a superseded `agent://` value no longer hides the value itself.
 
 ### Added
 
 - `ModelHubOptions.roleAgents` takes a promise of the agents per role; once it resolves, the Roles view lists the agents on the selected role and marks a custom role nothing uses with a `no agents` badge
-- A record setting whose ui declares `options` and a `defaultOption` edits as a per-provider choice in the settings panel: pick a provider, then one of the options; choosing the default removes that provider's entry
+- A record setting whose ui declares `options` and a `defaultOption` edits as a per-provider choice in the settings panel: pick a provider, then one of the options; choosing the default removes that provider's entry. `SettingsHost.setEntry` writes one entry of a record setting to the global config, and `validateProviderLimits` is gone
 
 ## [18.4.12] - 2026-10-02
 

@@ -2,14 +2,13 @@ import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { SETTING_TABS, type SettingsDisplayEntry, type SettingsHost } from "@oh-my-pi/pi-tui/overlays/settings-defs";
 import { isSettingsInitialized, Settings, settings } from "./settings";
 import { orderedSettings } from "./all-settings";
-import { type AnySetting, lookup } from "./registry";
+import { type AnySetting, isRecordSetting, lookup } from "./registry";
 
 import { cfgPlanAutosave, cfgPlanEnabled } from "../plan-mode/settings";
 import {
 	cfgRetryUsageAwareFallback,
 	cfgDefaultThinkingLevel,
 	normalizeProviderMaxInFlightRequests,
-	validateProviderMaxInFlightRequests,
 } from "../session/settings";
 import { cfgAutolearnEnabled } from "../autolearn/settings";
 import { cfgMemoryBackend } from "../memory-backend/settings";
@@ -76,7 +75,11 @@ export function createSettingsHost(): SettingsHost {
 		get: path => lookup(path)?.layered(settings),
 		set: (path, value) => resolve(path).set(settings, value),
 		unset: path => resolve(path).unset(settings),
+		setEntry: (path, key, value) => {
+			const setting = resolve(path);
+			if (!isRecordSetting(setting)) throw new Error(`Setting ${path} is not a record`);
+			setting.setEntry(settings, key, value);
+		},
 		normalizeProviderLimits: normalizeProviderMaxInFlightRequests,
-		validateProviderLimits: validateProviderMaxInFlightRequests,
 	};
 }
