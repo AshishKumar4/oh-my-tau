@@ -169,6 +169,8 @@ describe("auth-gateway auth retry", () => {
 			expect(usageLimitProvider).toBe("mock");
 			expect(usageLimitSessionId).toBe("gw-quota-rotation");
 			expect(usageLimitOptions?.apiKey).toBe(failedKey);
+			// The quota report for the blocked account is read at the request's endpoint.
+			expect(usageLimitOptions?.baseUrl).toBe(mock.model.baseUrl);
 			expect(invalidateSpy.mock.calls).toHaveLength(0);
 			expect(store.listAuthCredentials("mock")).toHaveLength(2);
 			expect(await storage.keys.get("mock", "gw-quota-rotation")).toBe(retriedKey);

@@ -510,6 +510,7 @@ export class RateLimits implements LimitsApi {
 				retryAfterMs,
 				providerTimed: retryAfterMs !== undefined,
 				modelId: options?.modelId,
+				baseUrl: options?.baseUrl,
 				accountIds: options?.accountIds,
 				errorMessage: message,
 				apiKey: options?.apiKey,

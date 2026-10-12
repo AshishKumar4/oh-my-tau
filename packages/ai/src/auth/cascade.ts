@@ -509,6 +509,7 @@ export class KeyCascade implements KeysApi {
 				const rotation = await this.#deps.rotate(provider, sessionId, {
 					error,
 					modelId,
+					baseUrl,
 					signal,
 					apiKey: previousKey,
 				});

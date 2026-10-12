@@ -790,6 +790,8 @@ export type MarkUsageLimitOptions = {
 export type RotateCredentialOptions = {
 	error?: unknown;
 	modelId?: string;
+	/** The failed request's endpoint: a usage limit's quota report is read there. */
+	baseUrl?: string;
 	/**
 	 * The model's account entitlements (`AuthApiKeyOptions.accountIds`). When one
 	 * stored OAuth account is entitled, strict selection takes only entitled

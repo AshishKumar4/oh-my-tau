@@ -2067,6 +2067,7 @@ export class SessionAdvisors {
 				{
 					error: message,
 					modelId: currentModel.id,
+					baseUrl: currentModel.baseUrl,
 					accountIds: this.#host.modelRegistry.accountIdsForModel(currentModel.provider, currentModel.id),
 					signal,
 				},

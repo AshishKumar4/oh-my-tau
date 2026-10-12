@@ -83,6 +83,7 @@ export function createApiKeyResolver(
 			const rotation = await registry.authStorage.limits.rotate(provider, sessionId, {
 				error,
 				modelId,
+				baseUrl,
 				accountIds: registry.accountIdsForModel?.(provider, modelId),
 				signal,
 				apiKey: previousKey,
