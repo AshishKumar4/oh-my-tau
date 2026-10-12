@@ -345,7 +345,11 @@ describe("provider credential pools with model-scoped key quotas", () => {
 			errorMessage: "429 Your prepaid balance is used up: Add funds or enable auto top-up",
 		});
 
-		expect(storage.limits.pools("cursor", "composer-2.5")[0]?.blocked).toBe(1);
+		const [keyPool] = storage.limits.pools("cursor", "composer-2.5");
+		expect(keyPool?.blocked).toBe(1);
+		// A used-up balance does not come back within a minute; the block must not
+		// expire before the quota-exhausted backoff and re-try the dead key.
+		expect(keyPool?.retryAtMs).toBeGreaterThan(Date.now() + 25 * 60_000);
 	});
 });
 

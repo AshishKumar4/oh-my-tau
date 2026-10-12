@@ -1,6 +1,6 @@
 import { scheduler } from "node:timers/promises";
 import * as AIError from "../error";
-import { isAccountBillingExhaustion, isUsageLimitOutcome } from "../error/rate-limit";
+import { calculateRateLimitBackoffMs, isAccountBillingExhaustion, isUsageLimitOutcome } from "../error/rate-limit";
 import { extractProviderRetryHint } from "../utils/retry-after";
 import { HOUR_MS } from "../usage/shared";
 import type { CredentialRankingContext, CredentialRankingStrategy } from "../usage";
@@ -321,19 +321,22 @@ export class RateLimits implements LimitsApi {
 		const credentialType = sessionCredential.type;
 		const targetCredentialId = target.id;
 
+		// Exhausted credits or a spend cap stop the account for every model and do
+		// not lift within a retry window. A model quota window (`tier:fable`,
+		// Cursor `pool:api`) keeps its own scope and the short default block.
+		const billingExhausted = options?.errorMessage !== undefined && isAccountBillingExhaustion(options.errorMessage);
 		const routing = this.#credentialBlockRouting(
 			provider,
 			credentialType,
 			options?.modelId,
-			// Exhausted credits or a spend cap stop the account for every model; a
-			// model quota window (`tier:fable`, Cursor `pool:api`) keeps its own scope.
-			options?.errorMessage !== undefined && isAccountBillingExhaustion(options.errorMessage)
-				? ACCOUNT_WIDE_BLOCK_SCOPE
-				: undefined,
+			billingExhausted ? ACCOUNT_WIDE_BLOCK_SCOPE : undefined,
 			options?.accountIds,
 		);
 		const now = Date.now();
-		const requestedBlockedUntilMs = now + (options?.retryAfterMs ?? DEFAULT_BLOCK_MS);
+		// Without a provider hint, billing exhaustion takes the quota-exhausted
+		// backoff turn recovery uses, so a spent key is not re-tried a minute later.
+		const fallbackBlockMs = billingExhausted ? calculateRateLimitBackoffMs("QUOTA_EXHAUSTED") : DEFAULT_BLOCK_MS;
+		const requestedBlockedUntilMs = now + (options?.retryAfterMs ?? fallbackBlockMs);
 		let blockedUntil = requestedBlockedUntilMs;
 		// Heuristic/default fallbacks are guesses; provider-stated hints and
 		// report-derived extensions are timed.
