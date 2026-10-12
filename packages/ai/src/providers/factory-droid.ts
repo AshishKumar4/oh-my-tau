@@ -16,7 +16,7 @@ import {
 	resolveFactoryDroidInferenceRegion,
 } from "@oh-my-pi/pi-catalog/wire/factory-droid";
 import { NO_AUTH_SENTINEL } from "../auth-retry";
-import type { OAuthRequestIdentity } from "../auth/types";
+import type { CredentialRequestScope } from "../auth/types";
 import * as AIError from "../error";
 import { mapAnthropicToolChoice } from "../stream";
 import type { Api, Context, Model, ModelSpec, ServiceTier, StreamFunction, StreamOptions, ToolChoice } from "../types";
@@ -122,7 +122,7 @@ function scopeToAccount(
 	model: Model<"factory-droid-agent">,
 	registry: FactoryDroidModelPolicy | undefined,
 	wire: FactoryDroidWire,
-	identity: OAuthRequestIdentity | undefined,
+	identity: CredentialRequestScope | undefined,
 	token: string,
 ): AccountScope {
 	if (!identity) {
@@ -549,7 +549,7 @@ export const streamFactoryDroid: StreamFunction<"factory-droid-agent"> = (
 			}
 			const registry = resolveFactoryDroidPolicy(model);
 			const wire = registry?.wire ?? "openai-completions";
-			const scope = scopeToAccount(model, registry, wire, options?.oauthIdentity, harnessToken);
+			const scope = scopeToAccount(model, registry, wire, options?.credentialScope, harnessToken);
 			// The proxy expects v4-shaped ids; the OMP session id is a UUIDv7-style
 			// timestamp id, so it maps through a deterministic v4 shape that stays
 			// stable per session.

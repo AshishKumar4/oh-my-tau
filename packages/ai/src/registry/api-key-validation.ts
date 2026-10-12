@@ -1,4 +1,6 @@
+import { type } from "@oh-my-pi/omptype";
 import { OpenAIHttpError, ProviderHttpError } from "../error/classes";
+import { isAnthropicWorkspaceDenial } from "../error/flags";
 import type { FetchImpl } from "../types";
 
 type OpenAICompatibleValidationOptions = {
@@ -172,4 +174,104 @@ export async function validateApiKeyAgainstModelsEndpoint(options: ModelListVali
 	}
 
 	throw await createApiKeyValidationError(options.provider, response);
+}
+
+/** Where the Claude Console lists an organization's workspaces and their IDs. */
+export const ANTHROPIC_WORKSPACES_URL = "https://platform.claude.com/settings/workspaces";
+
+/** A workspace an Anthropic API key can name in `anthropic-workspace-id`. */
+export interface AnthropicWorkspace {
+	id: string;
+	name: string;
+}
+
+/**
+ * Asks the user to settle an Anthropic key's workspace. Either callback
+ * resolves `undefined` when the user cancels.
+ */
+export interface AnthropicWorkspacePrompts {
+	/** Choose among the workspaces the key lists. */
+	pick(workspaces: readonly AnthropicWorkspace[]): Promise<string | undefined>;
+	/** Enter a workspace ID; the key may not list workspaces. */
+	ask(): Promise<string | undefined>;
+}
+
+const workspaceListSchema = type({
+	data: type({ id: "string", name: "string", "archived_at?": "string | null" }).array(),
+});
+
+async function requestAnthropicModels(
+	baseUrl: string,
+	apiKey: string,
+	workspaceId: string | undefined,
+	signal: AbortSignal,
+	fetchImpl: FetchImpl,
+): Promise<Response> {
+	return fetchImpl(`${baseUrl}/v1/models?limit=1`, {
+		method: "GET",
+		headers: {
+			"anthropic-version": "2023-06-01",
+			"x-api-key": apiKey,
+			...(workspaceId ? { "anthropic-workspace-id": workspaceId } : {}),
+		},
+		signal,
+	});
+}
+
+/** The key's unarchived workspaces, or `undefined` when it may not list them (that needs an admin's key). */
+async function listAnthropicWorkspaces(
+	baseUrl: string,
+	apiKey: string,
+	signal: AbortSignal,
+	fetchImpl: FetchImpl,
+): Promise<AnthropicWorkspace[] | undefined> {
+	const response = await fetchImpl(`${baseUrl}/v1/organizations/workspaces?include_default=true&limit=1000`, {
+		method: "GET",
+		headers: { "anthropic-version": "2023-06-01", "x-api-key": apiKey },
+		signal,
+	});
+	if (!response.ok) return undefined;
+	const parsed = workspaceListSchema(await response.json());
+	if (parsed instanceof type.errors) return undefined;
+	return parsed.data.flatMap(({ id, name, archived_at }) => (archived_at ? [] : [{ id, name }]));
+}
+
+/**
+ * Settle the workspace an Anthropic API key needs before it is stored. A key
+ * scoped to a workspace needs none. A key that is not must name one on every
+ * request: its only workspace is used, the user picks among several, and the
+ * user enters an ID when the key may not list them. The choice is verified
+ * against the API. Resolves `undefined` when the user cancels; throws for a key
+ * or workspace the API rejects.
+ */
+export async function resolveAnthropicKeyWorkspace(
+	apiKey: string,
+	prompts: AnthropicWorkspacePrompts,
+	options: { baseUrl: string; signal?: AbortSignal; fetch?: FetchImpl },
+): Promise<{ workspaceId?: string } | undefined> {
+	const timeoutSignal = AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
+	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+	const fetchImpl = options.fetch ?? fetch;
+	const baseUrl = normalizeAnthropicCompatibleBaseUrl(options.baseUrl);
+
+	const probe = await requestAnthropicModels(baseUrl, apiKey, undefined, signal, fetchImpl);
+	if (probe.ok) return {};
+	const error = await createApiKeyValidationError("Anthropic", probe);
+	if (probe.status !== 400 || !isAnthropicWorkspaceDenial(error)) throw error;
+
+	const workspaces = await listAnthropicWorkspaces(baseUrl, apiKey, signal, fetchImpl);
+	const workspaceId = !workspaces?.length
+		? (await prompts.ask())?.trim()
+		: workspaces.length === 1
+			? workspaces[0].id
+			: await prompts.pick(workspaces);
+	if (!workspaceId) return undefined;
+
+	// The prompts may wait on the user far longer than the request timeout.
+	const verifySignal = options.signal
+		? AbortSignal.any([options.signal, AbortSignal.timeout(VALIDATION_TIMEOUT_MS)])
+		: AbortSignal.timeout(VALIDATION_TIMEOUT_MS);
+	const verify = await requestAnthropicModels(baseUrl, apiKey, workspaceId, verifySignal, fetchImpl);
+	if (!verify.ok) throw await createApiKeyValidationError("Anthropic", verify);
+	return { workspaceId };
 }

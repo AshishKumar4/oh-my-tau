@@ -18,7 +18,7 @@ import { CODEX_BASE_URL } from "@oh-my-pi/pi-catalog/wire/codex";
 import { $env, $pickenv, getProviderInFlightRoot, isEnoent, logger, untilAborted } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
 import { createAuthRetryKeyState, isApiKeyResolver, resolvedApiKeyBearer, resolveNextAuthRetryKey } from "./auth-retry";
-import type { OAuthRequestIdentity } from "./auth/types";
+import type { CredentialRequestScope } from "./auth/types";
 import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
 import { isConcurrencyCapExclusion, isUsageLimitOutcome } from "./error/rate-limit";
@@ -1324,7 +1324,7 @@ function streamSimpleRequest<TApi extends Api>(
 		const runAttempt = async (
 			apiKey?: string,
 			credentialId?: number,
-			oauthIdentity?: OAuthRequestIdentity,
+			credentialScope?: CredentialRequestScope,
 		): Promise<AuthRetryFailure | undefined> => {
 			const bufferedEvents: AssistantMessageEvent[] = [];
 			let emittedReplayUnsafeEvent = false;
@@ -1334,7 +1334,7 @@ function streamSimpleRequest<TApi extends Api>(
 			};
 
 			try {
-				const attemptOptions = { ...requestOptions, apiKey, credentialId, oauthIdentity };
+				const attemptOptions = { ...requestOptions, apiKey, credentialId, credentialScope };
 				const inner = streamSimpleRequest(model, context, attemptOptions);
 				for await (const event of inner) {
 					if (credentialId !== undefined) {
@@ -1402,12 +1402,12 @@ function streamSimpleRequest<TApi extends Api>(
 		void (async () => {
 			let lastKey: string | undefined;
 			let credentialId: number | undefined;
-			let oauthIdentity: OAuthRequestIdentity | undefined;
+			let credentialScope: CredentialRequestScope | undefined;
 			try {
 				const resolved = await apiKeyResolver({ lastChance: false, error: undefined, signal });
 				lastKey = resolvedApiKeyBearer(resolved);
 				credentialId = typeof resolved === "string" ? undefined : resolved?.credentialId;
-				oauthIdentity = typeof resolved === "string" ? undefined : resolved?.oauthIdentity;
+				credentialScope = typeof resolved === "string" ? undefined : resolved?.credentialScope;
 			} catch (error) {
 				// A thrown resolver is a broker/OAuth/network failure, not a missing
 				// key — surface the cause instead of masking it as "No API key".
@@ -1429,14 +1429,14 @@ function streamSimpleRequest<TApi extends Api>(
 				return;
 			}
 			const retryState = createAuthRetryKeyState(lastKey);
-			let failure = await runAttempt(lastKey, credentialId, oauthIdentity);
+			let failure = await runAttempt(lastKey, credentialId, credentialScope);
 			if (!failure) return;
 			while (true) {
 				// Caller aborted between attempts: don't mint a fresh token or fire
 				// another doomed request — emit the captured failure instead.
 				if (signal?.aborted) break;
 				let nextCredentialId: number | undefined;
-				let nextOAuthIdentity: OAuthRequestIdentity | undefined;
+				let nextOAuthIdentity: CredentialRequestScope | undefined;
 				const nextKey = await resolveNextAuthRetryKey(
 					retryState,
 					apiKeyResolver,
@@ -1444,7 +1444,7 @@ function streamSimpleRequest<TApi extends Api>(
 					signal,
 					resolved => {
 						nextCredentialId = typeof resolved === "string" ? undefined : resolved?.credentialId;
-						nextOAuthIdentity = typeof resolved === "string" ? undefined : resolved?.oauthIdentity;
+						nextOAuthIdentity = typeof resolved === "string" ? undefined : resolved?.credentialScope;
 					},
 				);
 				if (nextKey === undefined) break;
@@ -1854,7 +1854,7 @@ function mapOptionsForApi<TApi extends Api>(
 		signal: options?.signal,
 		apiKey: apiKey ?? (typeof options?.apiKey === "string" ? options.apiKey : undefined),
 		credentialId: options?.credentialId,
-		oauthIdentity: options?.oauthIdentity,
+		credentialScope: options?.credentialScope,
 		cacheRetention: options?.cacheRetention,
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,

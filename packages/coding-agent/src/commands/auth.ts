@@ -17,10 +17,14 @@ export default class Auth extends Command {
 
 	static flags = {
 		json: Flags.boolean({ description: "Output JSON" }),
+		workspace: Flags.string({
+			description: "Anthropic workspace ID for a key not scoped to one (add; asked for when omitted)",
+		}),
 	};
 
 	static examples = [
 		`# Add a key to the anthropic pool (hidden prompt; or pipe it on stdin)\n  ${APP_NAME} auth keys add anthropic`,
+		`# Add a key that is not scoped to a workspace, naming the workspace its requests use\n  ${APP_NAME} auth keys add anthropic --workspace wrkspc_01Jw…`,
 		`# List pooled keys (masked) and the serving order\n  ${APP_NAME} auth keys list anthropic`,
 		`# Remove a pooled key by its id\n  ${APP_NAME} auth keys remove anthropic 12`,
 		`# Serve pooled API keys before subscriptions\n  ${APP_NAME} config set auth.poolOrder '{"anthropic":"api-keys-first"}'`,
@@ -36,6 +40,6 @@ export default class Auth extends Command {
 			id = Number(args.id);
 			if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`Invalid key id '${args.id}'`);
 		}
-		await runAuthKeysCommand({ action, provider: args.provider, id, json: flags.json });
+		await runAuthKeysCommand({ action, provider: args.provider, id, workspace: flags.workspace, json: flags.json });
 	}
 }

@@ -33,6 +33,8 @@ export type ApiKeyCredential = {
 	type: "api_key";
 	key: string;
 	source?: "login";
+	/** Anthropic: the workspace requests name when the key is not scoped to one (`anthropic-workspace-id`). */
+	workspaceId?: string;
 };
 
 /** Characters a masked key must keep hidden; shorter keys display as `…` alone. */
@@ -531,11 +533,16 @@ export type AuthApiKeyOptions = {
 	refreshReason?: OAuthRefreshReason;
 };
 
-/** Non-secret identity bound to the OAuth credential selected for one request attempt. */
-export interface OAuthRequestIdentity {
+/** Non-secret request scope bound to the stored credential selected for one request attempt. */
+export interface CredentialRequestScope {
+	/** OAuth: the account's organization. */
 	orgId?: string;
+	/** OAuth: the account's region. */
 	region?: string;
+	/** OAuth: where the account's inference runs. */
 	inferenceRegion?: "global" | "eu" | "us";
+	/** API key: the workspace an Anthropic key that is not scoped to one must name on every request. */
+	workspaceId?: string;
 }
 
 /**
@@ -907,10 +914,11 @@ export interface CredentialsApi {
 	/**
 	 * Add one API key to the provider's key pool. Distinct keys are appended
 	 * alongside existing keys and OAuth accounts; re-adding a stored key reuses
-	 * its row. Pooled keys serve in `auth.poolOrder` with the provider's OAuth
-	 * accounts and rotate when a key fails. Resolves with the stored row.
+	 * its row and replaces its `workspaceId`. Pooled keys serve in
+	 * `auth.poolOrder` with the provider's OAuth accounts and rotate when a key
+	 * fails. Resolves with the stored row.
 	 */
-	addApiKey(provider: string, key: string): Promise<StoredAuthCredential>;
+	addApiKey(provider: string, key: string, options?: { workspaceId?: string }): Promise<StoredAuthCredential>;
 	/**
 	 * The provider's pooled API keys (rows added through `addApiKey` or `/login`),
 	 * in storage order. Excludes legacy or broker-migrated static keys and

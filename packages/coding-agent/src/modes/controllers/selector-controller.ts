@@ -1,8 +1,17 @@
 import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
-import type { Model, PASTE_CODE_LOGIN_PROVIDERS as PasteCodeLoginProviders, UsageReport } from "@oh-my-pi/pi-ai";
+import type {
+	buildAnthropicAuthConfig as BuildAnthropicAuthConfig,
+	Model,
+	PASTE_CODE_LOGIN_PROVIDERS as PasteCodeLoginProviders,
+	UsageReport,
+} from "@oh-my-pi/pi-ai";
 import type { getOAuthProviders as GetOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
+import type {
+	ANTHROPIC_WORKSPACES_URL as AnthropicWorkspacesUrl,
+	resolveAnthropicKeyWorkspace as ResolveAnthropicKeyWorkspace,
+} from "@oh-my-pi/pi-ai/registry/api-key-validation";
 import { maskApiKey } from "@oh-my-pi/pi-ai/auth-storage";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
@@ -154,22 +163,30 @@ function loadModelOverlayComponents(): ModelOverlayModules {
 }
 
 interface ProviderAuthUiModules {
+	ANTHROPIC_WORKSPACES_URL: typeof AnthropicWorkspacesUrl;
+	buildAnthropicAuthConfig: typeof BuildAnthropicAuthConfig;
 	PASTE_CODE_LOGIN_PROVIDERS: typeof PasteCodeLoginProviders;
 	getOAuthProviders: typeof GetOAuthProviders;
 	LoginDialogComponent: typeof LoginDialogComponentType;
 	LogoutAccountSelectorComponent: typeof LogoutAccountSelectorComponentType;
 	OAuthSelectorComponent: typeof OAuthSelectorComponentType;
+	resolveAnthropicKeyWorkspace: typeof ResolveAnthropicKeyWorkspace;
 }
 
 /** Synchronous first-use boundary for provider auth catalog and dialog components. */
 function loadProviderAuthUi(): ProviderAuthUiModules {
+	const piAi = require("@oh-my-pi/pi-ai/index.js");
+	const apiKeyValidation = require("@oh-my-pi/pi-ai/registry/api-key-validation.js");
 	return {
-		PASTE_CODE_LOGIN_PROVIDERS: require("@oh-my-pi/pi-ai/index.js").PASTE_CODE_LOGIN_PROVIDERS,
+		ANTHROPIC_WORKSPACES_URL: apiKeyValidation.ANTHROPIC_WORKSPACES_URL,
+		buildAnthropicAuthConfig: piAi.buildAnthropicAuthConfig,
+		PASTE_CODE_LOGIN_PROVIDERS: piAi.PASTE_CODE_LOGIN_PROVIDERS,
 		getOAuthProviders: require("@oh-my-pi/pi-ai/registry/oauth/index.js").getOAuthProviders,
 		LoginDialogComponent: require("@oh-my-pi/pi-tui/overlays/login-dialog.js").LoginDialogComponent,
 		LogoutAccountSelectorComponent: require("@oh-my-pi/pi-tui/overlays/logout-account-selector.js")
 			.LogoutAccountSelectorComponent,
 		OAuthSelectorComponent: require("@oh-my-pi/pi-tui/overlays/oauth-selector.js").OAuthSelectorComponent,
+		resolveAnthropicKeyWorkspace: apiKeyValidation.resolveAnthropicKeyWorkspace,
 	};
 }
 
@@ -1887,7 +1904,11 @@ export class SelectorController {
 		return this.#handleOAuthLogin(providerId);
 	}
 
-	/** Read one API key through a masked prompt and add it to the provider's key pool. */
+	/**
+	 * Read one API key through a masked prompt and add it to the provider's key
+	 * pool. An Anthropic key that is not scoped to a workspace also gets the
+	 * workspace its requests name: its only one, a pick among several, or a typed ID.
+	 */
 	async #handleApiKeyLogin(providerId: string): Promise<boolean> {
 		const { dialog, restoreEditor } = this.#openLoginDialog(providerId);
 		try {
@@ -1899,18 +1920,51 @@ export class SelectorController {
 				this.ctx.showStatus("No API key entered");
 				return false;
 			}
+			let scope: { workspaceId?: string } | undefined = {};
+			if (providerId === "anthropic") {
+				const { ANTHROPIC_WORKSPACES_URL, buildAnthropicAuthConfig, resolveAnthropicKeyWorkspace } =
+					loadProviderAuthUi();
+				dialog.showProgress("Checking the key…");
+				scope = await resolveAnthropicKeyWorkspace(
+					key,
+					{
+						pick: async workspaces => {
+							// The selector takes the editor slot; the dialog has nothing left to ask.
+							restoreEditor();
+							const idByLabel = new Map(workspaces.map(({ id, name }) => [`${name} (${id})`, id]));
+							const choice = await this.ctx.showHookSelector(
+								"This key is not scoped to a workspace. Pick the one its requests use",
+								[...idByLabel.keys()],
+							);
+							return choice === undefined ? undefined : idByLabel.get(choice);
+						},
+						ask: () =>
+							dialog.showPrompt({
+								message: `This key is not scoped to a workspace and may not list them. Workspace ID (wrkspc_…), from ${ANTHROPIC_WORKSPACES_URL}:`,
+								secret: false,
+							}),
+					},
+					{ baseUrl: buildAnthropicAuthConfig(key).baseUrl, signal: dialog.signal },
+				);
+				if (dialog.signal.aborted) return false;
+			}
+			if (!scope) {
+				this.ctx.showStatus("No workspace chosen; the API key was not added");
+				return false;
+			}
 			const authStorage = this.ctx.session.modelRegistry.authStorage;
 			const pooledBefore = new Set(authStorage.credentials.pooledApiKeys(providerId).map(row => row.id));
-			const row = await authStorage.credentials.addApiKey(providerId, key);
+			const row = await authStorage.credentials.addApiKey(providerId, key, scope);
 			await this.ctx.session.modelRegistry.refreshProvider(providerId, "online");
 			const total = authStorage.credentials.pooledApiKeys(providerId).length;
-			const outcome = pooledBefore.has(row.id) ? "is already pooled for" : "added to";
+			const outcome = pooledBefore.has(row.id) ? "updated for" : "added to";
+			const workspace = scope.workspaceId ? `, workspace ${scope.workspaceId}` : "";
 			const block = new TranscriptBlock();
 			block.addChild(
 				new Text(
 					theme.fg(
 						"success",
-						`${theme.status.success} API key ${maskApiKey(key)} ${outcome} ${providerId} (${total} pooled key${total === 1 ? "" : "s"})`,
+						`${theme.status.success} API key ${maskApiKey(key)} ${outcome} ${providerId}${workspace} (${total} pooled key${total === 1 ? "" : "s"})`,
 					),
 					1,
 					0,

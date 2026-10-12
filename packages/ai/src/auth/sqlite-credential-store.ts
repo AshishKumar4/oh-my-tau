@@ -134,7 +134,11 @@ function normalizeStoredIdentityKey(identityKey: string | null | undefined): str
 
 export function serializeCredential(provider: string, credential: AuthCredential): SerializedCredentialRecord | null {
 	if (credential.type === "api_key") {
-		const data = credential.source === "login" ? { key: credential.key, source: "login" } : { key: credential.key };
+		const data = {
+			key: credential.key,
+			...(credential.source === "login" ? { source: "login" } : {}),
+			...(credential.workspaceId ? { workspaceId: credential.workspaceId } : {}),
+		};
 		return {
 			credentialType: "api_key",
 			data: JSON.stringify(data),
@@ -165,8 +169,12 @@ function deserializeCredential(row: AuthRow): AuthCredential | null {
 	if (row.credential_type === "api_key") {
 		const data = parsed as Record<string, unknown>;
 		if (typeof data.key === "string") {
-			const source = data.source === "login" ? "login" : undefined;
-			return source ? { type: "api_key", key: data.key, source } : { type: "api_key", key: data.key };
+			return {
+				type: "api_key",
+				key: data.key,
+				...(data.source === "login" ? { source: "login" } : {}),
+				...(typeof data.workspaceId === "string" && data.workspaceId ? { workspaceId: data.workspaceId } : {}),
+			};
 		}
 	}
 	if (row.credential_type === "oauth") {

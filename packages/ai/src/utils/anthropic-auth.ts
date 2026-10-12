@@ -18,6 +18,8 @@ export interface AnthropicAuthConfig {
 	apiKey: string;
 	baseUrl: string;
 	isOAuth: boolean;
+	/** The stored key's workspace (`anthropic-workspace-id`), from its credential scope. */
+	workspaceId?: string;
 }
 
 const DEFAULT_BASE_URL = "https://api.anthropic.com";
@@ -54,11 +56,12 @@ export function isOAuthToken(apiKey: string): boolean {
  * `isOAuth` is derived from the token prefix so the helper stays pure: callers
  * never have to thread the OAuth flag through their own resolution logic.
  */
-export function buildAnthropicAuthConfig(apiKey: string, baseUrl?: string): AnthropicAuthConfig {
+export function buildAnthropicAuthConfig(apiKey: string, baseUrl?: string, workspaceId?: string): AnthropicAuthConfig {
 	return {
 		apiKey,
 		baseUrl: normalizeBaseUrl(baseUrl) ?? resolveAnthropicBaseUrlFromEnv() ?? DEFAULT_BASE_URL,
 		isOAuth: isOAuthToken(apiKey),
+		...(workspaceId ? { workspaceId } : {}),
 	};
 }
 
@@ -77,6 +80,7 @@ export function buildAnthropicSearchHeaders(auth: AnthropicAuthConfig): Record<s
 		extraBetas: ["web-search-2025-03-05"],
 		stream: false,
 		modelHeaders: resolveAnthropicCustomHeadersForBaseUrl(auth.baseUrl),
+		workspaceId: auth.workspaceId,
 	});
 }
 

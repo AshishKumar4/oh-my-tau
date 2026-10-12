@@ -203,6 +203,8 @@ export type AnthropicHeaderOptions = {
 	servedClaudeCodeVersion?: string;
 	/** Allow explicit fingerprint headers to replace OAuth defaults on non-official endpoints. */
 	allowAnthropicHeaderOverrides?: boolean;
+	/** API key only: the workspace a key not scoped to one names (`anthropic-workspace-id`). */
+	workspaceId?: string;
 };
 
 // Build deduplicated beta header string
@@ -421,7 +423,12 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 			...(incomingApiKey ? { "X-Api-Key": incomingApiKey } : {}),
 		};
 		return allowAnthropicHeaderOverrides ? mergeHeaders(headers, anthropicHeaderOverrides) : headers;
-	} else if (!isOfficialAnthropicApiUrl(options.baseUrl)) {
+	}
+	// The key's own workspace outranks a configured one: it is what that key needs.
+	const workspaceHeader: Record<string, string> = options.workspaceId
+		? { "anthropic-workspace-id": options.workspaceId }
+		: {};
+	if (!isOfficialAnthropicApiUrl(options.baseUrl)) {
 		// A keyless provider (`auth: none`) resolves to the `N/A` sentinel
 		// rather than a real key; custom endpoints that authenticate via their
 		// own headers may reject a bogus bearer, so send no Authorization —
@@ -437,18 +444,19 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 			...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
 			...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
 			...(incomingApiKey ? { "X-Api-Key": incomingApiKey } : {}),
-		};
-	} else {
-		return {
-			...modelHeaders,
-			Accept: acceptHeader,
-			...sharedHeaders,
-			...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
-			...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
-			...(incomingAuthorization ? { Authorization: incomingAuthorization } : {}),
-			"X-Api-Key": incomingApiKey ?? options.apiKey,
+			...workspaceHeader,
 		};
 	}
+	return {
+		...modelHeaders,
+		Accept: acceptHeader,
+		...sharedHeaders,
+		...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
+		...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
+		...(incomingAuthorization ? { Authorization: incomingAuthorization } : {}),
+		"X-Api-Key": incomingApiKey ?? options.apiKey,
+		...workspaceHeader,
+	};
 }
 
 type AnthropicCacheControl = NonNullable<TextBlockParam["cache_control"]>;
@@ -1194,6 +1202,8 @@ export type AnthropicClientOptionsArgs = {
 	 * client rebuilt after a version rejection resolves the adopted version.
 	 */
 	servedClaudeCodeVersion?: string;
+	/** API key only: the stored key's workspace (`anthropic-workspace-id`). */
+	workspaceId?: string;
 	/** Working-identity cache key for this credential+host; undefined off the Copilot path. */
 	copilotCacheKey?: string;
 	/**
@@ -2384,6 +2394,7 @@ const streamAnthropicOnce = (
 						extractClaudeMetadataSessionId(options?.metadata?.user_id) ??
 						options?.promptCacheKey,
 					servedClaudeCodeVersion,
+					workspaceId: options?.credentialScope?.workspaceId,
 					disableStrictTools,
 				};
 				const created = createClient(model, clientArgs);
@@ -3729,6 +3740,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		maxRetryDelayMs,
 		sessionId,
 		servedClaudeCodeVersion,
+		workspaceId,
 		disableStrictTools: disableStrictToolsOverride,
 		copilotCacheKey,
 		copilotCacheSnapshot,
@@ -3844,6 +3856,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		allowAnthropicHeaderOverrides: model.compat.allowAnthropicHeaderOverrides,
 		claudeCodeSessionId: sessionId,
 		servedClaudeCodeVersion,
+		workspaceId,
 		claudeCodeBetas: oauthToken
 			? buildClaudeCodeBetas({
 					agentRequest: hasTools || thinkingEnabled,

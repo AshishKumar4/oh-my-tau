@@ -25,7 +25,7 @@ import { fallbackCreditTargets } from "@oh-my-pi/pi-catalog/compat/fallback-cred
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
-import { isUnexpectedSocketCloseMessage, logger, prompt, sleepLong } from "@oh-my-pi/pi-utils";
+import { APP_NAME, isUnexpectedSocketCloseMessage, logger, prompt, sleepLong } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
 
@@ -775,12 +775,16 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * Final error for a usage-limit failure that no credential or model could absorb.
-	 * When the provider holds more than one pooled credential, names each pool, how
-	 * many members are exhausted, and when the earliest becomes usable again.
+	 * Final error for a credential failure that no credential or model could absorb.
+	 * An Anthropic key rejected for its workspace gets the fix. A usage limit, when
+	 * the provider holds more than one pooled credential, names each pool, how many
+	 * members are exhausted, and when the earliest becomes usable again.
 	 */
-	#poolExhaustedError(errorMessage: string, id: number): string {
+	#credentialFailureError(errorMessage: string, id: number): string {
 		const model = this.#host.model();
+		if (model?.provider === "anthropic" && AIError.isAnthropicWorkspaceDenial(errorMessage)) {
+			return `${errorMessage}\nAn API key in the anthropic key pool is not scoped to a workspace. Re-add it with /login anthropic › Add API key, or \`${APP_NAME} auth keys add anthropic\`, to set the workspace its requests use.`;
+		}
 		if (!model || !AIError.is(id, AIError.Flag.UsageLimit)) return errorMessage;
 		const pools = this.#host.modelRegistry.authStorage.limits.pools(model.provider, model.id);
 		const members = pools.reduce((total, pool) => total + pool.members, 0);
@@ -2659,7 +2663,7 @@ export class TurnRecovery {
 		if (retryBudgetExhausted) {
 			if (!switchedModel && !switchedCredential) {
 				const attempt = this.#retryAttempt - 1;
-				const finalError = this.#poolExhaustedError(errorMessage, id);
+				const finalError = this.#credentialFailureError(errorMessage, id);
 				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${finalError}`;
 				await this.persistTerminalEmptyErrorTurn(message);
 				const retryErrors = await this.#markPendingRetryErrors({ status: "superseded" });
@@ -2761,7 +2765,7 @@ export class TurnRecovery {
 				type: "auto_retry_end",
 				success: false,
 				attempt,
-				finalError: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${this.#poolExhaustedError(errorMessage, id)}`,
+				finalError: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${this.#credentialFailureError(errorMessage, id)}`,
 			});
 			this.#clearPendingRetryErrors();
 			this.resolveRetry();

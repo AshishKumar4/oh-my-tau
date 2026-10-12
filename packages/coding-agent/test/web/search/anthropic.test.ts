@@ -84,6 +84,43 @@ describe("Anthropic search request body", () => {
 		}
 	});
 
+	it("names a pooled key's stored workspace on the official endpoint", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		await authStorage.credentials.addApiKey("anthropic", "sk-ant-api03-POOLEDsearchKey000000", {
+			workspaceId: "wrkspc_01SEARCHworkspace",
+		});
+		const modelRegistry = new ModelRegistry(authStorage, undefined, { ignoreLocalModelConfig: true });
+		const model = buildModel({
+			id: "claude-haiku-4-5",
+			name: "Claude Haiku 4.5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 16_384,
+		});
+		try {
+			const cap = makeCaptureFetch();
+			await searchAnthropic({
+				query: "workspace scoped search",
+				systemPrompt: "Use web search.",
+				sessionId: "session-workspace",
+				authStorage,
+				modelRegistry,
+				model,
+				fetch: cap.fetch,
+			});
+
+			expect(cap.headers()?.get("x-api-key")).toBe("sk-ant-api03-POOLEDsearchKey000000");
+			expect(cap.headers()?.get("anthropic-workspace-id")).toBe("wrkspc_01SEARCHworkspace");
+		} finally {
+			authStorage.close();
+		}
+	});
+
 	it("builds a Claude-Code-shaped metadata.user_id for OAuth auth", async () => {
 		const accountUuid = "abcd1234-abcd-1234-abcd-1234abcd1234";
 		const fixture = createFixture();

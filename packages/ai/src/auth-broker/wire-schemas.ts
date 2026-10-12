@@ -93,6 +93,7 @@ export const apiKeyCredentialSchema: FluentType<ApiKeyCredential> = type({
 	type: "'api_key'",
 	key: type("string").atLeastLength(1),
 	"source?": "'login'",
+	"workspaceId?": type("string").atLeastLength(1),
 });
 
 /** Discriminated union accepted on POST /v1/credential (writes). */

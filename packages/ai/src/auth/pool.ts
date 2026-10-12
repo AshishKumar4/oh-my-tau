@@ -52,8 +52,13 @@ export function credentialDisabledEvent(
 export function authCredentialEquals(left: AuthCredential, right: AuthCredential): boolean {
 	if (left.type !== right.type) return false;
 	if (left.type === "api_key") {
-		// `source` decides pool membership, so a key promoted to the pool is a change.
-		return right.type === "api_key" && left.key === right.key && left.source === right.source;
+		// `source` decides pool membership and `workspaceId` the request scope, so either changing is a change.
+		return (
+			right.type === "api_key" &&
+			left.key === right.key &&
+			left.source === right.source &&
+			left.workspaceId === right.workspaceId
+		);
 	}
 	if (right.type !== "oauth") return false;
 	return (
@@ -146,8 +151,13 @@ export class CredentialPool implements CredentialsApi {
 	 * Add one API key to the provider's key pool (`source: "login"`). Distinct keys
 	 * are appended; re-adding a stored key reuses its row. Returns the stored row.
 	 */
-	async addApiKey(provider: string, key: string): Promise<StoredAuthCredential> {
-		const credential: ApiKeyCredential = { type: "api_key", key, source: "login" };
+	async addApiKey(provider: string, key: string, options?: { workspaceId?: string }): Promise<StoredAuthCredential> {
+		const credential: ApiKeyCredential = {
+			type: "api_key",
+			key,
+			source: "login",
+			...(options?.workspaceId ? { workspaceId: options.workspaceId } : {}),
+		};
 		const stored = await this.#store.upsertAuthCredential(provider, credential);
 		this.replace(
 			provider,

@@ -18,7 +18,7 @@ import type {
 	AuthSourceOptions,
 	KeysApi,
 	LimitsApi,
-	OAuthRequestIdentity,
+	CredentialRequestScope,
 } from "./types";
 
 /**
@@ -297,12 +297,14 @@ export class KeyCascade implements KeysApi {
 		options?: AuthApiKeyOptions,
 	): Promise<ResolvedApiKey | undefined> {
 		let credentialId: number | undefined;
-		let oauthIdentity: OAuthRequestIdentity | undefined;
+		let credentialScope: CredentialRequestScope | undefined;
 		const apiKey = await this.#resolve(provider, sessionId, options, (id, identity) => {
 			credentialId = id;
-			oauthIdentity = identity;
+			credentialScope = identity;
 		});
-		return apiKey === undefined ? undefined : { apiKey, credentialId, ...(oauthIdentity ? { oauthIdentity } : {}) };
+		return apiKey === undefined
+			? undefined
+			: { apiKey, credentialId, ...(credentialScope ? { credentialScope } : {}) };
 	}
 
 	/**
@@ -324,7 +326,7 @@ export class KeyCascade implements KeysApi {
 		provider: string,
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
-		onCredentialId?: (id: number, identity?: OAuthRequestIdentity) => void,
+		onCredentialId?: (id: number, identity?: CredentialRequestScope) => void,
 	): Promise<string | undefined> {
 		// Runtime override takes highest priority
 		const runtimeKey = this.#deps.overrides.runtimeKey(provider);
@@ -364,7 +366,7 @@ export class KeyCascade implements KeysApi {
 			credential => credential.source !== "login",
 		);
 		if (storedApiKey) {
-			if (storedApiKey.apiKey !== undefined) onCredentialId?.(storedApiKey.credentialId);
+			if (storedApiKey.apiKey !== undefined) onCredentialId?.(storedApiKey.credentialId, storedApiKey.identity);
 			return storedApiKey.apiKey;
 		}
 		if (oauthRefreshFailure) throw oauthRefreshFailure;
@@ -384,7 +386,7 @@ export class KeyCascade implements KeysApi {
 		provider: string,
 		sessionId: string | undefined,
 		options: AuthApiKeyOptions | undefined,
-		onCredentialId: ((id: number, identity?: OAuthRequestIdentity) => void) | undefined,
+		onCredentialId: ((id: number, identity?: CredentialRequestScope) => void) | undefined,
 	): Promise<{
 		apiKey?: string;
 		admitted?: boolean;
@@ -462,9 +464,10 @@ export class KeyCascade implements KeysApi {
 		options: AuthApiKeyOptions | undefined,
 		filter: (credential: ApiKeyCredential) => boolean,
 		strict = false,
-	): Promise<{ apiKey: string | undefined; credentialId: number } | undefined> {
+	): Promise<{ apiKey: string | undefined; credentialId: number; identity?: CredentialRequestScope } | undefined> {
 		const selection = await this.#deps.selector.selectApiKey(provider, sessionId, options, filter, strict);
 		if (!selection) return undefined;
+		const { workspaceId } = selection.credential;
 		let apiKey = await this.#deps.overrides.resolve(selection.credential.key);
 		if (!this.#deps.selector.syncApiKeySelection(provider, selection, filter)) apiKey = undefined;
 		if (apiKey !== undefined) {
@@ -472,7 +475,7 @@ export class KeyCascade implements KeysApi {
 			if (sessionId && !recorded) apiKey = undefined;
 		}
 		// An admitted but unresolved source must not silently enable a lower-precedence key.
-		return { apiKey, credentialId: selection.credentialId };
+		return { apiKey, credentialId: selection.credentialId, ...(workspaceId ? { identity: { workspaceId } } : {}) };
 	}
 
 	/**

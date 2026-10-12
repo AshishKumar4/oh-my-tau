@@ -38,7 +38,7 @@ import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import type { Api, FetchImpl, KnownApi, Model, Provider, ThinkingBudgets, Usage } from "@oh-my-pi/pi-catalog/types";
 import type { ApiKey } from "./auth-retry";
-import type { OAuthRequestIdentity } from "./auth/types";
+import type { CredentialRequestScope } from "./auth/types";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { FallbackParam, StopDetails } from "./providers/anthropic-wire";
@@ -526,7 +526,7 @@ export interface StreamOptions {
 	/** @internal Stored credential row serving this request, when known. */
 	credentialId?: number;
 	/** @internal Non-secret identity of the bearer serving this attempt; never persisted in history. */
-	oauthIdentity?: OAuthRequestIdentity;
+	credentialScope?: CredentialRequestScope;
 	cacheRetention?: CacheRetention;
 	/**
 	 * Anthropic preserved-thinking behavior when a signed block no longer matches

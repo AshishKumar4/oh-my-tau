@@ -14,6 +14,37 @@ import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 const CONSOLE_KEY = "sk-ant-api03-CONSOLEKEYsecretPART0123456789";
+const WORKSPACES = [
+	{ id: "wrkspc_01DEFAULTworkspace", name: "Default Workspace" },
+	{ id: "wrkspc_01CREDITSworkspace", name: "Credits" },
+];
+
+/**
+ * Stand-in for the Anthropic API a key is checked against: `/v1/models` answers
+ * a scoped key, an unscoped key only with a workspace it can use, and the
+ * workspace list is open unless `listable` is false.
+ */
+function installAnthropicApi(options: { scoped: boolean; listable?: boolean }): string[] {
+	const workspaceHeaders: string[] = [];
+	const api = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+		const request = input instanceof Request ? new Request(input, init) : new Request(input.toString(), init);
+		const url = new URL(request.url);
+		if (request.headers.get("x-api-key") !== CONSOLE_KEY) return Response.json({ type: "error" }, { status: 401 });
+		if (url.pathname === "/v1/organizations/workspaces") {
+			if (options.listable === false) return Response.json({ type: "error" }, { status: 403 });
+			return Response.json({ data: WORKSPACES.map(workspace => ({ ...workspace, archived_at: null })) });
+		}
+		const workspace = request.headers.get("anthropic-workspace-id");
+		if (workspace) workspaceHeaders.push(workspace);
+		if (options.scoped || WORKSPACES.some(entry => entry.id === workspace)) return Response.json({ data: [] });
+		const message = workspace
+			? "This API key cannot use that workspace"
+			: "This API key is not scoped to a workspace, so this request must include the anthropic-workspace-id header";
+		return Response.json({ type: "error", error: { type: "invalid_request_error", message } }, { status: 400 });
+	};
+	vi.spyOn(globalThis, "fetch").mockImplementation(Object.assign(api, { preconnect: globalThis.fetch.preconnect }));
+	return workspaceHeaders;
+}
 
 describe("/login API key entry", () => {
 	let tempDir = "";
@@ -70,6 +101,7 @@ describe("/login API key entry", () => {
 	}
 
 	it("adds a masked API key to the provider's key pool", async () => {
+		installAnthropicApi({ scoped: true });
 		ctx.showHookSelector = vi.fn(async () => "Add API key");
 
 		const login = controller.showOAuthSelector("login", "anthropic");
@@ -79,12 +111,89 @@ describe("/login API key entry", () => {
 		dialog.handleInput("\r");
 		await login;
 
-		expect(authStorage.credentials.pooledApiKeys("anthropic").map(row => row.credential.key)).toEqual([CONSOLE_KEY]);
+		expect(authStorage.credentials.pooledApiKeys("anthropic").map(row => row.credential)).toEqual([
+			{ type: "api_key", key: CONSOLE_KEY, source: "login" },
+		]);
 		const message = presented.map(rendered).join("\n");
 		expect(message).toContain("added to anthropic (1 pooled key)");
 		expect(message).not.toContain("CONSOLEKEYsecret");
 		expect(ctx.editorContainer.children).toEqual([ctx.editor]);
 		expect(ctx.showError).not.toHaveBeenCalled();
+	});
+
+	it("has the user pick the workspace of a key that is not scoped to one", async () => {
+		const verified = installAnthropicApi({ scoped: false });
+		let editorWhilePicking: unknown;
+		const offered: unknown[] = [];
+		ctx.showHookSelector = vi.fn(async (_title: string, items: unknown[]) => {
+			offered.push(items);
+			if (offered.length === 1) return "Add API key";
+			editorWhilePicking = [...ctx.editorContainer.children];
+			return "Credits (wrkspc_01CREDITSworkspace)";
+		});
+
+		const login = controller.showOAuthSelector("login", "anthropic");
+		const dialog = await dialogShown;
+		dialog.pasteText(CONSOLE_KEY);
+		dialog.handleInput("\r");
+		await login;
+
+		expect(offered[1]).toEqual([
+			"Default Workspace (wrkspc_01DEFAULTworkspace)",
+			"Credits (wrkspc_01CREDITSworkspace)",
+		]);
+		// The selector took the editor slot from the dialog, not from under it.
+		expect(editorWhilePicking).toEqual([ctx.editor]);
+		expect(verified).toEqual(["wrkspc_01CREDITSworkspace"]);
+		expect(authStorage.credentials.pooledApiKeys("anthropic").map(row => row.credential.workspaceId)).toEqual([
+			"wrkspc_01CREDITSworkspace",
+		]);
+		const message = presented.map(rendered).join("\n");
+		expect(message).toContain("added to anthropic, workspace wrkspc_01CREDITSworkspace (1 pooled key)");
+		expect(message).not.toContain("CONSOLEKEYsecret");
+		expect(ctx.showError).not.toHaveBeenCalled();
+	});
+
+	it("asks for the workspace ID when the key may not list workspaces", async () => {
+		installAnthropicApi({ scoped: false, listable: false });
+		ctx.showHookSelector = vi.fn(async () => "Add API key");
+
+		const login = controller.showOAuthSelector("login", "anthropic");
+		const dialog = await dialogShown;
+		const workspacePrompt = Promise.withResolvers<void>();
+		const showPrompt = dialog.showPrompt.bind(dialog);
+		vi.spyOn(dialog, "showPrompt").mockImplementation(prompt => {
+			const answer = showPrompt(prompt);
+			if (!prompt.secret) workspacePrompt.resolve();
+			return answer;
+		});
+		dialog.pasteText(CONSOLE_KEY);
+		dialog.handleInput("\r");
+		await workspacePrompt.promise;
+		expect(rendered(dialog)).toContain("platform.claude.com/settings/workspaces");
+		dialog.pasteText("wrkspc_01DEFAULTworkspace");
+		dialog.handleInput("\r");
+		await login;
+
+		expect(authStorage.credentials.pooledApiKeys("anthropic").map(row => row.credential.workspaceId)).toEqual([
+			"wrkspc_01DEFAULTworkspace",
+		]);
+		expect(ctx.showError).not.toHaveBeenCalled();
+	});
+
+	it("stores nothing for a key Anthropic rejects", async () => {
+		installAnthropicApi({ scoped: true });
+		ctx.showHookSelector = vi.fn(async () => "Add API key");
+
+		const login = controller.showOAuthSelector("login", "anthropic");
+		const dialog = await dialogShown;
+		dialog.pasteText("sk-ant-api03-REVOKEDkey0000000000000000");
+		dialog.handleInput("\r");
+		await login;
+
+		expect(authStorage.credentials.list("anthropic")).toEqual([]);
+		expect(ctx.showError).toHaveBeenCalledWith(expect.stringContaining("validation failed (401)"));
+		expect(ctx.editorContainer.children).toEqual([ctx.editor]);
 	});
 
 	it("stores nothing when the key prompt is cancelled", async () => {

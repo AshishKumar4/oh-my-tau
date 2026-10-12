@@ -24,7 +24,7 @@ import {
 	type CredentialCompletionResult,
 	completeSimple,
 	type Model,
-	type OAuthRequestIdentity,
+	type CredentialRequestScope,
 } from "@oh-my-pi/pi-ai";
 import {
 	AuthBrokerClient,
@@ -612,7 +612,7 @@ async function probeOneModel(
 	model: Model<Api>,
 	apiKey: string,
 	outerSignal: AbortSignal,
-	oauthIdentity?: OAuthRequestIdentity,
+	credentialScope?: CredentialRequestScope,
 ): Promise<CredentialCompletionResult> {
 	const start = Date.now();
 	const attemptTimeoutSignal = AbortSignal.timeout(STRICT_PROBE_PER_ATTEMPT_TIMEOUT_MS);
@@ -629,7 +629,7 @@ async function probeOneModel(
 		},
 		{
 			apiKey,
-			oauthIdentity,
+			credentialScope,
 			maxTokens: 32,
 			signal: attemptSignal,
 		},
@@ -661,7 +661,7 @@ function createStrictCompletionProbe(): CompletionProbe {
 			return { ok: null, reason: `no bearer-compatible probe model bundled for provider ${input.provider}` };
 		}
 		const apiKey = composeProbeApiKey(input.provider, input.credential);
-		const oauthIdentity =
+		const credentialScope =
 			input.credential.type === "oauth"
 				? {
 						orgId: input.credential.orgId,
@@ -678,7 +678,7 @@ function createStrictCompletionProbe(): CompletionProbe {
 					modelId: model.id,
 				};
 			}
-			const result = await probeOneModel(model, apiKey, input.signal, oauthIdentity);
+			const result = await probeOneModel(model, apiKey, input.signal, credentialScope);
 			if (result.ok === true) return result;
 			lastFailure = result;
 			if (!RETRYABLE_MODEL_ERROR_RE.test(result.reason ?? "")) {

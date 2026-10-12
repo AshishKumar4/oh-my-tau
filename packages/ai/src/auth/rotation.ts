@@ -41,8 +41,8 @@ import {
 	windowResetAt,
 } from "./usage-report";
 
-/** Org-wide OAuth denials need an admin change: bounded so lifting the policy self-heals, far past a rotate-and-retry. */
-const ORG_OAUTH_DENIAL_BLOCK_MS = 6 * HOUR_MS;
+/** Standing denials need a setting change: bounded so fixing it self-heals, far past a rotate-and-retry. */
+const STANDING_DENIAL_BLOCK_MS = 6 * HOUR_MS;
 /**
  * Longest sibling block {@link RateLimits.rotate} sleeps out instead of giving
  * up. Covers Cloud Code Assist capacity 429s ("Resets in 0s", sub-second
@@ -554,11 +554,11 @@ export class RateLimits implements LimitsApi {
 			) {
 				this.#deps.affinity.clear(provider, sessionId);
 			}
-			// An org-wide OAuth prohibition (`oauth_not_allowed_for_organization`)
-			// holds until an administrator changes the org setting and denies every
-			// model, so re-selecting the credential each minute only spends a 403
-			// per minute. A per-request content denial keeps the short window.
-			const blockMs = AIError.isOrgOAuthDenialError(error) ? ORG_OAUTH_DENIAL_BLOCK_MS : DEFAULT_BLOCK_MS;
+			// A standing denial (an org-wide OAuth prohibition, or a key rejected for
+			// its workspace) holds until someone changes a setting and denies every
+			// model, so re-selecting the credential each minute only spends a failed
+			// request per minute. A per-request content denial keeps the short window.
+			const blockMs = AIError.isStandingAccountDenial(error) ? STANDING_DENIAL_BLOCK_MS : DEFAULT_BLOCK_MS;
 			const mark = this.#blockCredentialForRotation(
 				provider,
 				sessionCredential.type,

@@ -4,6 +4,7 @@
 
 ### Changed
 
+- `OAuthRequestIdentity` / `oauthIdentity` are now `CredentialRequestScope` / `credentialScope`: the per-attempt request scope also carries an API key's workspace, not only an OAuth account's identity. `isOrgOAuthDenialError` is now `isStandingAccountDenial` and also covers a key rejected for its workspace
 - Claude Code harness requests now claim the release of the served capture (for example `claude-cli/2.1.284`) in the User-Agent and billing header instead of the pinned default, and seed the billing fingerprint from the user's own words like Claude Code does; `PI_AI_CLAUDE_CODE_VERSION` still overrides it and native mode keeps the pinned default. A minimum version adopted after the server rejects an older capture never lowers requests that serve no capture (native, side requests, OAuth refresh, usage) below the pinned default.
 
 ### Fixed
@@ -14,6 +15,7 @@
 
 ### Added
 
+- An API-key credential can carry an Anthropic `workspaceId`; `credentials.addApiKey(provider, key, { workspaceId })` stores it and every Anthropic request the key serves sends `anthropic-workspace-id`. `resolveAnthropicKeyWorkspace` (in `registry/api-key-validation`) settles a key's workspace before it is stored, and `withAuth` passes each attempt's credential scope to its callback
 - Added `createAuthGatewayRouter`, the auth-gateway's routes without the HTTP listener, and `serveAuthGatewayStdio`, which serves them as JSON lines (`{"id", "path", "body"}` in, `{"id", "status", "body"}` out) for a parent process.
 
 ## [18.4.11] - 2026-10-02

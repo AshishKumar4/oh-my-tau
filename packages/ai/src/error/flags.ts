@@ -198,6 +198,12 @@ const CONTENT_FILTER_PATTERN = /\b(?:incomplete:\s*)?content_filter\b/i;
 const ORG_OAUTH_DENIAL_PATTERN =
 	/\boauth_not_allowed_for_organization\b|oauth authentication is currently not allowed for this organization/i;
 const ACCOUNT_POLICY_PATTERN = /\bcyber_policy\b|trusted access for cyber/i;
+/**
+ * An Anthropic API key rejected for its workspace: the key is not scoped to
+ * one and the request named none, or named one the key cannot use. Both
+ * messages name the `anthropic-workspace-id` header.
+ */
+const ANTHROPIC_WORKSPACE_DENIAL_PATTERN = /\bnot scoped to a workspace\b|\banthropic-workspace-id\b/i;
 export const ANTHROPIC_ACCOUNT_POLICY_PATTERN =
 	/\b(?:oauth_not_allowed_for_organization|permission_error)\b|\bOAuth authentication is currently not allowed for this organization\b/i;
 
@@ -530,7 +536,7 @@ function classifyText(
 		// An org OAuth denial is deliberately absent here: it is account-scoped,
 		// not a content refusal, and `ContentBlocked` would stop the rotation that
 		// reaches a working credential. `isAnthropicAccountPolicyText` below marks
-		// it `AccountPolicy` alone; `isOrgOAuthDenialError` still drives the longer
+		// it `AccountPolicy` alone; `isStandingAccountDenial` still drives the longer
 		// set-aside window in `RateLimits.rotate`.
 		if (
 			ACCOUNT_POLICY_PATTERN.test(errorMessage) ||
@@ -540,6 +546,13 @@ function classifyText(
 			kinds |= Flag.AccountPolicy | Flag.ContentBlocked;
 		}
 		if (isAnthropicAccountPolicyText(errorMessage, provider, statusClean)) {
+			kinds |= Flag.AccountPolicy;
+		}
+		// A sibling key or a subscription may still serve, so rotate like a policy denial.
+		if (
+			(provider === undefined || provider === "anthropic") &&
+			ANTHROPIC_WORKSPACE_DENIAL_PATTERN.test(errorMessage)
+		) {
 			kinds |= Flag.AccountPolicy;
 		}
 		if (isAuthFailureText(errorMessage)) kinds |= Flag.AuthFailed;
@@ -745,13 +758,19 @@ export function isAccountPolicyError(error: unknown, api?: Api): boolean {
 }
 
 /**
- * Whether the denial is an organization-wide OAuth prohibition. It holds until
- * an administrator changes the org setting, unlike the per-request content
- * denials that share the account-policy flag, so the credential is worth
- * setting aside for longer than a rotate-and-retry window.
+ * Whether the denial holds until someone changes a setting: an
+ * organization-wide OAuth prohibition, or an Anthropic API key rejected for its
+ * workspace. Unlike the per-request content denials that share the
+ * account-policy flag, retrying soon only repeats it, so the credential is
+ * worth setting aside for longer than a rotate-and-retry window.
  */
-export function isOrgOAuthDenialError(error: unknown): boolean {
-	return matchesErrorText(error, text => ORG_OAUTH_DENIAL_PATTERN.test(text));
+export function isStandingAccountDenial(error: unknown): boolean {
+	return matchesErrorText(error, text => ORG_OAUTH_DENIAL_PATTERN.test(text)) || isAnthropicWorkspaceDenial(error);
+}
+
+/** Whether Anthropic rejected an API key for its workspace: none named for an unscoped key, or one it cannot use. */
+export function isAnthropicWorkspaceDenial(error: unknown): boolean {
+	return matchesErrorText(error, text => ANTHROPIC_WORKSPACE_DENIAL_PATTERN.test(text));
 }
 
 /**

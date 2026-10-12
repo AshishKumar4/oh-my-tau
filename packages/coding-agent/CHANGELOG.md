@@ -8,6 +8,7 @@
 - The model hub's Roles view now shows which agents run on each role. A custom role that no agent runs on and that is not in the quick-switch cycle is marked `no agents`, and selecting it explains how to use it: set an agent's model to `@ROLE` in `/agents`
 - A provider can pool any number of API keys alongside its subscription accounts. Add them with `omp auth keys add <provider>` (hidden prompt or piped stdin), see them masked with `omp auth keys list`, and remove one with `omp auth keys remove <provider> <id>`. A session keeps its key while it works and moves to the next key when the provider reports exhausted credits, a spend limit, or an invalid key
 - `/login anthropic` now offers "Add API key" next to the browser sign-in. The key goes in through a masked prompt and joins the provider's key pool
+- Adding an Anthropic API key that is not scoped to a workspace now settles its workspace: OMP takes the key's only workspace, asks you to pick among several, or asks for the ID when the key may not list them (`--workspace <id>` on `omp auth keys add`). The workspace is stored with the key and sent on every request it serves, including web search, model discovery and image uploads. `omp auth keys list` shows each key's workspace, and adding a stored key again replaces it
 - `/settings` › Providers › Credential Pool Order sets, per provider, whether subscriptions or pooled API keys serve first; the current session switches without a restart
 - `auth.poolOrder` sets, per provider, whether subscriptions (`subscription-first`, the default) or pooled API keys (`api-keys-first`) serve first. The other pool takes over once every credential in the first is exhausted, and the error names the earliest time a credential frees up when both pools are exhausted
 
@@ -26,6 +27,7 @@
 
 ### Fixed
 
+- A pooled Anthropic key that Anthropic rejects for its workspace (`not scoped to a workspace`) no longer fails the turn: the key is set aside for six hours and the next key or a subscription serves. When no credential remains, the error says how to add the key again with its workspace
 - Logging in to a subscription no longer disables API keys you saved through `/login`, and `omp auth-broker migrate` copies every distinct stored API key instead of only the first per provider
 - Anthropic's "credit balance is too low" error now rotates to another credential instead of failing as a bad request
 - `read agent://<id>/<path>` now warns when the value comes from the agent's previous run while it runs a newer turn; the warning is a separate block, so the extracted value stays exact

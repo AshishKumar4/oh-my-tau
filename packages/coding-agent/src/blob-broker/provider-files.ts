@@ -1,4 +1,4 @@
-import type { Context, ImageContent, Model } from "@oh-my-pi/pi-ai";
+import type { Context, ImageContent, Model, ResolvedApiKey } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import { contextHasImages, decorateContextProviderFiles } from "./context-images";
 import {
@@ -15,16 +15,17 @@ import { createAnthropicFileClient } from "./provider-files-anthropic";
 import { createGeminiProviderFileClient } from "./provider-files-gemini";
 import { createOpenAIFileClient } from "./provider-files-openai";
 
-/** Resolve the current account credential for a model without retaining it. */
-export type ProviderFileCredentialResolver = (model: Model) => Promise<string | undefined>;
+/** Resolve the current account credential, with its request scope, for a model without retaining it. */
+export type ProviderFileCredentialResolver = (model: Model) => Promise<ResolvedApiKey | undefined>;
 
 /** Select a provider-native file client for a model and resolved credential. */
-export type ProviderFileClientFactory = (model: Model, credential: string) => ProviderFileClient | null;
+export type ProviderFileClientFactory = (model: Model, credential: ResolvedApiKey) => ProviderFileClient | null;
 
 const DEFAULT_CLIENT_FACTORIES: readonly ProviderFileClientFactory[] = [
-	createGeminiProviderFileClient,
-	createAnthropicFileClient,
-	createOpenAIFileClient,
+	(model, credential) => createGeminiProviderFileClient(model, credential.apiKey),
+	(model, credential) =>
+		createAnthropicFileClient(model, credential.apiKey, globalThis.fetch, credential.credentialScope?.workspaceId),
+	(model, credential) => createOpenAIFileClient(model, credential.apiKey),
 ];
 
 function imageBlocks(context: Context): ImageContent[] {
@@ -80,7 +81,7 @@ export class ProviderFileManager {
 		const images = imageBlocks(context);
 		if (!images.some(block => !block.url && block.data.length > 0)) return context;
 
-		let credential: string | undefined;
+		let credential: ResolvedApiKey | undefined;
 		try {
 			credential = await this.#resolveCredential(model);
 		} catch (error) {
@@ -90,7 +91,7 @@ export class ProviderFileManager {
 			});
 			return context;
 		}
-		if (!credential) return context;
+		if (!credential?.apiKey) return context;
 		let client: ProviderFileClient | null;
 		try {
 			client = this.#clientFor(model, credential);
@@ -121,7 +122,13 @@ export class ProviderFileManager {
 		await Promise.all(
 			[...groups].map(async ([hash, group]) => {
 				try {
-					const handle = await this.#ensureHandle(client, credential, hash, group.bytes, group.blocks[0].mimeType);
+					const handle = await this.#ensureHandle(
+						client,
+						credential.apiKey,
+						hash,
+						group.bytes,
+						group.blocks[0].mimeType,
+					);
 					const reference = toProviderFileReference(handle);
 					for (const block of group.blocks) referenceByBlock.set(block, reference);
 				} catch (error) {
@@ -143,7 +150,7 @@ export class ProviderFileManager {
 		if (blocks.length === 0) return;
 		let credential: string | undefined;
 		try {
-			credential = await this.#resolveCredential(model);
+			credential = (await this.#resolveCredential(model))?.apiKey;
 		} catch {
 			return;
 		}
@@ -167,7 +174,7 @@ export class ProviderFileManager {
 		this.#cache.save();
 	}
 
-	#clientFor(model: Model, credential: string): ProviderFileClient | null {
+	#clientFor(model: Model, credential: ResolvedApiKey): ProviderFileClient | null {
 		for (const factory of this.#factories) {
 			const client = factory(model, credential);
 			if (client) return client;

@@ -6,7 +6,13 @@
  * from hidden terminal input or piped stdin, never from argv, and are only ever
  * displayed masked.
  */
-import { DEFAULT_CREDENTIAL_POOL_ORDER, maskApiKey } from "@oh-my-pi/pi-ai";
+import * as readline from "node:readline/promises";
+import { buildAnthropicAuthConfig, DEFAULT_CREDENTIAL_POOL_ORDER, maskApiKey } from "@oh-my-pi/pi-ai";
+import {
+	ANTHROPIC_WORKSPACES_URL,
+	type AnthropicWorkspacePrompts,
+	resolveAnthropicKeyWorkspace,
+} from "@oh-my-pi/pi-ai/registry/api-key-validation";
 import { APP_NAME } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { cfgAuthPoolOrder } from "../config/model-settings";
@@ -21,7 +27,53 @@ export interface AuthKeysCommandArgs {
 	provider: string;
 	/** Stored row id for `remove`. */
 	id?: number;
+	/** `add`, Anthropic: the workspace a key not scoped to one names, instead of asking. */
+	workspace?: string;
 	json?: boolean;
+}
+
+/** One visible line from the terminal. */
+async function readLine(prompt: string): Promise<string> {
+	const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+	try {
+		return (await rl.question(prompt)).trim();
+	} finally {
+		rl.close();
+	}
+}
+
+/**
+ * Settle an Anthropic key's workspace from `--workspace` or terminal prompts.
+ * Piped input cannot answer a second question, so it needs `--workspace`.
+ */
+function terminalWorkspacePrompts(provider: string, flag: string | undefined): AnthropicWorkspacePrompts {
+	const needFlag = (choices: string): Error =>
+		new Error(
+			`this key is not scoped to a workspace; rerun with --workspace <id> (${choices}): ${APP_NAME} auth keys add ${provider} --workspace <id>`,
+		);
+	return {
+		async pick(workspaces) {
+			if (flag) return flag;
+			if (!process.stdin.isTTY) throw needFlag(`one of ${workspaces.map(workspace => workspace.id).join(", ")}`);
+			const listing = workspaces.map((workspace, index) => `  ${index + 1}. ${workspace.name} (${workspace.id})`);
+			process.stderr.write(
+				`This key is not scoped to a workspace. Pick the one requests use:\n${listing.join("\n")}\n`,
+			);
+			const answer = await readLine(`Workspace [1-${workspaces.length}]: `);
+			if (!answer) return undefined;
+			const choice = workspaces[Number(answer) - 1];
+			if (!choice) throw new Error(`no workspace numbered ${answer}`);
+			return choice.id;
+		},
+		async ask() {
+			if (flag) return flag;
+			if (!process.stdin.isTTY) throw needFlag(`find it under ${ANTHROPIC_WORKSPACES_URL}`);
+			process.stderr.write(
+				`This key is not scoped to a workspace and may not list them. Find its workspace ID under ${ANTHROPIC_WORKSPACES_URL}.\n`,
+			);
+			return readLine("Workspace ID (wrkspc_…): ");
+		},
+	};
 }
 
 /**
@@ -99,19 +151,27 @@ export async function runAuthKeysCommand(args: AuthKeysCommandArgs): Promise<voi
 		if (args.action === "add") {
 			const key = (await readSecret(`API key for ${provider}: `)).trim();
 			if (!key) throw new Error("no API key entered");
+			const scope =
+				provider === "anthropic"
+					? await resolveAnthropicKeyWorkspace(key, terminalWorkspacePrompts(provider, args.workspace?.trim()), {
+							baseUrl: buildAnthropicAuthConfig(key).baseUrl,
+						})
+					: {};
+			if (!scope) throw new Error("no workspace chosen; the key was not added");
 			const before = new Set(storage.credentials.pooledApiKeys(provider).map(row => row.id));
-			const row = await storage.credentials.addApiKey(provider, key);
+			const row = await storage.credentials.addApiKey(provider, key, scope);
 			const masked = maskApiKey(key);
 			const total = storage.credentials.pooledApiKeys(provider).length;
 			if (args.json) {
 				process.stdout.write(
-					`${JSON.stringify({ id: row.id, provider, key: masked, added: !before.has(row.id), total })}\n`,
+					`${JSON.stringify({ id: row.id, provider, key: masked, workspace: scope.workspaceId, added: !before.has(row.id), total })}\n`,
 				);
 				return;
 			}
-			const verb = before.has(row.id) ? "already pooled" : "added";
+			const verb = before.has(row.id) ? "updated" : "added";
+			const workspace = scope.workspaceId ? `; workspace ${scope.workspaceId}` : "";
 			process.stdout.write(
-				`${chalk.green("✓")} ${masked} ${verb} for ${provider} (id ${row.id}; ${total} pooled key${total === 1 ? "" : "s"}).\n`,
+				`${chalk.green("✓")} ${masked} ${verb} for ${provider} (id ${row.id}${workspace}; ${total} pooled key${total === 1 ? "" : "s"}).\n`,
 			);
 			return;
 		}
@@ -138,9 +198,11 @@ export async function runAuthKeysCommand(args: AuthKeysCommandArgs): Promise<voi
 		const pools = storage.limits.pools(provider);
 		const keyPool = pools.find(pool => pool.kind === "api_key");
 		const subscriptions = pools.find(pool => pool.kind === "oauth")?.members ?? 0;
-		const keys = storage.credentials
-			.pooledApiKeys(provider)
-			.map(row => ({ id: row.id, key: maskApiKey(row.credential.key) }));
+		const keys = storage.credentials.pooledApiKeys(provider).map(row => ({
+			id: row.id,
+			key: maskApiKey(row.credential.key),
+			workspace: row.credential.workspaceId,
+		}));
 		if (args.json) {
 			process.stdout.write(
 				`${JSON.stringify({ provider, order, subscriptions, keys, blockedKeys: keyPool?.blocked ?? 0 })}\n`,
@@ -154,7 +216,10 @@ export async function runAuthKeysCommand(args: AuthKeysCommandArgs): Promise<voi
 			process.stdout.write(chalk.dim(`Add one with \`${APP_NAME} auth keys add ${provider}\`.\n`));
 			return;
 		}
-		for (const row of keys) process.stdout.write(`  ${chalk.dim(`id ${row.id}`)}  ${row.key}\n`);
+		for (const row of keys) {
+			const workspace = row.workspace ? `  ${chalk.dim(`workspace ${row.workspace}`)}` : "";
+			process.stdout.write(`  ${chalk.dim(`id ${row.id}`)}  ${row.key}${workspace}\n`);
+		}
 		if (keyPool?.blocked) {
 			process.stdout.write(
 				chalk.yellow(`  ${keyPool.blocked} of ${keyPool.members} currently exhausted or failing.\n`),

@@ -2155,11 +2155,11 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			},
 		];
 		vi.spyOn(brokerClient, "fetchUsage").mockResolvedValue({ generatedAt: now, reports });
-		const oauthIdentity = "email:oauth@example.com";
+		const credentialScope = "email:oauth@example.com";
 		const remoteStore = new RemoteAuthCredentialStore({
 			client: brokerClient,
 			streamSnapshots: false,
-			accountPool: new Map([["anthropic", new Set([oauthIdentity])]]),
+			accountPool: new Map([["anthropic", new Set([credentialScope])]]),
 			initialSnapshot: {
 				generation: 1,
 				generatedAt: now,
@@ -2170,7 +2170,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 						id: 1,
 						provider: "anthropic",
 						credential: oauthCredential,
-						identityKey: oauthIdentity,
+						identityKey: credentialScope,
 						rotatesInMs: null,
 					},
 					{
@@ -2222,11 +2222,11 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		const reports: UsageReport[] = [matchingReport, strangerReport, nonPooledReport];
 		const fetchSpy = vi.spyOn(brokerClient, "fetchUsage").mockResolvedValue({ generatedAt: now, reports });
 		vi.spyOn(brokerClient, "disableCredential").mockResolvedValue({ ok: true });
-		const oauthIdentity = "email:oauth@example.com";
+		const credentialScope = "email:oauth@example.com";
 		const remoteStore = new RemoteAuthCredentialStore({
 			client: brokerClient,
 			streamSnapshots: false,
-			accountPool: new Map([["anthropic", new Set([oauthIdentity])]]),
+			accountPool: new Map([["anthropic", new Set([credentialScope])]]),
 			initialSnapshot: {
 				generation: 1,
 				generatedAt: now,
@@ -2237,7 +2237,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 						id: 1,
 						provider: "anthropic",
 						credential: oauthCredential,
-						identityKey: oauthIdentity,
+						identityKey: credentialScope,
 						rotatesInMs: null,
 					},
 				],

@@ -4237,7 +4237,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const blobBroker = new LiveImageUrlService(
 			settings,
 			() => sessionManager.getCwd(),
-			model => modelRegistry.getApiKey(model, providerSessionId),
+			model =>
+				modelRegistry.getApiKeyWithCredentialForProvider(model.provider, providerSessionId, {
+					baseUrl: model.baseUrl,
+					modelId: model.id,
+				}),
 		);
 		disposeCallbacks.add(() => blobBroker.dispose());
 		const dateCwdReminder = new DateCwdReminderInjector();

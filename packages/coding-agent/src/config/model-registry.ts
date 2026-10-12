@@ -2221,11 +2221,14 @@ export class ModelRegistry {
 				hasExplicitVllmConfig ||
 				canUseSharedCatalogWithoutAuth
 			) {
-				// Residency belongs to the token selected for discovery, not another
-				// stored account that happens to appear first in the pool.
+				// Residency and workspace belong to the credential selected for discovery,
+				// not another stored one that happens to appear first in the pool.
 				const identity = getOAuthCredentialsForProvider(this.authStorage, descriptor.providerId).find(
 					credential => credential.access === apiKey,
 				);
+				const workspaceId = this.authStorage.credentials
+					.pooledApiKeys(descriptor.providerId)
+					.find(entry => entry.credential.key === apiKey)?.credential.workspaceId;
 				const discoveryConfig = {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
 					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
@@ -2233,6 +2236,7 @@ export class ModelRegistry {
 					region: identity?.region,
 					inferenceRegion: identity?.inferenceRegion,
 					orgId: identity?.orgId,
+					workspaceId,
 				};
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??

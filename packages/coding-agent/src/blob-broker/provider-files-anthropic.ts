@@ -36,11 +36,12 @@ function authHeaders(credential: string): Readonly<Record<string, string>> {
 	return isAnthropicOAuthToken(credential) ? { Authorization: `Bearer ${credential}` } : { "x-api-key": credential };
 }
 
-function requestHeaders(credential: string): Readonly<Record<string, string>> {
+function requestHeaders(credential: string, workspaceId: string | undefined): Readonly<Record<string, string>> {
 	return {
 		...authHeaders(credential),
 		"anthropic-version": ANTHROPIC_VERSION,
 		"anthropic-beta": ANTHROPIC_FILES_BETA,
+		...(workspaceId ? { "anthropic-workspace-id": workspaceId } : {}),
 	};
 }
 
@@ -94,6 +95,7 @@ export function createAnthropicFileClient(
 	model: Model,
 	credential: string,
 	fetchImpl: FetchImpl = globalThis.fetch,
+	workspaceId?: string,
 ): ProviderFileClient | null {
 	if (
 		model.provider !== "anthropic" ||
@@ -104,7 +106,7 @@ export function createAnthropicFileClient(
 	}
 	if (credential.length === 0) throw new Error("Anthropic Files API credential is required");
 
-	const headers = requestHeaders(credential);
+	const headers = requestHeaders(credential, workspaceId);
 	return {
 		provider: "anthropic",
 		async upload(request: ProviderFileUploadRequest): Promise<ProviderFileHandle> {
