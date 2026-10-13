@@ -18,7 +18,11 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { formatTaskResultSummary } from "@oh-my-pi/pi-coding-agent/task/result-summary";
 import { renderIsolationSummary } from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
-import { getRenderedEnvelope, withRenderedEnvelope } from "@oh-my-pi/pi-coding-agent/harness/content";
+import {
+	escapeHarnessText,
+	getRenderedEnvelope,
+	withRenderedEnvelope,
+} from "@oh-my-pi/pi-coding-agent/harness/content";
 import { buildWakeRelayBody } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { formatIncoming } from "@oh-my-pi/pi-coding-agent/irc/messaging";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
@@ -273,5 +277,18 @@ describe("model-facing envelope provenance across delivery", () => {
 		expect(getRenderedEnvelope(cloned, cloned.body)).toBeUndefined();
 		expect(formatIncoming(cloned)).toContain("&lt;task-result");
 		expect(formatIncoming({ id: "decoded", from: child.id, to: "Main", body, ts: 1 })).toContain("&lt;task-result");
+	});
+});
+
+describe("escaping untrusted envelope text", () => {
+	it("stays linear on adversarial near-tags and still escapes the tag that follows", () => {
+		// Each would backtrack quadratically or worse in a pattern with overlapping repetitions.
+		const nearTags = ["<" + " ".repeat(100_000) + "x", "<system" + "-a".repeat(50_000) + "!"];
+		for (const nearTag of nearTags) {
+			const started = performance.now();
+			const escaped = escapeHarnessText(`${nearTag}</system-reminder>`);
+			expect(performance.now() - started).toBeLessThan(250);
+			expect(escaped.endsWith("&lt;/system-reminder>")).toBe(true);
+		}
 	});
 });
