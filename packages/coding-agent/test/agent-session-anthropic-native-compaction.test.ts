@@ -300,6 +300,20 @@ describe("AgentSession Anthropic native compaction", () => {
 				pi.on("context", () => ({ messages: kept }));
 			},
 		],
+		// The second message dropped from odd-length histories only, beside one note object
+		// kept across calls: the prefix leaves the note untraced, the full context adds it.
+		[
+			"drops a message from some histories beside a note it reuses",
+			pi => {
+				const kept: AgentMessage = { role: "user", content: "kept per-call note", timestamp: 0 };
+				pi.on("context", event => ({
+					messages:
+						event.messages.length % 2 === 1
+							? [...event.messages.filter((_, index) => index !== 1), kept]
+							: [...event.messages, kept],
+				}));
+			},
+		],
 		// The same shift at an unchanged length: a note prepended and the last message dropped.
 		[
 			"shifts clones at the same length",

@@ -198,17 +198,14 @@ export function copyPerCallContextMessage(
 }
 
 /**
- * Gives a conversion cached by identity its source's provenance for the current call.
- * A context hook may return one object across calls with a different origin each
- * time, so the mark from the call that built the cache entry may be stale.
+ * `message`, converted from `source`, as this call sends it. Conversions cached by
+ * identity are shared across calls, but a context hook may return one object with a
+ * different origin on each call: a marked source gets a copy carrying its current
+ * origin, so no later call can change the provenance this call read.
  */
-export function syncPerCallContextMessage(
-	target: PerCallContextMessageCarrier,
-	source: PerCallContextMessageCarrier,
-): void {
+export function withPerCallContextOrigin<T extends object>(message: T, source: PerCallContextMessageCarrier): T {
 	const origin = source[kPerCallContextMessage];
-	if (origin === undefined) delete target[kPerCallContextMessage];
-	else target[kPerCallContextMessage] = origin;
+	return origin === undefined ? message : { ...message, [kPerCallContextMessage]: origin };
 }
 
 /** True when a message was synthesized for the current provider call. */
