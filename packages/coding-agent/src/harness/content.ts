@@ -1,8 +1,9 @@
 import { escapeExpression, SafeString } from "@oh-my-pi/pi-utils/template";
 
 const renderedEnvelope = Symbol("harness.renderedEnvelope");
+// Whitespace around the slash still reads as a tag to the model (`< /system-notice>`).
 const RESERVED_TAG =
-	/<\/?(?:system(?:[-_][\w-]+)*|irc|task[-_]result|merge[-_]summary|abort[-_]reason|preview|output|error|meta)(?=[\s/>])/gi;
+	/<\s*\/?\s*(?:system(?:[-_][\w-]+)*|irc|task[-_]result|merge[-_]summary|abort[-_]reason|preview|output|error|meta)(?=[\s/>])/gi;
 
 /** Literal data cannot open or close the protocol envelopes around it. */
 export function escapeHarnessText(text: string): string {
