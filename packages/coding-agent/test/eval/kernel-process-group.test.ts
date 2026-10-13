@@ -125,6 +125,36 @@ describe("BaseKernel stdin failures", () => {
 		}
 	});
 
+	test("runs one shutdown sequence for concurrent callers, and lets a later call retry an unconfirmed one", async () => {
+		const exited = Promise.withResolvers<number>();
+		const writes: string[] = [];
+		const signals: string[] = [];
+		const proc = {
+			pid: undefined,
+			stdin: { write: (line: string) => writes.push(line), flush: () => undefined, end: () => {} },
+			stdout: new ReadableStream<Uint8Array>(),
+			stderr: new ReadableStream<Uint8Array>(),
+			exited: exited.promise,
+			// Ignores signals until SIGKILL, so the first sequence runs every escalation step and fails.
+			kill: (signal: string) => {
+				signals.push(signal);
+			},
+		};
+		const kernel = new TestKernel();
+		kernel.setProcess(proc as unknown as Parameters<TestKernel["setProcess"]>[0]);
+
+		// Several in-flight requests hitting one broken pipe each retire the kernel.
+		const results = await Promise.all([kernel.shutdown(), kernel.shutdown(), kernel.shutdown()]);
+		expect(results).toEqual([{ confirmed: false }, { confirmed: false }, { confirmed: false }]);
+		expect(writes.filter(line => line === "exit\n")).toHaveLength(1);
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+
+		// Unconfirmed: a later call runs a fresh sequence, which now sees the exit.
+		exited.resolve(0);
+		expect(await kernel.shutdown()).toEqual({ confirmed: true });
+		expect(writes.filter(line => line === "exit\n")).toHaveLength(2);
+	});
+
 	test("retires the kernel when a write fails after its request was already aborted", async () => {
 		const exited = Promise.withResolvers<number>();
 		const write = Promise.withResolvers<number>();

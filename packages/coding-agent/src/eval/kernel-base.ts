@@ -218,6 +218,7 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 	#alive = true;
 	#disposed = false;
 	#shutdownConfirmed = false;
+	#shutdownInFlight: Promise<KernelShutdownResult> | null = null;
 	#exitedPromise: Promise<number> | null = null;
 	#pending = new Map<string, PendingExecution>();
 	#pendingControls = new Map<string, PromiseWithResolvers<Frame>>();
@@ -411,9 +412,19 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 		}
 	}
 
-	async shutdown(options?: KernelShutdownOptions): Promise<KernelShutdownResult> {
-		if (this.#shutdownConfirmed) return { confirmed: true };
+	/**
+	 * Concurrent calls (e.g. several in-flight requests hitting the same broken pipe) share one
+	 * shutdown sequence. An unconfirmed shutdown clears the slot so a later call can retry.
+	 */
+	shutdown(options?: KernelShutdownOptions): Promise<KernelShutdownResult> {
+		if (this.#shutdownConfirmed) return Promise.resolve({ confirmed: true });
+		this.#shutdownInFlight ??= this.#shutdown(options).finally(() => {
+			this.#shutdownInFlight = null;
+		});
+		return this.#shutdownInFlight;
+	}
 
+	async #shutdown(options?: KernelShutdownOptions): Promise<KernelShutdownResult> {
 		this.#alive = false;
 		this.#abortPendingExecutions(`${this.#options.languageName} kernel shutdown`, { kernelKilled: true });
 
