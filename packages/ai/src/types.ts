@@ -480,6 +480,11 @@ export interface CodexForkContext {
 export interface AnthropicCompactionRequest {
 	/** Custom summarization prompt; replaces the API default entirely when set. */
 	instructions?: string;
+	/**
+	 * Replayed summaries' file metadata due before this time (ms) ends the request;
+	 * later metadata replays with the retained tail, which the new summary carries.
+	 */
+	filesDueBefore?: number;
 }
 
 /** OpenAI's GPT-5.6+ explicit prompt-cache controls. */
@@ -1138,11 +1143,32 @@ export interface AnthropicCompactionPayload {
 	encryptedContent?: string;
 	/**
 	 * Harness-appended file metadata (`<files>` section) kept out of the
-	 * byte-identical block. Replayed as a user message after the native block:
-	 * the converter replaces the summary message with the block and skips its
-	 * text, so without this the metadata would be invisible to this provider.
+	 * byte-identical block. The converter replaces the summary message with the
+	 * block and skips its text, so it replays this as a user message after the
+	 * block's retained tail: before the first message created after the summary.
 	 */
 	filesText?: string;
+	/**
+	 * File metadata of earlier summaries whose replay position lies inside this
+	 * summary's retained tail. Retained messages must reach the API unchanged,
+	 * so each keeps replaying where it did: before the first message created
+	 * after `after` (the earlier summary's commit time).
+	 */
+	retainedFiles?: AnthropicCompactionFiles[];
+	/**
+	 * Set on summaries whose retained tail replays unchanged: file metadata
+	 * after the tail, earlier metadata at `retainedFiles`. Summaries persisted
+	 * without it keep their original layout (metadata after the first retained
+	 * turn), since later thinking was signed against those bytes.
+	 */
+	exactTail?: true;
+}
+
+/** File metadata replayed at a fixed point of a natively compacted conversation. */
+export interface AnthropicCompactionFiles {
+	text: string;
+	/** Replays before the first message created after this time (ms). */
+	after: number;
 }
 
 export type ProviderPayload = OpenAIResponsesHistoryPayload | AnthropicMessagePayload | AnthropicCompactionPayload;

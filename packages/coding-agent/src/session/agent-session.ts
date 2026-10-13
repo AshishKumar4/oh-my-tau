@@ -322,6 +322,7 @@ import {
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
+import { isDateCwdReminderControl } from "./date-cwd-reminder";
 import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
 import {
 	collectPendingToolCalls,
@@ -2147,6 +2148,35 @@ export class AgentSession implements SettingsScope {
 			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
 			convertToLlmForSideRequest: messages => this.#convertToLlmForSideRequest(messages),
+			buildLiveProviderContext: async (summarized, retained, signal) => {
+				// compact() rebuilds the previous summary message; send the live
+				// agent's own one. Conversion caches and the shared date/cwd reminder
+				// key on message identity, so a copy would re-root the reminder state
+				// the live turns depend on and re-render the bytes they sent.
+				const liveSummary = this.agent.state.messages[0];
+				const first = summarized[0];
+				const history =
+					first?.role === "compactionSummary" &&
+					liveSummary?.role === "compactionSummary" &&
+					liveSummary.timestamp === first.timestamp
+						? [liveSummary, ...summarized.slice(1)]
+						: summarized;
+				// Transform the whole history as the live turn does, then cut it:
+				// provider transforms (inline imaging, image budgets) decide per
+				// request, so a separately transformed prefix can differ.
+				const prefixLength = (await this.convertMessagesToLlm(history, signal)).length;
+				const live = await this.agent.buildSideRequestContext(
+					await this.convertMessagesToLlm([...history, ...retained], signal),
+				);
+				// Date/cwd reminder controls are the only messages the transforms
+				// insert: count past them, and leave out any at the cut, so the kept
+				// turns follow the summarized range directly.
+				let cut = 0;
+				for (let counted = 0; cut < live.messages.length && counted < prefixLength; cut++) {
+					if (!isDateCwdReminderControl(live.messages[cut]!)) counted++;
+				}
+				return { ...live, messages: live.messages.slice(0, cut) };
+			},
 			obfuscateTextForProvider: text => this.#obfuscateTextForProvider(text),
 			obfuscatePreparationForProvider: preparation => this.#obfuscatePreparationForProvider(preparation),
 			closeCodexProviderSessionsForHistoryRewrite: () => this.#closeCodexProviderSessionsForHistoryRewrite(),

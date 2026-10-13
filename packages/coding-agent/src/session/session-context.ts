@@ -491,8 +491,17 @@ export function buildSessionContext(
 				(firstKeptIdx >= 0 && firstKeptIdx < compactionIdx ? path[firstKeptIdx] : undefined) ??
 				(snapshotIdx >= 0 && snapshotIdx < compactionIdx - 1 ? path[snapshotIdx + 1] : undefined) ??
 				path[compactionIdx + 1];
-			const retainedAt = firstRetained ? new Date(firstRetained.timestamp).getTime() : NaN;
-			if (Number.isFinite(retainedAt)) historyRewriteAt = retainedAt - 1;
+			// The message's own time, not the entry's: an assistant message is
+			// stamped when its stream starts and saved after it ends, so a marker
+			// derived from the entry would postdate that turn and strip its thinking.
+			// Summaries without `exactTail` keep the entry time: thinking created
+			// after them was signed against requests that stripped that turn's.
+			if (firstRetained?.type === "message" && anthropicPayload.exactTail) {
+				historyRewriteAt = firstRetained.message.timestamp - 1;
+			} else if (firstRetained) {
+				const retainedAt = new Date(firstRetained.timestamp).getTime();
+				if (Number.isFinite(retainedAt)) historyRewriteAt = retainedAt - 1;
+			}
 		}
 
 		// Re-attach any archived snapcompact frames so the model can keep

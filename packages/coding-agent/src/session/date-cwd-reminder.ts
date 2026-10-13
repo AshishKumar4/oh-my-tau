@@ -32,6 +32,14 @@ function injectReminder(message: UserMessage, reminder: string): UserMessage {
 	return { ...message, content };
 }
 
+/** Developer turns the injector inserted; every other output message maps to an input one. */
+const reminderControls = new WeakSet<Message>();
+
+/** Whether `message` is a developer turn a {@link DateCwdReminderInjector} inserted. */
+export function isDateCwdReminderControl(message: Message): boolean {
+	return reminderControls.has(message);
+}
+
 /**
  * Keeps volatile date/cwd reminders append-only across provider requests.
  *
@@ -82,15 +90,14 @@ export class DateCwdReminderInjector {
 				this.#injections.set(newUser, injectReminder(newUser, reminder));
 			} else {
 				const anchor = messages.at(-1)!;
-				this.#controls.push({
-					anchor,
-					message: {
-						role: "developer",
-						content: reminder,
-						synthetic: true,
-						timestamp: Date.now(),
-					},
-				});
+				const control: Message = {
+					role: "developer",
+					content: reminder,
+					synthetic: true,
+					timestamp: Date.now(),
+				};
+				reminderControls.add(control);
+				this.#controls.push({ anchor, message: control });
 			}
 			this.#currentReminder = reminder;
 		}
