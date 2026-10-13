@@ -52,7 +52,11 @@ import {
 } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
 import { convertMessageToLlm } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type { AssistantMessage, ImageContent, Message, TextContent, UserMessage } from "@oh-my-pi/pi-ai";
-import { isPerCallContextMessage, withPerCallContextOrigin } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import {
+	getContextHistoryPosition,
+	isPerCallContextMessage,
+	withContextProvenance,
+} from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
@@ -706,7 +710,7 @@ export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
 		if (wrappedMessages === undefined) {
 			wrappedMessages = messages.slice();
 		}
-		wrappedMessages[i] = withPerCallContextOrigin(wrappedMessage, message);
+		wrappedMessages[i] = withContextProvenance(wrappedMessage, message);
 	}
 	return wrappedMessages ?? messages;
 }
@@ -1155,7 +1159,9 @@ function convertOneCached(m: AgentMessage, interruptedNext: boolean): Message[] 
 		fragment = convertOne(m, interruptedNext);
 		convertCache.set(m, { interruptedNext, fragment });
 	}
-	return isPerCallContextMessage(m) ? fragment.map(message => withPerCallContextOrigin(message, m)) : fragment;
+	return isPerCallContextMessage(m) || getContextHistoryPosition(m) !== undefined
+		? fragment.map(message => withContextProvenance(message, m))
+		: fragment;
 }
 
 /** A genuine operator turn, selected before provider wire conversion. */

@@ -25,6 +25,7 @@ import {
 	markPerCallContextMessage,
 	restoreClonedMessageMetadata,
 	setContextHistoryIndex,
+	setContextHistoryPosition,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -1958,9 +1959,10 @@ export class ExtensionRunner {
 			}
 		} catch {
 			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
-			// or ProviderPayload). Fall back to a shallow array clone — extensions should
-			// return new message arrays rather than mutating in place.
-			currentMessages = [...messages];
+			// or ProviderPayload). Fall back to shallow copies — extensions should return
+			// new message arrays rather than mutating in place. Each message is still its
+			// own object, so the history position published on it belongs to this call.
+			currentMessages = messages.map(message => ({ ...message }));
 		}
 		for (let index = 0; index < currentMessages.length; index++) {
 			const message = currentMessages[index];
@@ -2010,9 +2012,10 @@ export class ExtensionRunner {
 		// changed one. Any other message claiming the slot (say, a note spread from a
 		// history message and appended beside it) was added for this call. A message
 		// with no slot is added only while every slot has its occupant; otherwise it
-		// may be a history message the transform restructured past tracing. History
-		// messages carry their own index while compared, so a copy's index tag alone
-		// never makes it unequal.
+		// may be a history message the transform restructured past tracing. Occupants
+		// publish their history position for the call's consumers. History messages
+		// carry their own index while compared, so a copy's index tag alone never makes
+		// it unequal.
 		for (let index = 0; index < messages.length; index++) setContextHistoryIndex(messages[index], index);
 		const occupants = new Map<number, AgentMessage>();
 		for (const message of currentMessages) {
@@ -2026,15 +2029,14 @@ export class ExtensionRunner {
 			if (historyIndex !== undefined && !occupants.has(historyIndex)) occupants.set(historyIndex, message);
 		}
 		const traced = occupants.size === messages.length;
+		const positions = new Map<AgentMessage, number>();
+		for (const [historyIndex, occupant] of occupants) positions.set(occupant, historyIndex);
 		for (const message of currentMessages) {
-			const historyIndex = getContextHistoryIndex(message);
 			clearContextHistoryIndex(message);
+			const position = positions.get(message);
+			setContextHistoryPosition(message, position);
 			if (unchanged.has(message)) continue;
-			if (historyIndex !== undefined && occupants.get(historyIndex) === message) {
-				markPerCallContextMessage(message, "rewritten");
-			} else {
-				markPerCallContextMessage(message, traced ? "added" : "untraced");
-			}
+			markPerCallContextMessage(message, position !== undefined ? "rewritten" : traced ? "added" : "untraced");
 		}
 		for (const message of messages) clearContextHistoryIndex(message);
 		// An aborted handler is skipped and its input kept unchanged. Never hand that

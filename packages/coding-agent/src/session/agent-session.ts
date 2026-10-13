@@ -84,7 +84,11 @@ import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import { isAddedContextMessage, isUntracedContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import {
+	getContextHistoryPosition,
+	isAddedContextMessage,
+	isPerCallContextMessage,
+} from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { supportsOutputTokenLimit } from "@oh-my-pi/pi-catalog/compat/output-limits";
 import { requiresNativeTools, requiresToolFreeHistoryForToolOptOut } from "@oh-my-pi/pi-catalog/compat/tools";
@@ -670,6 +674,25 @@ export function powerAssertionOptions(mode: "off" | "idle" | "display" | "system
 		system: mode === "system",
 		user: mode === "system",
 	};
+}
+
+/**
+ * How many messages of a native compaction's live context are summarized history once
+ * context hooks ran. Each message a hook kept from the history carries its position
+ * there, and messages it added are not counted. The counted messages must be history,
+ * then retained turns; any other order leaves no range to summarize, and the next
+ * compaction method runs instead.
+ */
+function summarizedLengthAfterContextHooks(messages: readonly Message[], historyLength: number): number {
+	const positions = messages.filter(message => !isAddedContextMessage(message)).map(getContextHistoryPosition);
+	const boundary = positions.findIndex(position => position === undefined || position >= historyLength);
+	const summarized = boundary === -1 ? positions.length : boundary;
+	if (positions.slice(summarized).some(position => position === undefined || position < historyLength)) {
+		throw new NativeCompactionError(
+			new Error("A context hook restructured the history, so the summarized range cannot be located"),
+		);
+	}
+	return summarized;
 }
 
 export class AgentSession implements SettingsScope {
@@ -2178,18 +2201,12 @@ export class AgentSession implements SettingsScope {
 				// Transform the whole history as the live turn does, then cut it:
 				// provider transforms (inline imaging, image budgets) decide per
 				// request, so a separately transformed prefix can differ.
-				// Context hooks may add messages for each call; those are not history,
-				// so neither count includes them. A rewritten message keeps its place.
-				const prefix = await this.convertMessagesToLlm(history, signal);
 				const full = await this.convertMessagesToLlm([...history, ...retained], signal);
-				// A hook that restructured the history past tracing leaves no way to find
-				// the summarized range; the next compaction method runs instead.
-				if (prefix.some(isUntracedContextMessage) || full.some(isUntracedContextMessage)) {
-					throw new NativeCompactionError(
-						new Error("A context hook restructured the history, so the summarized range cannot be located"),
-					);
-				}
-				const prefixLength = prefix.filter(message => !isAddedContextMessage(message)).length;
+				const prefixLength = full.some(
+					message => isPerCallContextMessage(message) || getContextHistoryPosition(message) !== undefined,
+				)
+					? summarizedLengthAfterContextHooks(full, history.length)
+					: (await this.convertMessagesToLlm(history, signal)).length;
 				const live = await this.agent.buildSideRequestContext(full);
 				// Date/cwd reminder controls are the only messages the provider transforms
 				// insert: count past them and messages hooks added, and leave out any at

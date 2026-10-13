@@ -230,6 +230,33 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(JSON.stringify(compaction.messages)).not.toContain("per-call note");
 	});
 
+	it("cuts by history position when a context hook drops turns by the context's size", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-window-");
+		// A window over the newest turns: the summarized history alone fits, the whole context does not.
+		const keepNewestExchange: ExtensionFactory = pi => {
+			pi.on("context", event => (event.messages.length > 3 ? { messages: event.messages.slice(-2) } : undefined));
+		};
+		const { session, requests, close } = await openSession(
+			tempDir,
+			request => (request <= 2 ? answer(request) : captured()),
+			[keepNewestExchange],
+		);
+		try {
+			await session.prompt("first question");
+			await session.prompt("second question");
+			await expect(session.compact()).rejects.toThrow("captured");
+		} finally {
+			await close();
+		}
+
+		expect(requests).toHaveLength(3);
+		const compaction = JSON.stringify(requests[2].messages);
+		// The whole context keeps the second exchange; its summarized part is the second question.
+		expect(compaction).toContain("second question");
+		expect(compaction).not.toContain("first question");
+		expect(compaction).not.toContain("answer 2");
+	});
+
 	it("keeps summarized messages a context hook rewrites for every request, by spread or by clone", async () => {
 		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-rewrite-");
 		const hasText = (message: AgentMessage, text: string) =>
@@ -298,20 +325,6 @@ describe("AgentSession Anthropic native compaction", () => {
 			pi => {
 				const kept: AgentMessage[] = [note];
 				pi.on("context", () => ({ messages: kept }));
-			},
-		],
-		// The second message dropped from odd-length histories only, beside one note object
-		// kept across calls: the prefix leaves the note untraced, the full context adds it.
-		[
-			"drops a message from some histories beside a note it reuses",
-			pi => {
-				const kept: AgentMessage = { role: "user", content: "kept per-call note", timestamp: 0 };
-				pi.on("context", event => ({
-					messages:
-						event.messages.length % 2 === 1
-							? [...event.messages.filter((_, index) => index !== 1), kept]
-							: [...event.messages, kept],
-				}));
 			},
 		],
 		// The same shift at an unchanged length: a note prepended and the last message dropped.
@@ -407,6 +420,40 @@ describe("AgentSession Anthropic native compaction", () => {
 		// "third question" turn sent, the inserted control included.
 		expect(JSON.stringify(compaction.messages)).not.toContain("answer 4");
 		expect(withoutCacheControl(compaction.messages)).toEqual(withoutCacheControl(live.messages));
+	});
+
+	it("cuts a later compaction behind the earlier summary when a context hook adds a note to every request", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-summary-hook-");
+		const appendNote: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+			}));
+		};
+		const { session, requests, close } = await openSession(
+			tempDir,
+			request => (request === 3 ? compactionAnswer() : request === 5 ? captured() : answer(request)),
+			[appendNote],
+		);
+		try {
+			await session.prompt("first question");
+			await session.prompt("second question");
+			await session.compact();
+			await session.prompt("third question");
+			await expect(session.compact()).rejects.toThrow("captured");
+		} finally {
+			await close();
+		}
+
+		expect(requests).toHaveLength(5);
+		const [live, compaction] = requests.slice(3);
+		// The earlier summary converts to a message of its own making; it still counts as history.
+		expect(JSON.stringify(compaction.messages[0])).toContain("sig-compact");
+		expect(withoutCacheControl(compaction.messages)).toEqual(
+			withoutCacheControl(live.messages.slice(0, compaction.messages.length)),
+		);
+		expect(JSON.stringify(compaction.messages)).toContain("third question");
+		expect(JSON.stringify(compaction.messages)).not.toContain("per-call note");
+		expect(JSON.stringify(compaction.messages)).not.toContain("answer 4");
 	});
 
 	it("replays a later compaction's prefix as sent, without disturbing the live reminder state", async () => {

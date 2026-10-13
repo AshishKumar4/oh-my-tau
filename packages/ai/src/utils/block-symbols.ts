@@ -197,17 +197,6 @@ export function copyPerCallContextMessage(
 	if (origin !== undefined) target[kPerCallContextMessage] = origin;
 }
 
-/**
- * `message`, converted from `source`, as this call sends it. Conversions cached by
- * identity are shared across calls, but a context hook may return one object with a
- * different origin on each call: a marked source gets a copy carrying its current
- * origin, so no later call can change the provenance this call read.
- */
-export function withPerCallContextOrigin<T extends object>(message: T, source: PerCallContextMessageCarrier): T {
-	const origin = source[kPerCallContextMessage];
-	return origin === undefined ? message : { ...message, [kPerCallContextMessage]: origin };
-}
-
 /** True when a message was synthesized for the current provider call. */
 export function isPerCallContextMessage(message: PerCallContextMessageCarrier | null | undefined): boolean {
 	return message?.[kPerCallContextMessage] !== undefined;
@@ -216,11 +205,6 @@ export function isPerCallContextMessage(message: PerCallContextMessageCarrier | 
 /** True when a context transform added the message for the current call: it is not part of the history. */
 export function isAddedContextMessage(message: PerCallContextMessageCarrier | null | undefined): boolean {
 	return message?.[kPerCallContextMessage] === "added";
-}
-
-/** True when a context transform left no trace of whether the message is history. */
-export function isUntracedContextMessage(message: PerCallContextMessageCarrier | null | undefined): boolean {
-	return message?.[kPerCallContextMessage] === "untraced";
 }
 
 /**
@@ -247,6 +231,51 @@ export function setContextHistoryIndex(message: ContextHistoryIndexCarrier, inde
 /** Removes context-history tracking before provider conversion. */
 export function clearContextHistoryIndex(message: ContextHistoryIndexCarrier): void {
 	delete message[kContextHistoryIndex];
+}
+
+/**
+ * History position of a message a context transform kept from its history, set by
+ * the extension runner on every message it hands back (absent on added ones). A
+ * native compaction cut uses it to tell the summarized history from the turns kept
+ * after it. Object spread retains it.
+ */
+export const kContextHistoryPosition = Symbol("agent.message.contextHistoryPosition");
+
+/** Carries the history position a context transform kept a message from. */
+export type ContextHistoryPositionCarrier = object & { [kContextHistoryPosition]?: number };
+
+/** Reads the history position a context transform kept a message from. */
+export function getContextHistoryPosition(
+	message: ContextHistoryPositionCarrier | null | undefined,
+): number | undefined {
+	return message?.[kContextHistoryPosition];
+}
+
+/** Records the history position a context transform kept a message from, or removes it. */
+export function setContextHistoryPosition(message: ContextHistoryPositionCarrier, position: number | undefined): void {
+	if (position === undefined) delete message[kContextHistoryPosition];
+	else message[kContextHistoryPosition] = position;
+}
+
+/**
+ * `message`, converted from `source`, as this call sends it. Conversions cached by
+ * identity are shared across calls, but a context transform's provenance (origin and
+ * history position) belongs to one call: a source carrying it gets a copy with its
+ * current values, so no later call can change what this call read.
+ */
+export function withContextProvenance<T extends PerCallContextMessageCarrier & ContextHistoryPositionCarrier>(
+	message: T,
+	source: PerCallContextMessageCarrier & ContextHistoryPositionCarrier,
+): T {
+	const origin = source[kPerCallContextMessage];
+	const position = source[kContextHistoryPosition];
+	if (origin === undefined && position === undefined) return message;
+	const copy = { ...message };
+	const carrier: PerCallContextMessageCarrier & ContextHistoryPositionCarrier = copy;
+	if (origin === undefined) delete carrier[kPerCallContextMessage];
+	else carrier[kPerCallContextMessage] = origin;
+	setContextHistoryPosition(carrier, position);
+	return copy;
 }
 
 /**

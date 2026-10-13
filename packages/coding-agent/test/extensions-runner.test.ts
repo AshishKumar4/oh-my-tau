@@ -9,7 +9,7 @@ import { Type } from "@oh-my-pi/omptype/typebox";
 import type { AgentMessage, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { MessageCreateParams } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
-import { setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { getContextHistoryPosition, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -4742,6 +4742,41 @@ describe("ExtensionRunner", () => {
 			// The two newest messages carry the rolling breakpoints, so the next request
 			// reads the streamed turn instead of paying for it again.
 			expect(anchored).toEqual([body.messages.length - 2, body.messages.length - 1]);
+		});
+
+		it("publishes history positions on its own copies when the history cannot be cloned", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "passthrough.ts"),
+				`export default function(pi) { pi.on("context", async event => ({ messages: event.messages })); }`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			// A function in a tool result's details makes `structuredClone` throw.
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "question", timestamp: 1 },
+				{
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "lookup",
+					content: [{ type: "text", text: "tool output" }],
+					details: { render: () => "rendered" },
+					isError: false,
+					timestamp: 2,
+				},
+			];
+			for (let call = 0; call < 2; call++) {
+				const transformed = await runner.emitContext(messages);
+				expect(transformed.map(getContextHistoryPosition)).toEqual([0, 1]);
+				expect(transformed.some((message, index) => message === messages[index])).toBe(false);
+				// The session's own messages stay free of one call's provenance.
+				expect(messages.map(getContextHistoryPosition)).toEqual([undefined, undefined]);
+			}
 		});
 	});
 });
