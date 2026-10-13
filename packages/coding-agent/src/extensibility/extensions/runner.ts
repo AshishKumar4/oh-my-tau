@@ -1998,7 +1998,10 @@ export class ExtensionRunner {
 							if (historyIndex !== undefined) setContextHistoryIndex(message, historyIndex);
 						}
 					}
-					currentMessages = nextMessages;
+					// The runner hands back an array it owns: LLM conversion memoizes by array
+					// identity on the premise that an array only grows, and a hook may keep and
+					// rewrite its own array across calls.
+					currentMessages = [...nextMessages];
 				}
 			}
 		}

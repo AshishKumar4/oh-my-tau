@@ -292,6 +292,14 @@ describe("AgentSession Anthropic native compaction", () => {
 					messages: [...event.messages.slice(0, 2), ...event.messages].map(m => structuredClone(m)),
 				})),
 		],
+		// One array the hook keeps and returns on every call, whatever the history.
+		[
+			"returns one array it keeps across calls",
+			pi => {
+				const kept: AgentMessage[] = [note];
+				pi.on("context", () => ({ messages: kept }));
+			},
+		],
 		// The same shift at an unchanged length: a note prepended and the last message dropped.
 		[
 			"shifts clones at the same length",
