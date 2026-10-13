@@ -1126,21 +1126,18 @@ export class RpcClient {
 							return;
 						}
 						if (req.method !== "input" || !onManualCodeInput) return;
-						void Promise.resolve(onManualCodeInput({ title: req.title, placeholder: req.placeholder }))
-							.then(value => {
-								this.#writeFrame({
-									type: "extension_ui_response",
-									id: req.id,
-									value,
-								});
-							})
-							.catch(() => {
-								this.#writeFrame({
-									type: "extension_ui_response",
-									id: req.id,
-									cancelled: true,
-								});
-							});
+						// The prompt can outlive the agent (e.g. a broken stdin pipe stops the client); drop the reply
+						// instead of throwing "Client not started" out of a detached promise chain.
+						void Promise.resolve(onManualCodeInput({ title: req.title, placeholder: req.placeholder })).then(
+							value => {
+								if (this.#process) this.#writeFrame({ type: "extension_ui_response", id: req.id, value });
+							},
+							() => {
+								if (this.#process) {
+									this.#writeFrame({ type: "extension_ui_response", id: req.id, cancelled: true });
+								}
+							},
+						);
 					}
 				: undefined;
 		if (listener) this.#extensionUiListeners.add(listener);

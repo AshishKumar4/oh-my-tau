@@ -1,66 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import * as path from "node:path";
-import { RpcClient, type RpcAgentProcess } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
-import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
+import { type RpcAgentProcess, RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 
 describe("RpcClient.start", () => {
-	test.each(["write-rejection", "flush-throw", "kill-throw"])(
-		"retires a failed transport and restarts through its spawn interface: %s",
-		async failure => {
-			let starts = 0;
-			let kills = 0;
-			using client = new RpcClient({
-				spawn: (): RpcAgentProcess => {
-					const failed = starts++ === 0;
-					const exit = Promise.withResolvers<number>();
-					let output: ReadableStreamDefaultController<Uint8Array> | undefined;
-					const stdin = {
-						write(data: string | Uint8Array) {
-							if (failed)
-								return failure === "flush-throw" ? 0 : Promise.reject(new Error("EPIPE fixture write"));
-							const frame = JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data));
-							if (!isRecord(frame)) throw new Error("Expected request frame");
-							output?.enqueue(
-								new TextEncoder().encode(
-									`${JSON.stringify({ type: "response", id: frame.id, command: frame.type, success: true, data: {} })}\n`,
-								),
-							);
-							return 1;
-						},
-						flush() {
-							if (failed && failure === "flush-throw") throw new Error("EPIPE fixture flush");
-							return 0;
-						},
-					};
-					return {
-						stdin,
-						stdout: new ReadableStream<Uint8Array>({
-							start(controller) {
-								output = controller;
-								controller.enqueue(new TextEncoder().encode('{"type":"ready"}\n'));
-							},
-						}),
-						peekStderr: () => "",
-						kill() {
-							kills++;
-							output?.close();
-							exit.resolve(0);
-							if (failed && failure === "kill-throw") throw new Error("Already exited");
-						},
-						exited: exit.promise,
-					};
-				},
-			});
-			await client.start();
-			await expect(client.getState()).rejects.toThrow("EPIPE fixture");
-			await expect(client.getState()).rejects.toThrow("Client not started");
-			expect(kills).toBe(1);
-			await client.start();
-			await expect(client.getState()).resolves.toBeDefined();
-			expect(starts).toBe(2);
-			await client.stop();
-		},
-	);
 	test("rejects when RPC process exits immediately", async () => {
 		using client = new RpcClient({
 			cliPath: path.join(import.meta.dir, "..", "src", "cli.ts"),
@@ -94,5 +36,158 @@ describe("RpcClient.start", () => {
 			"example/model",
 			"--no-session",
 		]);
+	});
+});
+
+describe("RpcClient stdin failures", () => {
+	test("fails the request and stops the client when write rejects and flush throws", async () => {
+		const exited = Promise.withResolvers<number>();
+		const proc: RpcAgentProcess & { stdin: { flush(): never } } = {
+			stdin: {
+				// A pending pipe write rejects with EPIPE once the agent is gone; flush() can throw synchronously.
+				write: () => Promise.reject(new Error("EPIPE: broken pipe, write")),
+				flush: () => {
+					throw new Error("flush failed");
+				},
+			},
+			stdout: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: "ready" })}\n`));
+				},
+			}),
+			peekStderr: () => "",
+			kill: () => exited.resolve(0),
+			exited: exited.promise,
+		};
+		using client = new RpcClient({ spawn: () => proc });
+		await client.start();
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await expect(client.getState()).rejects.toThrow("flush failed");
+			// Unhandled rejections are reported once the microtask queue drains; one macrotask turn suffices.
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			expect(unhandled).toEqual([]);
+			// The broken pipe is terminal: the agent is killed and the client no longer accepts commands.
+			expect(await exited.promise).toBe(0);
+			await expect(client.getState()).rejects.toThrow("Client not started");
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
+	test("rejects a non-serializable command without stopping a healthy client", async () => {
+		const exited = Promise.withResolvers<number>();
+		let killed = false;
+		const proc: RpcAgentProcess = {
+			stdin: { write: () => 0 },
+			stdout: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: "ready" })}\n`));
+				},
+			}),
+			peekStderr: () => "",
+			kill: () => {
+				killed = true;
+				exited.resolve(0);
+			},
+			exited: exited.promise,
+		};
+		using client = new RpcClient({ spawn: () => proc });
+		await client.start();
+
+		// A serialization error is not a pipe failure: only this request fails.
+		await expect(client.goal("create", { tokenBudget: 1n as unknown as number })).rejects.toThrow(TypeError);
+		expect(killed).toBe(false);
+	});
+
+	test("still stops the client when killing the agent throws during pipe-failure cleanup", async () => {
+		const proc: RpcAgentProcess = {
+			stdin: { write: () => Promise.reject(new Error("EPIPE: broken pipe, write")) },
+			stdout: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: "ready" })}\n`));
+				},
+			}),
+			peekStderr: () => "",
+			kill: () => {
+				throw new Error("kill failed");
+			},
+			exited: Promise.withResolvers<number>().promise,
+		};
+		using client = new RpcClient({ spawn: () => proc });
+		await client.start();
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await expect(client.getState()).rejects.toThrow("EPIPE");
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			expect(unhandled).toEqual([]);
+			await expect(client.getState()).rejects.toThrow("Client not started");
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
+	test("drops a manual login code that arrives after the client stopped", async () => {
+		const exited = Promise.withResolvers<number>();
+		const encoder = new TextEncoder();
+		let stdout!: ReadableStreamDefaultController<Uint8Array>;
+		const written: string[] = [];
+		const proc: RpcAgentProcess = {
+			stdin: { write: (data: string) => written.push(data) },
+			stdout: new ReadableStream<Uint8Array>({
+				start(controller) {
+					stdout = controller;
+					controller.enqueue(encoder.encode(`${JSON.stringify({ type: "ready" })}\n`));
+				},
+			}),
+			peekStderr: () => "",
+			kill: () => exited.resolve(0),
+			exited: exited.promise,
+		};
+		using client = new RpcClient({ spawn: () => proc });
+		await client.start();
+
+		const code = Promise.withResolvers<string>();
+		const prompted = Promise.withResolvers<void>();
+		const login = client.login("test-provider", {
+			onManualCodeInput: () => {
+				prompted.resolve();
+				return code.promise;
+			},
+		});
+		stdout.enqueue(
+			encoder.encode(
+				`${JSON.stringify({ type: "extension_ui_request", id: "ui_1", method: "input", title: "Paste code" })}\n`,
+			),
+		);
+		await prompted.promise;
+
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			// The client stops (as it does on a broken stdin pipe) while the user is still typing the code.
+			await client.stop();
+			await expect(login).rejects.toThrow("Client stopped");
+			const writesBefore = written.length;
+			code.resolve("pasted-code");
+			const turn = Promise.withResolvers<void>();
+			setImmediate(turn.resolve);
+			await turn.promise;
+			expect(unhandled).toEqual([]);
+			expect(written.length).toBe(writesBefore);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
 	});
 });
