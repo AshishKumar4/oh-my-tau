@@ -719,6 +719,7 @@ export class UsageService implements UsageApi {
 		const strategy = this.#deps.strategies(provider);
 		const providerReports = reports.filter(report => report.provider === provider);
 		if (providerReports.length === 0) return [];
+		const nowMs = Date.now();
 		const seen = new Set<string>();
 		const reporting: string[] = [];
 		for (const modelId of modelIds) {
@@ -727,7 +728,7 @@ export class UsageService implements UsageApi {
 			const context: CredentialRankingContext = { modelId };
 			const hasUsage = providerReports.some(report => {
 				const limits = strategy
-					? scopedUsageLimits(strategy, report, context)
+					? scopedUsageLimits(strategy, report, context, nowMs)
 					: report.limits.filter(limit => limit.scope.shared === true || limit.scope.modelId === modelId);
 				return limits.some(limit => isUsageLimitExhausted(limit) || resolveUsedFraction(limit) !== undefined);
 			});

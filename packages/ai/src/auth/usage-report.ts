@@ -176,13 +176,27 @@ export function isUsageLimitExhausted(limit: UsageLimit): boolean {
 	return false;
 }
 
-/** Return the usage limits that apply to the requested model for this strategy. */
+/**
+ * Whether a window's observation still describes the account: its reset is
+ * ahead, or it was observed after that reset. A window observed before a reset
+ * that has since passed says nothing about now; a retained report can carry one
+ * for days, and read as current it would hold a healthy account exhausted.
+ */
+function isCurrentUsageWindow(limit: UsageLimit, report: UsageReport, nowMs: number): boolean {
+	const resetsAt = limit.window?.resetsAt;
+	return resetsAt === undefined || resetsAt > nowMs || report.fetchedAt >= resetsAt;
+}
+
+/** Return the current usage limits that apply to the requested model for this strategy. */
 export function scopedUsageLimits(
 	strategy: CredentialRankingStrategy,
 	report: UsageReport,
 	context: CredentialRankingContext,
+	nowMs: number,
 ): UsageLimit[] {
-	return strategy.scopeLimits?.(report, context) ?? report.limits;
+	return (strategy.scopeLimits?.(report, context) ?? report.limits).filter(limit =>
+		isCurrentUsageWindow(limit, report, nowMs),
+	);
 }
 
 /** Returns true if usage indicates rate limit has been reached. */
@@ -222,21 +236,22 @@ export function normalizeUsageFraction(limit: UsageLimit | undefined): number {
 	return Math.min(Math.max(usedFraction, 0), 1);
 }
 
-/** Select usage limits for account reserve evaluation. */
+/** Select the current usage limits for account reserve evaluation. */
 export function reserveUsageLimits(
 	strategy: CredentialRankingStrategy | undefined,
 	report: UsageReport,
 	rankingContext: CredentialRankingContext,
+	nowMs: number,
 ): UsageLimit[] {
-	if (strategy) {
-		return (
-			strategy.scopeLimitsForReserve?.(report, rankingContext) ?? scopedUsageLimits(strategy, report, rankingContext)
-		);
-	}
-	return report.limits.filter(limit => {
-		const modelId = limit.scope.modelId;
-		return modelId === undefined || rankingContext.modelId === undefined || modelId === rankingContext.modelId;
-	});
+	const limits = strategy
+		? (strategy.scopeLimitsForReserve?.(report, rankingContext) ??
+			strategy.scopeLimits?.(report, rankingContext) ??
+			report.limits)
+		: report.limits.filter(limit => {
+				const modelId = limit.scope.modelId;
+				return modelId === undefined || rankingContext.modelId === undefined || modelId === rankingContext.modelId;
+			});
+	return limits.filter(limit => isCurrentUsageWindow(limit, report, nowMs));
 }
 
 /** Measure currently available quota outside expired windows. */
@@ -247,11 +262,7 @@ export function remainingUsageFraction(
 	nowMs: number,
 ): number | undefined {
 	if (!report) return undefined;
-	const usedFractions = reserveUsageLimits(strategy, report, rankingContext)
-		.filter(limit => {
-			const resetsAt = limit.window?.resetsAt;
-			return resetsAt === undefined || resetsAt > nowMs || report.fetchedAt >= resetsAt;
-		})
+	const usedFractions = reserveUsageLimits(strategy, report, rankingContext, nowMs)
 		.map(resolveUsedFraction)
 		.filter((fraction): fraction is number => fraction !== undefined);
 	return usedFractions.length === 0 ? undefined : Math.max(0, 1 - Math.max(...usedFractions));

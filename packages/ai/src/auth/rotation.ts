@@ -360,15 +360,15 @@ export class RateLimits implements LimitsApi {
 			// report from before a saved reset (or before the window rolled)
 			// still shows the account exhausted until its old reset, and would
 			// re-block a recovered account for days.
-			if (report && isLiveUsageReport(report, Date.now())) {
-				const scopedLimits = scopedUsageLimits(routing.strategy, report, routing.rankingContext);
+			const nowMs = Date.now();
+			if (report && isLiveUsageReport(report, nowMs)) {
+				const scopedLimits = scopedUsageLimits(routing.strategy, report, routing.rankingContext, nowMs);
 				if (isUsageLimitReached(scopedLimits)) {
-					const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
+					const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 					if (resetAtMs && resetAtMs > blockedUntil) {
 						blockedUntil = resetAtMs;
 						providerTimed = true;
 					}
-					const nowMs = Date.now();
 					const exhaustedLimits = scopedLimits.filter(limit => isUsageLimitExhausted(limit));
 					const futureResets = exhaustedLimits
 						.map(limit => windowResetAt(limit.window))

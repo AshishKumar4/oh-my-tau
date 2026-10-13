@@ -419,7 +419,7 @@ describe("xai-oauth usage provider", () => {
 		expect(report.limits[0]?.amount.limit).toBe(9516);
 		expect(report.limits[0]?.notes?.[0]).toContain("enforcement uncertain");
 		expect(xaiOauthRankingStrategy.scopeLimits?.(report, { modelId: "grok-4.7" })).toEqual([]);
-		expect(reserveUsageLimits(xaiOauthRankingStrategy, report, { modelId: "grok-4.7" })).toEqual([]);
+		expect(reserveUsageLimits(xaiOauthRankingStrategy, report, { modelId: "grok-4.7" }, Date.now())).toEqual([]);
 		expect(xaiOauthRankingStrategy.findWindowLimits(report).secondary).toBeUndefined();
 
 		const monthlyOnly = await xaiOauthUsageProvider.fetchUsage(
@@ -428,9 +428,9 @@ describe("xai-oauth usage provider", () => {
 		);
 		if (!monthlyOnly) throw new Error("Expected monthly-only billing report");
 		expect(isUsageLimitReached(xaiOauthRankingStrategy.scopeLimits?.(monthlyOnly) ?? [])).toBe(true);
-		expect(reserveUsageLimits(xaiOauthRankingStrategy, monthlyOnly, { modelId: "grok-4.7" })[0]?.status).toBe(
-			"exhausted",
-		);
+		expect(
+			reserveUsageLimits(xaiOauthRankingStrategy, monthlyOnly, { modelId: "grok-4.7" }, Date.now())[0]?.status,
+		).toBe("exhausted");
 
 		const explicitWeekly = await xaiOauthUsageProvider.fetchUsage(
 			{ provider: "xai-oauth", credential: makeCredential({ email: "stored@example.com" }) },

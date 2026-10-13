@@ -251,7 +251,7 @@ export class CredentialSelector {
 				args.blockScopes ?? args.blockScope,
 			);
 			let blocked = blockedUntil !== undefined;
-			const scopedLimits = usage ? scopedUsageLimits(strategy, usage, args.rankingContext) : undefined;
+			const scopedLimits = usage ? scopedUsageLimits(strategy, usage, args.rankingContext, nowMs) : undefined;
 			if (!blocked && scopedLimits && isUsageLimitReached(scopedLimits)) {
 				const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 				blockedUntil = resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS;
@@ -487,7 +487,8 @@ export class CredentialSelector {
 			let { blockedUntil } = result;
 			let blocked = blockedUntil !== undefined;
 			if (!this.#syncOAuthSelectionForUse(args.provider, selection)) continue;
-			const scopedLimits = usage && strategy ? scopedUsageLimits(strategy, usage, args.rankingContext) : undefined;
+			const scopedLimits =
+				usage && strategy ? scopedUsageLimits(strategy, usage, args.rankingContext, nowMs) : undefined;
 			if (!blocked && scopedLimits && isUsageLimitReached(scopedLimits)) {
 				const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 				blockedUntil = resetAtMs ?? Date.now() + DEFAULT_BLOCK_MS;
@@ -1035,9 +1036,10 @@ export class CredentialSelector {
 				return undefined;
 			}
 			if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
-				const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext);
+				const nowMs = Date.now();
+				const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext, nowMs);
 				if (isUsageLimitReached(scopedLimits)) {
-					const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
+					const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 					this.#deps.blocks.mark(
 						provider,
 						providerKey,
@@ -1092,9 +1094,10 @@ export class CredentialSelector {
 					return undefined;
 				}
 				if (checkUsage && !allowBlocked && usage && strategy && rankingContext) {
-					const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext);
+					const nowMs = Date.now();
+					const scopedLimits = scopedUsageLimits(strategy, usage, rankingContext, nowMs);
 					if (isUsageLimitReached(scopedLimits)) {
-						const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
+						const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 						this.#deps.blocks.mark(
 							provider,
 							providerKey,

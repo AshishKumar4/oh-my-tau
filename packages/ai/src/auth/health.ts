@@ -187,16 +187,8 @@ export class CredentialHealth implements HealthApi {
 				}
 				if (!report) return { credentialId: entry.id, credentialType, state: "unknown" };
 
-				const limits = reserveUsageLimits(strategy, report, rankingContext);
-				if (limits.length === 0) return { credentialId: entry.id, credentialType, state: "unknown" };
-
-				const currentLimits = limits.filter(limit => {
-					const resetsAt = limit.window?.resetsAt;
-					return resetsAt === undefined || resetsAt > nowMs || report.fetchedAt >= resetsAt;
-				});
-				if (currentLimits.length === 0) {
-					return { credentialId: entry.id, credentialType, state: "unknown" };
-				}
+				const currentLimits = reserveUsageLimits(strategy, report, rankingContext, nowMs);
+				if (currentLimits.length === 0) return { credentialId: entry.id, credentialType, state: "unknown" };
 				const activeExhausted = currentLimits.filter(limit => isUsageLimitExhausted(limit));
 				if (activeExhausted.length > 0) {
 					const futureResets = activeExhausted
