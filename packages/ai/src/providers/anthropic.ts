@@ -5800,18 +5800,18 @@ export function convertAnthropicMessages(
 	// dropped, or compaction file metadata was flushed after it — it moves to
 	// the next assistant turn, the first response that saw the change. Every
 	// later request derives the same slot, so continuations stay cache-stable.
-	for (let i = 0; i < params.length; i++) {
+	// Walking backwards relocates later controls first, so every control already
+	// waiting at a slot came from a later request and an earlier one goes before it.
+	for (let i = params.length - 1; i >= 0; i--) {
 		const control = params[i];
 		if (!controlParams.has(control) || control.content.length === 0) continue;
 		const next = skipControls(i, 1);
 		if (params[next]?.role !== "user") continue;
 		let slot = next;
 		while (slot < params.length && params[slot].role !== "assistant") slot++;
-		// Controls already waiting for that turn came from later requests.
 		while (controlParams.has(params[slot - 1])) slot--;
 		params.splice(slot, 0, control);
 		params.splice(i, 1);
-		i--;
 	}
 	if (opts?.compactionRequest) return params;
 	const last = skipControls(params.length, -1);

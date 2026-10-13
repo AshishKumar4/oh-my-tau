@@ -255,4 +255,31 @@ describe("Anthropic controls derived from the transcript", () => {
 		expectCacheStableContinuation(steered.payload, next.payload);
 		expectValidSystemPlacement(next.payload);
 	});
+
+	it("keeps two interrupted requests' tool changes in the order they were made", async () => {
+		const turn0 = [user("start")];
+		const first = await capture(turn0, Effort.Low, { tools: [tool("read"), tool("grep")] });
+		const grep = wireName(first, 1);
+		const history: Message[] = [...turn0, answering(reply("ready"), first), user("drop grep")];
+		const withdrawn = { tools: [tool("read")], inactiveTools: [tool("grep")] };
+		const removal = await capture(history, Effort.Low, withdrawn);
+		history.push(answering(assistant([], "aborted"), removal), user("actually keep grep", true));
+		const restored = { tools: [tool("read"), tool("grep")] };
+		const addition = await capture(history, Effort.Low, restored);
+		history.push(answering(assistant([], "aborted"), addition), user("go on", true));
+
+		// Both interrupted replies are dropped; their changes replay in order, so grep ends up active.
+		const next = await capture(history, Effort.Low, restored);
+		const grepChanges = next.payload.messages.flatMap(message =>
+			Array.isArray(message.content)
+				? message.content.flatMap((block: { type?: string; tool?: { name?: string } }) =>
+						block.tool?.name === grep && (block.type === "tool_removal" || block.type === "tool_addition")
+							? [block.type]
+							: [],
+					)
+				: [],
+		);
+		expect(grepChanges).toEqual(["tool_removal", "tool_addition"]);
+		expectValidSystemPlacement(next.payload);
+	});
 });
