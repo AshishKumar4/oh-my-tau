@@ -618,8 +618,9 @@ export class MnemopiSessionState {
 
 	/**
 	 * A fresh recall is cut by `budget` to the prefix the prompt carries next to the memory
-	 * instructions; a reused one is resent exactly as delivered. Memories the delivered block
-	 * shows, even in part, are tracked for change reports.
+	 * instructions; a reused one is resent exactly as delivered, and one recorded before
+	 * scopes is cut as every send of it was. Memories the delivered block shows, even in
+	 * part, are tracked for change reports.
 	 */
 	async beforeAgentStartPrompt(
 		promptText: string,
@@ -639,7 +640,7 @@ export class MnemopiSessionState {
 			// change for the next resume to report.
 			const changes = this.#recallChanges(persisted.memories);
 			return {
-				context: persisted.text || undefined,
+				context: (persisted.uncut ? budget(persisted.text) : persisted.text) || undefined,
 				notice: changes && {
 					content: changes.content,
 					details: { scope, memories: changes.memories } satisfies MemoryRecallChangesDetails,

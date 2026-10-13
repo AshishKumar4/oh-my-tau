@@ -84,8 +84,13 @@ function startProcess(
 	return state;
 }
 
-async function resume(storeDir: TempDir, sessionFile: string, sessionDir: TempDir): Promise<MnemopiSessionState> {
-	return startProcess(storeDir, await SessionManager.open(sessionFile, sessionDir.join("sessions")));
+async function resume(
+	storeDir: TempDir,
+	sessionFile: string,
+	sessionDir: TempDir,
+	overrides: Record<string, unknown> = {},
+): Promise<MnemopiSessionState> {
+	return startProcess(storeDir, await SessionManager.open(sessionFile, sessionDir.join("sessions")), overrides);
 }
 
 /** Runs the first turn's recall; returns the block and the change note delivered with it. */
@@ -439,13 +444,13 @@ describe("Recall entries written before scopes", () => {
 	const LEGACY_BLOCK = "- The deploy host is alpha-7.";
 
 	/** A transcript whose first turn recorded its recall the way sessions did before scopes. */
-	async function legacyTranscript(entry: { backend?: string; cwd?: string } = {}) {
+	async function legacyTranscript(entry: { backend?: string; cwd?: string; block?: string } = {}) {
 		const dir = tempDir();
 		const sessionManager = newSession(dir);
 		sessionManager.appendCustomEntry("memory_recall", {
 			backend: entry.backend ?? "mnemopi",
 			cwd: entry.cwd ?? sessionManager.getCwd(),
-			block: LEGACY_BLOCK,
+			block: entry.block ?? LEGACY_BLOCK,
 		});
 		const sessionFile = await writeTranscript(sessionManager);
 		return { dir, sessionManager, sessionFile };
@@ -459,6 +464,26 @@ describe("Recall entries written before scopes", () => {
 		expect(await firstTurn(resumed)).toEqual({ block: LEGACY_BLOCK, notice: undefined });
 		// Reused, not recalled again: no second entry.
 		expect(recallEntryCount(resumed.session.sessionManager)).toBe(1);
+	});
+
+	it("cuts an over-budget block to the injection budget, the same bytes on every resume", async () => {
+		// Those entries hold the whole recall; every send cut it to the budget beside the instructions.
+		const longBlock = Array.from(
+			{ length: 80 },
+			(_, i) => `- Deploy note ${i}: host alpha-${i} serves region ${i}.`,
+		).join("\n");
+		const { dir, sessionFile } = await legacyTranscript({ block: longBlock });
+		const budget = { "mnemopi.injectionTokenLimit": 300 };
+
+		const first = await resume(dir, sessionFile, dir, budget);
+		const { block } = await firstTurn(first);
+		expect(block).toBe(first.budgetRecallBlock(longBlock));
+		expect(block?.length).toBeLessThan(longBlock.length);
+		expect(block).toContain("Deploy note 0");
+		expect(block).not.toContain("Deploy note 79");
+
+		const again = await resume(dir, sessionFile, dir, budget);
+		expect((await firstTurn(again)).block).toBe(block);
 	});
 
 	it("recalls afresh for an entry from another cwd or backend", async () => {

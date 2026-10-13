@@ -37,6 +37,15 @@ export interface PersistedRecall {
 	memories: RecalledMemory[];
 }
 
+/** A recall found in the transcript. */
+export interface FoundRecall extends PersistedRecall {
+	/**
+	 * The entry predates scopes and holds the whole recall, not the block as delivered:
+	 * the backend cut it to its injection budget on every send, and must again.
+	 */
+	uncut?: true;
+}
+
 /** Details of a {@link MEMORY_RECALL_CHANGES_MESSAGE_TYPE} message. */
 export interface MemoryRecallChangesDetails {
 	scope: string;
@@ -137,7 +146,7 @@ export function findPersistedRecall(
 	sessionManager: Pick<SessionManager, "getBranch">,
 	scope: string,
 	legacy?: LegacyRecallScope,
-): PersistedRecall | undefined {
+): FoundRecall | undefined {
 	const entries: SessionEntry[] = sessionManager.getBranch();
 	let turnFollowed = false;
 	let reported: RecalledMemory[] | undefined;
@@ -160,7 +169,7 @@ export function findPersistedRecall(
 				data.backend === legacy.backend &&
 				data.cwd === legacy.cwd
 			) {
-				return { text: data.block, memories: [] };
+				return { text: data.block, memories: [], uncut: true };
 			}
 		}
 	}
