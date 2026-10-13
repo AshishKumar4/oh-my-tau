@@ -135,6 +135,39 @@ describe("date-cwd-reminder", () => {
 
 			expect(replay.messages[0]).toBe(first.messages[0]);
 		});
+
+		it("keeps the reminders of turns a compaction retains when the first user turn changes", () => {
+			const injector = new DateCwdReminderInjector();
+			const first: Message = { role: "user", content: "first", timestamp: 1 };
+			const kept: Message = { role: "user", content: "kept", timestamp: 2 };
+			const toolTurn = createAssistantMessage("calling a tool");
+			// The cwd moves mid tool loop: the continuation carries the reminder as a control.
+			injector.transform({ systemPrompt: ["system"], messages: [first] }, "2026-08-14", "/old");
+			injector.transform(
+				{ systemPrompt: ["system"], messages: [first, createAssistantMessage("a"), kept, toolTurn] },
+				"2026-08-14",
+				"/old",
+			);
+			const live = injector.transform(
+				{ systemPrompt: ["system"], messages: [first, createAssistantMessage("a"), kept, toolTurn] },
+				"2026-08-14",
+				"/new",
+			);
+			const control = live.messages.at(-1)!;
+			expect(control.role).toBe("developer");
+
+			// A compaction replaces everything before `kept` with a new summary turn.
+			const summary: Message = { role: "user", content: "summary", timestamp: 3 };
+			const after = injector.transform(
+				{ systemPrompt: ["system"], messages: [summary, kept, toolTurn] },
+				"2026-08-14",
+				"/new",
+			);
+
+			// The retained tail is sent exactly as before; only the new summary gets the current reminder.
+			expect(after.messages.slice(1)).toEqual([kept, toolTurn, control]);
+			expect(after.messages[0]?.content).toBe(`${renderDateCwdReminder("2026-08-14", "/new")}\n\nsummary`);
+		});
 	});
 });
 
