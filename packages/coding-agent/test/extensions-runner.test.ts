@@ -4654,6 +4654,84 @@ describe("ExtensionRunner", () => {
 			expect(cachedTexts).toEqual(["persisted user", "persisted assistant"]);
 		});
 
+		it("keeps a message a context handler caches unchanged across calls out of per-call context", async () => {
+			// The handler returns the first message object it saw on every later call. The
+			// history position published on it by one call must not read as a rewrite in the next.
+			await Bun.write(
+				path.join(extensionsDir, "cache-first.ts"),
+				`export default function(pi) {
+					let first;
+					pi.on("context", async event => {
+						first ??= event.messages[0];
+						return { messages: [first, ...event.messages.slice(1)] };
+					});
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const model = getBundledModel<"anthropic-messages">("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic model to exist");
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "persisted user", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "persisted assistant" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: model.id,
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 2,
+				},
+			];
+			const anchoredTexts = async (transformed: AgentMessage[]) => {
+				let body: MessageCreateParams | undefined;
+				const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+					body = JSON.parse(String(init?.body ?? "{}")) as MessageCreateParams;
+					return new Response(
+						JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
+						{ status: 400, headers: { "Content-Type": "application/json" } },
+					);
+				}) as typeof fetch;
+				await streamAnthropic(
+					model,
+					{ systemPrompt: ["system"], messages: convertToLlm(wrapSteeringForModel(transformed)) },
+					{ apiKey: "sk-ant-api-test", fetch: fetchMock },
+				)
+					.result()
+					.catch(() => undefined);
+				if (!body) throw new Error("Expected Anthropic wire body");
+				return body.messages.flatMap(message =>
+					Array.isArray(message.content)
+						? message.content.flatMap(block =>
+								"cache_control" in block && block.cache_control != null && block.type === "text"
+									? [block.text]
+									: [],
+							)
+						: [],
+				);
+			};
+
+			const first = await runner.emitContext(messages);
+			const second = await runner.emitContext(messages);
+			expect(second[0]).toBe(first[0]);
+			expect(await anchoredTexts(first)).toEqual(["persisted user", "persisted assistant"]);
+			expect(await anchoredTexts(second)).toEqual(["persisted user", "persisted assistant"]);
+		});
+
 		it("keeps rolling breakpoints on the tail when a context handler leaves freshly streamed messages untouched", async () => {
 			// A no-op context handler still routes every message through `structuredClone`,
 			// which cannot carry the symbol-keyed markers a live stream leaves on its

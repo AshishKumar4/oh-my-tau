@@ -2015,7 +2015,10 @@ export class ExtensionRunner {
 		// may be a history message the transform restructured past tracing. Occupants
 		// publish their history position for the call's consumers. History messages
 		// carry their own index while compared, so a copy's index tag alone never makes
-		// it unequal.
+		// it unequal. A message a hook keeps across calls may still carry the position
+		// an earlier call published; it is dropped here so it never reads as a rewrite,
+		// and every message handed back gets this call's.
+		for (const message of currentMessages) setContextHistoryPosition(message, undefined);
 		for (let index = 0; index < messages.length; index++) setContextHistoryIndex(messages[index], index);
 		const occupants = new Map<number, AgentMessage>();
 		for (const message of currentMessages) {
