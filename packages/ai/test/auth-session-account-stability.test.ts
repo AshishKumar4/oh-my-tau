@@ -113,4 +113,48 @@ describe("a warm session's account", () => {
 
 		expect(await serving(storage, "warm")).toBe("access-b");
 	});
+
+	it("stays when a different account is removed", async () => {
+		const { store, storage } = setup();
+		await storage.credentials.set("anthropic", [account("a"), account("b"), account("c")]);
+		for (const [id, used] of [
+			["a", 0.5],
+			["b", 0.5],
+			["c", 0.1],
+		] as const)
+			store.reports.set(id, weekly(id, used));
+		pin(storage, "warm", "a");
+		const removed = pin(storage, "other", "b");
+		expect(await serving(storage, "warm")).toBe("access-a");
+
+		await storage.credentials.removeById("anthropic", removed);
+		expect(await serving(storage, "warm")).toBe("access-a");
+		// The session on the removed account moves.
+		expect(await serving(storage, "other")).not.toBe("access-b");
+	});
+
+	it("stays when another session finds a sibling's grant revoked", async () => {
+		const { store, storage } = setup("b");
+		await storage.credentials.set("anthropic", [account("a"), account("b"), account("c")]);
+		for (const [id, used] of [
+			["a", 0.5],
+			["b", 0.5],
+			["c", 0.1],
+		] as const)
+			store.reports.set(id, weekly(id, used));
+		pin(storage, "warm", "a");
+		pin(storage, "driver", "b");
+		expect(await serving(storage, "warm")).toBe("access-a");
+		const row = store
+			.listAuthCredentials("anthropic")
+			.find(entry => entry.credential.type === "oauth" && entry.credential.accountId === "b");
+		if (row?.credential.type !== "oauth") throw new Error("no account b");
+		store.updateAuthCredential(row.id, { ...row.credential, expires: Date.now() - 1 });
+		await storage.credentials.reload();
+
+		// The driver's refresh disables b for good and moves the driver.
+		expect(await serving(storage, "driver")).not.toBe("access-b");
+		expect(storage.oauth.accounts("anthropic").some(entry => entry.accountId === "b")).toBe(false);
+		expect(await serving(storage, "warm")).toBe("access-a");
+	});
 });

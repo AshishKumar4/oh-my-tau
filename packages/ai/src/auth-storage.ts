@@ -187,10 +187,9 @@ export class AuthStorage {
 		const pool = new CredentialPool(store, {
 			policies,
 			blockHealth,
-			onReset: provider => {
-				selector.resetRoundRobin(provider);
-				affinity.clearProvider(provider);
-			},
+			// Session pins survive: each resolves through its durable row id and drops
+			// itself once that row is gone, so only sessions on a changed account move.
+			onReset: provider => selector.resetRoundRobin(provider),
 			onApiKeyAdded: (provider, credentialId) => blocks.clearAll(provider, credentialId),
 		});
 		const refresher = new OAuthRefresher({

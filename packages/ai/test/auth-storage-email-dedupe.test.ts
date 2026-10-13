@@ -945,7 +945,7 @@ describe("AuthStorage persistent session stickiness", () => {
 		}
 	});
 
-	it("drops persisted session stickiness after a lower-index credential is removed", async () => {
+	it("keeps a persisted session on its own account, by row id, after a lower-index credential is removed", async () => {
 		const provider = "unit-sticky-invalidation";
 		const mk = (suffix: string): OAuthCredential => ({
 			type: "oauth",
@@ -998,10 +998,16 @@ describe("AuthStorage persistent session stickiness", () => {
 		await authStorage.credentials.reload();
 		rows = authStorage.credentials.list(provider);
 		expect(rows.findIndex(row => row.id === stuckId)).toBe(stuckIndex - 1);
+		// The account now at the pin's old index: where an index-only pin would wrongly land.
+		const shifted = rows[stuckIndex]?.credential;
+		const shiftedToken = shifted?.type === "oauth" ? shifted.access : undefined;
+		expect(shiftedToken).toBeDefined();
 
 		const resolved = await authStorage.keys.get(provider, session);
 		authStorage.close();
-		expect(resolved).toBe(freshToken);
-		expect(resolved).not.toBe(stuckToken);
+		// Removing another account leaves the warm session on its own account, found by row id.
+		expect(resolved).toBe(stuckToken);
+		expect(resolved).not.toBe(shiftedToken);
+		expect(resolved).not.toBe(freshToken);
 	});
 });

@@ -88,7 +88,7 @@ function storedCredentialArraysEqual(left: StoredCredential[], right: StoredCred
 export interface CredentialPoolOptions {
 	policies: AccountPolicies;
 	blockHealth: BlockStoreHealth;
-	/** Called whenever a provider's credential set changed locally. */
+	/** Called whenever a provider's credential set changed locally: resets round-robin state. */
 	onReset: (provider: string) => void;
 	/** Called after an API key is added or added again: it serves at once, whatever set it aside. */
 	onApiKeyAdded: (provider: string, credentialId: number) => void;
@@ -134,7 +134,7 @@ export class CredentialPool implements CredentialsApi {
 		return this.#data.keys();
 	}
 
-	/** Reset session affinity and round-robin state after a local credential change. */
+	/** Reset round-robin state after a local credential change. */
 	reset(provider: string): void {
 		this.#options.onReset(provider);
 	}

@@ -52,20 +52,6 @@ export class SessionAffinity implements SessionsApi {
 		this.#blocks = blocks;
 	}
 
-	/** Drop every pin for a provider, both in memory and in the persisted cache. */
-	clearProvider(provider: string): void {
-		this.#sessionLastCredential.delete(provider);
-		const prefix = `${SESSION_STICKY_CACHE_PREFIX}${provider}:`;
-		for (const cacheKey of this.#persistedSticky.keys()) {
-			if (cacheKey.startsWith(prefix)) this.#persistedSticky.delete(cacheKey);
-		}
-		try {
-			this.#store.deleteCachePrefix?.(prefix);
-		} catch (err) {
-			logger.debug("Failed to clear provider session sticky credentials from persistent store cache", { err });
-		}
-	}
-
 	/** Drop only this in-memory session pin after OAuth selection falls through. */
 	forget(provider: string, sessionId: string): void {
 		this.#sessionLastCredential.get(provider)?.delete(sessionId);

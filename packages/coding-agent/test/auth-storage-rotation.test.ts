@@ -450,7 +450,7 @@ describe("AuthStorage account rotation", () => {
 		expect(new Set(attemptedKeys).size).toBe(4);
 	});
 
-	test("provider login invalidates only that provider's persisted session stickiness", async () => {
+	test("provider login leaves running sessions on their own accounts", async () => {
 		tempDir = path.join(os.tmpdir(), `pi-test-auth-rotation-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		authStorage.close();
@@ -522,9 +522,10 @@ describe("AuthStorage account rotation", () => {
 		authStorage = await createRotationStorage(path.join(tempDir, "testauth.db"));
 		await authStorage.credentials.reload();
 
+		// A new account ranks for new sessions; a running session keeps the account its cache is warm on.
 		const reloadedTargetKey = await authStorage.keys.get(targetProvider, sessionId);
-		expect(reloadedTargetKey).toBe(freshKey);
-		expect(reloadedTargetKey).not.toBe(stickyKey);
+		expect(reloadedTargetKey).toBe(stickyKey);
+		expect(reloadedTargetKey).not.toBe(freshKey);
 		expect(await authStorage.keys.get(unrelatedProvider, unrelatedSessionId)).toBe(unrelatedStickyKey);
 	});
 });
