@@ -1985,16 +1985,18 @@ export class ExtensionRunner {
 
 				if (handlerResult && (handlerResult as ContextEventResult).messages) {
 					const nextMessages = (handlerResult as ContextEventResult).messages!;
-					// A new object at a history message's position replaces it (a clone,
-					// possibly rewritten); one past the end was added. The final pass
-					// still marks a replacement that differs from its history message.
-					for (let index = 0; index < nextMessages.length; index++) {
-						const message = nextMessages[index];
-						if (!message || getContextHistoryIndex(message) !== undefined) continue;
-						const previousMessage = currentMessages[index];
-						if (!previousMessage) continue;
-						const historyIndex = getContextHistoryIndex(previousMessage);
-						if (historyIndex !== undefined) setContextHistoryIndex(message, historyIndex);
+					// A same-length result is a rewrite map: a new object (a clone, possibly
+					// rewritten) at a history message's position and with its role replaces
+					// it. Positions in any other result say nothing, so they are not guessed.
+					if (nextMessages.length === currentMessages.length) {
+						for (let index = 0; index < nextMessages.length; index++) {
+							const message = nextMessages[index];
+							if (!message || getContextHistoryIndex(message) !== undefined) continue;
+							const previousMessage = currentMessages[index];
+							if (!previousMessage || previousMessage.role !== message.role) continue;
+							const historyIndex = getContextHistoryIndex(previousMessage);
+							if (historyIndex !== undefined) setContextHistoryIndex(message, historyIndex);
+						}
 					}
 					currentMessages = nextMessages;
 				}
@@ -2003,26 +2005,32 @@ export class ExtensionRunner {
 
 		// Each history slot has one occupant: its first unchanged copy, else its first
 		// changed one. Any other message claiming the slot (say, a note spread from a
-		// history message and appended beside it) was added for this call. History
+		// history message and appended beside it) was added for this call. A message
+		// with no slot is added only while every slot has its occupant; otherwise it
+		// may be a history message the transform restructured past tracing. History
 		// messages carry their own index while compared, so a copy's index tag alone
 		// never makes it unequal.
 		for (let index = 0; index < messages.length; index++) setContextHistoryIndex(messages[index], index);
-		const unchangedOccupants = new Map<number, AgentMessage>();
+		const occupants = new Map<number, AgentMessage>();
 		for (const message of currentMessages) {
 			const historyIndex = getContextHistoryIndex(message);
-			if (historyIndex === undefined || unchangedOccupants.has(historyIndex)) continue;
-			if (Bun.deepEquals(message, messages[historyIndex])) unchangedOccupants.set(historyIndex, message);
+			if (historyIndex === undefined || occupants.has(historyIndex)) continue;
+			if (Bun.deepEquals(message, messages[historyIndex])) occupants.set(historyIndex, message);
 		}
-		const rewrittenSlots = new Set<number>();
+		const unchanged = new Set(occupants.values());
+		for (const message of currentMessages) {
+			const historyIndex = getContextHistoryIndex(message);
+			if (historyIndex !== undefined && !occupants.has(historyIndex)) occupants.set(historyIndex, message);
+		}
+		const traced = occupants.size === messages.length;
 		for (const message of currentMessages) {
 			const historyIndex = getContextHistoryIndex(message);
 			clearContextHistoryIndex(message);
-			if (historyIndex !== undefined && unchangedOccupants.get(historyIndex) === message) continue;
-			if (historyIndex !== undefined && !unchangedOccupants.has(historyIndex) && !rewrittenSlots.has(historyIndex)) {
-				rewrittenSlots.add(historyIndex);
+			if (unchanged.has(message)) continue;
+			if (historyIndex !== undefined && occupants.get(historyIndex) === message) {
 				markPerCallContextMessage(message, "rewritten");
 			} else {
-				markPerCallContextMessage(message, "added");
+				markPerCallContextMessage(message, traced ? "added" : "untraced");
 			}
 		}
 		for (const message of messages) clearContextHistoryIndex(message);

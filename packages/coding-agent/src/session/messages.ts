@@ -52,7 +52,7 @@ import {
 } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
 import { convertMessageToLlm } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type { AssistantMessage, ImageContent, Message, TextContent, UserMessage } from "@oh-my-pi/pi-ai";
-import { copyPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { syncPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
@@ -670,7 +670,6 @@ function wrapSteeringUserMessage(message: SteeringUserMessage): UserMessage {
 					attribution: "user",
 					timestamp: message.timestamp,
 				};
-	copyPerCallContextMessage(userMessage, message);
 	if (typeof message.content === "string") {
 		if (message.content.length === 0) return message.role === "user" ? message : userMessage;
 		return { ...userMessage, content: renderSteeringEnvelope(message.content) };
@@ -703,6 +702,7 @@ export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
 			wrappedMessage = wrapSteeringUserMessage(message);
 			steeringWrapperCache.set(message, wrappedMessage);
 		}
+		syncPerCallContextMessage(wrappedMessage, message);
 		if (wrappedMessage === message) continue;
 		if (wrappedMessages === undefined) {
 			wrappedMessages = messages.slice();
@@ -1149,10 +1149,14 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
  *  `interruptedNext` neighbor state hold; recomputes on a neighbor flip. */
 function convertOneCached(m: AgentMessage, interruptedNext: boolean): Message[] {
 	const cached = convertCache.get(m);
-	if (cached !== undefined && cached.interruptedNext === interruptedNext) return cached.fragment;
-	const fragment = convertOne(m, interruptedNext);
-	for (const message of fragment) copyPerCallContextMessage(message, m);
-	convertCache.set(m, { interruptedNext, fragment });
+	let fragment: Message[];
+	if (cached !== undefined && cached.interruptedNext === interruptedNext) {
+		fragment = cached.fragment;
+	} else {
+		fragment = convertOne(m, interruptedNext);
+		convertCache.set(m, { interruptedNext, fragment });
+	}
+	for (const message of fragment) syncPerCallContextMessage(message, m);
 	return fragment;
 }
 

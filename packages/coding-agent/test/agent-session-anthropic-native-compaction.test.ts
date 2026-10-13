@@ -277,6 +277,84 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(JSON.stringify(compaction.messages)).not.toContain("answer 2");
 	});
 
+	const note: AgentMessage = { role: "user", content: "per-call note", timestamp: 0 };
+	const restructuringHooks: Array<[string, ExtensionFactory]> = [
+		// Every message cloned (no provenance) and a note prepended: positions shift.
+		[
+			"prepends over clones",
+			pi => pi.on("context", event => ({ messages: [note, ...event.messages.map(m => structuredClone(m))] })),
+		],
+		// The opening exchange repeated ahead of the clones: the shift keeps roles aligned.
+		[
+			"repeats the opening exchange over clones",
+			pi =>
+				pi.on("context", event => ({
+					messages: [...event.messages.slice(0, 2), ...event.messages].map(m => structuredClone(m)),
+				})),
+		],
+		// The same shift at an unchanged length: a note prepended and the last message dropped.
+		[
+			"shifts clones at the same length",
+			pi =>
+				pi.on("context", event => ({
+					messages: [note, ...event.messages.slice(0, -1).map(m => structuredClone(m))],
+				})),
+		],
+	];
+
+	for (const [label, hook] of restructuringHooks) {
+		it(`declines rather than guess when a context hook ${label}`, async () => {
+			using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-restructure-");
+			const { session, requests, close } = await openSession(
+				tempDir,
+				request => (request <= 2 ? answer(request) : captured()),
+				[hook],
+			);
+			try {
+				await session.prompt("first question");
+				await session.prompt("second question");
+				await expect(session.compact()).rejects.toThrow("cannot be located");
+			} finally {
+				await close();
+			}
+			// No native compaction request was sent with a guessed range.
+			expect(requests).toHaveLength(2);
+		});
+	}
+
+	it("locates the summarized range by each call's provenance when a hook reuses one note object", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-reused-");
+		// One object across calls: untraced while the hook restructures, added once it appends.
+		const reusedNote: AgentMessage = { role: "user", content: "reused per-call note", timestamp: 0 };
+		let restructure = true;
+		const hook: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: restructure
+					? [reusedNote, ...event.messages.map(m => structuredClone(m))]
+					: [...event.messages, reusedNote],
+			}));
+		};
+		const { session, requests, close } = await openSession(
+			tempDir,
+			request => (request <= 2 ? answer(request) : captured()),
+			[hook],
+		);
+		try {
+			await session.prompt("first question");
+			await session.prompt("second question");
+			restructure = false;
+			await expect(session.compact()).rejects.toThrow("captured");
+		} finally {
+			await close();
+		}
+
+		expect(requests).toHaveLength(3);
+		const compaction = requests[2];
+		expect(JSON.stringify(compaction.messages)).toContain("second question");
+		expect(JSON.stringify(compaction.messages)).not.toContain("reused per-call note");
+		expect(JSON.stringify(compaction.messages)).not.toContain("answer 2");
+	});
+
 	it("keeps every summarized message when a reminder change mid tool loop inserted a control turn", async () => {
 		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-control-");
 		const file = tempDir.join("notes.txt");

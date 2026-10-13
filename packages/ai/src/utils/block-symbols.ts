@@ -175,9 +175,10 @@ export const kPerCallContextMessage = Symbol("agent.message.perCallContext");
 
 /**
  * How a per-call message came to be: `added` has no place in the history, `rewritten`
- * replaces the history message at its position.
+ * replaces the history message at its position, and `untraced` could be either: the
+ * transform restructured the history past tracing.
  */
-export type PerCallContextOrigin = "added" | "rewritten";
+export type PerCallContextOrigin = "added" | "rewritten" | "untraced";
 
 /** Carries per-call context provenance without exposing a string-keyed property. */
 export type PerCallContextMessageCarrier = object & { [kPerCallContextMessage]?: PerCallContextOrigin };
@@ -196,6 +197,20 @@ export function copyPerCallContextMessage(
 	if (origin !== undefined) target[kPerCallContextMessage] = origin;
 }
 
+/**
+ * Gives a conversion cached by identity its source's provenance for the current call.
+ * A context hook may return one object across calls with a different origin each
+ * time, so the mark from the call that built the cache entry may be stale.
+ */
+export function syncPerCallContextMessage(
+	target: PerCallContextMessageCarrier,
+	source: PerCallContextMessageCarrier,
+): void {
+	const origin = source[kPerCallContextMessage];
+	if (origin === undefined) delete target[kPerCallContextMessage];
+	else target[kPerCallContextMessage] = origin;
+}
+
 /** True when a message was synthesized for the current provider call. */
 export function isPerCallContextMessage(message: PerCallContextMessageCarrier | null | undefined): boolean {
 	return message?.[kPerCallContextMessage] !== undefined;
@@ -204,6 +219,11 @@ export function isPerCallContextMessage(message: PerCallContextMessageCarrier | 
 /** True when a context transform added the message for the current call: it is not part of the history. */
 export function isAddedContextMessage(message: PerCallContextMessageCarrier | null | undefined): boolean {
 	return message?.[kPerCallContextMessage] === "added";
+}
+
+/** True when a context transform left no trace of whether the message is history. */
+export function isUntracedContextMessage(message: PerCallContextMessageCarrier | null | undefined): boolean {
+	return message?.[kPerCallContextMessage] === "untraced";
 }
 
 /**

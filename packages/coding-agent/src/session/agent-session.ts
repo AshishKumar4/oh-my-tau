@@ -50,6 +50,7 @@ import {
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	generateBranchSummary,
+	NativeCompactionError,
 	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
@@ -83,7 +84,7 @@ import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import { isAddedContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { isAddedContextMessage, isUntracedContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { supportsOutputTokenLimit } from "@oh-my-pi/pi-catalog/compat/output-limits";
 import { requiresNativeTools, requiresToolFreeHistoryForToolOptOut } from "@oh-my-pi/pi-catalog/compat/tools";
@@ -2179,12 +2180,17 @@ export class AgentSession implements SettingsScope {
 				// request, so a separately transformed prefix can differ.
 				// Context hooks may add messages for each call; those are not history,
 				// so neither count includes them. A rewritten message keeps its place.
-				const prefixLength = (await this.convertMessagesToLlm(history, signal)).filter(
-					message => !isAddedContextMessage(message),
-				).length;
-				const live = await this.agent.buildSideRequestContext(
-					await this.convertMessagesToLlm([...history, ...retained], signal),
-				);
+				const prefix = await this.convertMessagesToLlm(history, signal);
+				const full = await this.convertMessagesToLlm([...history, ...retained], signal);
+				// A hook that restructured the history past tracing leaves no way to find
+				// the summarized range; the next compaction method runs instead.
+				if (prefix.some(isUntracedContextMessage) || full.some(isUntracedContextMessage)) {
+					throw new NativeCompactionError(
+						new Error("A context hook restructured the history, so the summarized range cannot be located"),
+					);
+				}
+				const prefixLength = prefix.filter(message => !isAddedContextMessage(message)).length;
+				const live = await this.agent.buildSideRequestContext(full);
 				// Date/cwd reminder controls are the only messages the provider transforms
 				// insert: count past them and messages hooks added, and leave out any at
 				// the cut, so the kept turns follow the summarized range directly.
