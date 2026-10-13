@@ -3,6 +3,7 @@ import { __resetProxyCache } from "@oh-my-pi/pi-ai/utils/proxy";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -115,7 +116,11 @@ describe("AgentSession Anthropic native compaction", () => {
 		});
 
 	/** A real session whose Messages API requests are recorded and answered by `respond`. */
-	async function openSession(tempDir: TempDir, respond: (request: number) => Response) {
+	async function openSession(
+		tempDir: TempDir,
+		respond: (request: number) => Response,
+		extensions: ExtensionFactory[] = [],
+	) {
 		const model = getBundledModel("anthropic", "claude-opus-5-5");
 		if (!model) throw new Error("Expected bundled claude-opus-5-5");
 		const requests: MessagesRequest[] = [];
@@ -139,6 +144,7 @@ describe("AgentSession Anthropic native compaction", () => {
 			modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
 			settings: Settings.isolated({ "compaction.methodOrder": ["remote"], "compaction.keepRecentTokens": 1 }),
 			model,
+			extensions,
 			disableExtensionDiscovery: true,
 			skills: [],
 			contextFiles: [],
@@ -182,6 +188,41 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(withoutCacheControl(compaction.messages)).toEqual(
 			withoutCacheControl(live.messages.slice(0, compaction.messages.length)),
 		);
+	});
+
+	it("cuts after the summarized range when a context hook appends a message to every request", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-hook-");
+		const appendNote: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+			}));
+		};
+		const { session, requests, close } = await openSession(
+			tempDir,
+			request => (request <= 2 ? answer(request) : captured()),
+			[appendNote],
+		);
+		try {
+			await session.prompt("first question");
+			await session.prompt("second question");
+			await expect(session.compact()).rejects.toThrow("captured");
+		} finally {
+			await close();
+		}
+
+		expect(requests).toHaveLength(3);
+		const [, live, compaction] = requests;
+		// The note rides at the end of each live request; it is not part of the history.
+		expect(JSON.stringify(live.messages.at(-1))).toContain("per-call note");
+		// One-token keep-recent keeps only the last answer: the compaction request is the
+		// history before it exactly as the live turn sent it, without the note and
+		// without the kept answer.
+		expect(compaction.messages.length).toBe(live.messages.length - 1);
+		expect(withoutCacheControl(compaction.messages)).toEqual(
+			withoutCacheControl(live.messages.slice(0, compaction.messages.length)),
+		);
+		expect(JSON.stringify(compaction.messages)).not.toContain("answer 2");
+		expect(JSON.stringify(compaction.messages)).not.toContain("per-call note");
 	});
 
 	it("keeps every summarized message when a reminder change mid tool loop inserted a control turn", async () => {
