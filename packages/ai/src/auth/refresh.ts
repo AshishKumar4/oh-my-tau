@@ -93,6 +93,7 @@ export interface OAuthRefresherDeps {
 	pool: CredentialPool;
 	policies: AccountPolicies;
 	override?: AuthStorageOptions["refreshOAuthCredential"];
+	overrideMints?: AuthStorageOptions["refreshOAuthCredentialMints"];
 }
 
 /** Single-flighted, lease-guarded OAuth refresh with compare-and-set persistence. */
@@ -111,6 +112,13 @@ export class OAuthRefresher {
 	 * Return the stored row while it still holds a usable token this refresher
 	 * minted within {@link OAUTH_REMINT_COOLDOWN_MS}.
 	 */
+	/** Whether refreshes run the provider token exchange in this process rather than delegating it. */
+	#mintsLocally(): boolean {
+		return this.#deps.override
+			? this.#deps.overrideMints === true
+			: this.#deps.store.refreshOAuthCredential === undefined;
+	}
+
 	#recentMint(id: number): { provider: string; credential: OAuthCredential } | undefined {
 		const mint = this.#recentMints.get(id);
 		if (!mint) return undefined;
@@ -345,7 +353,7 @@ export class OAuthRefresher {
 			} else {
 				this.#deps.store.updateAuthCredential(row.id, merged);
 			}
-			if (this.#deps.override === undefined && this.#deps.store.refreshOAuthCredential === undefined) {
+			if (this.#mintsLocally()) {
 				this.#rememberMint(provider, row.id, merged);
 			}
 			this.#deps.pool.replace(
@@ -462,11 +470,7 @@ export class OAuthRefresher {
 			.then(refreshed => {
 				// A delegated refresh may have returned a broker-cached token rather
 				// than minting one. Only direct local requests can establish mint time.
-				if (
-					!hasRefreshLeases(this.#deps.store) &&
-					this.#deps.override === undefined &&
-					this.#deps.store.refreshOAuthCredential === undefined
-				) {
+				if (!hasRefreshLeases(this.#deps.store) && this.#mintsLocally()) {
 					this.#rememberMint(provider, credentialId, refreshed);
 				}
 				return refreshed;

@@ -228,4 +228,83 @@ describe("AuthStorage OAuth account selection", () => {
 		// Target-only: no sibling credential was refreshed/rotated on the failure path.
 		expect(seen).toEqual(["access-b"]);
 	});
+
+	test("oauth.accessById force-refreshes only the durable requested row", async () => {
+		if (!store) throw new Error("test setup failed");
+		const refreshedIds: number[] = [];
+		const storage = new AuthStorage(store, {
+			refreshOAuthCredential: async (_provider, credentialId, credential) => {
+				refreshedIds.push(credentialId);
+				return {
+					access: `${credential.access}-reminted`,
+					refresh: credential.refresh,
+					expires: Date.now() + 60 * 60_000,
+					accountId: credential.accountId,
+					email: credential.email,
+				};
+			},
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			if (!credential) return null;
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		const target = storage.oauth.accounts(PROVIDER)[1];
+		if (!target) throw new Error("expected second OAuth account");
+
+		const result = await storage.oauth.accessById(PROVIDER, target.credentialId, { forceRefresh: true });
+
+		expect(result).toMatchObject({
+			ok: true,
+			credentialId: target.credentialId,
+			accountId: "acc-b",
+			accessToken: "access-b-reminted",
+		});
+		expect(refreshedIds).toEqual([target.credentialId]);
+		expect(
+			store.listAuthCredentials(PROVIDER).map(row => (row.credential.type === "oauth" ? row.credential.access : "")),
+		).toEqual(["access-a", "access-b-reminted", "access-c"]);
+
+		// Without forceRefresh the still-fresh row is served as stored.
+		const again = await storage.oauth.accessById(PROVIDER, target.credentialId);
+		expect(again).toMatchObject({ ok: true, accessToken: "access-b-reminted" });
+		expect(refreshedIds).toEqual([target.credentialId]);
+	});
+
+	test("oauth.accessById force refresh keeps the requested account when a lower row is removed meanwhile", async () => {
+		if (!store) throw new Error("test setup failed");
+		const storage = new AuthStorage(store, {
+			refreshOAuthCredential: async (_provider, _credentialId, credential) => ({
+				...credential,
+				access: `${credential.access}-reminted`,
+				expires: Date.now() + 60 * 60_000,
+			}),
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			if (!credential) return null;
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		const [lower, target] = storage.oauth.accounts(PROVIDER);
+		if (!lower || !target) throw new Error("expected three OAuth accounts");
+
+		// Another process holds the target's refresh lease and disables the lower row before releasing it,
+		// so the forced refresh re-lists the provider's rows without that row.
+		const { tryAcquireCredentialRefreshLease, releaseCredentialRefreshLease } = store;
+		if (!tryAcquireCredentialRefreshLease || !releaseCredentialRefreshLease)
+			throw new Error("expected refresh leases");
+		expect(tryAcquireCredentialRefreshLease.call(store, target.credentialId, "peer", Date.now() + 60_000)).toBe(true);
+		const pending = storage.oauth.accessById(PROVIDER, target.credentialId, { forceRefresh: true });
+		await store.deleteAuthCredential(lower.credentialId, "oauth refresh failed: invalid_grant");
+		releaseCredentialRefreshLease.call(store, target.credentialId, "peer");
+
+		expect(await pending).toMatchObject({
+			ok: true,
+			credentialId: target.credentialId,
+			accountId: "acc-b",
+			accessToken: "access-b-reminted",
+		});
+	});
 });
