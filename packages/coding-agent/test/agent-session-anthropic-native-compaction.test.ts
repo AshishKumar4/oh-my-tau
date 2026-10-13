@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { __resetProxyCache } from "@oh-my-pi/pi-ai/utils/proxy";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -190,12 +191,16 @@ describe("AgentSession Anthropic native compaction", () => {
 		);
 	});
 
-	it("cuts after the summarized range when a context hook appends a message to every request", async () => {
+	it("cuts after the summarized range when a context hook appends messages to every request", async () => {
 		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-hook-");
 		const appendNote: ExtensionFactory = pi => {
-			pi.on("context", event => ({
-				messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
-			}));
+			pi.on("context", event => {
+				const last = event.messages.at(-1);
+				// A fresh note, and one spread from the last history message: both are added, not history.
+				const notes: AgentMessage[] = [{ role: "user", content: "per-call note", timestamp: 0 }];
+				if (last?.role === "user") notes.push({ ...last, content: "spread per-call note" });
+				return { messages: [...event.messages, ...notes] };
+			});
 		};
 		const { session, requests, close } = await openSession(
 			tempDir,
@@ -212,12 +217,12 @@ describe("AgentSession Anthropic native compaction", () => {
 
 		expect(requests).toHaveLength(3);
 		const [, live, compaction] = requests;
-		// The note rides at the end of each live request; it is not part of the history.
+		// The notes ride at the end of each live request; they are not part of the history.
 		expect(JSON.stringify(live.messages.at(-1))).toContain("per-call note");
 		// One-token keep-recent keeps only the last answer: the compaction request is the
-		// history before it exactly as the live turn sent it, without the note and
+		// history before it exactly as the live turn sent it, without the notes and
 		// without the kept answer.
-		expect(compaction.messages.length).toBe(live.messages.length - 1);
+		expect(JSON.stringify(compaction.messages)).not.toContain("spread per-call note");
 		expect(withoutCacheControl(compaction.messages)).toEqual(
 			withoutCacheControl(live.messages.slice(0, compaction.messages.length)),
 		);
@@ -225,20 +230,26 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(JSON.stringify(compaction.messages)).not.toContain("per-call note");
 	});
 
-	it("keeps a summarized message a context hook rewrites for every request", async () => {
+	it("keeps summarized messages a context hook rewrites for every request, by spread or by clone", async () => {
 		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-rewrite-");
+		const hasText = (message: AgentMessage, text: string) =>
+			message.role === "user" &&
+			Array.isArray(message.content) &&
+			message.content.some(block => block.type === "text" && block.text === text);
 		const annotate: ExtensionFactory = pi => {
 			pi.on("context", event => ({
 				messages: event.messages.map(message => {
 					if (message.role !== "user" || !Array.isArray(message.content)) return message;
-					const content = message.content.map(block =>
-						block.type === "text" && block.text === "second question"
-							? { ...block, text: "second question (annotated)" }
-							: block,
-					);
-					return content.some((block, index) => block !== message.content[index])
-						? { ...message, content }
-						: message;
+					if (hasText(message, "first question")) {
+						return { ...message, content: [{ type: "text" as const, text: "first question (annotated)" }] };
+					}
+					if (hasText(message, "second question")) {
+						// A fresh object: it carries no provenance of its own.
+						const clone = structuredClone(message);
+						clone.content = [{ type: "text", text: "second question (annotated)" }];
+						return clone;
+					}
+					return message;
 				}),
 			}));
 		};
@@ -257,8 +268,10 @@ describe("AgentSession Anthropic native compaction", () => {
 
 		expect(requests).toHaveLength(3);
 		const [, live, compaction] = requests;
-		// The rewritten question ends the summarized range: the compaction request
-		// carries it as the live turn sent it, and stops before the kept answer.
+		// The rewritten questions stay in the summarized range, the last one ending it:
+		// the compaction request carries both as the live turn sent them, and stops
+		// before the kept answer.
+		expect(JSON.stringify(live.messages)).toContain("first question (annotated)");
 		expect(JSON.stringify(live.messages.at(-1))).toContain("second question (annotated)");
 		expect(withoutCacheControl(compaction.messages)).toEqual(withoutCacheControl(live.messages));
 		expect(JSON.stringify(compaction.messages)).not.toContain("answer 2");

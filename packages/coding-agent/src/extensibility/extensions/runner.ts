@@ -1985,29 +1985,45 @@ export class ExtensionRunner {
 
 				if (handlerResult && (handlerResult as ContextEventResult).messages) {
 					const nextMessages = (handlerResult as ContextEventResult).messages!;
+					// A new object at a history message's position replaces it (a clone,
+					// possibly rewritten); one past the end was added. The final pass
+					// still marks a replacement that differs from its history message.
 					for (let index = 0; index < nextMessages.length; index++) {
 						const message = nextMessages[index];
 						if (!message || getContextHistoryIndex(message) !== undefined) continue;
 						const previousMessage = currentMessages[index];
 						if (!previousMessage) continue;
 						const historyIndex = getContextHistoryIndex(previousMessage);
-						if (historyIndex === undefined) continue;
-						setContextHistoryIndex(message, historyIndex);
-						if (!Bun.deepEquals(message, previousMessage)) clearContextHistoryIndex(message);
+						if (historyIndex !== undefined) setContextHistoryIndex(message, historyIndex);
 					}
 					currentMessages = nextMessages;
 				}
 			}
 		}
 
+		// Each history slot has one occupant: its first unchanged copy, else its first
+		// changed one. Any other message claiming the slot (say, a note spread from a
+		// history message and appended beside it) was added for this call. History
+		// messages carry their own index while compared, so a copy's index tag alone
+		// never makes it unequal.
+		for (let index = 0; index < messages.length; index++) setContextHistoryIndex(messages[index], index);
+		const unchangedOccupants = new Map<number, AgentMessage>();
 		for (const message of currentMessages) {
 			const historyIndex = getContextHistoryIndex(message);
-			const historyMessage = historyIndex === undefined ? undefined : messages[historyIndex];
-			if (historyMessage && historyIndex !== undefined) setContextHistoryIndex(historyMessage, historyIndex);
-			const unchanged = historyMessage !== undefined && Bun.deepEquals(message, historyMessage);
+			if (historyIndex === undefined || unchangedOccupants.has(historyIndex)) continue;
+			if (Bun.deepEquals(message, messages[historyIndex])) unchangedOccupants.set(historyIndex, message);
+		}
+		const rewrittenSlots = new Set<number>();
+		for (const message of currentMessages) {
+			const historyIndex = getContextHistoryIndex(message);
 			clearContextHistoryIndex(message);
-			if (historyMessage) clearContextHistoryIndex(historyMessage);
-			if (!unchanged) markPerCallContextMessage(message, historyMessage ? "rewritten" : "added");
+			if (historyIndex !== undefined && unchangedOccupants.get(historyIndex) === message) continue;
+			if (historyIndex !== undefined && !unchangedOccupants.has(historyIndex) && !rewrittenSlots.has(historyIndex)) {
+				rewrittenSlots.add(historyIndex);
+				markPerCallContextMessage(message, "rewritten");
+			} else {
+				markPerCallContextMessage(message, "added");
+			}
 		}
 		for (const message of messages) clearContextHistoryIndex(message);
 		// An aborted handler is skipped and its input kept unchanged. Never hand that
