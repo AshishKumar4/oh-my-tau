@@ -690,7 +690,7 @@ const overridableAnthropicHeaderKeys = new Set(
 function createClaudeBillingHeader(firstUserMessageText: string, servedClaudeCodeVersion?: string): string {
 	// Fingerprint: SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]
 	// Matches CC's computeFingerprint in utils/fingerprint.ts.
-	// Uses chars from the first user message (not the system prompt).
+	// Uses chars from the first conversational wire user turn (not the system prompt).
 	const k = [4, 7, 20].map(i => firstUserMessageText[i] ?? "0").join("");
 	const version = getClaudeCodeVersion(servedClaudeCodeVersion);
 	const versionSuffix = Bun.SHA256.hash(`59cf53e54c78${k}${version}`, "hex").slice(0, 3);
@@ -3673,7 +3673,7 @@ export type AnthropicSystemBlock = {
 type SystemBlockOptions = {
 	includeClaudeCodeInstruction?: boolean;
 	extraInstructions?: string[];
-	/** Text of the first user message — used as fingerprint seed for the billing header. */
+	/** Text of the first conversational wire user turn, used as the billing fingerprint seed. */
 	firstUserMessageText?: string;
 	/** Served claude-code capture's `clientVersion`, which the billing header's `cc_version` claims. */
 	servedClaudeCodeVersion?: string;
@@ -4411,16 +4411,18 @@ function resolveAnthropicAdaptiveEffort(
 const LEADING_SYSTEM_REMINDER = /^\s*<system-reminder>[\s\S]*?<\/system-reminder>\s*/;
 
 /**
- * Seed of the billing-header fingerprint. Claude Code hashes the user's own
- * words: the `<system-reminder>` blocks it puts ahead of them in the first
- * user message are not part of the seed (2.1.284 captures: `hello` → `.b93`).
- * `skipReminders` (the claude-code profile) seeds omp's fingerprint the same
- * way, so the date/cwd reminder omp prepends stops pinning every session to
- * one suffix; other profiles keep hashing the message as sent.
+ * Seed of the billing-header fingerprint: the first conversational turn sent
+ * as a wire user turn, a developer-first session's developer message included,
+ * so a later user message or a side turn's extra turns cannot change it.
+ * Claude Code hashes the user's own words: the `<system-reminder>` blocks it
+ * puts ahead of them are not part of the seed (2.1.284 captures: `hello` →
+ * `.b93`). `skipReminders` (the claude-code profile) seeds omp's fingerprint
+ * the same way, so the date/cwd reminder omp prepends stops pinning every
+ * session to one suffix; other profiles keep hashing the turn as sent.
  */
-function extractClaudeCodeFirstUserMessageText(messages: readonly Message[], skipReminders = false): string {
+function extractClaudeCodeFirstWireUserMessageText(messages: readonly Message[], skipReminders = false): string {
 	for (const message of messages) {
-		if (message.role !== "user") continue;
+		if ((message.role !== "user" && message.role !== "developer") || anthropicControlOf(message)) continue;
 		const { content } = message;
 		const texts =
 			typeof content === "string"
@@ -4428,12 +4430,11 @@ function extractClaudeCodeFirstUserMessageText(messages: readonly Message[], ski
 				: Array.isArray(content)
 					? content.flatMap(block => (block.type === "text" ? [block.text] : []))
 					: [];
-		if (!skipReminders) return texts[0] ?? "";
 		for (let text of texts) {
-			while (LEADING_SYSTEM_REMINDER.test(text)) text = text.replace(LEADING_SYSTEM_REMINDER, "");
-			if (text.length > 0) return text;
+			if (skipReminders) while (LEADING_SYSTEM_REMINDER.test(text)) text = text.replace(LEADING_SYSTEM_REMINDER, "");
+			if (text.trim()) return text;
 		}
-		return "";
+		if (Array.isArray(content) && content.some(block => block.type === "image")) return "";
 	}
 	return "";
 }
@@ -4877,7 +4878,7 @@ function buildParams(
 	// Pre-compute system blocks so they occupy the right slot in the serialized body.
 	const shouldInjectClaudeCodeInstruction = isOAuthToken && model.compat.injectClaudeCodeInstruction !== false;
 	const firstUserMessageText = shouldInjectClaudeCodeInstruction
-		? extractClaudeCodeFirstUserMessageText(context.messages, effectiveHarness === "claude-code")
+		? extractClaudeCodeFirstWireUserMessageText(context.messages, effectiveHarness === "claude-code")
 		: "";
 	const systemBlocks = buildAnthropicSystemBlocks(context.systemPrompt, {
 		includeClaudeCodeInstruction: shouldInjectClaudeCodeInstruction,
