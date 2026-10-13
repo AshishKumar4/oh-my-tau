@@ -32,6 +32,16 @@ export function popLoopPhase(): void {
 	stack.pop();
 }
 
+/** Run `fn` under `label`. For an async `fn`, only its synchronous prefix (up to its first await) is labeled; label each continuation separately. */
+export function withLoopPhase<T>(label: string, fn: () => T): T {
+	pushLoopPhase(label);
+	try {
+		return fn();
+	} finally {
+		popLoopPhase();
+	}
+}
+
 export function currentLoopPhase(): string | undefined {
 	return stack[stack.length - 1];
 }

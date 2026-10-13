@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { resetExtractionStats } from "@oh-my-pi/pi-mnemopi/core/extraction/diagnostics";
 import { Mnemopi } from "@oh-my-pi/pi-mnemopi/core/memory";
 import type { MnemopiLlmCompletion } from "@oh-my-pi/pi-mnemopi/core/runtime-options";
 
@@ -10,6 +11,8 @@ afterEach(async () => {
 		memory.close();
 	}
 	instances.length = 0;
+	// Extraction counts are process-global; later files assert exact counts.
+	resetExtractionStats();
 });
 
 function makeMemory(llm: false | { complete: MnemopiLlmCompletion }): Mnemopi {

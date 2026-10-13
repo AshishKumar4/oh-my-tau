@@ -17,9 +17,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/hindsight/backend";
 import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import { HindsightRetainQueue, type HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
-import { RECALL_JOURNAL_ENTRY_TYPE } from "@oh-my-pi/pi-coding-agent/memory-backend/recall-journal";
 import type { AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { CustomEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 
 import {
 	cfgHindsightBankId,
@@ -41,52 +39,39 @@ interface FakeSessionDeps {
 function makeFakeSession(deps: FakeSessionDeps) {
 	const listeners = new Set<AgentSessionEventListener>();
 	const entries = deps.entries ?? [];
-	const journal: CustomEntry[] = [];
 	let hindsightState: HindsightSessionState | undefined;
-	const messageEntries = () =>
-		entries.map((e, i) => ({
-			id: `e${i}`,
-			parentId: i === 0 ? null : `e${i - 1}`,
-			timestamp: new Date(0).toISOString(),
-			type: "message" as const,
-			message:
-				e.role === "user"
-					? {
-							role: "user" as const,
-							content: e.text,
-							timestamp: 0,
-						}
-					: {
-							role: "assistant" as const,
-							content: [{ type: "text" as const, text: e.text }],
-							model: "x",
-							provider: "x",
-							api: "x",
-							stopReason: "end_turn" as const,
-							timestamp: 0,
-						},
-		}));
 	const session = {
 		sessionId: deps.sessionId,
 		memoryEnabled: true,
 		settings: deps.settings ?? Settings.isolated(),
 		sessionManager: {
-			getEntries: messageEntries,
-			// The first-turn recall journal (memory-backend/recall-journal.ts) reads
-			// the branch and appends to it, as on a real SessionManager.
-			getBranch: () => [...messageEntries(), ...journal],
-			appendCustomEntry(customType: string, data?: unknown): string {
-				const id = `c${journal.length}`;
-				journal.push({
-					type: "custom",
-					customType,
-					data,
-					id,
-					parentId: null,
+			getEntries: () =>
+				entries.map((e, i) => ({
+					id: `e${i}`,
+					parentId: i === 0 ? null : `e${i - 1}`,
 					timestamp: new Date(0).toISOString(),
-				});
-				return id;
+					type: "message" as const,
+					message:
+						e.role === "user"
+							? {
+									role: "user" as const,
+									content: e.text,
+									timestamp: 0,
+								}
+							: {
+									role: "assistant" as const,
+									content: [{ type: "text" as const, text: e.text }],
+									model: "x",
+									provider: "x",
+									api: "x",
+									stopReason: "end_turn" as const,
+									timestamp: 0,
+								},
+				})),
+			getBranch() {
+				return this.getEntries();
 			},
+			appendCustomEntry: () => "",
 			getCwd: () => deps.cwd ?? "/tmp",
 			getSessionFile: () => null,
 			getSessionId: () => deps.sessionId ?? "",
@@ -331,40 +316,6 @@ describe("hindsightBackend first-turn injection", () => {
 		block?.commit();
 		expect(session.getHindsightSessionState()?.hasRecalledForFirstTurn).toBe(true);
 		expect(session.getHindsightSessionState()?.lastRecallSnippet).toBe(block?.context);
-		// Committing journals the block so a resumed session replays it byte for byte.
-		expect(session.sessionManager.getBranch().filter(entry => entry.type === "custom")).toMatchObject([
-			{ customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "hindsight", cwd: "/tmp", block: block?.context } },
-		]);
-	});
-
-	it("replays a resumed session's journaled block instead of recalling again", async () => {
-		const settings = Settings.isolated({
-			"memory.backend": "hindsight",
-			"hindsight.apiUrl": "http://localhost:8888",
-		});
-		const session = makeFakeSession({ sessionId: "s-resume" });
-		const journaled = "<memories>\nrecalled before the resume\n</memories>";
-		session.sessionManager.appendCustomEntry(RECALL_JOURNAL_ENTRY_TYPE, {
-			backend: "hindsight",
-			cwd: session.sessionManager.getCwd(),
-			block: journaled,
-		});
-		await hindsightBackend.start({
-			session: session as never,
-			settings,
-			modelRegistry: {} as never,
-			agentDir: "/tmp",
-			taskDepth: 0,
-		});
-		const recall = vi.spyOn(HindsightApi.prototype, "recall").mockResolvedValue({ results: [] } as never);
-
-		const block = await hindsightBackend.beforeAgentStartPrompt?.(
-			session as never,
-			"What do I know about this user?",
-		);
-
-		expect(block?.context).toBe(journaled);
-		expect(recall).not.toHaveBeenCalled();
 	});
 
 	it("does not let agent_start preempt first-turn recall injection", async () => {

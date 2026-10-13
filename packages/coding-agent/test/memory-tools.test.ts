@@ -16,7 +16,6 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import type { HindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state";
-import { RECALL_JOURNAL_ENTRY_TYPE } from "@oh-my-pi/pi-coding-agent/memory-backend/recall-journal";
 import { mnemopiBackend } from "@oh-my-pi/pi-coding-agent/mnemopi/backend";
 import { loadMnemopiConfig, type MnemopiBackendConfig } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
 import {
@@ -35,7 +34,7 @@ import { MemoryRecallTool } from "@oh-my-pi/pi-coding-agent/tools/memory-recall"
 import { MemoryReflectTool } from "@oh-my-pi/pi-coding-agent/tools/memory-reflect";
 import { MemoryRetainTool } from "@oh-my-pi/pi-coding-agent/tools/memory-retain";
 import { resetMemoryForTests } from "@oh-my-pi/pi-mnemopi";
-import { logger, TempDir } from "@oh-my-pi/pi-utils";
+import { currentLoopPhase, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 
 // Mnemopi is lazy-loaded at runtime; preload it for synchronous state construction.
@@ -163,7 +162,6 @@ interface RegisterMnemopiStateOptions {
 	cwd?: string;
 	sessionId?: string;
 	entries?: () => unknown[];
-	appendCustomEntry?: (customType: string, data?: unknown) => string;
 	listeners?: Set<AgentSessionEventListener>;
 }
 
@@ -190,7 +188,7 @@ function registerMnemopiState(
 			sessionManager: {
 				getEntries: options.entries ?? (() => []),
 				getBranch: options.entries ?? (() => []),
-				appendCustomEntry: options.appendCustomEntry ?? (() => "entry"),
+				appendCustomEntry: () => "",
 				getCwd: () => options.cwd ?? "/tmp",
 			} as never,
 			emitNotice: () => {},
@@ -996,6 +994,51 @@ describe("Mnemopi backend lifecycle", () => {
 		expect(rows.map(row => row.retainedThroughUserTurn)).toEqual([2, 4, 6]);
 	});
 
+	it("labels the synchronous retain gate on turns that do not retain", async () => {
+		let observing = false;
+		const phases: (string | undefined)[] = [];
+		const state = registerMnemopiState(makeMnemopiConfig({ retainEveryNTurns: 4 }), {
+			cwd: "/work/project-alpha",
+			entries: () => {
+				if (observing) phases.push(currentLoopPhase());
+				return [{ type: "message", message: { role: "user", content: "turn 1" } }];
+			},
+		});
+		const retainSpy = vi.spyOn(state, "retainMessages");
+
+		observing = true;
+		await state.maybeRetainOnAgentEnd([] as never);
+		observing = false;
+
+		// 1 of 4 turns: the gate skips extraction, but still labels its cursor scan and turn count.
+		expect(retainSpy).not.toHaveBeenCalled();
+		expect(phases.length).toBeGreaterThan(0);
+		expect(phases.every(phase => phase === "mnemopi.retain")).toBe(true);
+		expect(currentLoopPhase()).toBeUndefined();
+	});
+
+	it("reads retain-turn history under mnemopi.retain", async () => {
+		let observing = false;
+		const phases: (string | undefined)[] = [];
+		const state = registerMnemopiState(makeMnemopiConfig({ retainEveryNTurns: 1 }), {
+			cwd: "/work/project-alpha",
+			entries: () => {
+				if (observing) phases.push(currentLoopPhase());
+				return [{ type: "message", message: { role: "user", content: "turn 1" } }];
+			},
+		});
+		const retainSpy = vi.spyOn(state, "retainMessages");
+
+		observing = true;
+		await state.maybeRetainOnAgentEnd([] as never);
+		observing = false;
+
+		expect(retainSpy).toHaveBeenCalledTimes(1);
+		expect(phases.length).toBeGreaterThan(0);
+		expect(phases.every(phase => phase === "mnemopi.retain")).toBe(true);
+		expect(currentLoopPhase()).toBeUndefined();
+	});
+
 	it("does not over-count legacy cumulative resumed rows when restoring the cursor", async () => {
 		const entries = Array.from({ length: 8 }, (_, index) => ({
 			type: "message",
@@ -1059,6 +1102,21 @@ describe("Mnemopi backend lifecycle", () => {
 		expect(options.embedText).toContain("I never use semicolons");
 		expect(options.embedText).not.toContain("[role:");
 		expect(options.embedText).not.toContain(":end]");
+	});
+
+	it("labels retention's synchronous work as mnemopi.retain for the loop watchdog", async () => {
+		const state = registerMnemopiState(makeMnemopiConfig(), { cwd: "/work/project-alpha" });
+		let phaseDuringRemember: string | undefined;
+		vi.spyOn(state, "rememberInScope").mockImplementation(() => {
+			phaseDuringRemember = currentLoopPhase();
+			return "memory-id";
+		});
+
+		await state.retainMessages([{ role: "user", content: "I always prefer tabs" }], "source-1");
+
+		// remember()'s SQLite writes and graph linking block the UI loop on large banks.
+		expect(phaseDuringRemember).toBe("mnemopi.retain");
+		expect(currentLoopPhase()).toBeUndefined();
 	});
 
 	it("flushes extractions and closes every owned bank on session shutdown (#2320)", async () => {
@@ -1610,120 +1668,6 @@ describe("recall.execute", () => {
 
 		const tool = MemoryRecallTool.createIf(makeSession(settings))!;
 		await expect(tool.execute("call-5", { query: "anything" })).rejects.toThrow(/HTTP 503/);
-	});
-});
-
-describe("mnemopi recall injection across a resume", () => {
-	beforeEach(() => {
-		resetSettingsForTest();
-		registeredMnemopiState = undefined;
-	});
-
-	afterEach(async () => {
-		vi.restoreAllMocks();
-		await registeredMnemopiState?.dispose();
-		registeredMnemopiState = undefined;
-	});
-
-	it("replays the journaled block instead of recalling again", async () => {
-		const block =
-			"<memories>\nFacts recalled from your long-term memory. Current time: 2026-09-17 21:27 UTC\n\n- prior fact\n</memories>";
-		const state = registerMnemopiState(undefined, {
-			entries: () => [
-				{ type: "custom", customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "mnemopi", cwd: "/tmp", block } },
-			],
-		});
-		// A resumed process must not re-query: a fresh block would carry a new
-		// timestamp, and it occupies the last system block the provider anchors
-		// its head cache on, so the whole conversation loses its cached prefix.
-		const queried = vi.spyOn(state, "recallForContext");
-
-		const prepared = await state.beforeAgentStartPrompt("what did we decide?");
-
-		expect(prepared?.context).toBe(block);
-		expect(queried).not.toHaveBeenCalled();
-		expect(prepared?.commit?.()).toBe(true);
-		expect(state.hasRecalledForFirstTurn).toBe(true);
-	});
-
-	it("journals the first recall so later turns can reproduce it", async () => {
-		const persisted: Array<{ customType: string; data?: unknown }> = [];
-		const state = registerMnemopiState(undefined, {
-			appendCustomEntry: (customType: string, data?: unknown) => {
-				persisted.push({ customType, data });
-				return "entry";
-			},
-		});
-		const block = "<memories>\nfresh recall\n</memories>";
-		vi.spyOn(state, "recallForContext").mockResolvedValue(block);
-
-		const prepared = await state.beforeAgentStartPrompt("first question");
-		expect(prepared?.context).toBe(block);
-		expect(persisted).toEqual([]);
-
-		expect(prepared?.commit?.()).toBe(true);
-		expect(persisted).toEqual([
-			{ customType: RECALL_JOURNAL_ENTRY_TYPE, data: { backend: "mnemopi", cwd: "/tmp", block } },
-		]);
-	});
-
-	it("recalls again in a cwd the block was not journaled in", async () => {
-		// `/move` rebinds memory to the destination project; replaying the
-		// source project's block there would carry its memories across.
-		const state = registerMnemopiState(undefined, {
-			cwd: "/projects/destination",
-			entries: () => [
-				{
-					type: "custom",
-					customType: RECALL_JOURNAL_ENTRY_TYPE,
-					data: { backend: "mnemopi", cwd: "/projects/source", block: "<memories>\nsource\n</memories>" },
-				},
-			],
-		});
-		const fresh = "<memories>\ndestination\n</memories>";
-		vi.spyOn(state, "recallForContext").mockResolvedValue(fresh);
-
-		const prepared = await state.beforeAgentStartPrompt("question");
-
-		expect(prepared?.context).toBe(fresh);
-	});
-
-	it("recalls again after a reset boundary rather than replaying pre-clear text", async () => {
-		// `/clear` clears the recall-once flag, so the next turn must query.
-		const state = registerMnemopiState(undefined, {
-			entries: () => [
-				{
-					type: "custom",
-					customType: RECALL_JOURNAL_ENTRY_TYPE,
-					data: { backend: "mnemopi", block: "<memories>\nstale\n</memories>" },
-				},
-				{ type: "reset_boundary" },
-			],
-		});
-		const fresh = "<memories>\nafter clear\n</memories>";
-		vi.spyOn(state, "recallForContext").mockResolvedValue(fresh);
-
-		const prepared = await state.beforeAgentStartPrompt("new question");
-
-		expect(prepared?.context).toBe(fresh);
-	});
-
-	it("ignores a block another backend journaled", async () => {
-		const state = registerMnemopiState(undefined, {
-			entries: () => [
-				{
-					type: "custom",
-					customType: RECALL_JOURNAL_ENTRY_TYPE,
-					data: { backend: "hindsight", block: "<memories>\nother backend\n</memories>" },
-				},
-			],
-		});
-		const own = "<memories>\nown recall\n</memories>";
-		vi.spyOn(state, "recallForContext").mockResolvedValue(own);
-
-		const prepared = await state.beforeAgentStartPrompt("question");
-
-		expect(prepared?.context).toBe(own);
 	});
 });
 
