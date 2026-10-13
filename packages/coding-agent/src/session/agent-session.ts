@@ -83,7 +83,7 @@ import { type Effort, serviceTierFamily, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import { isPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { isAddedContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { supportsOutputTokenLimit } from "@oh-my-pi/pi-catalog/compat/output-limits";
 import { requiresNativeTools, requiresToolFreeHistoryForToolOptOut } from "@oh-my-pi/pi-catalog/compat/tools";
@@ -2177,23 +2177,23 @@ export class AgentSession implements SettingsScope {
 				// Transform the whole history as the live turn does, then cut it:
 				// provider transforms (inline imaging, image budgets) decide per
 				// request, so a separately transformed prefix can differ.
-				// Context hooks may add or rewrite messages for each call; those are
-				// marked per-call and are not history, so neither count includes them.
+				// Context hooks may add messages for each call; those are not history,
+				// so neither count includes them. A rewritten message keeps its place.
 				const prefixLength = (await this.convertMessagesToLlm(history, signal)).filter(
-					message => !isPerCallContextMessage(message),
+					message => !isAddedContextMessage(message),
 				).length;
 				const live = await this.agent.buildSideRequestContext(
 					await this.convertMessagesToLlm([...history, ...retained], signal),
 				);
 				// Date/cwd reminder controls are the only messages the provider transforms
-				// insert: count past them and per-call messages, and leave out any at the
-				// cut, so the kept turns follow the summarized range directly.
+				// insert: count past them and messages hooks added, and leave out any at
+				// the cut, so the kept turns follow the summarized range directly.
 				let cut = 0;
 				let counted = 0;
 				for (const message of live.messages) {
 					if (counted >= prefixLength) break;
 					cut++;
-					if (!isDateCwdReminderControl(message) && !isPerCallContextMessage(message)) counted++;
+					if (!isDateCwdReminderControl(message) && !isAddedContextMessage(message)) counted++;
 				}
 				return { ...live, messages: live.messages.slice(0, cut) };
 			},

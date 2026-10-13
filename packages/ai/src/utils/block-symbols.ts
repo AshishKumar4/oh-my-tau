@@ -173,12 +173,18 @@ export function isSyntheticUser(message: SyntheticUserCarrier | null | undefined
  */
 export const kPerCallContextMessage = Symbol("agent.message.perCallContext");
 
+/**
+ * How a per-call message came to be: `added` has no place in the history, `rewritten`
+ * replaces the history message at its position.
+ */
+export type PerCallContextOrigin = "added" | "rewritten";
+
 /** Carries per-call context provenance without exposing a string-keyed property. */
-export type PerCallContextMessageCarrier = object & { [kPerCallContextMessage]?: true };
+export type PerCallContextMessageCarrier = object & { [kPerCallContextMessage]?: PerCallContextOrigin };
 
 /** Marks a message as synthesized for the current provider call. */
-export function markPerCallContextMessage(message: PerCallContextMessageCarrier): void {
-	message[kPerCallContextMessage] = true;
+export function markPerCallContextMessage(message: PerCallContextMessageCarrier, origin: PerCallContextOrigin): void {
+	message[kPerCallContextMessage] = origin;
 }
 
 /** Copies per-call context provenance to a converted or projected message. */
@@ -186,12 +192,18 @@ export function copyPerCallContextMessage(
 	target: PerCallContextMessageCarrier,
 	source: PerCallContextMessageCarrier,
 ): void {
-	if (source[kPerCallContextMessage] === true) target[kPerCallContextMessage] = true;
+	const origin = source[kPerCallContextMessage];
+	if (origin !== undefined) target[kPerCallContextMessage] = origin;
 }
 
 /** True when a message was synthesized for the current provider call. */
 export function isPerCallContextMessage(message: PerCallContextMessageCarrier | null | undefined): boolean {
-	return message?.[kPerCallContextMessage] === true;
+	return message?.[kPerCallContextMessage] !== undefined;
+}
+
+/** True when a context transform added the message for the current call: it is not part of the history. */
+export function isAddedContextMessage(message: PerCallContextMessageCarrier | null | undefined): boolean {
+	return message?.[kPerCallContextMessage] === "added";
 }
 
 /**

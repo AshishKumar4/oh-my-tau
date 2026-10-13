@@ -225,6 +225,45 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(JSON.stringify(compaction.messages)).not.toContain("per-call note");
 	});
 
+	it("keeps a summarized message a context hook rewrites for every request", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-rewrite-");
+		const annotate: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: event.messages.map(message => {
+					if (message.role !== "user" || !Array.isArray(message.content)) return message;
+					const content = message.content.map(block =>
+						block.type === "text" && block.text === "second question"
+							? { ...block, text: "second question (annotated)" }
+							: block,
+					);
+					return content.some((block, index) => block !== message.content[index])
+						? { ...message, content }
+						: message;
+				}),
+			}));
+		};
+		const { session, requests, close } = await openSession(
+			tempDir,
+			request => (request <= 2 ? answer(request) : captured()),
+			[annotate],
+		);
+		try {
+			await session.prompt("first question");
+			await session.prompt("second question");
+			await expect(session.compact()).rejects.toThrow("captured");
+		} finally {
+			await close();
+		}
+
+		expect(requests).toHaveLength(3);
+		const [, live, compaction] = requests;
+		// The rewritten question ends the summarized range: the compaction request
+		// carries it as the live turn sent it, and stops before the kept answer.
+		expect(JSON.stringify(live.messages.at(-1))).toContain("second question (annotated)");
+		expect(withoutCacheControl(compaction.messages)).toEqual(withoutCacheControl(live.messages));
+		expect(JSON.stringify(compaction.messages)).not.toContain("answer 2");
+	});
+
 	it("keeps every summarized message when a reminder change mid tool loop inserted a control turn", async () => {
 		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-control-");
 		const file = tempDir.join("notes.txt");

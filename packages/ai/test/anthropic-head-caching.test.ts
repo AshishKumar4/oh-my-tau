@@ -218,7 +218,7 @@ describe("anthropic head caching (general API-key path)", () => {
 				attribution: "agent",
 				timestamp: 3,
 			};
-			markPerCallContextMessage(perCallMessage);
+			markPerCallContextMessage(perCallMessage, "added");
 			messages.push(perCallMessage);
 			for (let turn = 1; turn <= turns; turn++) {
 				messages.push({ role: "user", content: `later user ${turn}`, timestamp: turn * 2 + 2 });
