@@ -179,7 +179,7 @@ export class TanCommandController {
 						});
 						clone = created.session;
 						clone.sessionManager?.appendSessionInit?.({
-							systemPrompt: clone.systemPrompt ? clone.systemPrompt.join("\n\n") : systemPrompt.join("\n\n"),
+							systemPrompt: clone.systemPrompt ?? systemPrompt,
 							task: trimmedWork,
 							tools: clone.getEnabledToolNames(),
 						});

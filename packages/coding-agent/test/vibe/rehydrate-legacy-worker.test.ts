@@ -39,7 +39,7 @@ async function parentWithFastWorker(
 	if (!sessionFile) throw new Error("Expected a persisted parent session");
 
 	const child = SessionManager.create(dir, path.join(dir, "children"));
-	child.appendSessionInit({ systemPrompt: "worker prompt", task: "work", tools: ["read", "edit"], agent });
+	child.appendSessionInit({ systemPrompt: ["worker prompt"], task: "work", tools: ["read", "edit"], agent });
 	await child.ensureOnDisk();
 	await child.flush();
 	const childFile = child.getSessionFile();

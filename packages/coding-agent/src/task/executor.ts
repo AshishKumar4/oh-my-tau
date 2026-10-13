@@ -3564,7 +3564,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 	// round-trip unchanged: the waits/rebuild can outlast the idle TTL, letting
 	// park() detach this instance, or the lane can be released meanwhile. Each
 	// observed replacement means another full park cycle, so reinstall on the
-	// fresh session (revivals start empty) and check again; genuine churn fails
+	// fresh session (a revival restores only the last persisted contract) and check again; genuine churn fails
 	// fast instead of driving a stale instance, and a released worker throws
 	// instead of driving a corpse. A wake may open a run on the validated
 	// session during the install, so the round repeats until one ends with the
@@ -4466,7 +4466,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					: enabledSubagentTools;
 
 			session.sessionManager.appendSessionInit({
-				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
+				// Blocks as sent; the session appends a newer session_init whenever a model call's base changes.
+				systemPrompt: session.agent.state.systemPrompt,
 				task,
 				tools: persistedSubagentTools,
 				agent: agent.name,

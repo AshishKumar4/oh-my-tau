@@ -531,7 +531,7 @@ describe("/recover", () => {
 			["Mechanic", "sonic"],
 		]) {
 			const child = SessionManager.create(dir.path(), path.join(dir.path(), "children"));
-			child.appendSessionInit({ systemPrompt: `${agent} prompt`, task: "work", tools: ["read"], agent });
+			child.appendSessionInit({ systemPrompt: [`${agent} prompt`], task: "work", tools: ["read"], agent });
 			// Cut off mid-call: a finished transcript would not be restarted.
 			child.appendMessage(toolTurn({ id: `${id}_call`, name: "read", args: { path: "src" } }));
 			await child.flush();
@@ -918,7 +918,7 @@ describe("/recover", () => {
 	it("recovers a sectioned yield's assembled result and its structured output", async () => {
 		const lane = laneSession();
 		lane.appendSessionInit({
-			systemPrompt: "reviewer prompt",
+			systemPrompt: ["reviewer prompt"],
 			task: "review",
 			tools: ["read", "yield"],
 			agent: "reviewer",
@@ -1011,7 +1011,12 @@ describe("/recover", () => {
 			}),
 			{ inherited: true },
 		);
-		child.appendSessionInit({ systemPrompt: "fork prompt", task: "check the docs", tools: ["read"], agent: "task" });
+		child.appendSessionInit({
+			systemPrompt: ["fork prompt"],
+			task: "check the docs",
+			tools: ["read"],
+			agent: "task",
+		});
 		child.appendMessage({ role: "user", content: "Check the docs.", timestamp: Date.now() });
 		yielded(child, "y", { data: { report: "the docs are fine" } });
 		await parked("Fork", child);
