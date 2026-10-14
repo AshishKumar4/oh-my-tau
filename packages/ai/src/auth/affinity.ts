@@ -347,17 +347,24 @@ export class SessionAffinity implements SessionsApi {
 		if (!sourceSessionId || !targetSessionId || sourceSessionId === targetSessionId) return 0;
 		let inherited = 0;
 		for (const provider of this.#pool.providers()) {
-			const credential = this.get(provider, sourceSessionId);
-			if (!credential) continue;
-			if (include && !include(provider, credential.explicit === true)) continue;
-			const recorded = this.record(
-				provider,
-				targetSessionId,
-				credential.type,
-				credential.index,
-				credential.lastUsedAtMs,
-				credential.explicit === true,
-			);
+			const current = this.get(provider, sourceSessionId);
+			if (!current) continue;
+			// Every pool's pin, the current one last so it stays current: a child forked
+			// during a pooled-key detour still knows the subscription account to return to.
+			const other = this.get(provider, sourceSessionId, current.type === "oauth" ? "api_key" : "oauth");
+			let recorded = false;
+			for (const credential of other ? [other, current] : [current]) {
+				if (include && !include(provider, credential.explicit === true)) continue;
+				recorded =
+					this.record(
+						provider,
+						targetSessionId,
+						credential.type,
+						credential.index,
+						credential.lastUsedAtMs,
+						credential.explicit === true,
+					) || recorded;
+			}
 			if (recorded) inherited += 1;
 		}
 		return inherited;

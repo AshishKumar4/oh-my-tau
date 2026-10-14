@@ -142,8 +142,37 @@ describe("a warm session's account", () => {
 			expect(setAside).toHaveLength(1);
 			expect(setAside[0]?.[1]).toMatchObject({ provider: "anthropic", credentialId: keyId });
 			expect(String(setAside[0]?.[1]?.providerMessage)).toContain(rejection.message.slice(0, 80));
+			// The logged end is the block selection honours: the key pool's retry time.
+			const keyPool = storage.limits.pools("anthropic").find(pool => pool.kind === "api_key");
+			expect(keyPool?.retryAtMs).toBeDefined();
+			expect(setAside[0]?.[1]?.blockedUntil).toBe(new Date(keyPool?.retryAtMs ?? 0).toISOString());
 		});
 	}
+
+	it("is inherited with the parent's key detour, so a forked child returns to it when the key fails", async () => {
+		const { store, storage } = setup(undefined, "api-keys-first");
+		await storage.credentials.set("anthropic", [account("a"), account("b")]);
+		store.reports.set("a", weekly("a", 0.5));
+		store.reports.set("b", weekly("b", 0.1));
+		pin(storage, "parent", "a");
+		expect(await serving(storage, "parent")).toBe("access-a");
+		await storage.credentials.addApiKey("anthropic", "sk-ant-api03-pooled-key");
+		expect(await serving(storage, "parent")).toBe("sk-ant-api03-pooled-key");
+
+		// The fork starts while the parent is on the key, then the key fails for the child.
+		expect(storage.sessions.inherit("parent", "child")).toBe(1);
+		const resolve = storage.keys.resolver("anthropic", { sessionId: "child" });
+		const key = await resolveApiKeyOnce(resolve);
+		expect(key).toBe("sk-ant-api03-pooled-key");
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const creditsExhausted = Object.assign(
+			new Error(
+				'400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}',
+			),
+			{ status: 400 },
+		);
+		expect(await resolveRetryKey(resolve, true, creditsExhausted, undefined, key)).toBe("access-a");
+	});
 
 	it("stays despite a roomier sibling, and moves at its own reserve", async () => {
 		const { store, storage } = setup();
