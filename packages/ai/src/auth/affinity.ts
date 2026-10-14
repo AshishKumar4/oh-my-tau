@@ -247,6 +247,10 @@ export class SessionAffinity implements SessionsApi {
 		// A promoted pin with a durable row id was persisted by the drop.
 		const remaining = this.#sessionPins.get(provider)?.get(sessionId);
 		if (remaining?.byPool[remaining.current]?.credentialId !== undefined) return;
+		this.#clearPersisted(provider, sessionId);
+	}
+
+	#clearPersisted(provider: string, sessionId: string): void {
 		const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
 		this.#persistedSticky.delete(cacheKey);
 		try {
@@ -372,14 +376,17 @@ export class SessionAffinity implements SessionsApi {
 	}
 
 	/**
-	 * Release a session's sticky credential so its next `KeyCascade.get` call
+	 * Release a session's sticky credentials so its next `KeyCascade.get` call
 	 * re-runs native pool ranking. This never blocks or penalizes the released
 	 * account; usage-aware routing uses it when another sibling has more
-	 * headroom, before considering a model/provider fallback.
+	 * headroom, before considering a model/provider fallback. Unlike a failed
+	 * credential's {@link clear}, it drops the pin in every pool: a re-rank that
+	 * kept one would hand the session straight back to it.
 	 */
 	release(provider: string, sessionId: string): boolean {
 		if (!this.get(provider, sessionId)) return false;
-		this.clear(provider, sessionId);
+		this.forget(provider, sessionId);
+		this.#clearPersisted(provider, sessionId);
 		return true;
 	}
 }

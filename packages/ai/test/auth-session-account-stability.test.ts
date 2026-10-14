@@ -199,6 +199,35 @@ describe("a warm session's account", () => {
 		expect(await serving(resumed, "parent")).toBe("access-a");
 	});
 
+	it("is ranked again with every other account once usage-aware routing releases the session", async () => {
+		const { store, storage } = setup(undefined, "api-keys-first");
+		await storage.credentials.set("anthropic", [account("a"), account("b")]);
+		store.reports.set("a", weekly("a", 0.5));
+		store.reports.set("b", weekly("b", 0.1));
+		pin(storage, "warm", "a");
+		expect(await serving(storage, "warm")).toBe("access-a");
+		await storage.credentials.addApiKey("anthropic", "sk-ant-api03-pooled-key");
+		expect(await serving(storage, "warm")).toBe("sk-ant-api03-pooled-key");
+
+		// Another session finds the key out of credit, which sets it aside for everyone.
+		vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const other = storage.keys.resolver("anthropic", { sessionId: "other" });
+		const key = await resolveApiKeyOnce(other);
+		expect(key).toBe("sk-ant-api03-pooled-key");
+		const creditsExhausted = Object.assign(
+			new Error(
+				'400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}',
+			),
+			{ status: 400 },
+		);
+		await resolveRetryKey(other, true, creditsExhausted, undefined, key);
+
+		// Routing then releases the warm session: every account is ranked afresh,
+		// rather than the session falling back through its old subscription pin.
+		expect(storage.sessions.release("anthropic", "warm")).toBe(true);
+		expect(await serving(storage, "warm")).toBe("access-b");
+	});
+
 	it("stays despite a roomier sibling, and moves at its own reserve", async () => {
 		const { store, storage } = setup();
 		await storage.credentials.set("anthropic", [account("a"), account("b")]);
