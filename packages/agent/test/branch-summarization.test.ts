@@ -8,6 +8,7 @@ import {
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, Usage } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 
 const MODEL: Model = buildModel({
 	id: "mock-model",
@@ -230,6 +231,84 @@ describe("branch summarization", () => {
 		const { messages } = prepareBranchEntries(entries, new Tokenizer(), 700);
 
 		expect(messages.some(m => m.role === "toolResult")).toBe(true);
+	});
+
+	// Contract: the summarizer receives the branch as plain text, so a Codex
+	// turn's native reasoning, charged at its reported tokens when the same model
+	// replays it, never takes up the selection budget.
+	test("replayed reasoning does not consume the text-only summary budget", async () => {
+		const codex = getBundledModel("openai-codex", "gpt-6.1-sol");
+		const reasoningItem = { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "e".repeat(16_000) };
+		const conclusion = "BRANCH_CONCLUSION_5000: keep the retry loop.";
+		const answerItem = {
+			type: "message",
+			role: "assistant",
+			content: [{ type: "output_text", text: conclusion, annotations: [] }],
+		};
+		// Signed, and payload-only as `/shake thinking` leaves it.
+		const variants: Array<[string, AssistantMessage["content"]]> = [
+			[
+				"signed",
+				[
+					{ type: "thinking", thinking: "", thinkingSignature: JSON.stringify(reasoningItem) },
+					{ type: "text", text: conclusion },
+				],
+			],
+			["payload only", [{ type: "text", text: conclusion }]],
+		];
+		for (const [name, content] of variants) {
+			const entries: SessionEntry[] = [
+				{
+					type: "message",
+					id: "assistant-1",
+					parentId: null,
+					timestamp: new Date(1).toISOString(),
+					message: {
+						role: "assistant",
+						content,
+						api: codex.api,
+						provider: codex.provider,
+						model: codex.id,
+						providerPayload: {
+							type: "openaiResponsesHistory",
+							provider: codex.provider,
+							dt: true,
+							items: [reasoningItem, answerItem],
+						},
+						usage: { ...ZERO_USAGE, output: 6_000, totalTokens: 6_000, reasoningTokens: 5_000 },
+						stopReason: "stop",
+						timestamp: 1,
+					},
+				},
+			];
+			let prompt = "";
+			const result = await generateBranchSummary(entries, {
+				// 1,000 tokens for the branch: room for the conclusion, not for the reasoning.
+				model: { ...codex, contextWindow: 2_000 },
+				reserveTokens: 1_000,
+				apiKey: "test-api-key",
+				signal: new AbortController().signal,
+				completeImpl: async (_model, ctx) => {
+					prompt = JSON.stringify(ctx.messages);
+					return {
+						role: "assistant",
+						content: [{ type: "text", text: "branch summary text" }],
+						api: codex.api,
+						provider: codex.provider,
+						model: codex.id,
+						usage: ZERO_USAGE,
+						stopReason: "stop",
+						timestamp: 2,
+					};
+				},
+			});
+			// The failure mode is "No content to summarize" without a summarizer call.
+			expect({ name, summarized: result.summary?.includes("branch summary text") }).toEqual({
+				name,
+				summarized: true,
+			});
+			expect(prompt).toContain("BRANCH_CONCLUSION_5000");
+		}
 	});
 
 	test("returns an aborted result when cancelled during transient retry backoff", async () => {

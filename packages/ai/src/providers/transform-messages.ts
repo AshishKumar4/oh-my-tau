@@ -361,7 +361,11 @@ function sanitizeMalformedToolCalls(messages: Message[]): Message[] {
 	return result;
 }
 
-function shouldDropTruncatedThinkingOnlyAssistant(msg: AssistantMessage): boolean {
+/**
+ * Whether {@link transformMessages} drops `msg` from every replay: a turn cut
+ * off by `length` / `error` / `aborted` that carries no text and no tool call.
+ */
+export function shouldDropTruncatedThinkingOnlyAssistant(msg: AssistantMessage): boolean {
 	const isTruncatedStop = msg.stopReason === "length" || msg.stopReason === "error" || msg.stopReason === "aborted";
 	return isTruncatedStop && !msg.content.some(block => block.type === "toolCall" || block.type === "text");
 }

@@ -208,10 +208,17 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	}
 }
 
+/**
+ * Tokens `message` adds to the summarizer's input, which is the branch
+ * serialized as plain text: tool results truncated as serialization truncates
+ * them, assistants without their native replay items or opaque reasoning
+ * payloads, which the text never carries.
+ */
 function estimateBranchSummaryTokens(message: AgentMessage, tokenizer: Tokenizer): number {
-	// The summarizer reads the branch serialized as text, which carries no
-	// signatures, server-tool payloads or replayed reasoning.
-	if (message.role !== "toolResult") return tokenizer.countMessage(message, { excludeEncryptedReasoning: true });
+	if (message.role === "assistant") {
+		return tokenizer.countMessage({ ...message, providerPayload: undefined }, { excludeEncryptedReasoning: true });
+	}
+	if (message.role !== "toolResult") return tokenizer.countMessage(message);
 	const text = message.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map(c => c.text)

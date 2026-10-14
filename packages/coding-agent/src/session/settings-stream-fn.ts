@@ -17,6 +17,7 @@ import {
 	tokenizerAccountingKey,
 } from "@oh-my-pi/pi-agent-core";
 import { type Model, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
+import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { serverSideFallbackModels } from "@oh-my-pi/pi-catalog/compat/server-side-fallback";
 import type { Settings } from "../config/settings";
 import { servedHarnessPrompt } from "../harness/capture";
@@ -81,8 +82,9 @@ export function createSettingsAwareStreamFn(
 	base: StreamFn = streamSimple,
 	slowModeContext?: SettingsStreamSlowModeContext,
 ): StreamFn {
-	// One tokenizer per accounting policy, so per-message counts are reused
-	// across requests and a model replaced under the same id gets its own.
+	// One tokenizer per accounting policy (reading model and native-history
+	// replay state), so per-message counts are reused across requests and a
+	// model replaced under the same id gets its own.
 	const tokenizers = new Map<string, Tokenizer>();
 	return (model, context, streamOptions) => {
 		const openrouterRoutingPreset = cfgProvidersOpenrouterVariant.get(settings);
@@ -132,9 +134,20 @@ export function createSettingsAwareStreamFn(
 						onLane: slowModeContext?.onLane,
 					})
 				: undefined;
-		let tokenizer = tokenizers.get(tokenizerAccountingKey(model));
+		const maxInFlightRequests = validateProviderMaxInFlightRequests(
+			streamOptions?.maxInFlightRequests ?? cfgProvidersMaxInFlightRequests.get(settings),
+		);
+		// A cold Responses session rebuilds turns without their encrypted reasoning.
+		// A request that may wait for a provider slot is built when it gets one,
+		// after a concurrent response may have warmed the session, so it is
+		// fitted as replaying.
+		const nativeHistoryReplay =
+			Object.hasOwn(maxInFlightRequests, model.provider) ||
+			openAIResponsesReplaysNativeHistory(model, streamOptions?.providerSessionState);
+		const tokenizerOptions = { nativeHistoryReplay };
+		let tokenizer = tokenizers.get(tokenizerAccountingKey(model, tokenizerOptions));
 		if (!tokenizer) {
-			tokenizer = new Tokenizer(model);
+			tokenizer = new Tokenizer(model, tokenizerOptions);
 			tokenizers.set(tokenizer.accountingKey, tokenizer);
 		}
 		const maxTokens = fitOutputTokensToContextWindow(model, context, streamOptions?.maxTokens, tokenizer);
@@ -162,9 +175,7 @@ export function createSettingsAwareStreamFn(
 			streamFirstEventTimeoutMs: streamOptions?.streamFirstEventTimeoutMs ?? streamFirstEventTimeoutMs,
 			streamIdleTimeoutMs: streamOptions?.streamIdleTimeoutMs ?? streamIdleTimeoutMs,
 			maxRetryDelayMs: streamOptions?.maxRetryDelayMs ?? cfgRetryMaxDelayMs.get(settings),
-			maxInFlightRequests: validateProviderMaxInFlightRequests(
-				streamOptions?.maxInFlightRequests ?? cfgProvidersMaxInFlightRequests.get(settings),
-			),
+			maxInFlightRequests,
 			loopGuard: {
 				enabled: cfgModelLoopGuardEnabled.get(settings),
 				checkAssistantContent: cfgModelLoopGuardCheckAssistantContent.get(settings),

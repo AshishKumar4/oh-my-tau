@@ -2012,7 +2012,7 @@ export function escapeReplayedControlTokens(items: ResponseInput): ResponseInput
 }
 
 /** Plaintext reasoning without server IDs or encrypted state remains replayable on a cold connection. */
-function isColdReplayableResponsesTurn(items: ResponseInput): boolean {
+export function isColdReplayableResponsesTurn(items: ResponseInput): boolean {
 	let hasReasoning = false;
 	for (const item of items) {
 		if ("id" in item && typeof item.id === "string") return false;

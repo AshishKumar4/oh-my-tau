@@ -49,6 +49,45 @@ function pngWithSize(width: number, height: number): string {
 	return bytes.toString("base64");
 }
 
+/** A rebuilt history holding one `producer` turn whose native payload replays 5,000 reasoning tokens. */
+function replayedReasoningContext(producer: Model): Context {
+	const reasoningItem = { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "e".repeat(16_000) };
+	return {
+		messages: [
+			// A rewrite marker newer than the turn makes its usage stale, so every
+			// request is counted locally (a rebuilt history).
+			{ role: "user", content: "summary", historyRewriteAt: 10, timestamp: 10 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "Done." }],
+				api: producer.api,
+				provider: producer.provider,
+				model: producer.id,
+				providerPayload: {
+					type: "openaiResponsesHistory",
+					provider: producer.provider,
+					dt: true,
+					items: [
+						reasoningItem,
+						{ type: "message", role: "assistant", content: [{ type: "output_text", text: "Done." }] },
+					],
+				},
+				usage: {
+					input: 9_000,
+					output: 6_000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 15_000,
+					reasoningTokens: 5_000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 1,
+			},
+		],
+	};
+}
+
 describe("createSettingsAwareStreamFn", () => {
 	it("applies provider settings to the forwarded options when caller omits them", () => {
 		const settings = Settings.isolated({
@@ -319,6 +358,88 @@ describe("createSettingsAwareStreamFn", () => {
 		const fitted = calls[1]?.options?.maxTokens ?? Number.POSITIVE_INFINITY;
 		expect(fitted).toBe(fresh.calls[0]?.options?.maxTokens ?? Number.NaN);
 		expect(4_763 + fitted).toBeLessThanOrEqual(10_000);
+	});
+
+	it("recounts replayed reasoning for a model it does not replay to", () => {
+		// Same encoding, different Responses reader: only the producing model
+		// replays the turn's 5,000 reasoning tokens.
+		const sol: Model = { ...getBundledModel("openai-codex", "gpt-6.1-sol"), contextWindow: 10_000, maxTokens: 9_000 };
+		const other: Model = { ...getBundledModel("openai-codex", "gpt-6-sol"), contextWindow: 10_000, maxTokens: 9_000 };
+		const context = replayedReasoningContext(sol);
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+		wrapped(sol, context, { apiKey: "k" });
+		wrapped(other, context, { apiKey: "k" });
+
+		// The producing model's prompt carries the reasoning, so its cap is fitted.
+		expect(calls[0]?.options?.maxTokens).toBeLessThan(9_000);
+		// The other model's prompt is a few tokens, so it keeps the transport default.
+		expect(calls[1]?.options?.maxTokens).toBeUndefined();
+	});
+
+	it("does not fit the output cap over reasoning a cold Responses session leaves out", () => {
+		const copilot: Model = {
+			...getBundledModel("github-copilot", "gpt-5.4"),
+			contextWindow: 10_000,
+			maxTokens: 9_000,
+		};
+		const context = replayedReasoningContext(copilot);
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+		// Fresh session state on a connection-bound host: the first request rebuilds
+		// the turn from its text, so its prompt is a few tokens.
+		wrapped(copilot, context, { apiKey: "k", providerSessionState: new Map() });
+		// Without session state the request replays the reasoning.
+		wrapped(copilot, context, { apiKey: "k" });
+
+		expect(calls[0]?.options?.maxTokens).toBeUndefined();
+		expect(calls[1]?.options?.maxTokens).toBeLessThan(9_000);
+	});
+
+	it("counts a cold request apart from an earlier replaying one", () => {
+		const copilot: Model = {
+			...getBundledModel("github-copilot", "gpt-5.4"),
+			contextWindow: 10_000,
+			maxTokens: 9_000,
+		};
+		const context = replayedReasoningContext(copilot);
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+		wrapped(copilot, context, { apiKey: "k" });
+		wrapped(copilot, context, { apiKey: "k", providerSessionState: new Map() });
+
+		expect(calls[0]?.options?.maxTokens).toBeLessThan(9_000);
+		expect(calls[1]?.options?.maxTokens).toBeUndefined();
+	});
+
+	it("fits a cold request that may wait for a provider slot as replaying", () => {
+		const copilot: Model = {
+			...getBundledModel("github-copilot", "gpt-5.4"),
+			contextWindow: 10_000,
+			maxTokens: 9_000,
+		};
+		const context = replayedReasoningContext(copilot);
+		const { fn: base, calls } = captureBase();
+		const queued = createSettingsAwareStreamFn(
+			Settings.isolated({ "providers.maxInFlightRequests": { "github-copilot": 1 } }),
+			base,
+		);
+
+		// The request is built when it gets a slot, after a concurrent response may
+		// have warmed the session, so the cap leaves room for the replayed reasoning.
+		queued(copilot, context, { apiKey: "k", providerSessionState: new Map() });
+		// Control: a limit on another provider does not hold this request back.
+		const elsewhere = createSettingsAwareStreamFn(
+			Settings.isolated({ "providers.maxInFlightRequests": { openrouter: 1 } }),
+			base,
+		);
+		elsewhere(copilot, context, { apiKey: "k", providerSessionState: new Map() });
+
+		expect(calls[0]?.options?.maxTokens).toBeLessThan(9_000);
+		expect(calls[1]?.options?.maxTokens).toBeUndefined();
 	});
 
 	describe("providers.anthropic.serverSideFallback (opt-in)", () => {

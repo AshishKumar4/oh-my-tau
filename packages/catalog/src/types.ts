@@ -1269,7 +1269,8 @@ export type ModelTokenizer =
 	| "qwen3"
 	| "deepseek-v3"
 	| "kimi-k2"
-	| "glm5";
+	| "glm5"
+	| "o200k";
 
 /** One account's discovered entitlements on a model; see {@link Model.accountAccess}. */
 export interface ModelAccountAccess {

@@ -23,6 +23,7 @@ import {
 	type ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
+import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import type { HarmonyAuditEvent } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -834,22 +835,31 @@ export class Agent {
 	/**
 	 * Tokenizer for the active model. The instance is replaced whenever the
 	 * active model's encoding, image or thinking-replay pricing, or
-	 * replayed-reasoning reader changes (see {@link setModel}), so callers must
-	 * not cache it across model switches.
+	 * replayed-reasoning reader changes (see {@link setModel}), or its Responses
+	 * session turns cold or warm, so callers must not cache it across model
+	 * switches or requests.
 	 */
 	get tokenizer(): Tokenizer {
+		// The provider warms or closes a session inside a request, so the replay
+		// state is read here rather than only on model switches.
+		const model = this.#state.model;
+		if (
+			openAIResponsesReplaysNativeHistory(model, this.#providerSessionState) !== this.#tokenizer.nativeHistoryReplay
+		) {
+			this.#syncTokenizer(model);
+		}
 		return this.#tokenizer;
 	}
 
 	/**
 	 * Swap the tokenizer only when the encoding, image or thinking-replay
-	 * pricing, or replayed-reasoning reader actually changes, so the warm
-	 * per-message memo survives same-pricing model switches.
+	 * pricing, replayed-reasoning reader or native-history replay state
+	 * actually changes, so the warm per-message memo survives same-pricing
+	 * model switches.
 	 */
 	#syncTokenizer(model: Model | null | undefined): void {
-		if (!this.#tokenizer.countsAlike(model)) {
-			this.#tokenizer = new Tokenizer(model);
-		}
+		const options = { nativeHistoryReplay: openAIResponsesReplaysNativeHistory(model, this.#providerSessionState) };
+		if (!this.#tokenizer.countsAlike(model, options)) this.#tokenizer = new Tokenizer(model, options);
 	}
 
 	get appendOnlyContext(): AppendOnlyContextManager | undefined {

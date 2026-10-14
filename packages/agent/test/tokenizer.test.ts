@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
-import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import type { Api, AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
+import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as natives from "@oh-my-pi/pi-natives";
 import { Agent } from "../src/agent";
@@ -25,6 +27,7 @@ describe("tokenizerEncodingForModel", () => {
 		expect(tokenizerEncodingForModel({ tokenizer: "deepseek-v3" })).toBe(natives.Encoding.DeepSeekV3);
 		expect(tokenizerEncodingForModel({ tokenizer: "kimi-k2" })).toBe(natives.Encoding.KimiK2);
 		expect(tokenizerEncodingForModel({ tokenizer: "glm5" })).toBe(natives.Encoding.Glm5);
+		expect(tokenizerEncodingForModel({ tokenizer: "o200k" })).toBe(natives.Encoding.O200kBase);
 	});
 
 	test("leaves unknown catalog models on the estimate policy", () => {
@@ -361,6 +364,233 @@ describe("countMessage replayed thinking", () => {
 		expect(agent.tokenizer.countMessage(turn)).toBe(VISIBLE_TOKENS);
 	});
 });
+
+// Contract: an assistant turn's native Responses history replays its reasoning
+// items only to the api, model and provider that produced it, and Codex bills
+// each replayed turn at that turn's reported reasoning tokens. The ciphertext
+// is not that price (it runs ~3x larger), and reasoning that is not replayed,
+// or that replay drops with its turn, costs nothing.
+describe("replayed Responses reasoning", () => {
+	const sol = bundledModel<"openai-codex-responses">("openai-codex", "gpt-6.1-sol");
+	const otherCodex = bundledModel<"openai-codex-responses">("openai-codex", "gpt-6-sol");
+	const REASONING_TOKENS = 5_000;
+	const reasoningItem = { type: "reasoning", id: "rs_1", summary: [], encrypted_content: "e".repeat(16_000) };
+	const callItem = { type: "function_call", call_id: "call_1", name: "read", arguments: '{"path":"a.ts"}' };
+	const emptyAnswerItem = {
+		type: "message",
+		role: "assistant",
+		content: [{ type: "output_text", text: "", annotations: [] }],
+	};
+	// Replayable native output a thinking-only turn can still carry.
+	const searchItem = {
+		type: "web_search_call",
+		id: "ws_1",
+		status: "completed",
+		action: { type: "search", query: "q" },
+	};
+	const signedThinking = { type: "thinking", thinking: "", thinkingSignature: JSON.stringify(reasoningItem) } as const;
+	const toolCall = { type: "toolCall", id: "call_1", name: "read", arguments: { path: "a.ts" } } as const;
+	const floored = { excludeEncryptedReasoning: true } as const;
+
+	function responsesTurn(
+		model: Model,
+		payload: AssistantMessage["providerPayload"],
+		content: AssistantMessage["content"] = [signedThinking, toolCall],
+		stopReason: AssistantMessage["stopReason"] = "toolUse",
+	): AssistantMessage {
+		return {
+			role: "assistant",
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			content,
+			providerPayload: payload,
+			usage: {
+				input: 0,
+				output: 6_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 6_000,
+				reasoningTokens: REASONING_TOKENS,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason,
+			timestamp: 0,
+		};
+	}
+	const codexTurn = (payload: AssistantMessage["providerPayload"], signed = true): AssistantMessage =>
+		responsesTurn(sol, payload, [signed ? signedThinking : { type: "thinking", thinking: "" }, toolCall]);
+	const history = (
+		provider: string,
+		items: Array<Record<string, unknown>> = [reasoningItem, callItem],
+	): AssistantMessage["providerPayload"] => ({ type: "openaiResponsesHistory", provider, dt: true, items });
+	const replayed = (provider: string = sol.provider) => history(provider);
+	const visibleTokens = (tokenizer: Tokenizer) => tokenizer.countMessage(codexTurn(undefined, false));
+	/** Reasoning items the real Codex request carries for `turn`. */
+	const wireReasoning = (turn: AssistantMessage) =>
+		convertCodexResponsesMessages(sol, { messages: [turn] }).filter(item => item.type === "reasoning").length;
+
+	test("charges the turn's reported reasoning tokens, not its ciphertext, to the model it replays to", () => {
+		const tokenizer = new Tokenizer(sol);
+		const expected = visibleTokens(tokenizer) + REASONING_TOKENS;
+		expect(tokenizer.countMessage(codexTurn(replayed()))).toBe(expected);
+		// The provider's own count is a token price, so the stored-context floor keeps it too.
+		expect(tokenizer.countMessage(codexTurn(replayed()), floored)).toBe(expected);
+	});
+
+	test("charges nothing for reasoning that does not replay to the reader", () => {
+		const tokenizer = new Tokenizer(sol);
+		// Control: the reader that produced the turn is charged.
+		expect(tokenizer.countMessage(codexTurn(replayed()), floored)).toBe(visibleTokens(tokenizer) + REASONING_TOKENS);
+		// Minted for another provider, or carrying no reasoning item: nothing replays.
+		expect(tokenizer.countMessage(codexTurn(replayed("openai")), floored)).toBe(visibleTokens(tokenizer));
+		expect(tokenizer.countMessage(codexTurn(history(sol.provider, [callItem])), floored)).toBe(
+			visibleTokens(tokenizer),
+		);
+		// Another model on the same provider gets the turn re-encoded without its reasoning.
+		const other = new Tokenizer(otherCodex);
+		expect(other.countMessage(codexTurn(replayed()), floored)).toBe(visibleTokens(other));
+	});
+
+	test("charges nothing to a reader that filters reasoning history out of its requests", () => {
+		const openai = bundledModel<"openai-responses">("openai", "gpt-6.1-sol");
+		const turn = responsesTurn(openai, history(openai.provider));
+		const visible = (tokenizer: Tokenizer) =>
+			tokenizer.countMessage(responsesTurn(openai, undefined, [{ type: "thinking", thinking: "" }, toolCall]));
+		const replaying = new Tokenizer(openai);
+		expect(replaying.countMessage(turn, floored)).toBe(visible(replaying) + REASONING_TOKENS);
+		const filtering = new Tokenizer({ ...openai, compat: { ...openai.compat, filterReasoningHistory: true } });
+		expect(filtering.countMessage(turn, floored)).toBe(visible(filtering));
+	});
+
+	test("charges nothing, signature included, for a turn whose replay sends no reasoning", () => {
+		const tokenizer = new Tokenizer(sol);
+		const dropped: Array<[string, AssistantMessage]> = [
+			// The sanitizer turns these native payloads into nothing replayable.
+			[
+				"hidden-empty",
+				responsesTurn(
+					sol,
+					history(sol.provider, [reasoningItem, emptyAnswerItem]),
+					[signedThinking, { type: "text", text: "" }],
+					"stop",
+				),
+			],
+			["reasoning-only", responsesTurn(sol, history(sol.provider, [reasoningItem]), [signedThinking], "stop")],
+			// transformMessages drops thinking-only turns that were cut off, even
+			// when their native items would otherwise replay.
+			...(["length", "error", "aborted"] as const).map((stopReason): [string, AssistantMessage] => [
+				`thinking-only ${stopReason}`,
+				responsesTurn(sol, history(sol.provider, [reasoningItem, searchItem]), [signedThinking], stopReason),
+			]),
+		];
+		for (const [name, turn] of dropped) {
+			expect({ name, wire: wireReasoning(turn) }).toEqual({ name, wire: 0 });
+			// Nothing of the turn reaches the wire: no reasoning price, no signature bytes.
+			expect({ name, count: tokenizer.countMessage(turn) }).toEqual({ name, count: 0 });
+			expect({ name, floor: tokenizer.countMessage(turn, floored) }).toEqual({ name, floor: 0 });
+		}
+		// Controls: the same items replay when the turn finished, and reasoning
+		// ahead of a tool call replays even when the turn was cut off.
+		const finished = responsesTurn(sol, history(sol.provider, [reasoningItem, searchItem]), [signedThinking], "stop");
+		expect(wireReasoning(finished)).toBe(1);
+		expect(tokenizer.countMessage(finished, floored)).toBe(REASONING_TOKENS);
+		const cutOffCall = responsesTurn(sol, replayed(), [signedThinking, toolCall], "length");
+		expect(wireReasoning(cutOffCall)).toBe(1);
+		expect(tokenizer.countMessage(cutOffCall, floored)).toBe(visibleTokens(tokenizer) + REASONING_TOKENS);
+	});
+
+	test("an Agent recounts replayed reasoning after switching to a model it does not replay to", () => {
+		const agent = new Agent({ initialState: { model: sol, systemPrompt: [], tools: [], messages: [] } });
+		const turn = codexTurn(replayed());
+		expect(agent.tokenizer.countMessage(turn, floored)).toBe(visibleTokens(agent.tokenizer) + REASONING_TOKENS);
+		agent.setModel(otherCodex);
+		expect(agent.tokenizer.countMessage(turn, floored)).toBe(visibleTokens(agent.tokenizer));
+	});
+
+	test("prices a replayed turn whose backend reported no reasoning tokens at the ciphertext it replays", () => {
+		const unreported = codexTurn(replayed());
+		delete unreported.usage.reasoningTokens;
+		// The reasoning item still goes on the wire, so the turn is not free.
+		const sent = convertCodexResponsesMessages(sol, { messages: [unreported] }).filter(
+			item => item.type === "reasoning",
+		);
+		expect(sent).toHaveLength(1);
+		const tokenizer = new Tokenizer(sol);
+		// Its only price is the ciphertext the request carries; the stored-context floor leaves that guess out.
+		expect(tokenizer.countMessage(unreported)).toBe(
+			visibleTokens(tokenizer) + tokenizer.countTokens(sent.map(item => JSON.stringify(item))),
+		);
+		expect(tokenizer.countMessage(unreported, floored)).toBe(visibleTokens(tokenizer));
+	});
+
+	test("follows a cold Responses session, which rebuilds encrypted reasoning out of the request", async () => {
+		const copilot = getBundledModel<"openai-responses">("github-copilot", "gpt-5.4");
+		const encrypted = responsesTurn(copilot, history(copilot.provider));
+		// Plaintext reasoning bound to no server state replays natively even cold.
+		const plaintext = responsesTurn(
+			copilot,
+			history(copilot.provider, [
+				{ type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "Reasoning." }] },
+				callItem,
+			]),
+		);
+		const visible = (tokenizer: Tokenizer) =>
+			tokenizer.countMessage(responsesTurn(copilot, undefined, [{ type: "thinking", thinking: "" }, toolCall]));
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const agent = new Agent({
+			initialState: { model: copilot, systemPrompt: [], tools: [], messages: [] },
+			providerSessionState,
+		});
+		const observe = async () => ({
+			wire: await responsesWireReasoning(copilot, encrypted, providerSessionState),
+			count: agent.tokenizer.countMessage(encrypted),
+			floor: agent.tokenizer.countMessage(encrypted, floored),
+		});
+
+		const cold = await observe();
+		expect(cold).toEqual({ wire: 0, count: visible(agent.tokenizer), floor: visible(agent.tokenizer) });
+		expect(await responsesWireReasoning(copilot, plaintext, providerSessionState)).toBe(1);
+		expect(agent.tokenizer.countMessage(plaintext, floored)).toBe(visible(agent.tokenizer) + REASONING_TOKENS);
+		// The first successful response warms the session (as the provider does).
+		for (const state of providerSessionState.values()) {
+			(state as ProviderSessionState & { nativeHistoryReplayWarmed: boolean }).nativeHistoryReplayWarmed = true;
+		}
+		const warm = visible(agent.tokenizer) + REASONING_TOKENS;
+		expect(await observe()).toEqual({ wire: 1, count: warm, floor: warm });
+		for (const state of providerSessionState.values()) state.close();
+		expect(await observe()).toEqual(cold);
+	});
+});
+
+function bundledModel<TApi extends Api = Api>(provider: "openai" | "openai-codex", id: string): Model<TApi> {
+	const model = getBundledModel<TApi>(provider, id);
+	if (!model) throw new Error(`Expected bundled ${provider}/${id}`);
+	return model;
+}
+
+/** Reasoning items the real Responses request carries for `turn` under the session's replay state. */
+async function responsesWireReasoning(
+	model: Model<"openai-responses">,
+	turn: AssistantMessage,
+	providerSessionState: Map<string, ProviderSessionState>,
+): Promise<number> {
+	const { promise, resolve } = Promise.withResolvers<unknown>();
+	const controller = new AbortController();
+	controller.abort();
+	const messages = [
+		{ role: "user" as const, content: "Question?", timestamp: 0 },
+		turn,
+		{ role: "user" as const, content: "Next.", timestamp: 0 },
+	];
+	streamOpenAIResponses(
+		model,
+		{ messages },
+		{ apiKey: "test-key", signal: controller.signal, providerSessionState, onPayload: resolve },
+	);
+	const { input } = (await promise) as { input: Array<{ type?: string }> };
+	return input.filter(item => item.type === "reasoning").length;
+}
 
 /** The per-image charge, read back through the arm that already applied it. */
 function inToolResultImageEstimate(tokenizer: Tokenizer): number {
