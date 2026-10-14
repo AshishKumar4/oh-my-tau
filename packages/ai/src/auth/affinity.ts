@@ -150,6 +150,9 @@ export class SessionAffinity implements SessionsApi {
 		const remaining = Object.values(pins.byPool).find(pin => pin !== undefined);
 		if (remaining) {
 			pins.current = remaining.type;
+			if (remaining.credentialId !== undefined) {
+				this.#persist(provider, sessionId, remaining, remaining.credentialId);
+			}
 			return;
 		}
 		sessionMap.delete(sessionId);
@@ -177,7 +180,8 @@ export class SessionAffinity implements SessionsApi {
 			const actualIndex = stored.findIndex(entry => entry.id === live.credentialId);
 			if (actualIndex === -1 || stored[actualIndex]?.credential.type !== live.type) {
 				this.#drop(provider, sessionId, type);
-				return undefined;
+				// Dropping the current pin made the other pool's pin current; read that one.
+				return pool === undefined ? this.get(provider, sessionId) : undefined;
 			}
 			live.index = actualIndex;
 			return live;
@@ -240,12 +244,9 @@ export class SessionAffinity implements SessionsApi {
 		if (!sessionId) return;
 		const pins = this.#sessionPins.get(provider)?.get(sessionId);
 		if (pins) this.#drop(provider, sessionId, pins.current);
+		// A promoted pin with a durable row id was persisted by the drop.
 		const remaining = this.#sessionPins.get(provider)?.get(sessionId);
-		const fallback = remaining?.byPool[remaining.current];
-		if (fallback?.credentialId !== undefined) {
-			this.#persist(provider, sessionId, fallback, fallback.credentialId);
-			return;
-		}
+		if (remaining?.byPool[remaining.current]?.credentialId !== undefined) return;
 		const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
 		this.#persistedSticky.delete(cacheKey);
 		try {

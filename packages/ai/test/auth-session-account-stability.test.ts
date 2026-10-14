@@ -174,6 +174,31 @@ describe("a warm session's account", () => {
 		expect(await resolveRetryKey(resolve, true, creditsExhausted, undefined, key)).toBe("access-a");
 	});
 
+	it("is what a session last on a removed key resumes and passes on", async () => {
+		const { store, storage } = setup(undefined, "api-keys-first");
+		// The warm account is stored second, so no first-account fallback can stand in for it.
+		await storage.credentials.set("anthropic", [account("b"), account("a")]);
+		store.reports.set("a", weekly("a", 0.5));
+		store.reports.set("b", weekly("b", 0.1));
+		pin(storage, "parent", "a");
+		expect(await serving(storage, "parent")).toBe("access-a");
+		await storage.credentials.addApiKey("anthropic", "sk-ant-api03-pooled-key");
+		expect(await serving(storage, "parent")).toBe("sk-ant-api03-pooled-key");
+
+		// The key is removed while the parent's last request used it.
+		const keyId = storage.credentials.list("anthropic").find(row => row.credential.type === "api_key")?.id;
+		if (keyId === undefined) throw new Error("Expected the pooled key's row");
+		expect(await storage.credentials.removeById("anthropic", keyId)).toBe(true);
+
+		// Its account is the session's again, for attribution, a forked child, and a resume.
+		expect(storage.oauth.identity("anthropic", "parent")?.accountId).toBe("a");
+		expect(storage.sessions.inherit("parent", "child")).toBe(1);
+		expect(await serving(storage, "child")).toBe("access-a");
+		const resumed = new AuthStorage(store, { poolOrders: { anthropic: "api-keys-first" }, defaultReservePct: 5 });
+		await resumed.credentials.reload();
+		expect(await serving(resumed, "parent")).toBe("access-a");
+	});
+
 	it("stays despite a roomier sibling, and moves at its own reserve", async () => {
 		const { store, storage } = setup();
 		await storage.credentials.set("anthropic", [account("a"), account("b")]);
