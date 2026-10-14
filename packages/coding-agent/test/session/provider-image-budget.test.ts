@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { Context, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { clampProviderContextImages } from "@oh-my-pi/pi-coding-agent/session/provider-image-budget";
 
 const UMANS_MODEL = buildModel({
@@ -63,10 +64,36 @@ describe("provider context image budgets", () => {
 
 		const clamped = clampProviderContextImages(context, UMANS_MODEL);
 
-		expect(imageData(clamped)).toEqual(Array.from({ length: 10 }, (_, index) => `image-${index + 21}`));
+		const kept = imageData(clamped);
+		expect(kept.length).toBeGreaterThan(0);
+		expect(kept.length).toBeLessThanOrEqual(10);
+		expect(kept).toEqual(imageData(context).slice(-kept.length));
 		expect(textData(clamped)).toEqual(Array.from({ length: 31 }, (_, index) => `text-${index}`));
 		expect(clamped).not.toBe(context);
 		expect(imageData(context)).toEqual(Array.from({ length: 31 }, (_, index) => `image-${index}`));
+	});
+
+	it("keeps the earlier request byte-identical while a growing conversation adds images past the cap", () => {
+		const model = getBundledModel("anthropic", "claude-opus-5-5");
+		if (!model) throw new Error("Expected bundled claude-opus-5-5");
+		const turn = (index: number): Context["messages"][number] => ({
+			role: "user",
+			content: [text(`look at screenshot ${index}`), image(`screenshot-${index}`)],
+			timestamp: index,
+		});
+		let previous: Context["messages"] = [];
+		let rewrites = 0;
+		const added = 120;
+		for (let total = 1; total <= 90 + added; total++) {
+			const messages = Array.from({ length: total }, (_, index) => turn(index));
+			const sent = clampProviderContextImages({ systemPrompt: ["system"], tools: [], messages }, model).messages;
+			expect(imageData({ systemPrompt: [], tools: [], messages: sent }).length).toBeLessThanOrEqual(90);
+			expect(JSON.stringify(sent.at(-1))).toContain(`screenshot-${total - 1}`);
+			if (JSON.stringify(sent.slice(0, previous.length)) !== JSON.stringify(previous)) rewrites++;
+			previous = sent;
+		}
+		// Each rewrite re-sends the whole cached prompt; it may happen once per batch of images, not per image.
+		expect(rewrites).toBeLessThanOrEqual(Math.ceil(added / 20));
 	});
 
 	it("keeps image-only tool results meaningful when every image block is dropped", () => {
@@ -86,7 +113,9 @@ describe("provider context image budgets", () => {
 		const clamped = clampProviderContextImages(context, UMANS_MODEL);
 		const firstMessage = clamped.messages[0];
 
-		expect(imageData(clamped)).toEqual(Array.from({ length: 10 }, (_, index) => `image-${index + 1}`));
+		const kept = imageData(clamped);
+		expect(kept.length).toBeLessThanOrEqual(10);
+		expect(kept).toEqual(imageData(context).slice(-kept.length));
 		expect(firstMessage?.role).toBe("toolResult");
 		expect(firstMessage?.content).toEqual([text("[image omitted: provider image limit]")]);
 	});

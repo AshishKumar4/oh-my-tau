@@ -76,7 +76,11 @@ export function clampProviderContextImages(context: Context, model: Model): Cont
 	const totalImages = countImages(context);
 	if (totalImages <= limit) return context;
 
-	const state = { remainingDrops: totalImages - limit };
+	// Dropping exactly the excess moves the oldest kept image on every request that
+	// adds one, which rewrites the whole cached prompt each time. Dropping in steps of
+	// a quarter of the cap changes the dropped set, and the prompt, once per step.
+	const step = Math.max(1, Math.floor(limit / 4));
+	const state = { remainingDrops: Math.min(totalImages, Math.ceil((totalImages - limit) / step) * step) };
 	const messages = context.messages.map(message => {
 		switch (message.role) {
 			case "user":
