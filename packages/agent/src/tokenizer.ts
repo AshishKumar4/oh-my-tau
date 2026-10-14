@@ -1,11 +1,17 @@
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import {
+	type ImageTokenization,
+	type ImageTokenizationTarget,
+	resolveImageTokenization,
+} from "@oh-my-pi/pi-catalog/compat/image-tokenization";
+import { resolveThinkingReplayTokens, type ThinkingReplayTokens } from "@oh-my-pi/pi-catalog/compat/thinking-replay";
 import type { ModelTokenizer } from "@oh-my-pi/pi-catalog/types";
 import * as natives from "@oh-my-pi/pi-natives";
 import { materializeString, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { isEstimateCacheable, messageEstimateVersion } from "./compaction/message-cache";
-import { estimateImageContentTokens } from "./image-tokens";
+import { base64ImageSize, estimateImageTokens, type ImageDetail, type ImageSize } from "./image-tokens";
 import type { AgentMessage } from "./types";
 
 const testEnv = Bun.env.NODE_ENV === "test";
@@ -27,6 +33,59 @@ export function tokenizerEncodingForModel(model: Pick<Model, "tokenizer"> | null
 	return model?.tokenizer ? NATIVE_ENCODING[model.tokenizer] : null;
 }
 
+type TokenizerModel = Pick<Model, "tokenizer"> &
+	ImageTokenizationTarget & { compat?: Model["compat"]; thinking?: Model["thinking"] };
+
+/** The model an assistant turn's native reasoning (signed thinking, Responses history) is replayed to. */
+interface ReasoningReplayReader {
+	api: string;
+	provider: string;
+	id: string;
+}
+
+function reasoningReplayReader(model: TokenizerModel | null | undefined): ReasoningReplayReader | undefined {
+	if (!model?.api || !model.provider || !model.id) return undefined;
+	// Filtering targets strip native reasoning items before the request is encoded.
+	const compat = model.compat;
+	if (compat && "filterReasoningHistory" in compat && compat.filterReasoningHistory) return undefined;
+	return { api: model.api, provider: model.provider, id: model.id };
+}
+
+/** Everything a {@link Tokenizer}'s counts depend on, resolved from the model reading the request. */
+interface CountingPolicy {
+	encoding: natives.Encoding | null;
+	/** The reader's catalog image rule; undefined prices images at the OpenAI wire's rule. */
+	imageRule: ImageTokenization | undefined;
+	reasoningReader: ReasoningReplayReader | undefined;
+	/** Claude's own API and prefix-bound hosts keep another model's signature from their deployment. */
+	readsDeploymentSignatures: boolean;
+	/** How the reader bills replayed signed thinking (catalog `thinking-replay-tokens`). */
+	thinkingReplayTokens: ThinkingReplayTokens;
+}
+
+function resolveCountingPolicy(model: TokenizerModel | null | undefined): CountingPolicy {
+	const compat = model?.compat;
+	return {
+		encoding: tokenizerEncodingForModel(model),
+		imageRule: model ? resolveImageTokenization(model) : undefined,
+		reasoningReader: reasoningReplayReader(model),
+		readsDeploymentSignatures:
+			model?.api === "anthropic-messages" &&
+			((compat !== undefined && "officialEndpoint" in compat && compat.officialEndpoint) ||
+				model.thinking?.prefixBinding === true),
+		thinkingReplayTokens: resolveThinkingReplayTokens(model ?? {}),
+	};
+}
+
+/**
+ * Identity of the counts a {@link Tokenizer} built for `model` produces: equal
+ * keys count every message alike, so one tokenizer serves every model with
+ * its key.
+ */
+export function tokenizerAccountingKey(model: TokenizerModel | null | undefined): string {
+	return JSON.stringify(resolveCountingPolicy(model));
+}
+
 /**
  * `strict` always tries an exact native count (the catalog-resolved tokenizer
  * when known, o200k_base otherwise), falling back to the byte upper bound when
@@ -43,11 +102,12 @@ export interface MessageCountOptions {
 	/**
 	 * Drop opaque provider reasoning payloads (`thinkingSignature`,
 	 * `redactedThinking`, native server-tool blocks) from the estimate. Those
-	 * are billed by the provider on replay, so the default counts them — but
-	 * their *local* byte size can diverge wildly from what the provider
-	 * charges, so the compaction floor (which only needs the reliably-countable,
-	 * on-wire-compressible content) excludes them to avoid false triggers on
-	 * thinking-heavy turns.
+	 * are billed by the provider on replay, so the default counts them (a reader
+	 * billing replayed thinking at `output` size: the reasoning, at its turn's
+	 * output size) — but their *local* byte size can diverge wildly from what
+	 * the provider charges, so the compaction floor (which only needs the
+	 * reliably-countable, on-wire-compressible content) excludes them to avoid
+	 * false triggers on thinking-heavy turns.
 	 */
 	excludeEncryptedReasoning?: boolean;
 }
@@ -149,13 +209,15 @@ interface MessageEstimate {
  * Model-aware local token counter. Immutable: the catalog-resolved encoding
  * is fixed at construction, so a cached count can never straddle two
  * encodings. An `Agent` owns one for its active model (swapping the instance
- * when the model's encoding changes); one-shot flows construct their own for
- * the model that will be billed. Known tokenizer families use exact native
- * counts; unknown models keep the fast byte estimate (or o200k when
- * `PI_TOKENIZER_ACCURATE=1`).
+ * when the model's encoding, image or thinking-replay pricing, or replay
+ * identity changes); one-shot flows construct their own for the model that
+ * will be billed. Known tokenizer families use exact native counts; unknown
+ * models keep the fast byte estimate (or o200k when `PI_TOKENIZER_ACCURATE=1`).
  */
 export class Tokenizer {
-	readonly #encoding: natives.Encoding | null;
+	readonly #policy: CountingPolicy;
+	/** {@link tokenizerAccountingKey} of the model this tokenizer counts for. */
+	readonly accountingKey: string;
 
 	/** Exact counts only; byte fallbacks remain mode-dependent and uncached. */
 	readonly #nativeCounts = new LRUCache<string, number>({
@@ -174,18 +236,24 @@ export class Tokenizer {
 	 */
 	#estimates = new WeakMap<AgentMessage, MessageEstimate>();
 
-	constructor(model?: Pick<Model, "tokenizer"> | null) {
-		this.#encoding = tokenizerEncodingForModel(model);
+	constructor(model?: TokenizerModel | null) {
+		this.#policy = resolveCountingPolicy(model);
+		this.accountingKey = JSON.stringify(this.#policy);
+	}
+
+	/** Whether a Tokenizer built for `model` would count every message as this one does. */
+	countsAlike(model: TokenizerModel | null | undefined): boolean {
+		return tokenizerAccountingKey(model) === this.accountingKey;
 	}
 
 	get encoding(): natives.Encoding | null {
-		return this.#encoding;
+		return this.#policy.encoding;
 	}
 
 	countTokens(text: string | string[], mode: TokenCountMode = "approximate"): number {
-		if (mode === "strict") return countTokensNat(text, this.#encoding, mode, this.#nativeCounts).tokens;
-		if (!testEnv && this.#encoding !== null)
-			return countTokensNat(text, this.#encoding, mode, this.#nativeCounts).tokens;
+		if (mode === "strict") return countTokensNat(text, this.#policy.encoding, mode, this.#nativeCounts).tokens;
+		if (!testEnv && this.#policy.encoding !== null)
+			return countTokensNat(text, this.#policy.encoding, mode, this.#nativeCounts).tokens;
 		if (accurate) return countTokensNat(text, undefined, mode, this.#nativeCounts).tokens;
 		return sumFragments(text, mode === "upperbound" ? byteLength : byteEstimate);
 	}
@@ -204,7 +272,7 @@ export class Tokenizer {
 	checkTokenBudget(text: string | string[], budget: number): TokenBudgetCheck {
 		const bound = sumFragments(text, byteLength);
 		if (bound <= budget) return { fits: true, tokens: bound, exact: false };
-		const result = countTokensNat(text, this.#encoding, "strict", this.#nativeCounts);
+		const result = countTokensNat(text, this.#policy.encoding, "strict", this.#nativeCounts);
 		return { fits: result.tokens <= budget, tokens: result.tokens, exact: result.exact };
 	}
 
@@ -214,8 +282,8 @@ export class Tokenizer {
 	 * Settled historical messages are counted once and reused until an owner
 	 * (prune/shake/strip-images) calls `invalidateMessageCache`; streaming
 	 * assistants bypass the memo entirely (see the message-cache settle-gate
-	 * invariant). Image blocks charge {@link estimateImageContentTokens}, the
-	 * same dimension-based estimate the native remote-compaction probe applies.
+	 * invariant). Image blocks charge {@link imageTokens}, the same estimate
+	 * the native remote-compaction probe applies.
 	 */
 	countMessage(message: AgentMessage, options?: MessageCountOptions): number {
 		const floored = options?.excludeEncryptedReasoning === true;
@@ -239,6 +307,31 @@ export class Tokenizer {
 		let total = 0;
 		for (const message of messages) total += this.countMessage(message, options);
 		return total;
+	}
+
+	/**
+	 * Input tokens for one image (not a snapcompact frame) under the reader's
+	 * catalog image rule, or the generic estimate when it has none.
+	 */
+	imageTokens(size: ImageSize | null | undefined, detail?: ImageDetail): number {
+		return estimateImageTokens(size, detail, this.#policy.imageRule);
+	}
+
+	/**
+	 * Whether `message`'s signed reasoning reaches this reader natively: from
+	 * the same model, host and wire, or from another Claude model on the same
+	 * Anthropic deployment, which keeps the signature (`transformMessages`).
+	 * Claude bills that reasoning when the reader can read it and drops the
+	 * block otherwise, so such a turn counts high rather than low.
+	 */
+	#replaysReasoningNatively(message: AssistantMessage): boolean {
+		const reader = this.#policy.reasoningReader;
+		return (
+			reader !== undefined &&
+			message.api === reader.api &&
+			message.provider === reader.provider &&
+			(message.model === reader.id || this.#policy.readsDeploymentSignatures)
+		);
 	}
 
 	#measureMessage(message: AgentMessage, excludeEncryptedReasoning: boolean): number {
@@ -269,35 +362,51 @@ export class Tokenizer {
 						if (block.type === "text" && block.text) {
 							fragments.push(block.text);
 						} else if (block.type === "image") {
-							extra += estimateImageContentTokens(block);
+							extra += this.imageTokens(base64ImageSize(block.data), block.detail);
 						}
 					}
 				}
 				break;
 			}
 			case "assistant": {
-				for (const block of message.content) {
+				const signaturesPriced = this.#policy.thinkingReplayTokens === "signature";
+				// The replay's signature rule (`transformMessages`): an aborted or
+				// errored turn's final block can hold a partial signature, and a turn
+				// whose tool calls ended without a tool-use stop is abandoned, so all
+				// its signatures are stripped. Every other block completed. The latest
+				// assistant turn keeps an abandoned turn's signatures byte-for-byte;
+				// a per-message count cannot see position, so it follows the rule for
+				// older turns, and that latest turn's own usage anchors transcript counts.
+				const content = message.content;
+				const invalidStop = message.stopReason === "aborted" || message.stopReason === "error";
+				const abandonedToolUse =
+					!invalidStop && message.stopReason !== "toolUse" && content.some(block => block.type === "toolCall");
+				const untrustedIndex = invalidStop ? content.length - 1 : -1;
+				let signedReasoning = false;
+				for (let index = 0; index < content.length; index++) {
+					const block = content[index];
 					if (block.type === "text") {
 						fragments.push(block.text);
 					} else if (block.type === "thinking") {
 						fragments.push(block.thinking);
 						// Providers charge for the opaque signature/reasoning payload that
 						// rides alongside the thinking text (OpenAI Responses encrypted
-						// reasoning items, Anthropic signed thinking blocks, etc.). Without
-						// counting it, this estimator can read ~half of the provider-reported
-						// usage on thinking-heavy turns — see #2275 for the resulting
-						// compaction-trigger / post-check metric divergence. The compaction
-						// floor excludes it (its local byte size diverges from provider billing).
-						if (block.thinkingSignature && !excludeEncryptedReasoning) {
+						// reasoning items, Gemini thought signatures). A reader billing at
+						// `output` size (Claude) charges the reasoning, priced below, not
+						// these bytes. The compaction floor excludes it (its local byte size
+						// diverges from provider billing).
+						if (block.thinkingSignature && !excludeEncryptedReasoning && signaturesPriced) {
 							fragments.push(block.thinkingSignature);
 						}
+						if (block.thinkingSignature && !abandonedToolUse && index !== untrustedIndex) signedReasoning = true;
 					} else if (block.type === "toolCall") {
 						fragments.push(block.name);
 						fragments.push(stringifyJson(block.arguments) ?? "null");
 					} else if (block.type === "redactedThinking") {
 						// Encrypted reasoning blob the provider still bills for on replay;
 						// excluded from the compaction floor for the same reason as above.
-						if (!excludeEncryptedReasoning) fragments.push(block.data);
+						signedReasoning = true;
+						if (!excludeEncryptedReasoning && signaturesPriced) fragments.push(block.data);
 					} else if (block.type === "anthropicServerTool") {
 						// Native Anthropic server-tool call/result replayed verbatim on the
 						// wire (server_tool_use input and opaque result content). The provider
@@ -306,6 +415,19 @@ export class Tokenizer {
 						// byte size diverges from provider billing.
 						if (!excludeEncryptedReasoning) fragments.push(stringifyJson(block.block) ?? "null");
 					}
+				}
+				// The visible text undercounts a native replay: the provider rebuilds
+				// the full reasoning from its signature, billed at the turn's output
+				// size less the visible text shake has since elided from it. The
+				// floor keeps the visible count.
+				if (
+					signedReasoning &&
+					!excludeEncryptedReasoning &&
+					!signaturesPriced &&
+					this.#replaysReasoningNatively(message)
+				) {
+					const visible = fragments.length === 0 ? extra : extra + this.countTokens(fragments);
+					return Math.max(visible, message.usage.output - (message.elidedOutputTokens ?? 0));
 				}
 				break;
 			}
@@ -319,7 +441,7 @@ export class Tokenizer {
 						if (block.type === "text" && block.text) {
 							fragments.push(block.text);
 						} else if (block.type === "image") {
-							extra += estimateImageContentTokens(block);
+							extra += this.imageTokens(base64ImageSize(block.data), block.detail);
 						}
 					}
 				}

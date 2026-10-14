@@ -986,7 +986,7 @@ export class SessionMaintenance {
 			) {
 				anchoredTokensRemoved += Math.max(0, region.tokens - replacementTokenCount);
 			}
-			return { region, replacement };
+			return { region, replacement, replacementTokens: replacementTokenCount };
 		});
 
 		const entrySnapshots = new Map<SessionEntry, SessionEntry>();
@@ -1058,7 +1058,19 @@ export class SessionMaintenance {
 			const entry = branchEntries[index];
 			if (entry.type !== "message" || rewrite.message.role !== entry.message.role) continue;
 			const before = this.#tokenizer.countMessage(entry.message);
-			entry.message = rewrite.message;
+			let message = rewrite.message;
+			if (message.role === "assistant" && entry.message.role === "assistant") {
+				// As shake records it: `usage.output` keeps billing the visible output
+				// the rewrite removed, so a replayed turn's count takes the tally off.
+				const removed =
+					this.#tokenizer.countMessage(entry.message, { excludeEncryptedReasoning: true }) -
+					this.#tokenizer.countMessage(message, { excludeEncryptedReasoning: true });
+				message = {
+					...message,
+					elidedOutputTokens: (entry.message.elidedOutputTokens ?? 0) + Math.max(0, removed),
+				};
+			}
+			entry.message = message;
 			invalidateMessageCache(entry.message);
 			const freed = Math.max(0, before - this.#tokenizer.countMessage(entry.message));
 			tokensFreed += freed;
@@ -1456,7 +1468,8 @@ export class SessionMaintenance {
 					// redactedThinking) have no trustworthy local token price, so counting
 					// them in the archived region's baseline while the imaged projection
 					// drops them lets an inflating result pass the guard (#10716). The
-					// window-fit check below keeps the conservative `projected`.
+					// window-fit check below keeps the full `projected`, which charges the
+					// replayed reasoning the reader bills.
 					const projectedForReduction = this.#projectSnapcompactContextTokens(preparation, snapcompactResult, {
 						excludeEncryptedReasoning: true,
 					});

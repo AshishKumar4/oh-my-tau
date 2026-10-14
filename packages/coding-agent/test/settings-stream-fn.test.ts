@@ -13,7 +13,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
-import type { Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import type { Context, ImageContent, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import { claudeCodeSystemInstruction } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -35,6 +35,19 @@ const stubModel = {} as unknown as Model;
 const stubCodexModel = { api: "openai-codex-responses" } as unknown as Model;
 const stubResponsesModel = { api: "openai-responses" } as unknown as Model;
 const stubContext = { messages: [], tools: [], systemPrompt: [] } as unknown as Context;
+
+/** Base64 PNG whose IHDR declares `width`x`height`; the pixel data is irrelevant to sizing. */
+function pngWithSize(width: number, height: number): string {
+	const bytes = Buffer.alloc(64);
+	Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes, 0);
+	bytes.writeUInt32BE(13, 8);
+	bytes.write("IHDR", 12, "ascii");
+	bytes.writeUInt32BE(width, 16);
+	bytes.writeUInt32BE(height, 20);
+	bytes[24] = 8;
+	bytes[25] = 6;
+	return bytes.toString("base64");
+}
 
 describe("createSettingsAwareStreamFn", () => {
 	it("applies provider settings to the forwarded options when caller omits them", () => {
@@ -235,6 +248,77 @@ describe("createSettingsAwareStreamFn", () => {
 		expect(promptTokens + (fitted ?? Number.POSITIVE_INFINITY)).toBeLessThanOrEqual(1_000_000);
 		// A prompt that leaves room keeps the transport's own default.
 		expect(calls[1]?.options?.maxTokens).toBeUndefined();
+	});
+
+	it("refits after a same-id model replacement changes how its history is counted", () => {
+		// A models.yml override or registry refresh can swap the Model behind one
+		// provider, api and id. Bound to its conversation prefix, it bills another
+		// Claude model's signed reasoning from its deployment at the turn's output.
+		const vertex = getBundledModel<"anthropic-messages">("google-vertex", "claude-opus-5@default");
+		if (!vertex.thinking) throw new Error("Expected Claude Opus 5 on Vertex to think");
+		const sized = { ...vertex, contextWindow: 10_000, maxTokens: 8_000 };
+		const bound: Model = { ...sized, thinking: { ...vertex.thinking, prefixBinding: true } };
+		const unbound: Model = { ...sized, thinking: { ...vertex.thinking, prefixBinding: false } };
+		const context: Context = {
+			messages: [
+				// A rewrite marker newer than the turn makes its usage stale, so it is counted locally.
+				{ role: "user", content: "summary", historyRewriteAt: 10, timestamp: 10 },
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "Plan.", thinkingSignature: "s".repeat(400) },
+						{ type: "text", text: "Done." },
+					],
+					api: vertex.api,
+					provider: vertex.provider,
+					model: "claude-opus-4-7@default",
+					usage: {
+						input: 100,
+						output: 6_000,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 6_100,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 1,
+				},
+			],
+		};
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+		wrapped(bound, context, { apiKey: "k" });
+		wrapped(unbound, context, { apiKey: "k" });
+
+		// The bound model's prompt carries the 6,000 reasoning tokens, so its cap is fitted.
+		expect(calls[0]?.options?.maxTokens).toBeLessThan(8_000);
+		// The replacement drops that reasoning: its prompt is a few tokens.
+		expect(calls[1]?.options?.maxTokens).toBeUndefined();
+	});
+
+	it("fits the output cap at the called model's prices, not an earlier model's", () => {
+		// Gemini bills any image a flat 1,120 tokens; GPT-6.1 bills this one 4,763.
+		const gemini = getBundledModel("google", "gemini-3-pro-preview");
+		const codex: Model = { ...getBundledModel("openai-codex", "gpt-6.1-sol"), contextWindow: 10_000 };
+		const image: ImageContent = {
+			type: "image",
+			data: pngWithSize(2000, 2000),
+			mimeType: "image/png",
+			detail: "original",
+		};
+		const context: Context = { messages: [{ role: "user", content: [image], timestamp: 0 }] };
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+		const fresh = captureBase();
+
+		wrapped(gemini, stubContext, { maxTokens: 8_000 });
+		wrapped(codex, context, { maxTokens: 8_000 });
+		createSettingsAwareStreamFn(Settings.isolated({}), fresh.fn)(codex, context, { maxTokens: 8_000 });
+
+		const fitted = calls[1]?.options?.maxTokens ?? Number.POSITIVE_INFINITY;
+		expect(fitted).toBe(fresh.calls[0]?.options?.maxTokens ?? Number.NaN);
+		expect(4_763 + fitted).toBeLessThanOrEqual(10_000);
 	});
 
 	describe("providers.anthropic.serverSideFallback (opt-in)", () => {

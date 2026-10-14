@@ -267,6 +267,47 @@ describe("AgentSession extension history rewrite", () => {
 			expect(end.type === "auto_compaction_end" && end.errorMessage).toBeUndefined();
 		});
 
+		it("frees the visible text a rewrite cuts from a Claude turn that replays its signed thinking", async () => {
+			// Claude bills a replayed signed turn at its output size, which still
+			// counts the 90k-token answer the rewrite removes.
+			const thinking = { type: "thinking" as const, thinking: "Plan.", thinkingSignature: "s".repeat(4_000) };
+			sessionManager.appendMessage({ role: "user", content: [{ type: "text", text: "write it" }], timestamp: 1 });
+			const assistantId = sessionManager.appendMessage({
+				role: "assistant",
+				content: [thinking, { type: "text", text: "lorem ipsum dolor ".repeat(20_000) }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				stopReason: "stop",
+				usage: { ...usage(16), output: 100_000, totalTokens: 100_016 },
+				timestamp: 2,
+			});
+			sessionManager.appendMessage({ role: "user", content: [{ type: "text", text: "next" }], timestamp: 3 });
+			hookAnswer = () => {
+				const original = entryMessage(assistantId);
+				if (original.role !== "assistant") throw new Error("expected the seeded assistant turn");
+				return {
+					rewrite: [
+						{
+							entryId: assistantId,
+							message: { ...original, content: [thinking, { type: "text", text: PLACEHOLDER }] },
+						},
+					],
+				};
+			};
+			const nativeSummary = mockNativeSummary();
+
+			await triggerThreshold(190_000);
+
+			expect(nativeSummary).not.toHaveBeenCalled();
+			expect(lifecycle().map(event => [event.type, event.action])).toEqual([
+				["auto_compaction_start", "context-full"],
+				["auto_compaction_end", "rewrite"],
+			]);
+			const rewritten = entryMessage(assistantId);
+			expect(rewritten.role === "assistant" && rewritten.elidedOutputTokens).toBeGreaterThan(80_000);
+		});
+
 		it("keeps context accounting honest when no usage anchor survives the rewrite", async () => {
 			// Every recent turn aborted (a provider outage), so no assistant usage
 			// can anchor accounting. The rewrite then lands with nothing to correct

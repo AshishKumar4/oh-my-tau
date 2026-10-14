@@ -14,11 +14,10 @@ import {
 	fitOutputTokensToContextWindow,
 	type StreamFn,
 	Tokenizer,
-	tokenizerEncodingForModel,
+	tokenizerAccountingKey,
 } from "@oh-my-pi/pi-agent-core";
 import { type Model, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { serverSideFallbackModels } from "@oh-my-pi/pi-catalog/compat/server-side-fallback";
-import type { Encoding } from "@oh-my-pi/pi-natives";
 import type { Settings } from "../config/settings";
 import { servedHarnessPrompt } from "../harness/capture";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
@@ -82,8 +81,9 @@ export function createSettingsAwareStreamFn(
 	base: StreamFn = streamSimple,
 	slowModeContext?: SettingsStreamSlowModeContext,
 ): StreamFn {
-	// One tokenizer per encoding, so per-message counts are reused across requests.
-	const tokenizers = new Map<Encoding | null, Tokenizer>();
+	// One tokenizer per accounting policy, so per-message counts are reused
+	// across requests and a model replaced under the same id gets its own.
+	const tokenizers = new Map<string, Tokenizer>();
 	return (model, context, streamOptions) => {
 		const openrouterRoutingPreset = cfgProvidersOpenrouterVariant.get(settings);
 		const openrouterVariant =
@@ -132,11 +132,10 @@ export function createSettingsAwareStreamFn(
 						onLane: slowModeContext?.onLane,
 					})
 				: undefined;
-		const encoding = tokenizerEncodingForModel(model);
-		let tokenizer = tokenizers.get(encoding);
+		let tokenizer = tokenizers.get(tokenizerAccountingKey(model));
 		if (!tokenizer) {
 			tokenizer = new Tokenizer(model);
-			tokenizers.set(encoding, tokenizer);
+			tokenizers.set(tokenizer.accountingKey, tokenizer);
 		}
 		const maxTokens = fitOutputTokensToContextWindow(model, context, streamOptions?.maxTokens, tokenizer);
 		// Session effective harness profile: `auto` resolves the catalog

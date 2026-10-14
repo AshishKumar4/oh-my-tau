@@ -1489,7 +1489,7 @@ describe("wave 5 — adapters and polish", () => {
 		(session as unknown as Record<string, unknown>).systemPrompt = ["You are a helpful assistant."];
 		session.messages = [
 			{ role: "user", content: "Hello, how are you?" },
-			{ role: "assistant", content: "I am doing well." },
+			{ role: "assistant", content: [{ type: "text", text: "I am doing well." }] },
 		];
 		const result = await executeAcpBuiltinSlashCommand("/context", runtime);
 		expect(result).toEqual({ consumed: true });

@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
+import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as natives from "@oh-my-pi/pi-natives";
+import { Agent } from "../src/agent";
+import type { SessionMessageEntry } from "../src/compaction/entries";
+import { applyShakeRegions, collectShakeRegions, RESCUE_SHAKE_CONFIG } from "../src/compaction/shake";
 import { Tokenizer, tokenizerEncodingForModel } from "../src/tokenizer";
 import type { AgentMessage } from "../src/types";
 
@@ -189,6 +194,171 @@ describe("countMessage", () => {
 
 		expect(textOnly).toBeGreaterThan(0);
 		expect(withImage).toBe(textOnly + inToolResultImageEstimate(tokenizer));
+	});
+});
+
+// Contract: a replayed signed thinking block costs what the reading model bills
+// for it: Claude rebuilds the full reasoning from the signature and bills it at
+// the size the turn billed as output; other readers are charged the
+// signature's bytes.
+describe("countMessage replayed thinking", () => {
+	const SIGNATURE = "s".repeat(4000);
+	const VISIBLE = "Check the call sites first.";
+	// What the visible blocks count to in the test env (bytes/4 per fragment).
+	const VISIBLE_TOKENS = 9;
+	const OUTPUT_TOKENS = 3000;
+
+	function reader(provider: "anthropic" | "openrouter" | "amazon-bedrock" | "google", id: string): Model {
+		const model = getBundledModel(provider, id);
+		if (!model) throw new Error(`missing bundled model ${provider}/${id}`);
+		return model;
+	}
+
+	function signedTurn(
+		from: Pick<Model, "api" | "provider" | "id">,
+		thinking: string,
+		thinkingSignature?: string,
+		stopReason: AssistantMessage["stopReason"] = "toolUse",
+	): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking, thinkingSignature },
+				{ type: "text", text: "Done." },
+			],
+			api: from.api,
+			provider: from.provider,
+			model: from.id,
+			usage: {
+				input: 100,
+				output: OUTPUT_TOKENS,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 100 + OUTPUT_TOKENS,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason,
+			timestamp: 1,
+		};
+	}
+
+	const opus = reader("anthropic", "claude-opus-5-5");
+	const bedrockOpus = reader("amazon-bedrock", "global.anthropic.claude-opus-5-5");
+	const openRouterOpus = reader("openrouter", "~anthropic/claude-opus-latest");
+
+	test.each([
+		["on the Claude API", opus, opus, VISIBLE, "toolUse"],
+		["on Bedrock", bedrockOpus, bedrockOpus, VISIBLE, "toolUse"],
+		// Omitted display: no visible thinking, the same reasoning billed.
+		["with its thinking omitted", opus, opus, "", "toolUse"],
+		// The Claude API keeps another model's signature from the same deployment,
+		// and Opus 5.5 reads Opus 5's thinking.
+		[
+			"from another Claude model on the same deployment",
+			opus,
+			reader("anthropic", "claude-opus-5"),
+			VISIBLE,
+			"toolUse",
+		],
+		// The thinking finished, signed, before the text hit max_tokens.
+		["that stopped on length", opus, opus, VISIBLE, "length"],
+		// The thinking finished, signed, before the abort cut the text short.
+		["aborted after its thinking", opus, opus, VISIBLE, "aborted"],
+	] as const)("charges a Claude turn replayed natively %s its output size", (_case, model, from, thinking, stop) => {
+		expect(new Tokenizer(model).countMessage(signedTurn(from, thinking, SIGNATURE, stop))).toBe(OUTPUT_TOKENS);
+	});
+
+	test.each([
+		// A signature is bound to the deployment that minted it.
+		["a turn from another host", bedrockOpus, opus],
+		// Bedrock binds it to the model too: another model's turn replays as text.
+		[
+			"another Claude model's turn on Bedrock",
+			bedrockOpus,
+			reader("amazon-bedrock", "global.anthropic.claude-opus-5"),
+		],
+		// OpenRouter filters reasoning history out of the request.
+		["a reader that filters reasoning history", openRouterOpus, openRouterOpus],
+	] as const)("charges only the visible blocks for %s, never the signature", (_case, model, from) => {
+		expect(new Tokenizer(model).countMessage(signedTurn(from, VISIBLE, SIGNATURE))).toBe(VISIBLE_TOKENS);
+	});
+
+	test("charges only the visible thinking of an aborted turn's final, partly signed block", () => {
+		// The replay drops that block's signature, so no reasoning rides along.
+		const turn: AssistantMessage = {
+			...signedTurn(opus, VISIBLE, SIGNATURE, "aborted"),
+			content: [{ type: "thinking", thinking: VISIBLE, thinkingSignature: SIGNATURE }],
+		};
+		const tokenizer = new Tokenizer(opus);
+		expect(tokenizer.countMessage(turn)).toBe(tokenizer.countMessage(turn, { excludeEncryptedReasoning: true }));
+	});
+
+	test("charges only the visible blocks of a turn that abandoned its tool calls", () => {
+		// The replay strips every signature of a turn whose tool calls ended
+		// without a tool-use stop: the model ended its turn, or max_tokens cut it.
+		const toolCall = { type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } } as const;
+		const tokenizer = new Tokenizer(opus);
+		for (const stop of ["stop", "length"] as const) {
+			const turn = signedTurn(opus, VISIBLE, SIGNATURE, stop);
+			turn.content = [...turn.content, toolCall];
+			expect(tokenizer.countMessage(turn)).toBe(tokenizer.countMessage(turn, { excludeEncryptedReasoning: true }));
+		}
+		const ranTools = signedTurn(opus, VISIBLE, SIGNATURE, "toolUse");
+		ranTools.content = [...ranTools.content, toolCall];
+		expect(tokenizer.countMessage(ranTools)).toBe(OUTPUT_TOKENS);
+	});
+
+	test("lowers a native Claude replay by the visible text a shake rewrite removes, after a reload too", () => {
+		// The turn's output was mostly a 2,000-token code block; shake replaces it
+		// in place, the reasoning still replays.
+		const block = `\`\`\`\n${"x".repeat(7_992)}\n\`\`\``;
+		const turn = signedTurn(opus, VISIBLE, SIGNATURE);
+		turn.content = [turn.content[0], { type: "text", text: block }];
+		const tokenizer = new Tokenizer(opus);
+		expect(tokenizer.countMessage(turn)).toBe(OUTPUT_TOKENS);
+		const entry: SessionMessageEntry = { type: "message", id: "a", parentId: null, timestamp: "", message: turn };
+		applyShakeRegions(
+			collectShakeRegions([entry], tokenizer, RESCUE_SHAKE_CONFIG).map(region => ({
+				region,
+				replacement: "[shaken]",
+				replacementTokens: tokenizer.countTokens("[shaken]"),
+			})),
+		);
+		// 3,000 output − (7 thinking + 2,000 block) visible = 993 reasoning, plus 7 + 2 visible now.
+		expect(tokenizer.countMessage(turn)).toBe(993 + 7 + 2);
+		// A reopened session, or a model switch, counts the saved turn in a new tokenizer.
+		const saved = JSON.parse(JSON.stringify(turn)) as AssistantMessage;
+		expect(new Tokenizer(opus).countMessage(saved)).toBe(993 + 7 + 2);
+	});
+
+	test("keeps the compaction floor at the visible blocks of a native Claude replay", () => {
+		const model = reader("anthropic", "claude-opus-5-5");
+		const floored = new Tokenizer(model).countMessage(signedTurn(model, VISIBLE, SIGNATURE), {
+			excludeEncryptedReasoning: true,
+		});
+		expect(floored).toBe(VISIBLE_TOKENS);
+	});
+
+	test("charges the signature's bytes for a reader whose catalog prices them", () => {
+		const model = reader("google", "gemini-3-pro-preview");
+		expect(new Tokenizer(model).countMessage(signedTurn(model, VISIBLE, SIGNATURE))).toBe(VISIBLE_TOKENS + 1000);
+	});
+
+	test("an Agent recounts another Claude model's turn when only the deployment's signature policy changes", () => {
+		// The same model behind Claude's own API and behind an endpoint that is not:
+		// only the former keeps another model's signature from its deployment.
+		const claude = getBundledModel<"anthropic-messages">("anthropic", "claude-opus-5-5");
+		if (!claude.thinking) throw new Error("Expected Claude Opus 5.5 to think");
+		const thinking = { ...claude.thinking, prefixBinding: false };
+		const official: Model = { ...claude, thinking, compat: { ...claude.compat, officialEndpoint: true } };
+		const proxied: Model = { ...claude, thinking, compat: { ...claude.compat, officialEndpoint: false } };
+		const turn = signedTurn(reader("anthropic", "claude-opus-5"), VISIBLE, SIGNATURE);
+		const agent = new Agent({ initialState: { model: official, systemPrompt: [], tools: [], messages: [] } });
+		expect(agent.tokenizer.countMessage(turn)).toBe(OUTPUT_TOKENS);
+
+		agent.setModel(proxied);
+
+		expect(agent.tokenizer.countMessage(turn)).toBe(VISIBLE_TOKENS);
 	});
 });
 

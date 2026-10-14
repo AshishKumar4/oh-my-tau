@@ -8,6 +8,7 @@ import {
 	type SessionMessageEntry,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import { Tokenizer } from "@oh-my-pi/pi-agent-core/tokenizer";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { createAssistantMessage } from "./helpers";
 
 const tokenizer = new Tokenizer();
@@ -94,5 +95,47 @@ describe("findCutPoint backward scan boundaries", () => {
 		expect(preparation?.messagesToSummarize).toEqual([oldAssistant.message]);
 		expect(preparation?.turnPrefixMessages).toEqual([]);
 		expect(preparation?.recentMessages).toHaveLength(2);
+	});
+});
+
+describe("prepareCompaction keep window under Claude", () => {
+	test("keeps the recent turns keepRecentTokens asks for, counting replayed thinking at its billed size", () => {
+		const opus = getBundledModel("anthropic", "claude-opus-5-5");
+		if (!opus) throw new Error("Expected bundled anthropic/claude-opus-5-5");
+		// Each turn billed 1,000 output tokens; its signature is twice that in bytes.
+		const entries: SessionMessageEntry[] = [];
+		for (let turn = 0; turn < 6; turn++) {
+			entries.push({
+				...base("message"),
+				type: "message",
+				message: { role: "user", content: "q", timestamp: turn },
+			});
+			entries.push({
+				...base("message"),
+				type: "message",
+				message: {
+					...createAssistantMessage([
+						{ type: "thinking", thinking: "", thinkingSignature: "s".repeat(8_000) },
+						{ type: "text", text: "Done." },
+					]),
+					api: opus.api,
+					provider: opus.provider,
+					model: opus.id,
+					usage: {
+						input: 0,
+						output: 1_000,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 1_000,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+				},
+			});
+		}
+
+		const preparation = prepareCompaction(entries, { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 4_100 }, opus);
+
+		// Four 1,001-token turns fit; counting signature bytes kept two.
+		expect(preparation?.recentMessages.filter(message => message.role === "assistant")).toHaveLength(4);
 	});
 });

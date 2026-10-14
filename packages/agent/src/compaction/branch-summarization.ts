@@ -209,7 +209,9 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 }
 
 function estimateBranchSummaryTokens(message: AgentMessage, tokenizer: Tokenizer): number {
-	if (message.role !== "toolResult") return tokenizer.countMessage(message);
+	// The summarizer reads the branch serialized as text, which carries no
+	// signatures, server-tool payloads or replayed reasoning.
+	if (message.role !== "toolResult") return tokenizer.countMessage(message, { excludeEncryptedReasoning: true });
 	const text = message.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")
 		.map(c => c.text)

@@ -41,7 +41,7 @@ import {
 import type { AppendOnlyContextManager } from "./append-only-context";
 import { isProviderRefusalMessage } from "./replay-policy";
 import { SentToolDefinitions } from "./sent-tool-definitions";
-import { Tokenizer, tokenizerEncodingForModel } from "./tokenizer";
+import { Tokenizer } from "./tokenizer";
 import {
 	createAdditionalContextMessage,
 	joinAdditionalContext,
@@ -833,7 +833,8 @@ export class Agent {
 
 	/**
 	 * Tokenizer for the active model. The instance is replaced whenever the
-	 * active model's encoding changes (see {@link setModel}), so callers must
+	 * active model's encoding, image or thinking-replay pricing, or
+	 * replayed-reasoning reader changes (see {@link setModel}), so callers must
 	 * not cache it across model switches.
 	 */
 	get tokenizer(): Tokenizer {
@@ -841,11 +842,12 @@ export class Agent {
 	}
 
 	/**
-	 * Swap the tokenizer only when the encoding actually changes, so the warm
-	 * per-message memo survives same-encoding model switches.
+	 * Swap the tokenizer only when the encoding, image or thinking-replay
+	 * pricing, or replayed-reasoning reader actually changes, so the warm
+	 * per-message memo survives same-pricing model switches.
 	 */
 	#syncTokenizer(model: Model | null | undefined): void {
-		if (tokenizerEncodingForModel(model) !== this.#tokenizer.encoding) {
+		if (!this.#tokenizer.countsAlike(model)) {
 			this.#tokenizer = new Tokenizer(model);
 		}
 	}
