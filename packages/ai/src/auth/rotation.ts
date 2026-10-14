@@ -1,4 +1,5 @@
 import { scheduler } from "node:timers/promises";
+import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { calculateRateLimitBackoffMs, isAccountBillingExhaustion, isUsageLimitOutcome } from "../error/rate-limit";
 import { extractProviderRetryHint } from "../utils/retry-after";
@@ -394,6 +395,7 @@ export class RateLimits implements LimitsApi {
 			routing,
 			providerTimed,
 		);
+		logSetAside(provider, targetCredentialId, "usage limit", rotation.blockedUntilMs, options?.errorMessage);
 		return {
 			...rotation,
 			requestedBlockedUntilMs,
@@ -568,6 +570,13 @@ export class RateLimits implements LimitsApi {
 				routing,
 				false,
 			);
+			logSetAside(
+				provider,
+				this.#deps.pool.entries(provider)[sessionCredential.index]?.id,
+				exactModelPolicy ? "model policy" : "account policy",
+				mark.blockedUntilMs,
+				message,
+			);
 			return awaitSiblingUnblock(mark, options?.signal);
 		}
 
@@ -595,13 +604,9 @@ export class RateLimits implements LimitsApi {
 		) {
 			this.#deps.affinity.clear(provider, sessionId);
 		}
-		this.#deps.blocks.mark(
-			provider,
-			providerKey,
-			sessionCredential.index,
-			Date.now() + DEFAULT_BLOCK_MS,
-			AUTH_BLOCK_SCOPE,
-		);
+		const authBlockedUntil = Date.now() + DEFAULT_BLOCK_MS;
+		this.#deps.blocks.mark(provider, providerKey, sessionCredential.index, authBlockedUntil, AUTH_BLOCK_SCOPE);
+		logSetAside(provider, target?.id, "auth failure", authBlockedUntil, message);
 
 		if (target && AIError.isInvalidatedOAuthTokenError(error)) {
 			const disabledCause = message ?? "upstream reported invalidated OAuth token";
@@ -632,6 +637,26 @@ export class RateLimits implements LimitsApi {
 
 		return { switched: hasSibling };
 	}
+}
+
+/**
+ * Records why a provider error set a credential aside. The provider's own words
+ * reach no session journal, and the transport logs only the status.
+ */
+function logSetAside(
+	provider: string,
+	credentialId: number | undefined,
+	reason: string,
+	blockedUntilMs: number | undefined,
+	providerMessage: string | undefined,
+): void {
+	logger.warn("Credential set aside after a provider error", {
+		provider,
+		credentialId,
+		reason,
+		blockedUntil: blockedUntilMs === undefined ? undefined : new Date(blockedUntilMs).toISOString(),
+		providerMessage: providerMessage?.slice(0, 500),
+	});
 }
 
 /**

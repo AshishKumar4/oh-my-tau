@@ -2,12 +2,13 @@
 // itself needs protecting: near its own reserve, exhausted now, or gone.
 // Moving it for any other reason re-sends the whole prompt uncached.
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import { resolveApiKeyOnce, resolveRetryKey } from "@oh-my-pi/pi-ai/auth-retry";
 import { AuthStorage, type CredentialPoolOrder, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import type { OAuthCredential } from "@oh-my-pi/pi-ai/auth/types";
 import type { Provider } from "@oh-my-pi/pi-ai/types";
 import type { UsageReport } from "@oh-my-pi/pi-ai/usage";
+import { logger } from "@oh-my-pi/pi-utils";
 
 const HOUR_MS = 60 * 60_000;
 
@@ -22,6 +23,7 @@ class ReportingStore extends SqliteAuthCredentialStore {
 const stores: ReportingStore[] = [];
 afterEach(() => {
 	for (const store of stores.splice(0)) store.close();
+	vi.restoreAllMocks();
 });
 
 function account(id: string): OAuthCredential {
@@ -84,8 +86,8 @@ async function serving(storage: AuthStorage, session: string): Promise<string | 
 }
 
 describe("a warm session's account", () => {
-	// A pooled key served first, then rejected: for credit it is set aside, for its
-	// workspace the session's key pin is cleared as well.
+	// A pooled key served first, then rejected: for credit it is set aside; for its
+	// workspace, or as invalid, the session's key pin is cleared as well.
 	const keyRejections: Array<[string, Error]> = [
 		[
 			"for credit",
@@ -105,6 +107,13 @@ describe("a warm session's account", () => {
 				{ status: 400 },
 			),
 		],
+		[
+			"as invalid",
+			Object.assign(
+				new Error('401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}'),
+				{ status: 401 },
+			),
+		],
 	];
 
 	for (const [reason, rejection] of keyRejections) {
@@ -121,8 +130,18 @@ describe("a warm session's account", () => {
 			const resolve = storage.keys.resolver("anthropic", { sessionId: "warm" });
 			const key = await resolveApiKeyOnce(resolve);
 			expect(key).toBe("sk-ant-api03-pooled-key");
+			const warnings = vi.spyOn(logger, "warn").mockImplementation(() => {});
 			expect(await resolveRetryKey(resolve, true, rejection, undefined, key)).toBe("access-a");
 			expect(await serving(storage, "warm")).toBe("access-a");
+
+			// The provider's reason is recorded once, against the key it set aside.
+			const keyId = storage.credentials.list("anthropic").find(row => row.credential.type === "api_key")?.id;
+			const setAside = warnings.mock.calls.filter(
+				([message]) => message === "Credential set aside after a provider error",
+			);
+			expect(setAside).toHaveLength(1);
+			expect(setAside[0]?.[1]).toMatchObject({ provider: "anthropic", credentialId: keyId });
+			expect(String(setAside[0]?.[1]?.providerMessage)).toContain(rejection.message.slice(0, 80));
 		});
 	}
 
