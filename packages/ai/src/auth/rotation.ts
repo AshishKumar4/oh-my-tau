@@ -604,9 +604,21 @@ export class RateLimits implements LimitsApi {
 		) {
 			this.#deps.affinity.clear(provider, sessionId);
 		}
-		const authBlockedUntil = Date.now() + DEFAULT_BLOCK_MS;
-		this.#deps.blocks.mark(provider, providerKey, sessionCredential.index, authBlockedUntil, AUTH_BLOCK_SCOPE);
-		logSetAside(provider, target?.id, "auth failure", authBlockedUntil, message);
+		this.#deps.blocks.mark(
+			provider,
+			providerKey,
+			sessionCredential.index,
+			Date.now() + DEFAULT_BLOCK_MS,
+			AUTH_BLOCK_SCOPE,
+		);
+		// The block map keeps the longest block, so report the one it now holds.
+		logSetAside(
+			provider,
+			target?.id,
+			"auth failure",
+			this.#deps.blocks.blockedUntil(provider, providerKey, sessionCredential.index, AUTH_BLOCK_SCOPE),
+			message,
+		);
 
 		if (target && AIError.isInvalidatedOAuthTokenError(error)) {
 			const disabledCause = message ?? "upstream reported invalidated OAuth token";
