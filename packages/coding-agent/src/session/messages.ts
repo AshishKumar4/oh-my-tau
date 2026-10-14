@@ -61,6 +61,7 @@ import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
 import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
+import { contextHistorySource } from "./context-history-source";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 
 export {
@@ -700,13 +701,15 @@ export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
 	let wrappedMessages: AgentMessage[] | undefined;
 	for (let i = 0; i < messages.length; i++) {
 		const message = messages[i];
-		if (!isSteeringUserMessage(message)) continue;
-		let wrappedMessage = steeringWrapperCache.get(message);
+		// A context hook call's copy wraps as its source, whatever its position.
+		const source = contextHistorySource(message);
+		if (!isSteeringUserMessage(source)) continue;
+		let wrappedMessage = steeringWrapperCache.get(source);
 		if (wrappedMessage === undefined) {
-			wrappedMessage = wrapSteeringUserMessage(message);
-			steeringWrapperCache.set(message, wrappedMessage);
+			wrappedMessage = wrapSteeringUserMessage(source);
+			steeringWrapperCache.set(source, wrappedMessage);
 		}
-		if (wrappedMessage === message) continue;
+		if (wrappedMessage === source) continue;
 		if (wrappedMessages === undefined) {
 			wrappedMessages = messages.slice();
 		}
@@ -1149,15 +1152,17 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 }
 
 /** Cached per-message conversion. Reuses the stored fragment while identity and
- *  `interruptedNext` neighbor state hold; recomputes on a neighbor flip. */
+ *  `interruptedNext` neighbor state hold; recomputes on a neighbor flip. A context
+ *  hook call's copy of a history message converts as its source, whatever its position. */
 function convertOneCached(m: AgentMessage, interruptedNext: boolean): Message[] {
-	const cached = convertCache.get(m);
+	const source = contextHistorySource(m);
+	const cached = convertCache.get(source);
 	let fragment: Message[];
 	if (cached !== undefined && cached.interruptedNext === interruptedNext) {
 		fragment = cached.fragment;
 	} else {
-		fragment = convertOne(m, interruptedNext);
-		convertCache.set(m, { interruptedNext, fragment });
+		fragment = convertOne(source, interruptedNext);
+		convertCache.set(source, { interruptedNext, fragment });
 	}
 	return isPerCallContextMessage(m) || getContextHistoryPosition(m) !== undefined
 		? fragment.map(message => withContextProvenance(message, m))

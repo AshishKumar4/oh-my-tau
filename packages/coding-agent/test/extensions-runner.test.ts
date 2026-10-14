@@ -7,13 +7,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "@oh-my-pi/omptype/typebox";
 import type { AgentMessage, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { MessageCreateParams } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import { getContextHistoryPosition, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
-import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { isCursorExecResolved, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, stripImagesFromMessage, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -4820,6 +4821,127 @@ describe("ExtensionRunner", () => {
 			// The two newest messages carry the rolling breakpoints, so the next request
 			// reads the streamed turn instead of paying for it again.
 			expect(anchored).toEqual([body.messages.length - 2, body.messages.length - 1]);
+		});
+
+		it("keeps a file mention's image in an earlier call's output after its owner strips the session's images", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "append-note.ts"),
+				`export default function(pi) {
+					pi.on("context", async event => ({
+						messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+					}));
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const screenshot: ImageContent = { type: "image", data: "U0NSRUVOU0hPVA==", mimeType: "image/png" };
+			const mention: AgentMessage = {
+				role: "fileMention",
+				files: [{ path: "shot.png", content: "", image: screenshot }],
+				timestamp: 1,
+			};
+			const sent = await runner.emitContext([mention, { role: "user", content: "what is this?", timestamp: 2 }]);
+
+			// The owner strips the session's images in place, as an image shake does.
+			expect(stripImagesFromMessage(mention)).toBe(1);
+
+			expect(JSON.stringify(convertToLlm(sent))).toContain(screenshot.data);
+		});
+
+		it("converts a hooked call's history with the provider markers its messages carry", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "append-note.ts"),
+				`export default function(pi) {
+					pi.on("context", async event => ({
+						messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+					}));
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			// A Cursor turn whose tool call already ran on the provider's side.
+			const resolvedCall = {
+				type: "toolCall" as const,
+				id: "call-cursor",
+				name: "read",
+				arguments: { path: "x" },
+				[kCursorExecResolved]: true as const,
+			};
+			const turn: AgentMessage = { ...createAssistantMessage("reading"), content: [resolvedCall] };
+
+			const sent = convertToLlm(await runner.emitContext([{ role: "user", content: "read x", timestamp: 1 }, turn]));
+
+			const call = sent.find(message => message.role === "assistant")?.content[0];
+			expect(call).toMatchObject({ type: "toolCall", id: "call-cursor" });
+			expect(isCursorExecResolved(call)).toBe(true);
+		});
+
+		it("hands back one object per unchanged history message across calls, a new one once it moves or is rewritten", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "append-note.ts"),
+				`export default function(pi) {
+					pi.on("context", async event => ({
+						messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+					}));
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const question: AgentMessage = { role: "user", content: "question", timestamp: 1 };
+			const answer: AgentMessage = createAssistantMessage("answer");
+			const first = await runner.emitContext([question, answer]);
+			const second = await runner.emitContext([question, answer]);
+			// Caches keyed by message identity (conversion, estimates, the date/cwd reminder)
+			// see the same history message on every hooked call; the note is this call's own.
+			expect(second[0]).toBe(first[0]);
+			expect(second[1]).toBe(first[1]);
+			expect(second[2]).not.toBe(first[2]);
+			expect(second.slice(0, 2)).not.toContain(question);
+
+			// A history rebuilt ahead of the answer moves it; the earlier call keeps what it read.
+			const summary: AgentMessage = { role: "user", content: "summary", timestamp: 0 };
+			const moved = await runner.emitContext([summary, question, answer]);
+			expect(moved[2]).not.toBe(first[1]);
+			expect(moved.map(getContextHistoryPosition)).toEqual([0, 1, 2, undefined]);
+			expect(first.map(getContextHistoryPosition)).toEqual([0, 1, undefined]);
+
+			// An owner rewriting the answer in place gets a copy of the new content.
+			const items: Array<Record<string, unknown>> = [{ type: "message", role: "assistant" }];
+			const rewritten: AssistantMessage = {
+				...createAssistantMessage("answer"),
+				providerPayload: { type: "openaiResponsesHistory", provider: "openai", items },
+			};
+			const before = await runner.emitContext([question, rewritten]);
+			const sent = JSON.stringify(before[1]);
+			const text = rewritten.content[0];
+			if (text?.type !== "text") throw new Error("Expected a text block");
+			text.text = "[shaken]";
+			items.push({ type: "reasoning", summary: [] });
+			invalidateMessageCache(rewritten);
+			const after = await runner.emitContext([question, rewritten]);
+			expect(after[1]).not.toBe(before[1]);
+			expect(JSON.stringify(after[1])).toBe(JSON.stringify(rewritten));
+			// What an earlier call handed back stays as it was read, its content included.
+			expect(JSON.stringify(before[1])).toBe(sent);
+			expect(sent).toContain('"answer"');
 		});
 
 		it("publishes history positions on its own copies when the history cannot be cloned", async () => {

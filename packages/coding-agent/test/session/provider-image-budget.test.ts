@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { Context, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import type { Context, ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { clampProviderContextImages } from "@oh-my-pi/pi-coding-agent/session/provider-image-budget";
@@ -107,6 +107,30 @@ describe("provider context image budgets", () => {
 		}
 		// Each rewrite re-sends the whole cached prompt; it may happen once per batch of images, not per image.
 		expect(rewrites).toBeLessThanOrEqual(Math.ceil(added / 20));
+	});
+
+	it("clamps a tool result's current content after its owner rewrites it in place", () => {
+		// Shake replaces a tool result's content array, keeping its images, and marks it pruned.
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call-shots",
+			toolName: "bash",
+			content: [text("CAPTURE-LOG"), ...Array.from({ length: 12 }, (_, index) => image(`shot-${index}`))],
+			isError: false,
+			timestamp: 1,
+		};
+		const clamp = () => clampProviderContextImages({ systemPrompt: [], tools: [], messages: [result] }, UMANS_MODEL);
+		const first = clamp();
+		expect(textData(first)).toEqual(["CAPTURE-LOG"]);
+
+		result.content = [text("[shaken]"), ...result.content.filter(part => part.type === "image")];
+		result.prunedAt = 2;
+		const second = clamp();
+
+		// The same images drop, and what goes out is what the message holds now.
+		expect(imageData(second)).toEqual(imageData(first));
+		expect(textData(second)).toEqual(["[shaken]"]);
+		expect(second.messages[0]).toMatchObject({ prunedAt: 2 });
 	});
 
 	it("keeps image-only tool results meaningful when every image block is dropped", () => {

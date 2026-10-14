@@ -8,7 +8,8 @@ import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/e
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import { asGlobalFetch } from "./helpers/fetch-mock";
 
 interface MessagesRequest {
@@ -121,6 +122,8 @@ describe("AgentSession Anthropic native compaction", () => {
 		tempDir: TempDir,
 		respond: (request: number) => Response,
 		extensions: ExtensionFactory[] = [],
+		seed?: (sessionManager: SessionManager) => Promise<void>,
+		keepRecentTokens = 1,
 	) {
 		const model = getBundledModel("anthropic", "claude-opus-5-5");
 		if (!model) throw new Error("Expected bundled claude-opus-5-5");
@@ -137,13 +140,17 @@ describe("AgentSession Anthropic native compaction", () => {
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 		authStorage.keys.setRuntime("anthropic", "sk-ant-test");
 		const sessionManager = SessionManager.inMemory(tempDir.path());
+		await seed?.(sessionManager);
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
 			sessionManager,
 			authStorage,
 			modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
-			settings: Settings.isolated({ "compaction.methodOrder": ["remote"], "compaction.keepRecentTokens": 1 }),
+			settings: Settings.isolated({
+				"compaction.methodOrder": ["remote"],
+				"compaction.keepRecentTokens": keepRecentTokens,
+			}),
 			model,
 			extensions,
 			disableExtensionDiscovery: true,
@@ -485,5 +492,139 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(withoutCacheControl(next.messages.slice(0, live.messages.length))).toEqual(
 			withoutCacheControl(live.messages),
 		);
+	});
+
+	it("sends each request as the previous one plus new turns, over a snapcompacted archive and a context hook's note", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-cache-stability-");
+		const REASONING = "PRIVATE-REASONING";
+		const NOTE = "per-call note";
+		await Bun.write(tempDir.join("notes.txt"), "notes");
+		const appendNote: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: [...event.messages, { role: "user", content: NOTE, timestamp: 0 }],
+			}));
+		};
+		// A resumed session whose archive was rendered under GPT, reasoning included.
+		const seedGptArchive = async (sessionManager: SessionManager) => {
+			const gpt = getBundledModel("openai", "gpt-5.4");
+			const keptId = sessionManager.appendMessage({ role: "user", content: "Kept turn.", timestamp: 1 });
+			const archived = await snapcompact.compact(
+				{
+					firstKeptEntryId: keptId,
+					messagesToSummarize: [
+						{ role: "user", content: "Plan the migration.", timestamp: 0 },
+						{
+							role: "assistant",
+							content: [
+								{ type: "thinking", thinking: `${REASONING} about the migration.` },
+								{ type: "text", text: "Migrated." },
+							],
+							api: gpt.api,
+							provider: gpt.provider,
+							model: gpt.id,
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "stop",
+							timestamp: 0,
+						},
+					],
+					turnPrefixMessages: [],
+					tokensBefore: 10_000,
+					fileOps: snapcompact.createFileOps(),
+				},
+				{ model: gpt },
+			);
+			expect(archived.summary).toContain("¶think:");
+			sessionManager.appendCompaction(archived.summary, archived.shortSummary, keptId, archived.tokensBefore, {
+				details: archived.details,
+				preserveData: archived.preserveData,
+				method: "snapcompact",
+			});
+		};
+		const opened = await openSession(
+			tempDir,
+			request => answer(request, request === 2 ? "notes.txt" : undefined),
+			[appendNote],
+			seedGptArchive,
+		);
+		try {
+			await opened.session.prompt("first question");
+			// The second answer reads a file, so its tool loop makes one more request.
+			await opened.session.prompt("second question");
+			opened.moveCwd();
+			await opened.session.prompt("third question");
+			await opened.session.prompt("fourth question");
+		} finally {
+			await opened.close();
+		}
+
+		expect(opened.requests).toHaveLength(5);
+		// Every request ends with the hook's note, exactly as the hook wrote it; the rest is
+		// history. A breakpoint sends its message's text as a block, so text is compared as blocks.
+		const history = (request: MessagesRequest | undefined): unknown[] => {
+			const messages = request?.messages ?? [];
+			expect(messages.at(-1)).toEqual({ role: "user", content: NOTE });
+			return messages.slice(0, -1).map(message => {
+				const sent = withoutCacheControl(message);
+				return isRecord(sent) && typeof sent.content === "string"
+					? { ...sent, content: [{ type: "text", text: sent.content }] }
+					: sent;
+			});
+		};
+		// Claude reads the archive without its reasoning from the first request on.
+		expect(JSON.stringify(opened.requests[0]?.messages)).not.toContain(REASONING);
+		for (let index = 1; index < opened.requests.length; index++) {
+			const previous = history(opened.requests[index - 1]);
+			const next = history(opened.requests[index]);
+			expect({ index, sent: next.slice(0, previous.length) }).toEqual({ index, sent: previous });
+			expect(next.length).toBeGreaterThan(previous.length);
+		}
+		// The moved cwd rides on the turn that followed the move, and stays there.
+		const moved = JSON.stringify(history(opened.requests.at(-1)));
+		expect(moved).toContain(`${tempDir.join("moved")}`);
+	});
+
+	it("replays a kept turn's moved reminder unchanged after native compaction when a context hook adds a note to every request", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-kept-reminder-");
+		const appendNote: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+			}));
+		};
+		// Keeps the last question and its answer, so the reminder-bearing turn moves to the front of the history.
+		const keepRecentTokens = 9;
+		const opened = await openSession(
+			tempDir,
+			request => (request === 4 ? compactionAnswer() : answer(request)),
+			[appendNote],
+			undefined,
+			keepRecentTokens,
+		);
+		try {
+			await opened.session.prompt("first question");
+			await opened.session.prompt("second question");
+			opened.moveCwd();
+			await opened.session.prompt("third question");
+			await opened.session.compact();
+			await opened.session.prompt("fourth question");
+		} finally {
+			await opened.close();
+		}
+
+		expect(opened.requests).toHaveLength(5);
+		const [, , live, compaction, next] = opened.requests;
+		const keptTurn = (request: MessagesRequest | undefined) =>
+			withoutCacheControl(request?.messages.find(message => JSON.stringify(message).includes("third question")));
+		expect(JSON.stringify(compaction?.messages)).toContain("second question");
+		expect(JSON.stringify(compaction?.messages)).not.toContain("third question");
+		// The turn after the cwd move carries the moved reminder, and replays with it.
+		expect(JSON.stringify(keptTurn(live))).toContain(tempDir.join("moved"));
+		expect(keptTurn(next)).toEqual(keptTurn(live));
 	});
 });

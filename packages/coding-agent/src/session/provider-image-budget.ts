@@ -11,6 +11,7 @@ import type {
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
 import { decodeDataUri } from "@oh-my-pi/pi-ai/providers/openai-data-uri";
+import { inheritContextIdentity } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { providerImageBudget } from "@oh-my-pi/snapcompact";
@@ -47,40 +48,37 @@ function countImages(context: Context): number {
 	return count;
 }
 
-function clampContent(
+/** `content` without its `drops` oldest images. */
+function withoutOldestImages(
 	content: readonly (TextContent | ImageContent)[],
-	state: { remainingDrops: number },
-): (TextContent | ImageContent)[] | undefined {
-	let changed = false;
-	const clamped: (TextContent | ImageContent)[] = [];
-	for (const part of content) {
-		if (part.type === "image" && state.remainingDrops > 0) {
-			state.remainingDrops--;
-			changed = true;
-			continue;
+	drops: number,
+): (TextContent | ImageContent)[] {
+	let remaining = drops;
+	return content.filter(part => part.type !== "image" || remaining-- <= 0);
+}
+
+/**
+ * `message` without its `drops` oldest images, standing for the same message:
+ * a drop batch drops the same images on every request, and state kept per
+ * message across requests (the date/cwd reminder's first turn) holds.
+ */
+function clampedMessage(message: UserMessage | DeveloperMessage | ToolResultMessage, drops: number): Message {
+	switch (message.role) {
+		case "toolResult": {
+			const content = withoutOldestImages(message.content, drops);
+			return inheritContextIdentity(
+				{ ...message, content: content.length > 0 ? content : [TOOL_RESULT_IMAGE_OMISSION] },
+				message,
+			);
 		}
-		clamped.push(part);
+		case "user":
+		case "developer":
+			if (typeof message.content === "string") return message;
+			return inheritContextIdentity(
+				{ ...message, content: withoutOldestImages(message.content, drops), providerPayload: undefined },
+				message,
+			);
 	}
-	return changed ? clamped : undefined;
-}
-
-function clampUserMessage(message: UserMessage, state: { remainingDrops: number }): UserMessage {
-	if (!Array.isArray(message.content) || state.remainingDrops <= 0) return message;
-	const content = clampContent(message.content, state);
-	return content ? { ...message, content, providerPayload: undefined } : message;
-}
-
-function clampDeveloperMessage(message: DeveloperMessage, state: { remainingDrops: number }): DeveloperMessage {
-	if (!Array.isArray(message.content) || state.remainingDrops <= 0) return message;
-	const content = clampContent(message.content, state);
-	return content ? { ...message, content, providerPayload: undefined } : message;
-}
-
-function clampToolResultMessage(message: ToolResultMessage, state: { remainingDrops: number }): ToolResultMessage {
-	if (state.remainingDrops <= 0) return message;
-	const content = clampContent(message.content, state);
-	if (!content) return message;
-	return { ...message, content: content.length > 0 ? content : [TOOL_RESULT_IMAGE_OMISSION] };
 }
 
 /**
@@ -100,19 +98,13 @@ export function clampProviderContextImages(context: Context, model: Model): Cont
 	// adds one, which rewrites the whole cached prompt each time. Dropping in steps of
 	// a quarter of the cap changes the dropped set, and the prompt, once per step.
 	const step = Math.max(1, Math.floor(limit / 4));
-	const state = { remainingDrops: Math.min(totalImages, Math.ceil((totalImages - limit) / step) * step) };
+	let remainingDrops = Math.min(totalImages, Math.ceil((totalImages - limit) / step) * step);
 	const messages = context.messages.map(message => {
-		switch (message.role) {
-			case "user":
-				return clampUserMessage(message, state);
-			case "developer":
-				return clampDeveloperMessage(message, state);
-			case "toolResult":
-				return clampToolResultMessage(message, state);
-			case "assistant":
-				return message;
-		}
-		return message;
+		if (message.role === "assistant" || remainingDrops <= 0 || !Array.isArray(message.content)) return message;
+		const drops = Math.min(remainingDrops, message.content.filter(part => part.type === "image").length);
+		if (drops === 0) return message;
+		remainingDrops -= drops;
+		return clampedMessage(message, drops);
 	});
 	return { ...context, messages };
 }

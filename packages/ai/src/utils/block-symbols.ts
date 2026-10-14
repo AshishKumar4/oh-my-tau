@@ -1,3 +1,5 @@
+import type { Message } from "../types";
+
 /** Stores streamed tool-call argument JSON for live renderers and parser recovery. */
 export const kStreamingPartialJson = Symbol("provider.block.partialJson");
 
@@ -258,23 +260,62 @@ export function setContextHistoryPosition(message: ContextHistoryPositionCarrier
 }
 
 /**
+ * The message a per-call copy stands for. A message converted once and handed to
+ * each call as a provenance copy keeps one identity whatever position or origin a
+ * call gives it, so state kept per message across requests (the date/cwd reminder
+ * a turn went out with) survives a position change. Object spread retains it.
+ */
+export const kContextIdentity = Symbol("agent.message.contextIdentity");
+
+/** Carries the message a per-call copy stands for. */
+export type ContextIdentityCarrier = object & { [kContextIdentity]?: object };
+
+/** The message `message` stands for across calls: itself unless it is a per-call copy. */
+export function contextIdentity(message: ContextIdentityCarrier): object {
+	return message[kContextIdentity] ?? message;
+}
+
+/** Marks `copy`, a per-call rewrite of `source`, as standing for the message `source` stands for. */
+export function inheritContextIdentity<T extends object>(copy: T, source: ContextIdentityCarrier): T {
+	const carrier: ContextIdentityCarrier = copy;
+	carrier[kContextIdentity] = contextIdentity(source);
+	return copy;
+}
+
+/** Provenance copies of each converted message, by the origin and history position they carry. */
+const provenanceCopies = new WeakMap<Message, Map<string, Message>>();
+
+/**
  * `message`, converted from `source`, as this call sends it. Conversions cached by
  * identity are shared across calls, but a context transform's provenance (origin and
  * history position) belongs to one call: a source carrying it gets a copy with its
- * current values, so no later call can change what this call read.
+ * current values, so no later call can change what this call read. A copy is never
+ * changed once made, so calls with the same provenance share it, and caches keyed by
+ * message identity hold across them; every copy of `message` has its
+ * {@link contextIdentity}.
  */
-export function withContextProvenance<T extends PerCallContextMessageCarrier & ContextHistoryPositionCarrier>(
-	message: T,
+export function withContextProvenance(
+	message: Message,
 	source: PerCallContextMessageCarrier & ContextHistoryPositionCarrier,
-): T {
+): Message {
 	const origin = source[kPerCallContextMessage];
 	const position = source[kContextHistoryPosition];
 	if (origin === undefined && position === undefined) return message;
+	let copies = provenanceCopies.get(message);
+	const key = `${origin ?? ""}:${position ?? ""}`;
+	const shared = copies?.get(key);
+	if (shared) return shared;
 	const copy = { ...message };
 	const carrier: PerCallContextMessageCarrier & ContextHistoryPositionCarrier = copy;
 	if (origin === undefined) delete carrier[kPerCallContextMessage];
 	else carrier[kPerCallContextMessage] = origin;
 	setContextHistoryPosition(carrier, position);
+	inheritContextIdentity(copy, message);
+	if (!copies) {
+		copies = new Map();
+		provenanceCopies.set(message, copies);
+	}
+	copies.set(key, copy);
 	return copy;
 }
 

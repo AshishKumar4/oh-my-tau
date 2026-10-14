@@ -11,6 +11,7 @@
  * for the lifetime of a session/day and refresh automatically at midnight.
  */
 import type { Context, Message, UserMessage } from "@oh-my-pi/pi-ai";
+import { contextIdentity, isPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { prompt } from "@oh-my-pi/pi-utils";
 import dateCwdReminderTemplate from "../prompts/system/date-cwd-reminder.md" with { type: "text" };
 
@@ -49,14 +50,21 @@ export function isDateCwdReminderControl(message: Message): boolean {
  */
 export class DateCwdReminderInjector {
 	/**
+	 * State is kept per {@link contextIdentity}: a context hook's per-call copy of
+	 * a history message stands for one message whatever position a call gives it,
+	 * so a turn compaction moves keeps the reminder it went out with.
+	 *
 	 * The reminder each first user turn last went out with. A request rooted at
 	 * a turn sent before resumes from its reminder, so a request over another
 	 * view of the history (another root) leaves the live root's bytes alone.
 	 */
-	#rootReminders = new WeakMap<UserMessage, string>();
-	#injections = new WeakMap<Message, Message>();
+	#rootReminders = new WeakMap<object, string>();
+	/** The reminder each user turn carries. */
+	#reminders = new WeakMap<object, string>();
+	/** Each user turn as last sent with its reminder, rebuilt when its content or reminder changes. */
+	#injected = new WeakMap<UserMessage, { content: UserMessage["content"]; reminder: string; message: UserMessage }>();
 	/** Reminder controls, by the message they follow. */
-	#controls = new WeakMap<Message, Message[]>();
+	#controls = new WeakMap<object, Message[]>();
 	#seen = new WeakSet<object>();
 
 	/** Apply the current reminder while preserving all earlier injected bytes. */
@@ -70,25 +78,25 @@ export class DateCwdReminderInjector {
 	#inject(messages: Message[], reminder: string): Message[] {
 		const firstUser = messages.find((message): message is UserMessage => message.role === "user");
 		if (!firstUser) return messages;
-		const sent = this.#rootReminders.get(firstUser);
+		const root = contextIdentity(firstUser);
+		const sent = this.#rootReminders.get(root);
 		if (sent === undefined) {
 			// A new compaction root must not rewrite reminders on retained turns.
-			if (!this.#injections.has(firstUser) && !messageStartsWithReminder(firstUser, reminder)) {
-				this.#injections.set(firstUser, injectReminder(firstUser, reminder));
+			if (!this.#reminders.has(root) && !messageStartsWithReminder(firstUser, reminder)) {
+				this.#reminders.set(root, reminder);
 			}
 		} else if (sent !== reminder) {
-			let newUser: UserMessage | undefined;
-			for (let index = messages.length - 1; index >= 0; index--) {
-				const candidate = messages[index]!;
-				if (candidate.role === "user" && !this.#seen.has(candidate)) {
-					newUser = candidate;
-					break;
-				}
-			}
+			// A context hook rebuilds its per-call messages on every request, so a
+			// reminder riding on one, or following one, would be gone from the next.
+			const history = messages.filter(message => !isPerCallContextMessage(message));
+			const newUser = history.findLast(
+				(candidate): candidate is UserMessage =>
+					candidate.role === "user" && !this.#seen.has(contextIdentity(candidate)),
+			);
 			if (newUser) {
-				this.#injections.set(newUser, injectReminder(newUser, reminder));
+				this.#reminders.set(contextIdentity(newUser), reminder);
 			} else {
-				const anchor = messages.at(-1)!;
+				const anchor = contextIdentity(history.at(-1) ?? firstUser);
 				const control: Message = {
 					role: "developer",
 					content: reminder,
@@ -101,21 +109,30 @@ export class DateCwdReminderInjector {
 				else this.#controls.set(anchor, [control]);
 			}
 		}
-		this.#rootReminders.set(firstUser, reminder);
+		this.#rootReminders.set(root, reminder);
 
 		let changed = false;
 		const out: Message[] = [];
 		for (const message of messages) {
-			const injected = this.#injections.get(message);
-			out.push(injected ?? message);
-			if (injected) changed = true;
-			const controls = this.#controls.get(message);
+			const identity = contextIdentity(message);
+			const carried = message.role === "user" && this.#reminders.get(identity);
+			out.push(carried ? this.#withReminder(message, carried) : message);
+			if (carried) changed = true;
+			const controls = this.#controls.get(identity);
 			if (controls) {
 				out.push(...controls);
 				changed = true;
 			}
-			this.#seen.add(message);
+			this.#seen.add(identity);
 		}
 		return changed ? out : messages;
+	}
+
+	#withReminder(message: UserMessage, reminder: string): UserMessage {
+		const cached = this.#injected.get(message);
+		if (cached?.content === message.content && cached.reminder === reminder) return cached.message;
+		const injected = injectReminder(message, reminder);
+		this.#injected.set(message, { content: message.content, reminder, message: injected });
+		return injected;
 	}
 }

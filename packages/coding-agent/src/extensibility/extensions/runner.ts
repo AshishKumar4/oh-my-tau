@@ -27,8 +27,9 @@ import {
 	setContextHistoryIndex,
 	setContextHistoryPosition,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { messageEstimateVersion } from "@oh-my-pi/pi-agent-core/compaction";
 import type { KeyId } from "@oh-my-pi/pi-tui";
-import { logger } from "@oh-my-pi/pi-utils";
+import { cloneJsonTree, logger } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_RULE_NAME } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Settings, withActiveSettings } from "../../config/settings";
@@ -36,6 +37,7 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
+import { setContextHistorySource } from "../../session/context-history-source";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
@@ -487,8 +489,43 @@ export const TOP_LEVEL_AGENT: ExtensionAgentIdentity = Object.freeze({
 	depth: 0,
 });
 
+/** A history message's detached source for one version, and the copy handed back at one position. */
+interface HistoryCopy {
+	version: number;
+	source: AgentMessage;
+	position: number;
+	copy: AgentMessage;
+}
+
+/**
+ * `message` sharing no object its owner may rewrite in place, so what a call was
+ * handed never changes behind it. Its symbol metadata is restored as on a hook's
+ * input; strings (image data included) are immutable and stay shared. History
+ * tracking stays with the session's message.
+ */
+function detachedHistoryMessage(message: AgentMessage): AgentMessage {
+	let copy: AgentMessage;
+	try {
+		copy = cloneJsonTree(message);
+		restoreClonedMessageMetadata(copy, message);
+	} catch {
+		// A cyclic value leaves it shared, as a hook's own input is then.
+		copy = { ...message };
+	}
+	clearContextHistoryIndex(copy);
+	return copy;
+}
+
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
+	/**
+	 * Each history message's copy handed back from a context hook call that kept
+	 * it unchanged. Later calls return the same object while the message keeps
+	 * its position and content, so caches keyed by message identity (conversion,
+	 * token estimates, the date/cwd reminder) hold across hooked calls; a copy at
+	 * a new position shares its source, which conversion keys on.
+	 */
+	#historyCopies = new WeakMap<AgentMessage, HistoryCopy>();
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
@@ -2026,6 +2063,16 @@ export class ExtensionRunner {
 			if (historyIndex === undefined || occupants.has(historyIndex)) continue;
 			if (Bun.deepEquals(message, messages[historyIndex])) occupants.set(historyIndex, message);
 		}
+		// An unchanged occupant goes back as the history message's copy from an earlier
+		// call, made by the runner from the message itself: no hook has seen it, and
+		// the history position it carries never changes.
+		const handedBack = new Map<AgentMessage, AgentMessage>();
+		for (const [historyIndex, occupant] of occupants) {
+			const copy = this.#historyCopy(messages[historyIndex], historyIndex);
+			occupants.set(historyIndex, copy);
+			handedBack.set(occupant, copy);
+		}
+		currentMessages = currentMessages.map(message => handedBack.get(message) ?? message);
 		const unchanged = new Set(occupants.values());
 		for (const message of currentMessages) {
 			const historyIndex = getContextHistoryIndex(message);
@@ -2046,6 +2093,24 @@ export class ExtensionRunner {
 		// untransformed (possibly unredacted) context back to a caller as if every hook ran.
 		signal?.throwIfAborted();
 		return currentMessages;
+	}
+
+	/**
+	 * `message`'s copy for a context hook call that kept it unchanged at history
+	 * `position`. A history message keeps its content under one identity unless an
+	 * owner rewrites it in place and bumps its version (the conversion cache's
+	 * invariant), so its detached source is made once per version and the copy is
+	 * reused until the position moves.
+	 */
+	#historyCopy(message: AgentMessage, position: number): AgentMessage {
+		const version = messageEstimateVersion(message);
+		const cached = this.#historyCopies.get(message);
+		const source = cached?.version === version ? cached.source : detachedHistoryMessage(message);
+		if (cached?.source === source && cached.position === position) return cached.copy;
+		const copy = { ...source };
+		setContextHistorySource(copy, source);
+		this.#historyCopies.set(message, { version, source, position, copy });
+		return copy;
 	}
 
 	/** Runs request payload hooks with the model used for that provider request. */
