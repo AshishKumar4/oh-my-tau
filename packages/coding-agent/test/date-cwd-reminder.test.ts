@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import type { Api, AssistantMessage, Context, Message, Model, ModelSpec, ToolCall } from "@oh-my-pi/pi-ai";
 import { clearCustomApis, registerCustomApi } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
@@ -12,6 +13,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { formatLocalCalendarDate } from "@oh-my-pi/pi-tui/chrome/local-date";
 import { normalizePromptPath } from "@oh-my-pi/pi-coding-agent/utils/prompt-path";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 describe("date-cwd-reminder", () => {
@@ -349,5 +351,136 @@ describe("date-cwd reminder on the provider wire", () => {
 			setSystemTime();
 			authStorage.close();
 		}
+	});
+});
+
+describe("date-cwd reminder across reader views of a snapcompact archive", () => {
+	afterEach(() => {
+		clearCustomApis();
+		vi.restoreAllMocks();
+	});
+
+	/**
+	 * A live session on a GPT model over an archive it rendered with reasoning.
+	 * Live requests reach `contexts` after the provider transforms, the date/cwd
+	 * reminder included.
+	 */
+	async function openSession(tempDir: TempDir) {
+		const api = "test-date-cwd-reader-view";
+		const contexts: Context[] = [];
+		registerCustomApi(api, (_model, context) => {
+			contexts.push(context);
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+			});
+			return stream;
+		});
+		const gpt = buildModel({
+			id: "gpt-5.4",
+			name: "GPT reader",
+			api,
+			provider: "managed-primary",
+			baseUrl: "https://api.example.com/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400_000,
+			maxTokens: 32_000,
+		});
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const keptId = sessionManager.appendMessage({ role: "user", content: "Kept turn.", timestamp: 1 });
+		const archived = await snapcompact.compact(
+			{
+				firstKeptEntryId: keptId,
+				messagesToSummarize: [
+					{ role: "user", content: "Plan the migration.", timestamp: 0 },
+					{
+						...createAssistantMessage("Migrated."),
+						content: [
+							{ type: "thinking", thinking: "PRIVATE-REASONING about the migration." },
+							{ type: "text", text: "Migrated." },
+						],
+					},
+				],
+				turnPrefixMessages: [],
+				tokensBefore: 10_000,
+				fileOps: snapcompact.createFileOps(),
+			},
+			{ model: gpt },
+		);
+		expect(archived.summary).toContain("¶think:");
+		sessionManager.appendCompaction(archived.summary, archived.shortSummary, keptId, archived.tokensBefore, {
+			details: archived.details,
+			preserveData: archived.preserveData,
+			method: "snapcompact",
+		});
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		authStorage.keys.setRuntime(gpt.provider, "test-key");
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager,
+			authStorage,
+			modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			model: gpt,
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+		});
+		// A reminder change is what a date rollover or a cwd move produces; the cwd is the deterministic one.
+		const moveCwd = () => vi.spyOn(sessionManager, "getCwd").mockReturnValue(tempDir.join("moved"));
+		/** A side request over the live history, as the reader `model` reads it (the live model by default). */
+		const sideRequest = async (model?: Model) =>
+			session.agent.buildSideRequestContext(await session.convertMessagesToLlm(session.messages, undefined, model));
+		const close = async () => {
+			await session.dispose();
+			authStorage.close();
+		};
+		return { session, contexts, moveCwd, sideRequest, close };
+	}
+
+	function expectExtends(next: Context | undefined, previous: Context | undefined): void {
+		if (!next || !previous) throw new Error("Expected both live requests");
+		expect(next.messages.slice(0, previous.messages.length)).toEqual(previous.messages);
+	}
+
+	it("keeps the live model's sent bytes when a request for a reader without reasoning passes through", async () => {
+		using tempDir = TempDir.createSync("@pi-date-cwd-reader-view-");
+		const claude = getBundledModel("anthropic", "claude-opus-5-5");
+		const opened = await openSession(tempDir);
+		try {
+			await opened.session.prompt("first");
+			opened.moveCwd();
+			const side = await opened.sideRequest(claude);
+			expect(JSON.stringify(side.messages)).not.toContain("PRIVATE-REASONING");
+			await opened.session.prompt("second");
+		} finally {
+			await opened.close();
+		}
+
+		expect(opened.contexts).toHaveLength(2);
+		expectExtends(opened.contexts[1], opened.contexts[0]);
+	});
+
+	it("keeps the live model's sent bytes across a side request on the same model", async () => {
+		using tempDir = TempDir.createSync("@pi-date-cwd-same-reader-");
+		const opened = await openSession(tempDir);
+		try {
+			await opened.session.prompt("first");
+			opened.moveCwd();
+			await opened.sideRequest();
+			await opened.session.prompt("second");
+		} finally {
+			await opened.close();
+		}
+
+		expectExtends(opened.contexts[1], opened.contexts[0]);
 	});
 });

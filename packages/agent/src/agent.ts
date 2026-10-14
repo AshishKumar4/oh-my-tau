@@ -493,7 +493,7 @@ export class Agent {
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
-	#beforeModelCallHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
+	#beforeModelCallHooks = new Set<(signal: AbortSignal | undefined, context: AgentContext) => Promise<void> | void>();
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -948,15 +948,18 @@ export class Agent {
 		return () => this.#beforeQueuedMessageDequeueHooks.delete(registration);
 	}
 
-	/** Register an independently removable hook that runs immediately before each model call. */
-	addBeforeModelCallHook(hook: (signal?: AbortSignal) => Promise<void> | void): () => void {
-		const registration = (signal?: AbortSignal) => hook(signal);
+	/** Register an independently removable hook that runs immediately before each model call, with the
+	 *  loop's live context (mutating `context.messages` changes what this and later calls send). */
+	addBeforeModelCallHook(
+		hook: (signal: AbortSignal | undefined, context: AgentContext) => Promise<void> | void,
+	): () => void {
+		const registration = (signal: AbortSignal | undefined, context: AgentContext) => hook(signal, context);
 		this.#beforeModelCallHooks.add(registration);
 		return () => this.#beforeModelCallHooks.delete(registration);
 	}
 
-	async #runBeforeModelCallHooks(signal?: AbortSignal): Promise<void> {
-		for (const hook of this.#beforeModelCallHooks) await hook(signal);
+	async #runBeforeModelCallHooks(signal: AbortSignal | undefined, context: AgentContext): Promise<void> {
+		for (const hook of this.#beforeModelCallHooks) await hook(signal, context);
 	}
 
 	async #runBeforeQueuedMessageDequeueHooks(signal?: AbortSignal): Promise<void> {
@@ -1815,7 +1818,7 @@ export class Agent {
 			getApiKey: this.getApiKey,
 			getToolContext: this.#getToolContext,
 			syncContextBeforeModelCall: async (context, signal) => {
-				await this.#runBeforeModelCallHooks(signal);
+				await this.#runBeforeModelCallHooks(signal, context);
 				if (this.#listeners.size > 0) {
 					await Bun.sleep(0);
 				}

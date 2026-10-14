@@ -79,7 +79,8 @@ function isCrashRiskLegacySnapcompactArchive(
 	);
 }
 
-function snapcompactHistoryBlockOptions(
+/** Byte budget and frame resolution for one archive's prompt blocks, as context rebuilding applies them. */
+export function snapcompactHistoryBlockOptions(
 	archive: snapcompact.Archive,
 	options: BuildSessionContextOptions | undefined,
 ): snapcompact.HistoryBlockOptions {

@@ -26,6 +26,7 @@ import {
 	toError,
 } from "@oh-my-pi/pi-utils";
 import type { StructuredSubagentSchemaMode } from "@oh-my-pi/pi-tui/tools/task";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
@@ -42,7 +43,12 @@ import {
 } from "./messages";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
-import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
+import {
+	type BuildSessionContextOptions,
+	buildSessionContext,
+	type SessionContext,
+	snapcompactHistoryBlockOptions,
+} from "./session-context";
 import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
@@ -3514,6 +3520,12 @@ export class SessionManager {
 			resolveFrameData: data => lazyImageDataSync(this.#blobs, data),
 			...options,
 		});
+	}
+
+	/** Prompt blocks for a snapcompact archive, budgeted and resolved as {@link buildSessionContext} attaches them. */
+	snapcompactHistoryBlocks(archive: snapcompact.Archive): (TextContent | ImageContent)[] {
+		const resolveFrameData = (data: string) => lazyImageDataSync(this.#blobs, data);
+		return snapcompact.historyBlocks(archive, snapcompactHistoryBlockOptions(archive, { resolveFrameData }));
 	}
 
 	/**

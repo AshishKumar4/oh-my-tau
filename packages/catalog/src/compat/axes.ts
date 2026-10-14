@@ -362,6 +362,19 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 		shape: "scalar",
 		values: [true, false],
 	},
+	/**
+	 * The model's input classifier refuses requests that reproduce assistant
+	 * reasoning as quoted text (`reasoning_extraction`), so reasoning must not
+	 * be replayed as text into its input: compaction archives, summarizer
+	 * transcripts and demoted interrupted turns leave it out. Declared per class
+	 * in `classes/*.kdl`.
+	 */
+	"classifier-cot-extraction": {
+		key: "classifierCotExtraction",
+		set: "catalog",
+		shape: "scalar",
+		values: [true, false],
+	},
 	"clamp-context-override": { key: "clampContextOverride", set: "catalog", shape: "scalar" },
 	"context-promotion-target": { key: "contextPromotionTarget", set: "catalog", shape: "scalar" },
 	"context-window-floor": { key: "contextWindowFloor", set: "catalog", shape: "scalar" },

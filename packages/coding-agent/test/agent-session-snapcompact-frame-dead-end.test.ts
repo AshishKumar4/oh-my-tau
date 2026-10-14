@@ -320,6 +320,47 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		expect(recovery[0].level).toBe("info");
 	});
 
+	it("rebuilds the archive for a Claude reader without its reasoning", async () => {
+		// The rescue re-renders for the active model, so it must apply that
+		// model's reasoning policy: an Anthropic reader gets no `¶think:` scope.
+		await createSession({ frameCount: SEEDED_FRAME_COUNT });
+		const isCompaction = (entry: { type: string }): entry is CompactionEntry => entry.type === "compaction";
+		const stale = sessionManager.getBranch().findLast(isCompaction);
+		if (!stale) throw new Error("Expected the seeded compaction entry");
+		const text = Array.from(
+			{ length: 40 },
+			(_, i) => `¶user: turn ${i}\n¶think: private plan ${i}\n\nstill planning ${i}\n¶ai: reply ${i}`,
+		).join("\n");
+		stale.summary = "- `¶user:`, `¶think:`, `¶ai:`, `¶call:`: user, assistant reasoning, assistant reply, tool call.";
+		stale.preserveData = {
+			snapcompact: { frames: makeFrames(SEEDED_FRAME_COUNT), text, totalChars: text.length, truncatedChars: 0 },
+		};
+		vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		vi.spyOn(session.agent, "continue").mockResolvedValue();
+		vi.spyOn(session, "getContextUsage").mockImplementation(() =>
+			sessionManager.getBranch().filter(isCompaction).length > 1
+				? { tokens: 30000, contextWindow: 200000, percent: 15 }
+				: { tokens: 190000, contextWindow: 200000, percent: 95 },
+		);
+		vi.spyOn(session, "shake").mockResolvedValue({
+			mode: "elide",
+			toolResultsDropped: 0,
+			blocksDropped: 0,
+			tokensFreed: 0,
+		});
+
+		await triggerMaintenance();
+
+		const rebuilt = sessionManager.getBranch().findLast(isCompaction);
+		const rebuiltArchive = snapcompact.getPreservedArchive(rebuilt?.preserveData);
+		if (!rebuilt || !rebuiltArchive) throw new Error("Expected a rebuilt snapcompact archive");
+		expect(rebuilt.id).not.toBe(stale.id);
+		expect(rebuilt.summary).not.toContain("¶think:");
+		const rebuiltText = snapcompact.archiveSourceText(rebuiltArchive);
+		expect(rebuiltText).toContain("reply 39");
+		expect(rebuiltText).not.toContain("planning");
+	});
+
 	it("rebuilds the just-written archive when a completed pass dead-ends on its own frames", async () => {
 		// POST-PASS shape (observed live on 17.0.8): compaction ran and wrote a
 		// frame archive, but the archive itself is the over-budget cost — each

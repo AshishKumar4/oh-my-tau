@@ -52,7 +52,7 @@ export interface SessionHandoffHost {
 	setSkipPostTurnMaintenance(timestamp: number | undefined): void;
 	obfuscateTextForProvider(text: string | undefined): string | undefined;
 	deobfuscateFromProvider(text: string): string;
-	convertMessagesToLlm(messages: AgentMessage[], signal?: AbortSignal): Promise<Message[]>;
+	convertMessagesToLlm(messages: AgentMessage[], signal: AbortSignal | undefined, model: Model): Promise<Message[]>;
 	prepareSimpleStreamOptions(options: SimpleStreamOptions, provider?: string): SimpleStreamOptions;
 	effectiveServiceTier(model: Model | undefined): ServiceTier | undefined;
 }
@@ -150,7 +150,7 @@ export class SessionHandoff {
 					timestamp: Date.now(),
 				},
 			];
-			const handoffLlmMessages = await this.#host.convertMessagesToLlm(handoffSnapshot, handoffSignal);
+			const handoffLlmMessages = await this.#host.convertMessagesToLlm(handoffSnapshot, handoffSignal, model);
 			// Base system prompt, not a per-turn `before_agent_start` hook override —
 			// the document seeds the post-compaction context and must not carry
 			// prompt-specific hook state.

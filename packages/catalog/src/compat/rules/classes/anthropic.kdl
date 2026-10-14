@@ -22,6 +22,9 @@ class "anthropic" {
 	// Claude searches back 20 content-block positions from each cache breakpoint,
 	// grouping consecutive tool_use/tool_result runs into one position.
 	prompt-cache-lookback 20
+	// Claude's input classifier refuses requests that quote earlier reasoning
+	// back as text (`reasoning_extraction`, issue #6093).
+	classifier-cot-extraction #true
 	thinking-replay-tokens "output"
 	// verified: billing matched this formula on Opus 4.7+ and Fable 5.1.
 	image-tokenization {

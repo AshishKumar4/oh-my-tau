@@ -650,14 +650,15 @@ export interface SummaryOptions {
 	convertToLlm?: ConvertToLlm;
 	/**
 	 * The provider context a live turn sends for `summarized` + `retained`, cut to
-	 * `summarized`. Anthropic on-demand compaction sends it so retained signed
-	 * thinking keeps its prefix; without it the request uses `remoteSystemPrompt`,
-	 * `tools` and `convertToLlm`.
+	 * `summarized`, as read by the summarizer `model`. Anthropic on-demand
+	 * compaction sends it so retained signed thinking keeps its prefix; without
+	 * it the request uses `remoteSystemPrompt`, `tools` and `convertToLlm`.
 	 */
 	buildProviderContext?: (
 		summarized: AgentMessage[],
 		retained: AgentMessage[],
-		signal?: AbortSignal,
+		signal: AbortSignal | undefined,
+		model: Model,
 	) => Promise<Context>;
 	/** Select operator-authored turns before wire conversion erases their origin. */
 	isUserAuthored?: (message: AgentMessage) => boolean;
@@ -1619,12 +1620,28 @@ export async function compact(
 		oneshotRetry: options?.oneshotRetry,
 	};
 
-	const previousSnapcompactArchive = snapcompact.getPreservedArchive(previousPreserveData);
+	// An archive keeps the reasoning policy of the model it was rendered for;
+	// Claude refuses inputs that reproduce reasoning (issue #6093), so a
+	// summarizer whose classifier refuses quoted reasoning (the
+	// `classifier-cot-extraction` catalog axis) reads the archive's no-reasoning view (scrubbed
+	// while its tool-output spans are still marked), and a summary with no
+	// archive behind it is scrubbed of `¶think:` sections.
+	const withoutThinking = !snapcompact.readerIncludesThinking(model);
+	const storedSnapcompactArchive = snapcompact.getPreservedArchive(previousPreserveData);
+	const snapcompactView =
+		storedSnapcompactArchive && withoutThinking
+			? snapcompact.viewWithoutThinking(previousSummary ?? "", storedSnapcompactArchive)
+			: undefined;
+	const previousSnapcompactArchive = snapcompactView?.archive ?? storedSnapcompactArchive;
+	const previousSummaryForReader =
+		withoutThinking && previousSummary !== undefined
+			? (snapcompactView?.summary ?? snapcompact.textWithoutThinking(previousSummary))
+			: previousSummary;
 	const previousSnapcompactArchiveText = previousSnapcompactArchive
 		? snapcompact.archiveSourceText(previousSnapcompactArchive)
 		: undefined;
 	const previousSummaryForCompaction = mergePreviousSummaryWithSnapcompactArchive(
-		previousSummary,
+		previousSummaryForReader,
 		previousSnapcompactArchiveText,
 	);
 	const snapcompactArchiveMigrationMessage = previousSnapcompactArchiveText
@@ -1635,8 +1652,8 @@ export async function compact(
 	// A local summary has no native payload to carry it into the first remote
 	// request. Encode it as history; do not resend opaque native placeholders.
 	const previousSummaryMigrationMessage =
-		settings.remoteEnabled !== false && previousSummary && !previousNativeHistory
-			? createCompactionSummaryMessage(previousSummary, tokensBefore, new Date().toISOString())
+		settings.remoteEnabled !== false && previousSummaryForReader && !previousNativeHistory
+			? createCompactionSummaryMessage(previousSummaryForReader, tokensBefore, new Date().toISOString())
 			: undefined;
 
 	let preserveData = withAnthropicCompactionPreserveData(
@@ -1944,7 +1961,7 @@ export async function compact(
 			// history when the host can build them: kept thinking remains valid
 			// only when the summarized prefix matches what was sent byte for byte.
 			const context = summaryOptions.buildProviderContext
-				? await summaryOptions.buildProviderContext(summarizedMessages, allMessages.slice(safeCut), signal)
+				? await summaryOptions.buildProviderContext(summarizedMessages, allMessages.slice(safeCut), signal, model)
 				: {
 						systemPrompt: summaryOptions.remoteSystemPrompt ?? [],
 						messages: (summaryOptions.convertToLlm ?? defaultConvertToLlm)(summarizedMessages),

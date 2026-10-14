@@ -45,10 +45,11 @@
  * re-attached to the compaction summary message on every context rebuild.
  */
 
-import type { Api, ImageContent, Message, TextContent } from "@oh-my-pi/pi-ai";
+import type { Api, ImageContent, Message, Model, TextContent } from "@oh-my-pi/pi-ai";
+import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { classifyModel, compareRevision, parseRevision } from "@oh-my-pi/pi-catalog/identity";
 import { renderSnapcompactPng, snapcompactSupportedChars } from "@oh-my-pi/pi-natives";
-import { formatGroupedPaths, prompt } from "@oh-my-pi/pi-utils";
+import { formatGroupedPaths, isRecord, prompt } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import fileOperationsTemplate from "./prompts/file-operations.md" with { type: "text" };
 import snapcompactSummaryPrompt from "./prompts/snapcompact-summary.md" with { type: "text" };
@@ -576,6 +577,30 @@ export interface Archive {
 	textHead?: string;
 	/** Newest text region kept verbatim around the imaged middle. */
 	textTail?: string;
+	/** The same history re-rendered for a reader that excludes assistant
+	 *  reasoning ({@link SerializeOptions.includeThinking} `false`), when this
+	 *  archive carries it. Read through {@link viewWithoutThinking}. */
+	withoutThinking?: ArchiveView;
+	/** Every cut that dropped part of {@link text}, here or in an archive it
+	 *  grew from, restated the scope in force after it. Archives planned before
+	 *  cuts did may continue a dropped `¶think:` section with no label. */
+	scopedCuts?: true;
+	/** Where {@link text}, grown from such an older truncated archive, may hold
+	 *  that unlabeled continuation: from `from` up to the first scope label at
+	 *  or after `to`. */
+	unscoped?: UnscopedRegion;
+}
+
+/** Offsets in an archive's text bounding lines whose scope is unknown; see {@link Archive.unscoped}. */
+export interface UnscopedRegion {
+	from: number;
+	to: number;
+}
+
+/** What a reader gets for one compaction: the summary text and the archive it introduces. */
+export interface ArchiveView {
+	summary: string;
+	archive: Archive;
 }
 
 export interface Geometry {
@@ -767,7 +792,8 @@ export interface SerializeOptions {
 	 *  louder than archived tool noise. Defaults to `true`. */
 	dimToolResults?: boolean;
 	/** Serialize assistant reasoning as `¶think:` sections. Defaults to `true`.
-	 *  Callers archiving for a Claude/Anthropic-dialect model set this `false`:
+	 *  Callers archiving for a reader whose classifier refuses quoted reasoning
+	 *  ({@link readerIncludesThinking} `false`) set this `false`:
 	 *  the archive frames are replayed as text into every later request, and
 	 *  reasoning rendered back to Claude trips its `reasoning_extraction`
 	 *  classifier (issue #6093). */
@@ -861,13 +887,23 @@ function adjacentMarkdownOpenerStart(text: string, dataIndex: number, cursor: nu
  *  (and similar) remain visible after elision and the label stays a pure
  *  function of the captured text. */
 function elideDataUrls(text: string, context: DataUrlContext = "source"): string {
-	if (!/;base64,/i.test(text)) return text;
+	return applyDataUrlElisions(text, dataUrlElisions(text, context));
+}
+
+/** A data URL {@link elideDataUrls} replaces: the span `[start, end)` and the text standing in for it. */
+interface DataUrlElision {
+	start: number;
+	end: number;
+	replacement: string;
+}
+
+/** The replacements {@link elideDataUrls} makes in `text`, in order. */
+function dataUrlElisions(text: string, context: DataUrlContext): DataUrlElision[] {
+	const elisions: DataUrlElision[] = [];
+	if (!/;base64,/i.test(text)) return elisions;
 	DATA_URL_ATOM.lastIndex = 0;
-	let match = DATA_URL_ATOM.exec(text);
-	if (match === null) return text;
-	const out: string[] = [];
 	let cursor = 0;
-	while (match !== null) {
+	for (let match = DATA_URL_ATOM.exec(text); match !== null; match = DATA_URL_ATOM.exec(text)) {
 		const urlStart = match.index;
 		const urlEnd = urlStart + match[0].length;
 		const mime = match[1] ?? "";
@@ -879,36 +915,51 @@ function elideDataUrls(text: string, context: DataUrlContext = "source"): string
 			marker !== null ||
 			CANONICAL_BASE64.test(payload) ||
 			payload.length >= DAMAGED_PAYLOAD_MIN_CHARS;
-		if (!isAtom) {
-			// Advance through short prose too, so a later wrapper cannot swallow
-			// a data URL already copied out of its Markdown label.
-			out.push(text.slice(cursor, urlEnd));
-			cursor = urlEnd;
-		} else {
+		if (isAtom) {
 			const b64Chars = marker
 				? payload.length - marker[0].length + Number(/\d+/.exec(marker[0])?.[0] ?? 0)
 				: payload.length;
 			const placeholder = `[data URL omitted: ${mime}, ${b64Chars} base64 chars]`;
 			const foundOpener = adjacentMarkdownOpenerStart(text, urlStart, cursor);
 			const openerStart = foundOpener !== undefined && foundOpener >= cursor ? foundOpener : undefined;
-			const emitStart = openerStart ?? urlStart;
-			out.push(text.slice(cursor, emitStart));
 			// Swallow the Markdown wrapper only when both delimiters matched;
 			// otherwise re-emit whichever half was captured untouched. An opener
 			// that starts before the already-emitted cursor would overlap a prior
 			// replacement, so that URL is treated as bare.
-			if (openerStart !== undefined && closer !== undefined) {
-				out.push(placeholder);
-			} else {
-				const opener = openerStart !== undefined ? text.slice(openerStart, urlStart) : "";
-				out.push(opener, placeholder, closer ?? "");
-			}
-			cursor = urlEnd;
+			const replacement =
+				openerStart !== undefined && closer !== undefined
+					? placeholder
+					: `${openerStart !== undefined ? text.slice(openerStart, urlStart) : ""}${placeholder}${closer ?? ""}`;
+			elisions.push({ start: openerStart ?? urlStart, end: urlEnd, replacement });
 		}
-		match = DATA_URL_ATOM.exec(text);
+		// Advance through short prose too, so a later wrapper cannot swallow
+		// a data URL already copied out of its Markdown label.
+		cursor = urlEnd;
+	}
+	return elisions;
+}
+
+function applyDataUrlElisions(text: string, elisions: readonly DataUrlElision[]): string {
+	if (elisions.length === 0) return text;
+	const out: string[] = [];
+	let cursor = 0;
+	for (const { start, end, replacement } of elisions) {
+		out.push(text.slice(cursor, start), replacement);
+		cursor = end;
 	}
 	out.push(text.slice(cursor));
 	return out.join("");
+}
+
+/** Where `offset` in a text lands once `elisions` are applied; an offset inside a replaced span lands at its start. */
+function elidedOffset(elisions: readonly DataUrlElision[], offset: number): number {
+	let shift = 0;
+	for (const { start, end, replacement } of elisions) {
+		if (start >= offset) break;
+		if (end > offset) return start + shift;
+		shift += replacement.length - (end - start);
+	}
+	return offset + shift;
 }
 
 const DIM_MARKERS = /[\u000e\u000f]/g;
@@ -1700,9 +1751,8 @@ export function frames(text: string, options?: Pick<RenderManyOptions, "shape" |
 // Archive helpers
 // ============================================================================
 
-/** Validate and extract a persisted frame archive from `preserveData`. */
-export function getPreservedArchive(preserveData: Record<string, unknown> | undefined): Archive | undefined {
-	const candidate = preserveData?.[PRESERVE_KEY];
+/** Validate one persisted archive object (frames, counters, text regions). */
+function validateArchive(candidate: unknown): Archive | undefined {
 	if (!candidate || typeof candidate !== "object") return undefined;
 	const archive = candidate as Archive;
 	const frames = Array.isArray(archive.frames)
@@ -1730,7 +1780,25 @@ export function getPreservedArchive(preserveData: Record<string, unknown> | unde
 		...(text !== undefined ? { text } : {}),
 		...(textHead !== undefined ? { textHead } : {}),
 		...(textTail !== undefined ? { textTail } : {}),
+		...(archive.scopedCuts === true ? { scopedCuts: true } : {}),
+		...(isRecord(archive.unscoped) &&
+		typeof archive.unscoped.from === "number" &&
+		typeof archive.unscoped.to === "number"
+			? { unscoped: { from: archive.unscoped.from, to: archive.unscoped.to } }
+			: {}),
 	};
+}
+
+/** Validate and extract a persisted frame archive from `preserveData`, with its
+ *  {@link Archive.withoutThinking} variant when that is valid too. */
+export function getPreservedArchive(preserveData: Record<string, unknown> | undefined): Archive | undefined {
+	const slot = preserveData?.[PRESERVE_KEY];
+	const archive = validateArchive(slot);
+	if (!archive || !isRecord(slot) || !isRecord(slot.withoutThinking)) return archive;
+	const { summary, archive: variant } = slot.withoutThinking;
+	if (typeof summary !== "string" || !summary) return archive;
+	const variantArchive = validateArchive(variant);
+	return variantArchive ? { ...archive, withoutThinking: { summary, archive: variantArchive } } : archive;
 }
 
 /** Drop the persisted frame archive ({@link PRESERVE_KEY}) from `preserveData`,
@@ -1992,7 +2060,7 @@ function planArchive(text: string, high: Shape, low: Shape, maxFrames: number): 
 			frames: [],
 			textHead,
 			textTail,
-			keptText: textHead + textTail,
+			keptText: textHead + scopeJoin(textHead, text.slice(0, text.length - edgeCap), textTail) + textTail,
 			truncatedChars: text.length - textHead.length - textTail.length,
 		};
 	}
@@ -2008,20 +2076,27 @@ function planArchive(text: string, high: Shape, low: Shape, maxFrames: number): 
 	// newest pages with the session head pinned, drop the oldest middle.
 	if (high.columns === 2) {
 		const pages = docPages(imageText, geometry(high), usesWideCells(high));
-		let kept = pages;
-		let truncatedChars = 0;
-		if (pages.length > maxFrames) {
-			const dropped = pages.slice(1, pages.length - (maxFrames - 1));
-			truncatedChars = dropped.reduce((sum, page) => sum + page.length, 0);
-			kept = [...pages.slice(0, 1), ...pages.slice(pages.length - (maxFrames - 1))];
+		const flatten = (part: readonly string[]) => part.map(page => page.replaceAll("\n", " ")).join(" ");
+		if (pages.length <= maxFrames) {
+			return {
+				frames: planFrames(pages, high),
+				textHead,
+				textTail,
+				keptText: textHead + flatten(pages) + textTail,
+				truncatedChars: 0,
+			};
 		}
-		const flat = kept.map(page => page.replaceAll("\n", " ")).join(" ");
+		const first = pages.slice(0, 1);
+		const newest = pages.slice(pages.length - (maxFrames - 1));
+		const dropped = pages.slice(1, pages.length - newest.length);
+		const before = textHead + flatten(first);
+		const join = scopeJoin(before, `${before} ${flatten(dropped)}`, flatten(newest) || textTail);
 		return {
-			frames: planFrames(kept, high),
+			frames: planFrames([...first, ...newest], high),
 			textHead,
 			textTail,
-			keptText: textHead + flat + textTail,
-			truncatedChars,
+			keptText: before + join + flatten(newest) + textTail,
+			truncatedChars: dropped.reduce((sum, page) => sum + page.length, 0),
 		};
 	}
 
@@ -2055,6 +2130,8 @@ function planArchive(text: string, high: Shape, low: Shape, maxFrames: number): 
 		truncatedChars = dropped.length;
 		middleText = middleSource.slice(dropped.length);
 		middlePages = middlePages.slice(middlePages.length - middleBudget);
+		const before = textHead + imageHead;
+		middleText = scopeJoin(before, before + dropped, middleText) + middleText;
 	}
 	return {
 		frames: [...planFrames(headPages, high), ...planFrames(middlePages, low), ...planFrames(tailPages, high)],
@@ -2065,27 +2142,186 @@ function planArchive(text: string, high: Shape, low: Shape, maxFrames: number): 
 	};
 }
 
+const THINK_LABEL = "¶think:";
+
+/** A scope label opening a serialized section, at the start of a line in raw
+ *  (`\n`) or normalized ({@link NEWLINE_GLYPH}) archive text. */
+const SECTION_START = new RegExp(`(?<=^|[\\n${NEWLINE_GLYPH}])(?=¶(?:user|think|ai|call):)`);
+
+const TRAILING_LINE_BREAKS = new RegExp(`[\\n${NEWLINE_GLYPH}]+$`);
+
+/** A scope label at the start of a section. */
+const SCOPE_LABEL = /^¶(?:user|think|ai|call):/;
+
 /**
- * Drop `¶think:` sections from serialized archive source text.
+ * `text` split into scope sections, each opening at a scope label; a label
+ * inside a dimmed tool-output body is output text. `dimOpen` tells whether
+ * such a body is still open at the end of `text`.
+ */
+function scopeSections(text: string): { sections: string[]; dimOpen: boolean } {
+	const sections: string[] = [];
+	let dimOpen = false;
+	for (const piece of text.split(SECTION_START)) {
+		if (dimOpen) sections[sections.length - 1] += piece;
+		else sections.push(piece);
+		const on = piece.lastIndexOf(DIM_ON);
+		const off = piece.lastIndexOf(DIM_OFF);
+		if (on !== off) dimOpen = on > off;
+	}
+	return { sections, dimOpen };
+}
+
+/**
+ * What joins kept archive source across a dropped slice: `before` is the kept
+ * source up to the slice, `throughCut` the original source through it, and
+ * `after` the kept continuation. Spliced on as is, the continuation would read
+ * as part of the last kept section, and a reader that drops reasoning would
+ * keep the tail of a `¶think:` section whose label was dropped. The join closes
+ * a tool output `before` left open, starts a new line, and restates the label
+ * and dimming in force at the cut.
+ */
+function scopeJoin(before: string, throughCut: string, after: string): string {
+	const cut = scopeSections(throughCut);
+	const restarts = !cut.dimOpen && SCOPE_LABEL.test(after);
+	const label = restarts ? "" : (cut.sections.at(-1)?.match(SCOPE_LABEL)?.[0] ?? "");
+	return `${scopeSections(before).dimOpen ? DIM_OFF : ""}${NEWLINE_GLYPH}${label}${cut.dimOpen ? DIM_ON : ""}`;
+}
+
+/**
+ * Drop every `¶think:` section from archive source text: its label line and
+ * every following line up to the next scope label.
  *
- * Archives written before {@link SerializeOptions.includeThinking} existed bake
- * reasoning into their kept source; replaying it to Claude trips the
- * `reasoning_extraction` classifier (issue #6093). Re-compaction re-renders the
- * whole unfolded source, so scrubbing the prior text heals a poisoned session
- * at its next compaction. Conservative by construction: only sections that
- * start with `¶think:` at a section boundary are dropped.
+ * Archives rendered with {@link SerializeOptions.includeThinking} (or before it
+ * existed) bake reasoning into their kept source; replaying it to Claude trips
+ * the `reasoning_extraction` classifier (issue #6093). Re-rendering for a reader
+ * that excludes thinking scrubs the prior text with this. Paragraph breaks
+ * inside a thought are line breaks like any other, so a section ends only at
+ * the next label; a label inside a dimmed tool-output body is output text.
  */
 function stripThinkingSections(text: string): string {
-	return text
-		.split(NEWLINE_GLYPH)
-		.map(segment =>
-			segment
-				.split(/\n\n(?=¶(?:user|think|ai|call):)/)
-				.filter(section => !section.startsWith("¶think:"))
-				.join("\n\n"),
-		)
-		.filter(segment => segment.length > 0)
+	const { sections } = scopeSections(text);
+	const kept = sections.filter(section => !section.startsWith(THINK_LABEL));
+	if (kept.length === sections.length) return text;
+	const stripped = kept.join("");
+	// A dropped final section leaves its predecessor's line break dangling.
+	return sections.at(-1)?.startsWith(THINK_LABEL) ? stripped.replace(TRAILING_LINE_BREAKS, "") : stripped;
+}
+
+/**
+ * Whether an archive read by `model` may carry assistant reasoning. The archive
+ * replays as text into every later request, and a reader whose classifier
+ * refuses reasoning quoted back into its input (the `classifier-cot-extraction`
+ * catalog axis, set for Claude: `reasoning_extraction`, issue #6093) gets
+ * `¶think:` sections and their legend left out.
+ */
+export function readerIncludesThinking(model: Model): boolean {
+	return resolveCatalogPolicy(model).classifierCotExtraction !== true;
+}
+
+/** Whether a snapcompact summary declares `¶think:` reasoning scopes: true for
+ *  archives rendered with {@link SerializeOptions.includeThinking}, and for
+ *  summaries written before that legend was gated on it. */
+export function summaryIncludesThinking(summary: string): boolean {
+	return summary.includes(THINK_LABEL);
+}
+
+/** The reasoning scope in a scope legend, current and earlier summary wordings
+ *  alike, wherever it sits: a summary, or one archived inside another archive. */
+const LEGEND_REASONING_SCOPE =
+	/`¶user:`, `¶think:`, (`¶ai:`, (?:and )?`¶call:`:? (?:open )?user, )assistant reasoning, /g;
+
+/** `text` (a summary or archive source, raw or normalized) without its
+ *  `¶think:` sections, and with the reasoning scope dropped from any legend. */
+export function textWithoutThinking(text: string): string {
+	return stripThinkingSections(text).replace(LEGEND_REASONING_SCOPE, "`¶user:`, $1");
+}
+
+const PREVIOUS_SUMMARY_HEAD = "[Summary of earlier history]";
+
+/** `archive`'s kept source: its whole {@link Archive.text}, else its edges. */
+function archiveSource(archive: Archive): string {
+	return (
+		archive.text ??
+		[archive.textHead, archive.textTail]
+			.filter((part): part is string => typeof part === "string" && part.length > 0)
+			.join(NEWLINE_GLYPH)
+	);
+}
+
+/**
+ * Lines of {@link archiveSource} whose scope is unknown. Without its whole
+ * source an archive keeps only its edges, and the tail's lines before its
+ * first scope label continue a section cut off in the imaged middle. A
+ * truncated archive planned before cuts restated their scope records no cut
+ * positions, and that planner cut anywhere between its text edges.
+ */
+function unscopedRegion(archive: Archive): UnscopedRegion | undefined {
+	const head = archive.textHead?.length ?? 0;
+	if (!archive.text) return { from: head, to: head };
+	if (archive.scopedCuts || archive.truncatedChars === 0) return undefined;
+	return archive.unscoped ?? { from: head, to: archive.text.length - (archive.textTail?.length ?? 0) };
+}
+
+/**
+ * `archive`'s kept source as a reader that excludes reasoning may unfold it;
+ * `mayCarryReasoning` is whether its summary declares reasoning scopes. Lines
+ * whose scope is unknown ({@link unscopedRegion}) may continue a `¶think:`
+ * section, so they are left out, through the first scope label after them.
+ */
+function sourceForReaderWithoutThinking(archive: Archive, mayCarryReasoning: boolean): string {
+	const source = archiveSource(archive);
+	const region = archive.text && !mayCarryReasoning ? undefined : unscopedRegion(archive);
+	if (!region) return source;
+	const after = source.slice(region.to);
+	const labelled = after.search(SECTION_START);
+	return [source.slice(0, region.from), labelled < 0 ? "" : after.slice(labelled)]
+		.filter(part => part.length > 0)
 		.join(NEWLINE_GLYPH);
+}
+
+/**
+ * What a reader that excludes assistant reasoning reads for a compaction
+ * whose summary is `summary` and archive `archive`: the archive's
+ * {@link Archive.withoutThinking} variant when it carries one, the original
+ * when its summary declares no reasoning, else a fail-closed text-only form.
+ * That form keeps no frames (pixels cannot be scrubbed), takes its text edges
+ * from the source after every `¶think:` section is removed (so a section
+ * crossing an edge cannot leak), counts the dropped middle as truncated, and
+ * re-renders the summary without the reasoning legend; `details` restores its
+ * file list.
+ */
+export function viewWithoutThinking(summary: string, archive: Archive, details?: CompactionDetails): ArchiveView {
+	if (archive.withoutThinking) return archive.withoutThinking;
+	if (!summaryIncludesThinking(summary)) return { summary, archive };
+	const source = sourceForReaderWithoutThinking(archive, true);
+	const text = textWithoutThinking(source);
+	const headChars = archive.textHead?.length ?? 0;
+	const tailChars = archive.textTail?.length ?? 0;
+	const fits = headChars + tailChars >= text.length;
+	const textHead = fits ? text : text.slice(0, headChars);
+	const textTail = fits || tailChars === 0 ? "" : text.slice(text.length - tailChars);
+	const truncatedChars = archive.truncatedChars + (fits ? 0 : text.length - headChars - tailChars);
+	const files = details ? formatFileList(details.readFiles, details.modifiedFiles) : "";
+	return {
+		summary:
+			textHead.length === 0 && files.length === 0
+				? "No prior history."
+				: prompt.render(snapcompactSummaryPrompt, {
+						frameCount: 0,
+						truncatedChars,
+						includedPreviousSummary: text.startsWith(PREVIOUS_SUMMARY_HEAD),
+						files: files.length > 0 ? files : undefined,
+						includeThinking: false,
+					}),
+		archive: {
+			frames: [],
+			totalChars: textHead.length + textTail.length,
+			truncatedChars,
+			...(text ? { text } : {}),
+			...(textHead ? { textHead } : {}),
+			...(textTail ? { textTail } : {}),
+		},
+	};
 }
 
 /**
@@ -2113,21 +2349,26 @@ export async function compact<TMessage = Message>(
 	const llmMessages = (options?.convertToLlm ?? defaultConvertToLlm)(messages);
 	const serialized = serializeConversation(llmMessages, options);
 	const previousArchive = getPreservedArchive(previousPreserveData);
-	const previousTextRaw =
-		previousArchive?.text ??
-		[previousArchive?.textHead, previousArchive?.textTail]
-			.filter((part): part is string => typeof part === "string" && part.length > 0)
-			.join(NEWLINE_GLYPH);
+	const excludeThinking = options?.includeThinking === false;
+	const previousMayCarryReasoning = previousSummary === undefined || summaryIncludesThinking(previousSummary);
+	const previousTextRaw = !previousArchive
+		? ""
+		: excludeThinking
+			? sourceForReaderWithoutThinking(previousArchive, previousMayCarryReasoning)
+			: archiveSource(previousArchive);
+	// Lines an older planner's cut left unscoped stay so in this archive.
+	const inheritedUnscoped =
+		previousArchive && !excludeThinking && previousMayCarryReasoning ? unscopedRegion(previousArchive) : undefined;
 	// Legacy archives may carry `¶think:` sections from before includeThinking
-	// existed; scrub them when this compaction excludes thinking so the
-	// re-rendered archive stops replaying reasoning (issue #6093). They may
-	// also carry data URLs a pre-guard slice cut at any offset; heal those in
-	// archive context before the text is folded into the new source.
-	const previousTextHealed = elideDataUrls(previousTextRaw, "archive");
+	// existed, and any archive may carry an earlier summary's reasoning legend;
+	// scrub both when this compaction excludes thinking so the re-rendered
+	// archive stops replaying reasoning (issue #6093). They may also carry data
+	// URLs a pre-guard slice cut at any offset; heal those in archive context
+	// before the text is folded into the new source.
+	const previousElisions = dataUrlElisions(previousTextRaw, "archive");
+	const previousTextHealed = applyDataUrlElisions(previousTextRaw, previousElisions);
 	const previousText =
-		options?.includeThinking === false && previousTextHealed.length > 0
-			? stripThinkingSections(previousTextHealed)
-			: previousTextHealed;
+		excludeThinking && previousTextHealed.length > 0 ? textWithoutThinking(previousTextHealed) : previousTextHealed;
 	const hasPreviousText = previousText.length > 0;
 	const includedPreviousSummary = !hasPreviousText && !!previousSummary;
 	const shapeProbeText = renderabilityProbeText(serialized, previousPreserveData, previousSummary);
@@ -2143,7 +2384,8 @@ export async function compact<TMessage = Message>(
 	let archiveText = normalize(serialized, { shape: high });
 
 	if (includedPreviousSummary && previousSummary) {
-		const head = `[Summary of earlier history] ${normalize(previousSummary, { shape: high })}`;
+		const lead = excludeThinking ? textWithoutThinking(previousSummary) : previousSummary;
+		const head = `${PREVIOUS_SUMMARY_HEAD} ${normalize(lead, { shape: high })}`;
 		archiveText = archiveText.length > 0 ? `${head} [Recent conversation] ${archiveText}` : head;
 	}
 
@@ -2160,13 +2402,14 @@ export async function compact<TMessage = Message>(
 	// request. previousText is already strictly healed above; this source-mode
 	// pass covers intact URLs in fresh user/assistant text, which the
 	// serializer never truncates.
-	archiveText = elideDataUrls(archiveText);
+	const sourceElisions = dataUrlElisions(archiveText, "source");
+	archiveText = applyDataUrlElisions(archiveText, sourceElisions);
 
 	const layout = planArchive(archiveText, high, low, maxFrames);
 	truncatedChars += layout.truncatedChars;
 
-	// Re-render the planned frames, carrying any open dim span across every
-	// boundary: textHead → frames → textTail.
+	// Re-render the planned frames, carrying any open dim span from textHead
+	// across every frame boundary.
 	let dimOpen = layout.textHead.lastIndexOf(DIM_ON) > layout.textHead.lastIndexOf(DIM_OFF);
 	const newFrames: Promise<Frame>[] = [];
 	for (const planned of layout.frames) {
@@ -2191,7 +2434,11 @@ export async function compact<TMessage = Message>(
 	}
 
 	const textHead = layout.textHead;
-	const textTail = layout.textTail.length > 0 ? (dimOpen ? DIM_ON : "") + layout.textTail : "";
+	// The tail resumes the kept source's own dimming: across a dropped slice the
+	// frames carry the head's, which the kept source restates at the cut.
+	const keptBeforeTail = layout.keptText.slice(0, layout.keptText.length - layout.textTail.length);
+	const tailDimmed = keptBeforeTail.lastIndexOf(DIM_ON) > keptBeforeTail.lastIndexOf(DIM_OFF);
+	const textTail = layout.textTail.length > 0 ? (tailDimmed ? DIM_ON : "") + layout.textTail : "";
 	const textChars = textHead.length + textTail.length;
 
 	const frames = await Promise.all(newFrames);
@@ -2229,10 +2476,17 @@ export async function compact<TMessage = Message>(
 	// OpenAI replacement history and the Anthropic compaction block like the
 	// default summarizer path does.
 	const basePreserve = stripProviderCompactionPreserveData(previousPreserveData) ?? {};
-	const persistedText =
-		layout.keptText.length > 0 && layout.textTail.length > 0
-			? `${layout.keptText.slice(0, layout.keptText.length - layout.textTail.length)}${textTail}`
-			: layout.keptText;
+	const persistedText = layout.textTail.length > 0 ? keptBeforeTail + textTail : layout.keptText;
+	// This plan restates the scope at its cuts. Inherited unscoped lines move
+	// with the data URLs healed before them (the previous text leads the
+	// source). This plan's cut lies past the head and only removes text, so
+	// they start no later than the head's end, and end no later than where the
+	// cut left them, plus the dimming the tail may restate.
+	const healedOffset = (offset: number) => elidedOffset(sourceElisions, elidedOffset(previousElisions, offset));
+	const unscoped: UnscopedRegion | undefined = inheritedUnscoped && {
+		from: Math.min(healedOffset(inheritedUnscoped.from), textHead.length),
+		to: Math.min(persistedText.length, healedOffset(inheritedUnscoped.to) + textTail.length - layout.textTail.length),
+	};
 	const archive: Archive = {
 		frames,
 		totalChars,
@@ -2240,6 +2494,7 @@ export async function compact<TMessage = Message>(
 		...(persistedText.length > 0 ? { text: persistedText } : {}),
 		...(textHead ? { textHead } : {}),
 		...(textTail ? { textTail } : {}),
+		...(unscoped ? { unscoped } : { scopedCuts: true }),
 	};
 
 	const textNote = textChars > 0 ? ` (+${textChars.toLocaleString()} chars as text)` : "";

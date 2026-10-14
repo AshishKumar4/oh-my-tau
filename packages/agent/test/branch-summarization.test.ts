@@ -141,6 +141,65 @@ describe("branch summarization", () => {
 		expect(capturedPrompt).not.toContain("NO_MATCH_SENTINEL_4076");
 	});
 
+	test("a Claude summarizer reads a compaction summary without its archived reasoning", async () => {
+		const summary = [
+			"- `¶user:`, `¶think:`, `¶ai:`, `¶call:`: user, assistant reasoning, assistant reply, tool call.",
+			"HISTORY",
+			"¶user: fix the build",
+			"¶think: PRIVATE-REASONING plan",
+			"",
+			"PRIVATE-REASONING continued",
+			"¶ai: BUILD_FIXED_4076",
+		].join("\n");
+		const entries: SessionEntry[] = [
+			{
+				type: "compaction",
+				id: "compaction-1",
+				parentId: null,
+				timestamp: new Date(0).toISOString(),
+				summary,
+				firstKeptEntryId: "user-1",
+				tokensBefore: 1000,
+			},
+			{
+				type: "message",
+				id: "user-1",
+				parentId: "compaction-1",
+				timestamp: new Date(1).toISOString(),
+				message: { role: "user", content: "Next step.", timestamp: 1 },
+			},
+		];
+		const prompts: string[] = [];
+		const completeImpl: GenerateBranchSummaryOptions["completeImpl"] = async (model, ctx) => {
+			prompts.push(JSON.stringify(ctx.messages));
+			return {
+				role: "assistant",
+				content: [{ type: "text", text: "branch summary text" }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: ZERO_USAGE,
+				stopReason: "stop",
+				timestamp: 5,
+			};
+		};
+
+		for (const id of ["claude-opus-5-5", "gpt-5.4"]) {
+			await generateBranchSummary(entries, {
+				model: { ...MODEL, id },
+				apiKey: "test-api-key",
+				signal: new AbortController().signal,
+				completeImpl,
+			});
+		}
+
+		const [claude, gpt] = prompts;
+		expect(claude).toContain("BUILD_FIXED_4076");
+		expect(claude).not.toContain("¶think:");
+		expect(claude).not.toContain("PRIVATE-REASONING");
+		expect(gpt).toContain("PRIVATE-REASONING");
+	});
+
 	test("useless tool results do not consume the token budget", () => {
 		const uselessBlob = "USELESS_".repeat(4000);
 		const entries: SessionEntry[] = [

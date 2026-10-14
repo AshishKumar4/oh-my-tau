@@ -48,10 +48,15 @@ export function isDateCwdReminderControl(message: Message): boolean {
  * previously sent message byte-identical.
  */
 export class DateCwdReminderInjector {
-	#root: UserMessage | undefined;
-	#currentReminder: string | undefined;
-	#injections = new Map<Message, Message>();
-	#controls: Array<{ anchor: Message; message: Message }> = [];
+	/**
+	 * The reminder each first user turn last went out with. A request rooted at
+	 * a turn sent before resumes from its reminder, so a request over another
+	 * view of the history (another root) leaves the live root's bytes alone.
+	 */
+	#rootReminders = new WeakMap<UserMessage, string>();
+	#injections = new WeakMap<Message, Message>();
+	/** Reminder controls, by the message they follow. */
+	#controls = new WeakMap<Message, Message[]>();
 	#seen = new WeakSet<object>();
 
 	/** Apply the current reminder while preserving all earlier injected bytes. */
@@ -65,19 +70,13 @@ export class DateCwdReminderInjector {
 	#inject(messages: Message[], reminder: string): Message[] {
 		const firstUser = messages.find((message): message is UserMessage => message.role === "user");
 		if (!firstUser) return messages;
-		if (this.#root !== firstUser) {
+		const sent = this.#rootReminders.get(firstUser);
+		if (sent === undefined) {
 			// A new compaction root must not rewrite reminders on retained turns.
-			const present = new Set<Message>(messages);
-			for (const message of this.#injections.keys()) {
-				if (!present.has(message)) this.#injections.delete(message);
-			}
-			this.#controls = this.#controls.filter(control => present.has(control.anchor));
-			this.#root = firstUser;
-			this.#currentReminder = reminder;
 			if (!this.#injections.has(firstUser) && !messageStartsWithReminder(firstUser, reminder)) {
 				this.#injections.set(firstUser, injectReminder(firstUser, reminder));
 			}
-		} else if (this.#currentReminder !== reminder) {
+		} else if (sent !== reminder) {
 			let newUser: UserMessage | undefined;
 			for (let index = messages.length - 1; index >= 0; index--) {
 				const candidate = messages[index]!;
@@ -97,17 +96,12 @@ export class DateCwdReminderInjector {
 					timestamp: Date.now(),
 				};
 				reminderControls.add(control);
-				this.#controls.push({ anchor, message: control });
+				const controls = this.#controls.get(anchor);
+				if (controls) controls.push(control);
+				else this.#controls.set(anchor, [control]);
 			}
-			this.#currentReminder = reminder;
 		}
-
-		const controlsByAnchor = new Map<Message, Message[]>();
-		for (const control of this.#controls) {
-			const controls = controlsByAnchor.get(control.anchor);
-			if (controls) controls.push(control.message);
-			else controlsByAnchor.set(control.anchor, [control.message]);
-		}
+		this.#rootReminders.set(firstUser, reminder);
 
 		let changed = false;
 		const out: Message[] = [];
@@ -115,7 +109,7 @@ export class DateCwdReminderInjector {
 			const injected = this.#injections.get(message);
 			out.push(injected ?? message);
 			if (injected) changed = true;
-			const controls = controlsByAnchor.get(message);
+			const controls = this.#controls.get(message);
 			if (controls) {
 				out.push(...controls);
 				changed = true;
