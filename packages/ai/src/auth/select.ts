@@ -325,8 +325,8 @@ export class CredentialSelector {
 			this.syncApiKeySelection(provider, candidate, filter) &&
 			!this.#deps.blocks.isBlocked(provider, providerKey, candidate.index, blockScopes);
 
-		const sticky = this.#deps.affinity.get(provider, sessionId);
-		if (sticky?.type === "api_key") {
+		const sticky = this.#deps.affinity.get(provider, sessionId, "api_key");
+		if (sticky) {
 			const pinned = credentials.find(candidate => candidate.index === sticky.index);
 			if (pinned && usable(pinned)) return pinned;
 		}
@@ -610,8 +610,8 @@ export class CredentialSelector {
 		const policyReserveEnabled = hasAccountPolicy && canFetchPolicyUsage;
 		const checkUsage =
 			(strategy !== undefined || policyReserveEnabled) && (credentials.length > 1 || hasPlanRequirement);
-		const sessionCredential = this.#deps.affinity.get(provider, sessionId);
-		const sessionPreferredIndex = sessionCredential?.type === "oauth" ? sessionCredential.index : undefined;
+		const sessionCredential = this.#deps.affinity.get(provider, sessionId, "oauth");
+		const sessionPreferredIndex = sessionCredential?.index;
 		const sessionPreferredSelection =
 			sessionPreferredIndex !== undefined
 				? credentials.find(entry => entry.index === sessionPreferredIndex)
@@ -626,8 +626,7 @@ export class CredentialSelector {
 		// stickiness rather than risk switching while their prompt cache remains warm. New sessions
 		// (no preference), blocked pins, and sessions idle past the provider's sticky window still
 		// rank. Legacy pins predating `lastUsedAtMs` count as warm until the next resolve rewrites the row.
-		const sessionPreferredLastUsedAtMs =
-			sessionCredential?.type === "oauth" ? sessionCredential.lastUsedAtMs : undefined;
+		const sessionPreferredLastUsedAtMs = sessionCredential?.lastUsedAtMs;
 		const sessionPreferredIsWarm =
 			strategy?.stickyWarmMs === undefined ||
 			sessionPreferredLastUsedAtMs === undefined ||
@@ -636,7 +635,7 @@ export class CredentialSelector {
 			sessionPreferredIndex !== undefined &&
 			sessionPreferredCanRefreshOrUse &&
 			!this.#deps.blocks.isBlocked(provider, providerKey, sessionPreferredIndex, blockScopes);
-		const sessionPinIsExplicit = sessionCredential?.type === "oauth" && sessionCredential.explicit === true;
+		const sessionPinIsExplicit = sessionCredential?.explicit === true;
 		const rankDespitePin =
 			!sessionPreferredIsAvailable ||
 			!sessionPreferredIsWarm ||

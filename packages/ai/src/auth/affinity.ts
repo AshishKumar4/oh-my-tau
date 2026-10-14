@@ -34,10 +34,21 @@ export type SessionCredential = {
 	explicit?: true;
 };
 
+/**
+ * A session's pin in each stored pool (OAuth subscriptions, pooled API keys) and
+ * the pool it used last. Selecting from a pool reads that pool's pin, so a
+ * detour through the other pool (pooled keys served first, then failing) does
+ * not cost the session the account it warmed a prompt cache on.
+ */
+type SessionPins = {
+	current: AuthCredential["type"];
+	byPool: Partial<Record<AuthCredential["type"], SessionCredential>>;
+};
+
 /** Session → credential affinity (pins), persisted in the store cache. */
 export class SessionAffinity implements SessionsApi {
-	/** Tracks the last used credential per provider for a session (used for rate-limit switching). */
-	#sessionLastCredential: Map<string, Map<string, SessionCredential>> = new Map();
+	/** Each session's pins per provider (used for rate-limit switching). */
+	#sessionPins: Map<string, Map<string, SessionPins>> = new Map();
 	/** Persisted sticky rows keyed by cache key, so unchanged re-records skip the write. */
 	#persistedSticky: Map<string, PersistedSticky> = new Map();
 	#store: AuthCredentialStore;
@@ -52,9 +63,9 @@ export class SessionAffinity implements SessionsApi {
 		this.#blocks = blocks;
 	}
 
-	/** Drop only this in-memory session pin after OAuth selection falls through. */
+	/** Drop only this session's in-memory pins after OAuth selection falls through. */
 	forget(provider: string, sessionId: string): void {
-		this.#sessionLastCredential.get(provider)?.delete(sessionId);
+		this.#sessionPins.get(provider)?.delete(sessionId);
 	}
 
 	/**
@@ -80,8 +91,9 @@ export class SessionAffinity implements SessionsApi {
 		if (!sessionId || this.#blocks.isHeld(provider, index)) return false;
 		const nowMs = lastUsedAtMs ?? Date.now();
 		const credentialId = this.#pool.entries(provider)[index]?.id;
-		const sessionMap = this.#sessionLastCredential.get(provider) ?? new Map();
-		const previous = sessionMap.get(sessionId);
+		const sessionMap = this.#sessionPins.get(provider) ?? new Map<string, SessionPins>();
+		const pins = sessionMap.get(sessionId);
+		const previous = pins?.byPool[type];
 		const sameCredential =
 			previous?.type === type &&
 			(credentialId !== undefined ? previous.credentialId === credentialId : previous.index === index);
@@ -93,43 +105,69 @@ export class SessionAffinity implements SessionsApi {
 			lastUsedAtMs: nowMs,
 			...(isExplicit ? { explicit: true as const } : {}),
 		};
-		sessionMap.set(sessionId, sessionCredential);
-		this.#sessionLastCredential.set(provider, sessionMap);
+		sessionMap.set(sessionId, { current: type, byPool: { ...pins?.byPool, [type]: sessionCredential } });
+		this.#sessionPins.set(provider, sessionMap);
+		if (credentialId !== undefined) this.#persist(provider, sessionId, sessionCredential, credentialId);
+		return true;
+	}
 
-		if (credentialId === undefined) return true;
+	/** Writes the pin other processes resume from: the session's current one. */
+	#persist(provider: string, sessionId: string, sessionCredential: SessionCredential, credentialId: number): void {
+		const { type } = sessionCredential;
 		const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
-		const expiresAtSec = Math.floor(nowMs / 1000) + SESSION_STICKY_TTL_SEC;
+		const lastUsedAtMs = sessionCredential.lastUsedAtMs ?? Date.now();
+		const explicit = sessionCredential.explicit === true;
+		const expiresAtSec = Math.floor(lastUsedAtMs / 1000) + SESSION_STICKY_TTL_SEC;
 		const persisted = this.#persistedSticky.get(cacheKey);
 		if (
 			persisted &&
 			persisted.type === type &&
 			persisted.credentialId === credentialId &&
-			persisted.explicit === isExplicit &&
-			Math.abs(nowMs - persisted.lastUsedAtMs) < SESSION_STICKY_PERSIST_INTERVAL_MS
+			persisted.explicit === explicit &&
+			Math.abs(lastUsedAtMs - persisted.lastUsedAtMs) < SESSION_STICKY_PERSIST_INTERVAL_MS
 		) {
-			return true;
+			return;
 		}
 		try {
 			this.#store.setCache(cacheKey, JSON.stringify(sessionCredential), expiresAtSec);
-			this.#persistedSticky.set(cacheKey, {
-				type,
-				credentialId,
-				explicit: isExplicit,
-				lastUsedAtMs: nowMs,
-			});
+			this.#persistedSticky.set(cacheKey, { type, credentialId, explicit, lastUsedAtMs });
 		} catch (err) {
 			this.#persistedSticky.delete(cacheKey);
 			logger.debug("Failed to write session sticky credential to persistent store cache", { err });
 		}
-		return true;
 	}
 
-	/** Retrieves the last credential used by a session. */
-	get(provider: string, sessionId: string | undefined): SessionCredential | undefined {
+	/**
+	 * Drops one pool's pin. When it was the current one, the session's pin in the
+	 * other pool becomes current (and is what other processes resume from).
+	 */
+	#drop(provider: string, sessionId: string, type: AuthCredential["type"]): void {
+		const sessionMap = this.#sessionPins.get(provider);
+		const pins = sessionMap?.get(sessionId);
+		if (!sessionMap || !pins) return;
+		delete pins.byPool[type];
+		if (pins.current !== type) return;
+		const remaining = Object.values(pins.byPool).find(pin => pin !== undefined);
+		if (remaining) {
+			pins.current = remaining.type;
+			return;
+		}
+		sessionMap.delete(sessionId);
+		if (sessionMap.size === 0) this.#sessionPins.delete(provider);
+	}
+
+	/**
+	 * Retrieves the credential a session used last, or with `pool` its pin in that
+	 * pool: the account a selection from that pool keeps while it stays usable.
+	 */
+	get(provider: string, sessionId: string | undefined, pool?: AuthCredential["type"]): SessionCredential | undefined {
 		if (!sessionId) return undefined;
-		let sessionMap = this.#sessionLastCredential.get(provider);
-		const live = sessionMap?.get(sessionId);
-		if (live) {
+		let sessionMap = this.#sessionPins.get(provider);
+		const pins = sessionMap?.get(sessionId);
+		if (pins) {
+			const type = pool ?? pins.current;
+			const live = pins.byPool[type];
+			if (!live) return undefined;
 			// Another process can add or drop rows mid-session and the pool is an
 			// index-ordered snapshot, so re-resolve the pin through its durable row
 			// id: a compacted array must not point the session at a different
@@ -138,7 +176,7 @@ export class SessionAffinity implements SessionsApi {
 			const stored = this.#pool.entries(provider);
 			const actualIndex = stored.findIndex(entry => entry.id === live.credentialId);
 			if (actualIndex === -1 || stored[actualIndex]?.credential.type !== live.type) {
-				sessionMap?.delete(sessionId);
+				this.#drop(provider, sessionId, type);
 				return undefined;
 			}
 			live.index = actualIndex;
@@ -168,7 +206,7 @@ export class SessionAffinity implements SessionsApi {
 
 				if (!sessionMap) {
 					sessionMap = new Map();
-					this.#sessionLastCredential.set(provider, sessionMap);
+					this.#sessionPins.set(provider, sessionMap);
 				}
 				const sessionVal: SessionCredential = {
 					type: val.type,
@@ -185,8 +223,8 @@ export class SessionAffinity implements SessionsApi {
 						lastUsedAtMs: val.lastUsedAtMs,
 					});
 				}
-				sessionMap.set(sessionId, sessionVal);
-				return sessionVal;
+				sessionMap.set(sessionId, { current: sessionVal.type, byPool: { [sessionVal.type]: sessionVal } });
+				return pool === undefined || pool === sessionVal.type ? sessionVal : undefined;
 			}
 		} catch (err) {
 			logger.debug("Failed to read session sticky credential from persistent store cache", { err });
@@ -194,15 +232,19 @@ export class SessionAffinity implements SessionsApi {
 		return undefined;
 	}
 
-	/** Clears the last credential used by a session for a provider. */
+	/**
+	 * Clears the credential a session used last for a provider. Its pin in the
+	 * provider's other pool, if any, becomes current.
+	 */
 	clear(provider: string, sessionId: string | undefined): void {
 		if (!sessionId) return;
-		const sessionMap = this.#sessionLastCredential.get(provider);
-		if (sessionMap) {
-			sessionMap.delete(sessionId);
-			if (sessionMap.size === 0) {
-				this.#sessionLastCredential.delete(provider);
-			}
+		const pins = this.#sessionPins.get(provider)?.get(sessionId);
+		if (pins) this.#drop(provider, sessionId, pins.current);
+		const remaining = this.#sessionPins.get(provider)?.get(sessionId);
+		const fallback = remaining?.byPool[remaining.current];
+		if (fallback?.credentialId !== undefined) {
+			this.#persist(provider, sessionId, fallback, fallback.credentialId);
+			return;
 		}
 		const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
 		this.#persistedSticky.delete(cacheKey);

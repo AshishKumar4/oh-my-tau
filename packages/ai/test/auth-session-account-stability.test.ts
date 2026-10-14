@@ -3,7 +3,8 @@
 // Moving it for any other reason re-sends the whole prompt uncached.
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
-import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import { resolveApiKeyOnce, resolveRetryKey } from "@oh-my-pi/pi-ai/auth-retry";
+import { AuthStorage, type CredentialPoolOrder, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import type { OAuthCredential } from "@oh-my-pi/pi-ai/auth/types";
 import type { Provider } from "@oh-my-pi/pi-ai/types";
 import type { UsageReport } from "@oh-my-pi/pi-ai/usage";
@@ -53,10 +54,11 @@ function weekly(id: string, used: number, resetsAt = Date.now() + HOUR_MS, fetch
 	};
 }
 
-function setup(revokedAccount?: string) {
+function setup(revokedAccount?: string, poolOrder?: CredentialPoolOrder) {
 	const store = new ReportingStore(new Database(":memory:"));
 	stores.push(store);
 	const storage = new AuthStorage(store, {
+		...(poolOrder ? { poolOrders: { anthropic: poolOrder } } : {}),
 		defaultReservePct: 5,
 		// An account policy enables reserve protection for pinned sessions, as in the user's configuration.
 		accountPolicies: [{ provider: "anthropic", account: { accountId: "a" }, priority: 0 }],
@@ -82,6 +84,48 @@ async function serving(storage: AuthStorage, session: string): Promise<string | 
 }
 
 describe("a warm session's account", () => {
+	// A pooled key served first, then rejected: for credit it is set aside, for its
+	// workspace the session's key pin is cleared as well.
+	const keyRejections: Array<[string, Error]> = [
+		[
+			"for credit",
+			Object.assign(
+				new Error(
+					'400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}',
+				),
+				{ status: 400 },
+			),
+		],
+		[
+			"for its workspace",
+			Object.assign(
+				new Error(
+					'400 {"type":"error","error":{"type":"invalid_request_error","message":"This API key is not scoped to a workspace. Set the anthropic-workspace-id header."}}',
+				),
+				{ status: 400 },
+			),
+		],
+	];
+
+	for (const [reason, rejection] of keyRejections) {
+		it(`returns to it when a pooled key served first is rejected ${reason}`, async () => {
+			const { store, storage } = setup(undefined, "api-keys-first");
+			await storage.credentials.set("anthropic", [account("a"), account("b")]);
+			store.reports.set("a", weekly("a", 0.5));
+			store.reports.set("b", weekly("b", 0.1));
+			pin(storage, "warm", "a");
+			expect(await serving(storage, "warm")).toBe("access-a");
+
+			// A key added while the session runs serves first, as the pool order asks.
+			await storage.credentials.addApiKey("anthropic", "sk-ant-api03-pooled-key");
+			const resolve = storage.keys.resolver("anthropic", { sessionId: "warm" });
+			const key = await resolveApiKeyOnce(resolve);
+			expect(key).toBe("sk-ant-api03-pooled-key");
+			expect(await resolveRetryKey(resolve, true, rejection, undefined, key)).toBe("access-a");
+			expect(await serving(storage, "warm")).toBe("access-a");
+		});
+	}
+
 	it("stays despite a roomier sibling, and moves at its own reserve", async () => {
 		const { store, storage } = setup();
 		await storage.credentials.set("anthropic", [account("a"), account("b")]);
