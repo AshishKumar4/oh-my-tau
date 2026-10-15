@@ -38,6 +38,16 @@ You need Bun, Rust/Cargo, Git, and Python 3 for the installer. Install and sign 
 
 The installer records profiles for the clients it finds on your PATH. Claude Code and Codex prompts load from your local profile cache; they are not bundled in this repository. Without a valid capture, the profile keeps its tool adaptations but uses OMP's prompt.
 
+### My working setup (optional)
+
+To also use my working rules, the `expert` and `debugger` agents, and my lane-orchestration playbook, run this from the checkout:
+
+```sh
+omp plugin install ./profile
+```
+
+See [profile/README.md](profile/README.md) for what it contains.
+
 ## Profiles and forks
 
 `harness.mode` accepts `auto` (the default), `native`, `claude-code`, `codex`, or `pi`. Each session, including each subagent, resolves `auto` from its own active model:
