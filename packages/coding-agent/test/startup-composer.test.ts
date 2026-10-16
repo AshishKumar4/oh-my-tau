@@ -7,16 +7,17 @@ import * as registry from "@oh-my-pi/pi-coding-agent/collab/registry";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as pluginHelpers from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { runRootCommand } from "@oh-my-pi/pi-coding-agent/main";
 import { Composer, type ComposerPreferences } from "@oh-my-pi/pi-tui/prompt/composer";
+import * as composerCache from "@oh-my-pi/pi-tui/prompt/composer-cache";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import {
 	applyStartupComposerPreferences,
 	beginStartupComposer,
 	ComposerLease,
-	setStartupComposerLspServers,
 	stopPendingStartupComposer,
 	takeStartupComposerLease,
 } from "@oh-my-pi/pi-coding-agent/modes/startup-composer";
@@ -26,6 +27,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
 import { installInMemoryRelay, uninstallInMemoryRelay } from "./collab/helpers/in-memory-relay";
+import { cfgTierOpenai } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { createTestSession } from "./utilities";
 
 import {
@@ -37,7 +39,6 @@ import {
 	cfgSpellingAutocorrect,
 	cfgSpellingTypoDetection,
 	cfgStartupChangelogMode,
-	cfgStartupCheckUpdate,
 	cfgStartupQuiet,
 	cfgStartupSetupWizard,
 	cfgStartupShowSplash,
@@ -45,8 +46,6 @@ import {
 	cfgTuiMaxInlineImages,
 	cfgTuiResizeScrollback,
 } from "@oh-my-pi/pi-coding-agent/modes/settings";
-
-const noRecentSessions = async () => [];
 
 class CountingTerminal extends VirtualTerminal {
 	starts = 0;
@@ -59,6 +58,14 @@ class CountingTerminal extends VirtualTerminal {
 	override stop(): void {
 		this.stops += 1;
 		super.stop();
+	}
+}
+
+class WriteTrackingTerminal extends CountingTerminal {
+	written = "";
+	override write(data: string): void {
+		this.written += data;
+		super.write(data);
 	}
 }
 
@@ -102,7 +109,6 @@ describe("outer startup collaboration gate", () => {
 		});
 		setProjectDir(testSession.tempDir);
 		const activeSettings = await Settings.init({ inMemory: true, cwd: testSession.tempDir });
-		cfgStartupCheckUpdate.override(activeSettings, false);
 		cfgStartupChangelogMode.override(activeSettings, "hidden");
 		cfgStartupSetupWizard.override(activeSettings, false);
 		cfgStartupShowSplash.override(activeSettings, false);
@@ -155,7 +161,6 @@ describe("outer startup collaboration gate", () => {
 			terminal: new VirtualTerminal(),
 			version: "test",
 			cache: false,
-			recentSessions: noRecentSessions,
 		});
 		const rawArgs = ["--no-session", "--no-extensions", "--no-skills", "--no-rules", "--no-tools", "--no-lsp"];
 		const running = runRootCommand(parseArgs(rawArgs), rawArgs, {
@@ -265,9 +270,10 @@ describe("outer startup collaboration gate", () => {
 			vi.restoreAllMocks();
 			uninstallInMemoryRelay();
 			authStorage.close();
+			// setProjectDir chdir'd into tempDir; Windows cannot delete the process cwd.
+			setProjectDir(originalProject);
 			await testSession.cleanup();
 			resetSettingsForTest();
-			setProjectDir(originalProject);
 			Object.defineProperty(process.stdin, "isTTY", { value: originalIsTTY, configurable: true });
 		}
 	});
@@ -299,6 +305,54 @@ describe("Composer prepaint", () => {
 		stopPendingStartupComposer();
 		resetSettingsForTest();
 	});
+
+	it.each([
+		{ configured: "priority", sessionFast: false, cachedFast: true },
+		{ configured: "none", sessionFast: true, cachedFast: false },
+	] as const)(
+		"prepaints fast mode from tier.openai=$configured, not a session-only /fast toggle",
+		async ({ configured, sessionFast, cachedFast }) => {
+			const testSession = await createTestSession();
+			const cache = composerCache.ComposerCache.open(path.join(testSession.tempDir, "composer.db"));
+			vi.spyOn(composerCache, "sharedComposerCache").mockReturnValue(cache);
+			const anthropic = testSession.session.model;
+			const openai = getBundledModel("openai", "gpt-5.2");
+			if (!anthropic || !openai) throw new Error("Bundled test models missing");
+			testSession.session.settings.setModelRole("default", `${openai.provider}/${openai.id}`);
+			vi.spyOn(testSession.session.modelRegistry, "hasConfiguredAuth").mockReturnValue(true);
+			vi.spyOn(testSession.session.modelRegistry, "getAvailable").mockReturnValue([openai, anthropic]);
+			cfgTierOpenai.set(testSession.session.settings, configured);
+			await testSession.session.setModel(openai);
+			testSession.session.setFastMode(sessionFast);
+			expect(testSession.session.isFastModeActive()).toBe(sessionFast);
+			const composer = new Composer({ terminal: new VirtualTerminal() });
+			composer.start();
+			const mode = new InteractiveMode(
+				testSession.session,
+				"test",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				composer,
+			);
+			vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+			try {
+				await mode.init({ suppressWelcomeIntro: true });
+				await testSession.session.setModel(anthropic);
+				mode.stop();
+				const status = cache.read(testSession.sessionManager.getCwd()).status?.statusLine;
+				expect(status?.model?.id).toBe(openai.id);
+				expect(status?.fastMode).toBe(cachedFast);
+			} finally {
+				mode.stop();
+				cache.close();
+				await testSession.cleanup();
+				vi.restoreAllMocks();
+			}
+		},
+	);
 
 	it("keeps one live editor and terminal across handoff", () => {
 		const terminal = new CountingTerminal();
@@ -421,7 +475,6 @@ describe("Composer prepaint", () => {
 			await releaseInit.promise;
 		});
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
-		vi.spyOn(testSession.session, "maybeStartTitleGeneration").mockImplementation(() => {});
 		const prompt = vi.spyOn(testSession.session, "prompt").mockResolvedValue(true);
 
 		try {
@@ -453,6 +506,40 @@ describe("Composer prepaint", () => {
 		}
 	});
 
+	it("turns kitty enhanced paste on when the interactive mode adopts an already started composer", async () => {
+		// The prepaint composer starts the TUI before InteractiveMode wires the input
+		// controller, so enhanced paste (ESC[?5522h) cannot wait for a start event.
+		const terminal = new WriteTrackingTerminal();
+		const composer = new Composer({ preferences: config, terminal });
+		composer.start();
+		const lease = new ComposerLease(composer);
+		const testSession = await createTestSession({ inMemory: true });
+		const mode = new InteractiveMode(
+			testSession.session,
+			"test",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			lease.composer,
+		);
+		lease.adopt();
+		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+
+		try {
+			expect(terminal.written).not.toContain("\x1b[?5522h");
+			await mode.init({ suppressWelcomeIntro: true });
+			expect(terminal.written.split("\x1b[?5522h")).toHaveLength(2);
+			expect(terminal.starts).toBe(1);
+		} finally {
+			mode.stop();
+			lease.dispose();
+			await testSession.cleanup();
+			vi.restoreAllMocks();
+		}
+	});
+
 	it("accepts input while the initial CLI prompt's first turn is still running", async () => {
 		const terminal = new CountingTerminal();
 		const composer = new Composer({ preferences: config, terminal });
@@ -471,7 +558,6 @@ describe("Composer prepaint", () => {
 		);
 		lease.adopt();
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
-		vi.spyOn(testSession.session, "maybeStartTitleGeneration").mockImplementation(() => {});
 		const turn = Promise.withResolvers<boolean>();
 		const prompt = vi.spyOn(testSession.session, "prompt").mockResolvedValue(true);
 
@@ -628,42 +714,29 @@ describe("Composer prepaint", () => {
 		const composer = new Composer({
 			preferences: config,
 			terminal,
-			welcome: {
-				version: "9.9.9",
-				recentSessions: [{ name: "prior work", timeAgo: "5m ago" }],
-			},
+			welcome: { version: "9.9.9" },
 		});
 		composer.start();
-		await terminal.waitForRender(() =>
-			terminal.getViewport().some(row => Bun.stripANSI(row).includes("Welcome back!")),
-		);
+		await terminal.waitForRender(() => terminal.getViewport().some(row => Bun.stripANSI(row).includes("v9.9.9")));
 
 		const output = terminal
 			.getViewport()
 			.map(r => Bun.stripANSI(r))
 			.join("\n");
-		expect(output).toContain("Welcome back!");
-		expect(output).toContain("omp");
-		expect(output).toContain("9.9.9");
-		expect(output).toContain("prior work");
 		expect(output).not.toContain("Starting OMP");
-		expect(output).toContain("╭");
+		expect(output).toContain("╰");
 		const initialEditorRow = terminal
 			.getViewport()
 			.map(row => Bun.stripANSI(row))
-			.findLastIndex(row => row.startsWith("╭"));
-		composer.updateWelcome({
-			modelName: "provider/model-with-an-authoritative-name-that-is-longer-than-the-left-column",
-			providerName: "provider-with-a-long-name",
-			lspServers: [{ name: "rust-analyzer", status: "connecting", fileTypes: [".rs"] }],
-		});
+			.findLastIndex(row => row.startsWith("╰"));
+		composer.updateWelcome({ version: "10.0.0-authoritative" });
 		await terminal.waitForRender(() =>
-			terminal.getViewport().some(row => Bun.stripANSI(row).includes("rust-analyzer")),
+			terminal.getViewport().some(row => Bun.stripANSI(row).includes("v10.0.0-authoritative")),
 		);
 		const updatedEditorRow = terminal
 			.getViewport()
 			.map(row => Bun.stripANSI(row))
-			.findLastIndex(row => row.startsWith("╭"));
+			.findLastIndex(row => row.startsWith("╰"));
 		expect(updatedEditorRow).toBe(initialEditorRow);
 		composer.stop();
 	});
@@ -673,21 +746,14 @@ describe("Composer prepaint", () => {
 		const composer = new Composer({
 			preferences: config,
 			terminal,
-			welcome: {
-				version: "9.9.9",
-				modelName: "Claude Fable 5",
-				providerName: "anthropic",
-				recentSessions: [{ name: "prior work", timeAgo: "5m ago" }],
-			},
+			// The prepaint's speculative version; InteractiveMode's is authoritative.
+			welcome: { version: "9.9.8" },
 		});
 		composer.start();
-		await terminal.waitForRender(() =>
-			terminal.getViewport().some(row => Bun.stripANSI(row).includes("Welcome back!")),
-		);
+		await terminal.waitForRender(() => terminal.getViewport().some(row => Bun.stripANSI(row).includes("v9.9.8")));
 		const prepaintRows = terminal.getViewport().map(row => Bun.stripANSI(row));
-		expect(prepaintRows.join("\n")).toContain("Claude Fable 5");
-		expect(prepaintRows.join("\n")).toContain("anthropic");
-		const prepaintEditorRow = prepaintRows.findLastIndex(row => row.startsWith("╭"));
+		expect(prepaintRows.join("\n")).toContain("v9.9.8");
+		const prepaintEditorRow = prepaintRows.findLastIndex(row => row.startsWith("╰"));
 
 		terminal.sendInput("draft message");
 		const lease = new ComposerLease(composer);
@@ -722,19 +788,19 @@ describe("Composer prepaint", () => {
 				.getViewport()
 				.map(r => Bun.stripANSI(r))
 				.join("\n");
-			const modelName = testSession.session.model?.name ?? "";
-			expect(output).toContain(modelName);
+			expect(output).toContain("v9.9.9");
+			expect(output).not.toContain("v9.9.8");
 			realTopBorder.mockReturnValue({ content: "real status bar *18 ?5", width: 21, revision: 2 });
 			mode.ui.requestRender();
 			await terminal.waitForRender(() =>
 				terminal.getViewport().some(row => Bun.stripANSI(row).includes("real status bar *18 ?5")),
 			);
-			const welcomeMatches = (output.match(/Welcome back!/g) || []).length;
+			const welcomeMatches = (output.match(/v9\.9\.9/g) || []).length;
 			expect(welcomeMatches).toBe(1);
 			const adoptedEditorRow = terminal
 				.getViewport()
 				.map(row => Bun.stripANSI(row))
-				.findLastIndex(row => row.startsWith("╭"));
+				.findLastIndex(row => row.startsWith("╰"));
 			expect(adoptedEditorRow).toBe(prepaintEditorRow);
 		} finally {
 			mode?.stop();
@@ -751,17 +817,8 @@ describe("Composer prepaint", () => {
 			terminal,
 			version: "9.9.9",
 			cache: false,
-			recentSessions: noRecentSessions,
 		});
-		await terminal.waitForRender(() =>
-			terminal.getViewport().some(row => Bun.stripANSI(row).includes("Welcome back!")),
-		);
-		expect(
-			terminal
-				.getViewport()
-				.map(r => Bun.stripANSI(r))
-				.join("\n"),
-		).toContain("Welcome back!");
+		await terminal.waitForRender(() => terminal.getViewport().some(row => Bun.stripANSI(row).includes("v9.9.9")));
 
 		applyStartupComposerPreferences({
 			quiet: true,
@@ -782,7 +839,7 @@ describe("Composer prepaint", () => {
 			.getViewport()
 			.map(r => Bun.stripANSI(r))
 			.join("\n");
-		expect(output).not.toContain("Welcome back!");
+		expect(output).not.toContain("v9.9.9");
 
 		terminal.sendInput("still editable");
 		await terminal.waitForRender();
@@ -794,56 +851,6 @@ describe("Composer prepaint", () => {
 		).toContain("still editable");
 	});
 
-	it("LSP feed fills the welcome rows", async () => {
-		const terminal = new CountingTerminal(80, 32);
-		beginStartupComposer({
-			preferences: config,
-			terminal,
-			version: "9.9.9",
-			cache: false,
-			recentSessions: noRecentSessions,
-		});
-		await terminal.waitForRender(() =>
-			terminal.getViewport().some(row => Bun.stripANSI(row).includes("Welcome back!")),
-		);
-
-		setStartupComposerLspServers([{ name: "rust-analyzer", status: "connecting", fileTypes: [".rs"] }]);
-		await terminal.waitForRender(() =>
-			terminal.getViewport().some(row => Bun.stripANSI(row).includes("rust-analyzer")),
-		);
-
-		const output = terminal
-			.getViewport()
-			.map(r => Bun.stripANSI(r))
-			.join("\n");
-		expect(output).toContain("rust-analyzer");
-	});
-	it("starts recent-session I/O only after the prepaint turn and transfers it across ownership", async () => {
-		const terminal = new CountingTerminal(80, 32);
-		const load = Promise.withResolvers<Array<{ name: string; timeAgo: string }>>();
-		let calls = 0;
-		beginStartupComposer({
-			preferences: config,
-			terminal,
-			version: "9.9.9",
-			cache: false,
-			recentSessions: () => {
-				calls++;
-				return load.promise;
-			},
-		});
-
-		expect(calls).toBe(0);
-		const lease = takeStartupComposerLease();
-		expect(lease).toBeDefined();
-		const updateWelcome = vi.spyOn(lease!.composer, "updateWelcome");
-		lease?.dispose();
-		const rows = [{ name: "already loading", timeAgo: "just now" }];
-		load.resolve(rows);
-		expect(await lease?.recentSessions).toEqual(rows);
-		expect(calls).toBe(1);
-		expect(updateWelcome).not.toHaveBeenCalled();
-	});
 	it("defers raw input until resolved settings arrive, adoption as fallback", async () => {
 		// Regression contract: losing the deferral re-blinds typing during the
 		// startup module-load stall; losing the enable leaves the keyboard dead
@@ -854,7 +861,6 @@ describe("Composer prepaint", () => {
 			terminal,
 			version: "9.9.9",
 			cache: false,
-			recentSessions: noRecentSessions,
 		});
 		// The prepaint must be physically written before any async runtime import
 		// can monopolize the event loop; a merely queued render is still a blind gap.
@@ -879,7 +885,6 @@ describe("Composer prepaint", () => {
 			terminal,
 			version: "9.9.9",
 			cache: false,
-			recentSessions: noRecentSessions,
 		});
 		const lease = takeStartupComposerLease();
 		lease?.adopt();

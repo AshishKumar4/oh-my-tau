@@ -738,7 +738,11 @@ describe("Anthropic compaction replay", () => {
 	it("places a new tool addition after compaction file metadata, not before a user turn", async () => {
 		const first = await captureRequest(preserved, options, context.messages, [readTool]);
 		const opened = keptFrom(first);
-		const summary = summaryMessage({ signature: SIGNATURE, filesText: "<files>handlers.ts (Read)</files>" });
+		const summary = summaryMessage(
+			{ signature: SIGNATURE, filesText: "<files>handlers.ts (Read)</files>" },
+			"anthropic",
+			3,
+		);
 		const request = await captureRequest(
 			preserved,
 			options,

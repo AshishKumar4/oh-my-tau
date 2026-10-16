@@ -7,7 +7,7 @@ import type { Context, ProviderSessionState } from "@oh-my-pi/pi-ai/types";
 it.each(["plaintext", "summary-only", "server-id", "encrypted", "mixed-summary"])(
 	"reopens Responses history according to its actual replay binding: %s",
 	async kind => {
-		const model = buildModel({
+		const built = buildModel({
 			id: "fixture",
 			name: "Fixture",
 			api: "openai-responses",
@@ -19,6 +19,10 @@ it.each(["plaintext", "summary-only", "server-id", "encrypted", "mixed-summary"]
 			contextWindow: 200_000,
 			maxTokens: 8192,
 		});
+		// A reopened session replays native history warm unless the host binds
+		// items to a connection (a catalog axis, not a spec override); this
+		// scenario covers the cold rebuild.
+		const model = { ...built, compat: { ...built.compat, connectionBoundNativeHistory: true } };
 		const reasoning = {
 			type: "reasoning",
 			summary: kind === "summary-only" ? [{ type: "summary_text", text: "Only a summary" }] : [],

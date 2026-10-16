@@ -537,6 +537,107 @@ describe("date-cwd reminder on the provider wire", () => {
 			authStorage.close();
 		}
 	});
+
+	it("keeps an earlier steering message byte-identical when the date rolls over mid-turn", async () => {
+		using tempDir = TempDir.createSync("@pi-date-cwd-reminder-");
+		await Bun.write(tempDir.join("notes.txt"), "notes");
+		const api = "test-date-cwd-reminder-steer";
+		const contexts: Context[] = [];
+		const pushReadCall = (stream: AssistantMessageEventStream, id: string) => {
+			const toolCall = { type: "toolCall" as const, id, name: "read", arguments: { path: "notes.txt" } };
+			const message: AssistantMessage = {
+				...createAssistantMessage(""),
+				content: [toolCall],
+				stopReason: "toolUse",
+			};
+			stream.push({ type: "start", partial: message });
+			stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: message });
+			stream.push({ type: "done", reason: "toolUse", message });
+		};
+		registerCustomApi(api, (_model, context) => {
+			contexts.push(context);
+			const stream = new AssistantMessageEventStream();
+			const request = contexts.length;
+			queueMicrotask(() => {
+				if (request === 1) {
+					void session.steer("steered");
+					pushReadCall(stream, "read-1");
+				} else if (request === 2) {
+					// The next requests are tool continuations with no new user turn.
+					setSystemTime(new Date(2026, 7, 15, 0, 1));
+					pushReadCall(stream, "read-2");
+				} else if (request < 5) {
+					pushReadCall(stream, `read-${request}`);
+				} else {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				}
+			});
+			return stream;
+		});
+		const model = buildModel({
+			id: "date-cwd-reminder-steer",
+			name: "Date cwd reminder steer",
+			api,
+			provider: "managed-primary",
+			// Remote endpoint: a loopback URL would turn on append-only context, which pins message identity.
+			baseUrl: "https://api.example.com/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 1024,
+		} as ModelSpec<Api>) as Model<Api>;
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		authStorage.keys.setRuntime(model.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const { session } = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			model,
+			toolNames: ["read"],
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			taskDepth: 1,
+			agentId: "SubAgent",
+		});
+		sessions.push(session);
+
+		setSystemTime(new Date(2026, 7, 14, 23, 59));
+		try {
+			await session.sendUserMessage("first");
+			await session.waitForIdle();
+
+			expect(contexts).toHaveLength(5);
+			const wire = contexts.map(context =>
+				context.messages.map(message => JSON.stringify([message.role, message.content])),
+			);
+			const steerIndex = contexts[1]!.messages.findLastIndex(message => message.role === "user");
+			expect(wire[1]![steerIndex]).toContain("steered");
+			// Bytes the provider already saw stay put on every later request; the new date is appended once.
+			for (let request = 2; request < wire.length; request++) {
+				expect(wire[request]!.slice(0, wire[request - 1]!.length)).toEqual(wire[request - 1]!);
+			}
+			const reminder = JSON.stringify([
+				"developer",
+				renderDateCwdReminder("2026-08-15", normalizePromptPath(tempDir.path())),
+			]);
+			expect(wire[2]!.at(-1)).toBe(reminder);
+			expect(wire[4]!.filter(message => message === reminder)).toHaveLength(1);
+		} finally {
+			setSystemTime();
+			authStorage.close();
+		}
+	});
 });
 
 describe("date-cwd reminder across reader views of a snapcompact archive", () => {

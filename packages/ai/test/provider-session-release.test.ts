@@ -151,6 +151,7 @@ describe("routing session release", () => {
 				expect((await streamOpenAICodexResponses(model, context, variant).result()).stopReason).toBe("stop");
 			}
 			expect(opened).toBe(3);
+			expect(getOpenAICodexTransportDetails(model, side).hasSessionState).toBe(true);
 			for (const state of states.values()) state.releaseSession?.(sideId);
 			expect(getOpenAICodexTransportDetails(model, side)).toMatchObject({
 				hasSessionState: false,
@@ -158,6 +159,7 @@ describe("routing session release", () => {
 				websocketConnected: false,
 			});
 			await released.promise;
+			expect(closedCount).toBe(2);
 			expect(getOpenAICodexTransportDetails(model, parent).websocketConnected).toBe(true);
 			const next = await streamOpenAICodexResponses(
 				model,

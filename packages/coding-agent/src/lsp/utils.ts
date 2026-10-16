@@ -20,6 +20,7 @@ import type {
 
 export { detectLanguageId } from "@oh-my-pi/pi-tui/lang-from-path";
 
+/** Read a file's text, refusing FIFOs, devices and sockets, whose reads can block forever or never end. */
 export async function readTextFromDisk(filePath: string): Promise<string> {
 	const kind = specialFileKind(await fs.stat(filePath));
 	if (kind) throw new Error(`Cannot open '${filePath}': it is a ${kind}, not a regular file or directory.`);
@@ -680,6 +681,7 @@ export async function readLocationContext(filePath: string, line: number, contex
 	const targetLine = Math.max(1, line);
 	const surrounding = Math.max(0, contextLines);
 	try {
+		// Context is decoration: a special-file location keeps its header, like a missing file.
 		if (specialFileKind(await fs.stat(filePath))) return [];
 		const fileText = await Bun.file(filePath).text();
 		const lines = fileText.split("\n");

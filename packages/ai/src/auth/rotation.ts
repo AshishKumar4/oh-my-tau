@@ -85,7 +85,7 @@ export class RateLimits implements LimitsApi {
 		this.#deps = deps;
 	}
 
-	pools(provider: string, modelId?: string): CredentialPoolSummary[] {
+	pools(provider: string, modelId?: string, sessionId?: string): CredentialPoolSummary[] {
 		const entries = this.#deps.pool.credentials(provider).map((credential, index) => ({ credential, index }));
 		const summaries: CredentialPoolSummary[] = [];
 		for (const kind of this.#deps.policies.poolOrder(provider)) {
@@ -94,7 +94,8 @@ export class RateLimits implements LimitsApi {
 				entry =>
 					entry.credential.type === kind &&
 					isPoolCredential(provider, entry.credential) &&
-					!this.#deps.blocks.isHeld(provider, entry.index),
+					!this.#deps.blocks.isHeld(provider, entry.index) &&
+					this.#deps.affinity.allows(provider, sessionId, entry.credential),
 			);
 			if (members.length === 0) continue;
 			const deadlines = members.map(entry =>
@@ -162,10 +163,12 @@ export class RateLimits implements LimitsApi {
 	 * A cross-pool OAuth candidate must pass the same account filter the strict
 	 * OAuth pass applies: when the model names entitled accounts and one is
 	 * stored, only those count. Otherwise rotation would report a switch the next
-	 * resolve refuses, and the request would retry the exhausted key.
+	 * resolve refuses, and the request would retry the exhausted key. A session
+	 * restricted to an account pool rotates only inside it.
 	 */
 	#rotationCandidates(
 		provider: string,
+		sessionId: string | undefined,
 		credentialType: AuthCredential["type"],
 		targetIndex: number,
 		accountIds: readonly string[] | undefined,
@@ -175,7 +178,11 @@ export class RateLimits implements LimitsApi {
 		// A pooled credential rotates only within the pools; a static key is never a
 		// sibling of one, since selection serves it only after both pools are spent.
 		const pooled = failed === undefined || isPoolCredential(provider, failed);
-		const entitled = oauthEntitlementFilter(credentials, accountIds);
+		// Entitlement counts only the accounts this session may use, as selection counts them.
+		const entitled = oauthEntitlementFilter(
+			credentials.filter(credential => this.#deps.affinity.allows(provider, sessionId, credential)),
+			accountIds,
+		);
 		const eligible = (credential: AuthCredential): boolean =>
 			credential.type === "oauth"
 				? entitled === undefined || entitled(credential)
@@ -187,7 +194,8 @@ export class RateLimits implements LimitsApi {
 					entry.index !== targetIndex &&
 					!this.#deps.blocks.isHeld(provider, entry.index) &&
 					(entry.credential.type === credentialType || pooled) &&
-					eligible(entry.credential),
+					eligible(entry.credential) &&
+					this.#deps.affinity.allows(provider, sessionId, entry.credential),
 			);
 		// Same-pool siblings first: rotation stays in the serving pool while it can.
 		return [
@@ -224,6 +232,7 @@ export class RateLimits implements LimitsApi {
 	}
 	#blockCredentialForRotation(
 		provider: string,
+		sessionId: string | undefined,
 		credentialType: AuthCredential["type"],
 		targetIndex: number,
 		blockedUntil: number,
@@ -267,7 +276,13 @@ export class RateLimits implements LimitsApi {
 				: blockedUntil;
 
 		let retryAtMs: number | undefined;
-		for (const candidate of this.#rotationCandidates(provider, credentialType, targetIndex, routing.accountIds)) {
+		for (const candidate of this.#rotationCandidates(
+			provider,
+			sessionId,
+			credentialType,
+			targetIndex,
+			routing.accountIds,
+		)) {
 			// Sibling availability must use the same scope set selection reads, or
 			// this reports a sibling as free that selection will then refuse.
 			const candidateRouting =
@@ -389,6 +404,7 @@ export class RateLimits implements LimitsApi {
 			.findIndex(entry => entry.id === targetCredentialId && entry.credential.type === credentialType);
 		const rotation = this.#blockCredentialForRotation(
 			provider,
+			sessionId,
 			credentialType,
 			targetIndex,
 			blockedUntil,
@@ -564,6 +580,7 @@ export class RateLimits implements LimitsApi {
 			const blockMs = AIError.isStandingAccountDenial(error) ? STANDING_DENIAL_BLOCK_MS : DEFAULT_BLOCK_MS;
 			const mark = this.#blockCredentialForRotation(
 				provider,
+				sessionId,
 				sessionCredential.type,
 				sessionCredential.index,
 				Date.now() + blockMs,
@@ -585,6 +602,7 @@ export class RateLimits implements LimitsApi {
 		// suspect hook can't reindex the answer out from under us.
 		const hasSibling = this.#rotationCandidates(
 			provider,
+			sessionId,
 			sessionCredential.type,
 			sessionCredential.index,
 			options?.accountIds,

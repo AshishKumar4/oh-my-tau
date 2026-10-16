@@ -68,8 +68,8 @@ export type SchemeSelectors = "lines" | "none" | "opaque";
 /**
  * Mutation class of a writable scheme; drives plan-mode and device-only `write` gates.
  * - `workspace`: mutates user/external state; blocked in plan mode and device-only sessions.
- * - `sandbox`: session scratch space (local://); allowed in plan mode, and in device-only sessions while plan mode is active.
- * - `coordination`: peer messaging (agent://); always allowed.
+ * - `sandbox`: session scratch space (local://); allowed in plan mode and device-only sessions.
+ * - `coordination`: peer messaging (agent://); always allowed. {@link SchemeWritePolicy.cancels} grants the same per URL.
  * - `device`: tool-device dispatch (xd://); always allowed, the device enforces its own policy.
  */
 export type SchemeWriteScope = "workspace" | "sandbox" | "coordination" | "device";
@@ -95,6 +95,12 @@ export interface SchemeWritePolicy {
 	tier(url: InternalUrl, content: string | undefined, session: ToolSession | undefined): ToolApprovalDecision;
 	/** True when `write` may omit `content` for this URL (`proc://<id>/kill`). */
 	contentOptional?(url: InternalUrl): boolean;
+	/**
+	 * True when this URL's write only cancels background work (`proc://<id>/kill`), so it
+	 * passes the plan-mode and device-only gates like a `coordination`-scoped write. Approval
+	 * still follows {@link SchemeWritePolicy.tier}.
+	 */
+	cancels?(url: InternalUrl): boolean;
 }
 
 /**
@@ -133,6 +139,8 @@ export interface LocateOptions {
 	directory?: boolean;
 	/** Return the path even when the entry does not exist yet (write/bash targets). Never creates anything. */
 	create?: boolean;
+	/** The caller needs a local file (`%load`, plan-mode write checks): report a miss now instead of deferring it to a remote resolve. */
+	localOnly?: boolean;
 }
 
 /**
@@ -196,6 +204,8 @@ export interface InternalResource {
 	 * resources. Mutable resources (e.g. local://) behave like editable files.
 	 */
 	immutable?: boolean;
+	/** Overrides {@link SchemeSpec.unbounded} for this resource (an MCP resource read through `skill://`). */
+	unbounded?: boolean;
 	/**
 	 * True when the resource is a directory listing rather than file content.
 	 * `search` refuses to grep such a resource when it has no `sourcePath` — a

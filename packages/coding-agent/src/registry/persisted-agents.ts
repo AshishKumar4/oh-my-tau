@@ -14,9 +14,9 @@ import {
 	type AgentHistorySummary,
 	type AgentMetricsSummary,
 	type AgentRegistry,
-	getAgentTombstonePath,
 	MAIN_AGENT_ID,
 } from "./agent-registry";
+import { getAgentTombstonePath } from "./agent-tombstone";
 
 /** Maximum prefix entries inspected for task metadata. */
 const MAX_METADATA_LINES = 64;
@@ -150,8 +150,12 @@ async function readPersistedAgentHistory(
 	const parents = new Map<string, string | undefined>();
 	const assistantById = new Map<string, AssistantMetrics>();
 	const modelChangeById = new Map<string, { model: string; role?: string; resolvedModelIsFallback: boolean }>();
+	// Raw-record copy of `sessionEntryLeafId`/`resolveSessionLeafId` (session-entries.ts); keep them in sync.
 	let leafId: string | undefined;
+	let selfSelectedLeafId: string | undefined;
 	let leafTimestamp: number | undefined;
+	let directCost = 0;
+	// Direct cost mirrors lifetime SessionManager usage; legacy metrics below stay leaf-scoped.
 	try {
 		await visitEntriesFromFileStream(
 			transcript.sessionFile,
@@ -165,6 +169,20 @@ async function readPersistedAgentHistory(
 				leafId = id;
 				const parsedTimestamp = timestampOf(record.timestamp);
 				if (parsedTimestamp !== undefined) leafTimestamp = parsedTimestamp;
+				if (record.type === "model_usage") {
+					const usage = recordOf(record.usage);
+					const cost = recordOf(usage?.cost);
+					directCost += finiteNumber(cost?.total);
+					if (typeof record.activeLeafId === "string") {
+						leafId = record.activeLeafId;
+					} else if (record.activeLeafId === null) {
+						leafId = undefined;
+					} else {
+						selfSelectedLeafId = id;
+					}
+					return;
+				}
+				selfSelectedLeafId = id;
 				if (record.type === "model_change" && typeof record.model === "string") {
 					modelChangeById.set(id, {
 						model: record.model,
@@ -175,7 +193,11 @@ async function readPersistedAgentHistory(
 				}
 				if (record.type !== "message") return;
 				const message = recordOf(record.message);
-				if (message?.role === "assistant") assistantById.set(id, assistantMetrics(message));
+				if (message?.role === "assistant") {
+					const assistant = assistantMetrics(message);
+					assistantById.set(id, assistant);
+					directCost += assistant.cost;
+				}
 			},
 			// Advisor transcripts are the one file that can grow pathologically large
 			// (issue #9553); cap their scan so one bad transcript can't stall the Hub
@@ -198,6 +220,7 @@ async function readPersistedAgentHistory(
 		return {};
 	}
 
+	if (leafId !== undefined && !parents.has(leafId)) leafId = selfSelectedLeafId;
 	const metrics: AgentMetricsSummary = {
 		tokens: 0,
 		requests: 0,
@@ -263,6 +286,7 @@ async function readPersistedAgentHistory(
 	}
 	if (contextTokens !== undefined) metrics.contextTokens = contextTokens;
 	return {
+		directCost,
 		...(metrics.requests > 0 ? { metrics } : {}),
 		...(resolvedModel ? { resolvedModel, resolvedModelIsFallback } : {}),
 		...(modelRole ? { modelRole } : {}),

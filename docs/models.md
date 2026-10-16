@@ -110,6 +110,9 @@ Custom `models` entries can set their own `baseUrl`; otherwise they inherit the 
 For built-in models, a provider `baseUrl` override is scoped to the effective APIs of custom models
 that inherit it, or to the provider's `api` for an override-only configuration. Without either
 scope it applies provider-wide. `transport: pi-native` always applies the gateway URL provider-wide.
+An unscoped OpenRouter `baseUrl` names the `/api/v1` chat root, so OpenRouter Decisions (judge)
+models use its `/api/alpha` sibling on the same host, e.g. a `.../api/v1` relay serves judges at
+`.../api/alpha/decisions`.
 
 `preferWebsockets` (on a model or `modelOverrides` entry) controls whether Codex requests prefer
 the WebSocket transport. `omitMaxOutputTokens` omits the model-derived output cap.
@@ -140,8 +143,63 @@ override matching model tags. These fields do not configure the Anthropic Messag
 - `google-vertex`
 - `typesafe`
 - `openrouter-decisions`
+- `openai-decisions`
+- `workers-ai-systemone`
 
-`typesafe` and `openrouter-decisions` are judgment APIs, not chat transports: a model declared with one answers System One judgment requests (`{baseUrl}/v1/systemone` and `{baseUrl}/decisions` respectively) and is selected by the `judge` model role. Its `headers` carry gateway routing or custom authentication headers for that traffic.
+`typesafe`, `openrouter-decisions`, `openai-decisions`, and `workers-ai-systemone` are judgment APIs, not chat transports: a model declared with one answers judgment requests and is selected by the `judge` model role. `typesafe` posts TypeSafe's System One body to `{baseUrl}/v1/systemone` (any System One server: TypeSafe, OpenJEV, Kev, self-hosted Clef); `openrouter-decisions` posts the same body to `{baseUrl}/decisions`; `openai-decisions` translates questions and answers to OpenAI's Decisions API at `{baseUrl}/decisions` (the bundled `openai/gpt-6-luna-decisions` row sends the wire model `gpt-6-luna`); `workers-ai-systemone` posts the System One body to Cloudflare Workers AI at `{baseUrl}/{model id}`, where `<account>` in the base URL is filled from the stored credential's account id or `CLOUDFLARE_ACCOUNT_ID`. Its `headers` carry gateway routing or custom authentication headers for that traffic.
+Judgment requests can share image attachments with vision-chat requests. Native OpenAI Decisions, TypeSafe Jev, OpenRouter Jev, and Workers AI judges, plus prompted vision-chat models, support images; text-only candidates are skipped for image requests. `Judge.supportsImages` identifies compatible candidates, and a judge chain with no image-capable model fails explicitly rather than dropping images. Prompted judgments normalize images for the selected candidate, including upscaling undersized rasters and converting WebP for models with STB-backed decoders; native judges continue to receive the original image bytes. When constructing a `NativeJudge` directly for System One, set `supportsImages: true`; `createNativeJudge` derives this flag from the catalog.
+
+OpenAI Decisions forwards embedded `ImageContent.detail` when supplied. Native image-judgment cache identities include the effective detail: different fidelity settings have separate cached answers, while omitted detail and explicit `auto` share the default setting.
+
+Image inputs are validated before any candidate runs; malformed images fail as caller errors rather than exhausting the chain. Providers may enforce additional limits. Workers AI Clef accepts at most 4 PNG, JPEG, or WebP images of up to 4 MiB and 16 MP each, 8 MiB in total. Valid padded and unpadded base64, and MIME case variants, share one cache identity.
+
+After image filtering, the same native-only tail policy used for text judgments applies: a failed native judge may fall through to another compatible native, never to a prompted chat model. Filtering removes natives without image support and natives whose documented image bounds the request's images fall outside, so when no compatible native remains, eligible prompted candidates and a vision-capable session-model fallback can still answer.
+
+#### Jev images (experimental)
+
+Native image judgments for Jev are experimental. Direct TypeSafe Jev supports `jev-latest`, `jev-preview`, `jev-1.13.0`, and `jev-1.14.0` (for example, select `typesafe/jev-latest` for the `judge` role). OpenRouter supports `typesafe/jev-1.13`, `typesafe/jev-1.14`, and `~typesafe/jev-latest`.
+
+Images join `state` without replacing it: an object root keeps its fields and gains them under a collision-safe `__omp_judgment_images` key (with a numeric suffix if the key is taken), an array root gains them at the end, and a string root becomes `[original, ...images]`. Direct TypeSafe requests add each image as a referenced `assets` entry and put its reference in `state`, setting `TypeSafe-Danger-Zone-Images: true` only when images are attached; caller-supplied assets (auth gateway) must each be referenced in `state`, `instructions`, or `criteria`, and each split request carries only the assets it references. OpenRouter encodes each image as an `image_url` data URL part and uses neither the TypeSafe header nor a top-level `images` field.
+
+Text-only requests retain their original request shape and bytes. Image support is limited to the listed TypeSafe Jev and OpenRouter Jev models; it does not imply support for other System One-compatible servers or OpenRouter Decisions models.
+
+Both paths accept PNG and JPEG of 280–1568 pixels per side and 78,400–2,458,624 pixels in total, and send their original bytes without resizing. TypeSafe Jev has no image-detail equivalent, so `ImageContent.detail` is ignored on direct TypeSafe requests.
+
+See TypeSafe's [image documentation](https://docs.typesafe.ai/images) and OpenRouter's [multimodal Decisions guide](https://openrouter.ai/docs/guides/community/multimodal-decisions) for their image constraints.
+
+For example, configure TypeSafe Jev as the judge and attach an image in JavaScript or Python:
+
+```yaml
+modelRoles:
+  judge: typesafe/jev-latest
+```
+
+```js
+await judge(state, question, { images: ["./chart.png"] });
+```
+
+```python
+await judge(state, question, images=["./chart.png"])
+```
+
+A model or `modelOverrides` entry may also use a runner API, which serves one model `kind`; `RUNNER_API_KINDS` in `packages/catalog/src/types.ts` lists them (for example `openai-images` serves `image`, `openai-embeddings` serves `embedding`, `openai-speech` serves `tts`). `web-search` is built in and cannot be named here, so neither can `kind: search`. `kind` defaults to the api's kind (`chat` for chat transports), and an explicit `kind` must be one its api serves. Chat transports serve `chat` and `tiny` (small models for the `tiny`, `memory`, and `judge` roles); those that `generate_image` runs (`openai-responses`, `openai-codex-responses`, `google-generative-ai`, `google-gemini-cli`) also serve `image`: on `openai-responses`, the image is generated through the Responses `image_generation` tool, carried by a GPT-5+ chat model on the same provider, instead of `/images/generations`. This moves discovered gateway models to the image role:
+
+```yaml
+providers:
+  my-gateway:
+    api: openai-responses
+    discovery:
+      type: openai-models-list
+    modelOverrides:
+      gpt-image-2:
+        api: openai-images # kind: image, generated via /images/generations
+      gpt-image-1.5:
+        kind: image # stays on openai-responses, generated via the hosted image tool
+```
+
+A configured `kind`, explicit or implied by a runner API, outranks the bundled catalog's classification of the same id and survives `modelOverrides` and refreshes.
+
+Loading models.yml checks a `modelOverrides` `kind` only against an api the file names: the override's own `api`, or that of a `models` entry with the same id. A built-in or discovered model gets its api later, so its override `kind` is checked against that api when the override applies; a kind the api does not serve is ignored and logged. An `api` override without `kind` takes a runner API's kind, keeps a kind the new api still serves, and otherwise makes the model `chat`. A `models` entry that redefines a built-in id on a different api follows the same rule, so redefining an image row on `openai-completions` makes it `chat`.
 
 ### Allowed auth/discovery values
 
@@ -202,6 +260,14 @@ the V1 `/responses/compact` request. See [compaction](./compaction.md).
 - `id` is required and non-empty; optional `name`, model `baseUrl`, `contextPromotionTarget`, and `compactionModel` must also be non-empty
 - custom `models` entries require positive `contextWindow` and `maxTokens` when provided; the current auxiliary positivity check does not cover `modelOverrides`
 - on both custom models and overrides, `maxContextWindow` must be a positive safe integer no smaller than `contextWindow` when both are set
+
+### Unknown compatibility keys
+
+Unknown keys in provider, model, and `modelOverrides` `compat` blocks produce non-fatal warnings: a notification at interactive startup, and a stderr line in print and RPC modes and when listing models (including JSON output; stdout is unchanged). Each warning names the config file and the dotted key path; model array entries use zero-based indices, as schema errors do. The configuration still loads and unknown keys are preserved for forward compatibility. A registry reports each unknown key path only once, even after forced refreshes or re-reading an unchanged file.
+
+Known record-level keys, at the top level of `compat` and inside its `whenThinking` override, come from both the models.yml compatibility schemas and the runtime compatibility vocabulary (wire axes). The schemas validate only a curated subset, so a runtime-recognized key such as `streamFirstEventTimeoutMs` does not warn merely because the file schema omits it. A nested `whenThinking.whenThinking` still warns: a thinking override cannot contain another thinking override. Thinking and catalog axes belong outside `compat` and are not included. Other nested checking follows only schema-declared fixed-field objects, including routing blocks and `reasoningEffortMap`; open maps such as `extraBody` accept arbitrary keys and nested payloads. Runtime extension provider registrations are not checked against the file schema: they can register custom APIs with their own compatibility fields.
+
+The runtime vocabulary is not filtered by the provider's `api`: a wire key that only another API family reads (for example an Anthropic-only key in an `openai-completions` provider) does not warn, even though it has no effect there.
 
 ### Command-resolved secrets
 
@@ -265,10 +331,10 @@ Provider defaults vs per-model overrides:
 
 - Provider `headers`, `compat`, and `remoteCompaction` are baselines.
 - Model `headers` override provider header keys.
-- `modelOverrides` can override model metadata (`name`, `reasoning`, `thinking`, `input`, `imageInputDecoder`,
-  `tokenizer`, `supportsTools`, `cost`, `promptCache`, `premiumMultiplier`, `contextWindow`, `maxContextWindow`, `maxTokens`,
-  `omitMaxOutputTokens`, `preferWebsockets`, `headers`, `compat`, `contextPromotionTarget`, `compactionModel`, and
-  `remoteCompaction`).
+- `modelOverrides` can override model metadata (`name`, `api`, `kind`, `reasoning`, `thinking`, `input`,
+  `imageInputDecoder`, `tokenizer`, `supportsTools`, `cost`, `promptCache`, `premiumMultiplier`, `contextWindow`,
+  `maxContextWindow`, `maxTokens`, `omitMaxOutputTokens`, `preferWebsockets`, `headers`, `compat`,
+  `contextPromotionTarget`, `compactionModel`, and `remoteCompaction`).
 - `compat` is deep-merged for nested routing blocks (`openRouterRouting`, `vercelGatewayRouting`,
   `extraBody`, and `whenThinking`).
 
@@ -321,9 +387,11 @@ For the first-party `deepseek` provider, the catalog follows [DeepSeek's officia
 - Flash pricing covers `deepseek-flash` and the retired-but-still-accepted `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` ids, all billed at the Flash card. Peak rates per million tokens are $0.30 uncached input, $0.006 cached input, and $1.20 output.
 - `deepseek-v4-pro` initially uses peak rates of $1.32 uncached input, $0.044 cached input, and $3.96 output per million tokens. From **2026-09-14 04:00 UTC**, its estimates use the Flash rate card, with the same peak/off-peak schedule.
 
+Some catalog prices change on a date without a peak/off-peak tariff. Gemini 4 Argon on `google`, `google-vertex`, `google-antigravity`, and `cursor` is estimated at $2 input / $0.10 cached input / $10 output per million tokens through 2026-11-30, and at Google's $4 / $0.20 / $20 list price from **2026-12-01 08:00 UTC** (midnight US Pacific). The request's timestamp picks the price, so a model loaded before the change prices later requests at the new rate without a catalog update, and the model browser and `omp models --json` show the price in force.
+
 Local estimates use the assistant message's **request-start timestamp** to choose both the rate card and tariff for the whole request. This is OMP's estimation convention: DeepSeek's pricing page does not specify how its server bills a request spanning a boundary. When importing historical usage without recorded cost, the stats importer leaves scheduled pricing unpriced if no request timestamp can be recovered, rather than choosing a wall-clock tariff.
 
-The status line's `cost` segment appends **↑** for peak or **↓** for off-peak pricing on the **currently active provider/model**, using the current wall clock. It refreshes at tariff boundaries even while idle; the arrow is not a label for the accumulated session total. Models without scheduled pricing, including explicit flat-price overrides, show no arrow.
+The status line's `cost` segment appends **↑** for peak or **↓** for off-peak pricing on the **currently active provider/model**, using the current wall clock. It refreshes at tariff boundaries even while idle; the arrow is not a label for the accumulated session total. Models without a peak/off-peak tariff, including dated price changes and explicit flat-price overrides, show no arrow.
 
 An explicit model `cost` in `models.yml`, including `modelOverrides`, is a flat-price override and disables inherited time-based pricing for that model. Omitting `cost` preserves catalog pricing. `models.yml` does **not** configure a `timeBased` schedule; that metadata belongs to the catalog's [KDL pricing rules](../packages/catalog/src/compat/rules/README.md#time-based-pricing).
 
@@ -388,8 +456,11 @@ This path also works for local OpenAI-compatible servers that are not LM Studio.
 On Apple Silicon macOS, an unconfigured, non-disabled `apple` provider is probed through the
 in-process Foundation Models bridge. When the bridge reports it usable, `apple/on-device` is
 available without credentials, with context size, reasoning, image input, and tool support derived
-from bridge metadata. Ineligible devices, disabled Apple Intelligence, and builds without the
-bridge yield no models. Its internal API is `apple-foundation-models`; no HTTP endpoint is used.
+from bridge metadata. It is not selected automatically: its on-device context window may be
+smaller than the default coding-agent prompt and project instructions. Select it deliberately with
+`--model apple/on-device` or `/model`; otherwise use `/login` or configure another local model.
+Ineligible devices, disabled Apple Intelligence, and builds without the bridge yield no models.
+Its internal API is `apple-foundation-models`; no HTTP endpoint is used.
 
 ### LiteLLM provider discovery
 
@@ -410,9 +481,13 @@ If every metadata route is unavailable, discovery falls back to the OpenAI-compa
 `discovery.injectV1: false` treats the configured URL as the complete API root. Reported
 `max_model_len` wins over `context_length`. If both are absent, nested
 `limits.max_input_tokens` and `limits.max_output_tokens` supply their sum as context only when both
-are positive safe integers and the sum is safe. A valid `max_output_tokens` independently sets the
+are positive safe integers and the sum is safe. A valid `limits.max_output_tokens` independently sets the
 chat output cap, clamped to the resolved context; an incomplete or invalid context pair does not
-discard a valid output limit. Otherwise, context follows the existing native/reference/default fallback.
+discard a valid output limit. Without it, a valid top-level `max_output_tokens`, then
+`max_completion_tokens`, then `top_provider.max_completion_tokens`, then the generic `max_tokens`
+sets the cap, ahead of any bundled-reference limit. Each spelling is validated on its own, so an
+unusable value on one never suppresses a usable sibling. Otherwise, context and output follow the
+existing native/reference/default fallback.
 Silent endpoints can inherit bundled-reference limits, reasoning, and input modalities; unknown models
 use 128,000 context and 32,768 output as generic chat defaults. Output caps are bounded by the resolved context;
 Anthropic-routed models use an 8,192-token fallback output cap.
@@ -586,7 +661,7 @@ When a bare id matches models from multiple providers, preference order is:
 1. explicit CLI provider+model
 2. first scoped model (if not resuming)
 3. saved default provider/model
-4. known provider defaults (e.g. OpenAI/Anthropic/etc.) among available models
+4. known provider defaults (e.g. OpenAI/Anthropic/etc.) among available models; a provider whose discovery marks the account's default model (`isProviderDefault`, e.g. Devin) uses it in place of its bundled `default-model`
 5. first available model
 
 The automatic fallback first restricts the pool to providers with concrete credentials (including
@@ -699,10 +774,17 @@ The table's `images` column reports what the transport will actually send, so a 
 stripped (`compat.stripImageInput`, see [Image handling](#compatibility-and-routing-fields)) shows `no`
 even when its spec declares `input: [text, image]`; `--json` keeps the declared `input`.
 
-## Context promotion (model-level fallback chains)
+## Context promotion
 
 Context promotion switches to an explicitly configured larger-context model before compaction.
 It is attempted on context overflow errors and at pre-prompt or post-turn compaction thresholds.
+
+Context promotion and [retry model fallback](./non-compaction-retry-policy.md) are independent.
+Turning off **Auto-Promote Context** (`contextPromotion.enabled`) does not disable
+`retry.fallbackChains`: provider errors still switch the active model while `retry.modelFallback`
+is on, even when the fallback model happens to have a larger context window. To stop those
+switches, set `retry.modelFallback: false`; same-model retries (`retry.enabled`) and automatic
+compaction (`compaction.enabled`) are unaffected.
 
 ### Trigger and order
 
@@ -731,16 +813,16 @@ Promotion uses temporary switching (`setModelTemporary`):
 - recorded as a `model_change` with the ephemeral role `"fallback"` (not a durable user model selection)
 - does not rewrite saved role mapping
 
-### Configuring explicit fallback chains
+### Configuring promotion targets
 
-Configure fallback directly in model metadata via `contextPromotionTarget`.
+Configure the target directly in model metadata via `contextPromotionTarget`.
 
 `contextPromotionTarget` accepts either:
 
 - `provider/model-id` (explicit)
 - `model-id` (resolved within current provider)
 
-Example (`models.yml`) for an explicit OpenAI fallback:
+Example (`models.yml`) for an explicit OpenAI promotion target:
 
 ```yaml
 providers:
@@ -781,12 +863,16 @@ Request shaping:
 - `disableReasoningWithTools` — suppress reasoning when tools are present even without forced tool choice. Default: `false` unless catalog policy overrides it.
 - `alwaysSendMaxTokens` — always send a max-token field when the caller did not provide one. Default: auto (Kimi-family models derive TPM limits from `max_tokens`).
 - `strictResponsesPairing` — Responses-API tool-call/result history must be strictly paired. Default: auto (Azure OpenAI, GitHub Copilot).
+- `statefulResponses` — enable or disable stored `previous_response_id` chaining for `openai-responses`. Enabling it sends `store: true` and delta input on later turns; disabling it replays full context with `store: false`. Precedence: call option > `PI_OPENAI_STATEFUL` > `compat.statefulResponses` > `compat.officialEndpoint` (on for official OpenAI, off elsewhere). This key does not enable `officialEndpoint` or official-only fields such as `text.verbosity`; it does not change Codex or Azure Responses behavior.
 - `streamIdleTimeoutMs` — stream-watchdog idle-timeout floor in ms for slow reasoning hosts. Default: auto (GLM coding-plan hosts, direct DeepSeek reasoning).
 - `streamMarkupHealingPattern` — recover leaked stream control markup with the `kimi`, `dsml`, `qwen`, or `thinking` grammar. Default: endpoint/model policy.
 - `cacheControlFormat` — `"anthropic"` to include Anthropic-style prompt-cache markers in chat-completions payloads. Default: auto (OpenRouter `anthropic/*` models).
 - `supportsLongPromptCacheRetention` — host honors `prompt_cache_retention: "24h"` on the Responses API. Default: auto (api.openai.com).
 - `supportsImageDetailOriginal` — allow the Responses API's nonstandard `detail: "original"` image
-  mode where the endpoint supports it.
+  mode where the endpoint supports it. Default: `true` for OpenAI, Azure OpenAI, and Codex;
+  `false` for other hosts, including custom/local endpoints, xAI, and Copilot. Custom hosts receive
+  `auto` for snapcompact frames and computer screenshots unless they opt in with
+  `compat.supportsImageDetailOriginal: true`. An explicit `false` also overrides the known-host default.
 - `supportsConfigurationUpdate` — let the Responses API change `reasoning.effort` mid-session through a `configuration_update` input item while the request-level effort stays pinned for prompt caching (GPT-6 SKUs). Default: auto (`true` for `gpt-6-astra` on every host and for `gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna` on `openai-codex`, `false` otherwise). Set `false` for custom `openai-responses` / `openai-codex-responses` endpoints that reject the item type with HTTP 400; effort changes are then sent as the top-level `reasoning.effort` and no update items are emitted.
 - `supportsSteering` — let the Codex WebSocket transport send `response.steer`, so a message typed while the model responds joins that response instead of waiting for the next request. Default: auto (`true` for the GPT-6 family). Set `false` for proxies that reject the event.
 - `extraBody` — extra top-level fields merged into every request body (gateway hints, controller selectors, etc.).
@@ -867,8 +953,14 @@ drops override keys the resolved shape does not declare.
 
 The same `compat` slot accepts `promptCacheMode` (`none`, `automatic`, or `explicit`),
 `supportsLongPromptCacheRetention`, `promptCacheMinimumTokens`,
-`promptCacheMaximumCheckpoints`, and `supportsForcedToolChoice` (forced `any`/`tool` choices
-fall back to `auto` when `false`; built in for Claude Opus/Sonnet 5.5) for Bedrock models.
+`promptCacheMaximumCheckpoints`, `supportsForcedToolChoice` (forced `any`/`tool` choices
+fall back to `auto` when `false`; built in for Claude Opus/Sonnet 5.5), and
+`supportsThinkingBindingControls` for Bedrock models. Prefix-bound Claude models (Fable 5.1+,
+Opus/Sonnet/Haiku 5.5) send `thinking.block_binding`, the `thinking-binding-controls-2026-08-01`
+beta and the `/input_transformations` response path by default; set
+`supportsThinkingBindingControls: false` for a gateway or region that rejects them. Local
+prefix-binding safeguards stay on, and a prefix-mismatch rejection is retried once with
+bound thinking stripped.
 
 By default `bedrock-converse-stream` requests go to `bedrock-runtime.{region}.amazonaws.com`.
 An explicit per-request region or a model ARN's region wins. Otherwise an ambient region from
@@ -977,7 +1069,7 @@ not acquire that capability just from `bedrockMessagesApi`.
 
 ### Strict tool schemas (`disableStrictTools`)
 
-Anthropic's API supports a `strict` field on tool definitions that forces the model to always follow the provided schema exactly. OMP enables it by default for a small allowlist of high-frequency built-in `anthropic-messages` tools (`bash`, `python`, `edit`, and `find`) whose schemas fit Anthropic's strict grammar limits; other tools still send normalized schemas but omit `strict`.
+Anthropic's API supports a `strict` field on tool definitions that forces the model to always follow the provided schema exactly. OMP enables it by default for a small allowlist of high-frequency built-in `anthropic-messages` tools (`python`, `edit`, and `find`) whose schemas fit Anthropic's strict grammar limits; other tools still send normalized schemas but omit `strict`. `bash` is left out: strict decoding fixes property order, so once a call has written `async`, the `timeout` declared before it can no longer be emitted.
 
 Third-party providers that front the Anthropic API (AWS Bedrock, Azure, self-hosted proxies) do not always implement this field and will reject requests that include it. Set `disableStrictTools: true` at the provider level to opt out of strict mode for the allowlisted tools:
 

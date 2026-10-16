@@ -22,6 +22,7 @@ import {
 	type CompactionEntry,
 	type CustomMessageEntry,
 	EPHEMERAL_MODEL_CHANGE_ROLE,
+	resolveSessionLeafId,
 	type SessionEntry,
 	type SessionMessageEntry,
 } from "./session-entries";
@@ -35,6 +36,16 @@ const LEGACY_SNAPCOMPACT_ARCHIVE_TEXT_GUARD = 250_000;
 const LEGACY_SNAPCOMPACT_TRUNCATED_CHARS_GUARD = 1_000_000;
 const SUPERSEDED_COMPACTION_SUMMARY = "[Superseded compaction summary elided after a newer compaction]";
 const SUPERSEDED_COMPACTION_SHORT_SUMMARY = "Superseded compaction elided";
+
+function isRolloverRequestEntry(entry: SessionEntry): boolean {
+	return (
+		isUserRequestEntry(entry) ||
+		(entry.type === "custom_message" &&
+			entry.customType === "irc:incoming" &&
+			isRecord(entry.details) &&
+			entry.details.fromParent === true)
+	);
+}
 
 function hasLegacySnapcompactFrames(archive: snapcompact.Archive): boolean {
 	return archive.frames.some(frame => frame.font === undefined && frame.variant === undefined);
@@ -56,7 +67,7 @@ function hasCrashRiskSnapcompactFramePayload(
 ): boolean {
 	return (
 		archive.frames.length >= LEGACY_SNAPCOMPACT_FRAME_COUNT_GUARD ||
-		snapcompactFrameDataBytes(archive, resolveFrameData) >= snapcompact.FRAME_DATA_BYTES_BUDGET
+		snapcompactFrameDataBytes(archive, resolveFrameData) >= snapcompact.DEFAULT_FRAME_DATA_BYTES_BUDGET
 	);
 }
 
@@ -90,7 +101,7 @@ export function snapcompactHistoryBlockOptions(
 		return { maxFrameDataBytes: 0, ...(resolveFrameData ? { resolveFrameData } : {}) };
 	}
 	return {
-		maxFrameDataBytes: snapcompact.FRAME_DATA_BYTES_BUDGET,
+		maxFrameDataBytes: options?.maxFrameDataBytes ?? snapcompact.DEFAULT_FRAME_DATA_BYTES_BUDGET,
 		...(resolveFrameData ? { resolveFrameData } : {}),
 	};
 }
@@ -138,7 +149,7 @@ export function getRestorableSessionModels(
 	return [roleModel, defaultModel];
 }
 
-export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
+export function getLatestCompactionEntry(entries: readonly SessionEntry[]): CompactionEntry | null {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		if (entries[i].type === "compaction") {
 			return entries[i] as CompactionEntry;
@@ -158,21 +169,25 @@ export interface BuildSessionContextOptions {
 	/** In transcript mode, elide entries replaced by the latest compaction. */
 	collapseCompactedHistory?: boolean;
 	/**
-	 * Transcript mode only: keep `toolCall` blocks that have no matching
-	 * `toolResult` on the path instead of stripping them. Pass this when the
-	 * session is mid-turn (a tool is still executing, its result not yet
-	 * persisted) so the rebuilt transcript renders the in-flight call as
-	 * pending; without it a focus/unfocus or overlay-close rebuild silently
-	 * hides the call the agent is still waiting on.
-	 */
-	keepDanglingToolCalls?: boolean;
-	/**
 	 * Tool calls the live agent loop is still executing. They count as paired, so a
 	 * mid-turn rebuild keeps the in-flight assistant turn; the loop appends their results.
 	 */
 	inFlightToolCallIds?: ReadonlySet<string>;
 	/** Price and resolve persisted snapcompact frame payloads on demand. */
 	resolveFrameData?: (data: string) => snapcompact.LazyFrameData | undefined;
+	/** Archive frame bytes the LLM context attaches: the active model's {@link snapcompact.frameDataBytesBudget}
+	 *  (unset: {@link snapcompact.DEFAULT_FRAME_DATA_BYTES_BUDGET}). */
+	maxFrameDataBytes?: number;
+}
+
+/** Options for `AgentSession.buildTranscriptSessionContext` (via `SessionProviderBoundary`). */
+export interface TranscriptSessionContextOptions extends Pick<BuildSessionContextOptions, "collapseCompactedHistory"> {
+	/**
+	 * Keep the unpaired tool calls of the turn the agent loop is still executing,
+	 * so a mid-turn rebuild keeps them routable. Calls left unpaired by earlier
+	 * turns are stripped either way. Pass while the viewed session streams.
+	 */
+	keepInFlightToolCalls?: boolean;
 }
 
 /**
@@ -197,6 +212,82 @@ function snapcompactHistoryBlocksForContext(
 	if (!archive) return undefined;
 	if (options?.transcript && options.collapseCompactedHistory) return undefined;
 	return snapcompact.historyBlocks(archive, snapcompactHistoryBlockOptions(archive, options));
+}
+
+/**
+ * Where the kept tail of `compaction`, at `compactionIdx` on `path`, starts: its
+ * `firstKeptEntryId`, or, for a native Anthropic snapshot that kept no entry by
+ * id, the entry after its replay-through boundary. `-1` when it keeps no entry
+ * before itself. A remote replacement history replays its own items instead
+ * (see {@link getOpenAiRemoteCompactionPayload}).
+ */
+export function keptTailStart(
+	path: readonly SessionEntry[],
+	compaction: CompactionEntry,
+	compactionIdx: number,
+): number {
+	const firstKeptIdx = path.findIndex(
+		(entry, index) => index < compactionIdx && entry.id === compaction.firstKeptEntryId,
+	);
+	if (firstKeptIdx >= 0) return firstKeptIdx;
+	const replayThrough = compaction.providerReplayThroughEntryId;
+	if (
+		compaction.firstKeptEntryId !== "" ||
+		!replayThrough ||
+		getAnthropicCompactionPayload(compaction.preserveData) === undefined
+	) {
+		return -1;
+	}
+	const snapshotIdx = path.findIndex(entry => entry.id === replayThrough);
+	return snapshotIdx >= 0 && snapshotIdx + 1 < compactionIdx ? snapshotIdx + 1 : -1;
+}
+
+/**
+ * The request an experimental context rollover replays from before its kept
+ * tail: the latest authoritative request below `compactionIdx` and after
+ * `resetBoundaryIdx`, when it precedes `firstKeptEntryId`; `-1` otherwise
+ * (another compaction, or a request the kept tail already replays).
+ */
+export function rolloverRequestIndex(
+	path: readonly SessionEntry[],
+	compaction: CompactionEntry,
+	compactionIdx: number,
+	resetBoundaryIdx: number,
+): number {
+	if (!isRecord(compaction.details) || compaction.details.kind !== "experimental-context-rollover") return -1;
+	const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
+	for (let i = compactionIdx - 1; i > resetBoundaryIdx; i--) {
+		if (isRolloverRequestEntry(path[i])) return i < firstKeptIdx ? i : -1;
+	}
+	return -1;
+}
+
+/**
+ * Whether the model context {@link buildSessionContext} rebuilds from `path`
+ * replays the entry at an index: every entry after the latest `/clear`
+ * boundary or compaction, whichever is later, and what that compaction kept
+ * below itself. A remote replacement history replays its own items for the
+ * history it covers, and the entries after its replay-through boundary; any
+ * other compaction its kept tail ({@link keptTailStart}) and a rollover's
+ * restored request ({@link rolloverRequestIndex}). Entries between are not
+ * replayed, so this is membership, not a range.
+ */
+export function replaysInContext(path: readonly SessionEntry[]): (index: number) => boolean {
+	const resetBoundaryIdx = path.findLastIndex(entry => entry.type === "reset_boundary");
+	const compaction = getLatestCompactionEntry(path);
+	const compactionIdx = compaction ? path.lastIndexOf(compaction) : -1;
+	if (!compaction || resetBoundaryIdx > compactionIdx) return index => index > resetBoundaryIdx;
+	const request = rolloverRequestIndex(path, compaction, compactionIdx, resetBoundaryIdx);
+	let from = compactionIdx + 1;
+	if (getOpenAiRemoteCompactionPayload(compaction) !== undefined) {
+		const replayThrough = compaction.providerReplayThroughEntryId;
+		const throughIdx = replayThrough === undefined ? -1 : path.findIndex(entry => entry.id === replayThrough);
+		if (throughIdx >= 0 && throughIdx < compactionIdx) from = throughIdx + 1;
+	} else {
+		const kept = keptTailStart(path, compaction, compactionIdx);
+		if (kept >= 0) from = kept;
+	}
+	return index => index >= from || index === request;
 }
 
 /** Reads validated OpenAI Responses replacement history from a compaction entry. */
@@ -235,10 +326,9 @@ export function buildSessionContext(
 		}
 	}
 
-	// Find leaf
-	let leaf: SessionEntry | undefined;
-	if (leafId === null) {
-		// Explicitly null - return no messages (navigated to before first entry)
+	// An explicit null or a replayed clear marker selects no active branch.
+	const resolvedLeafId = leafId === undefined ? resolveSessionLeafId(entries) : leafId;
+	if (resolvedLeafId === null) {
 		return {
 			messages: [],
 			thinkingLevel: "off",
@@ -248,14 +338,12 @@ export function buildSessionContext(
 			mode: "none",
 		};
 	}
-	if (leafId) {
-		leaf = byId.get(leafId);
+	let leaf = byId.get(resolvedLeafId);
+	if (!leaf && leafId !== undefined) {
+		// An explicitly requested leaf is unavailable: use the replayed leaf, never a trailing usage marker.
+		const replayedLeafId = resolveSessionLeafId(entries);
+		leaf = replayedLeafId === null ? undefined : byId.get(replayedLeafId);
 	}
-	if (!leaf) {
-		// Fallback to last entry (when leafId is undefined)
-		leaf = entries[entries.length - 1];
-	}
-
 	if (!leaf) {
 		return {
 			messages: [],
@@ -488,15 +576,8 @@ export function buildSessionContext(
 		// still retires the tail's pre-compaction usage reports.
 		let historyRewriteAt: number | undefined;
 		if (anthropicPayload !== undefined) {
-			const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
-			const snapshotIdx =
-				compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId
-					? path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId)
-					: -1;
-			const firstRetained =
-				(firstKeptIdx >= 0 && firstKeptIdx < compactionIdx ? path[firstKeptIdx] : undefined) ??
-				(snapshotIdx >= 0 && snapshotIdx < compactionIdx - 1 ? path[snapshotIdx + 1] : undefined) ??
-				path[compactionIdx + 1];
+			const keptStart = keptTailStart(path, compaction, compactionIdx);
+			const firstRetained = path[keptStart >= 0 ? keptStart : compactionIdx + 1];
 			// The message's own time, not the entry's: an assistant message is
 			// stamped when its stream starts and saved after it ends, so a marker
 			// derived from the entry would postdate that turn and strip its thinking.
@@ -534,24 +615,18 @@ export function buildSessionContext(
 		}
 
 		// Notes-backed windows do not summarize a discarded turn prefix. Recover
-		// its latest user request verbatim, independently of the disposable tail.
+		// its latest authoritative request verbatim, independently of the
+		// disposable tail. Parent IRC delivered while idle is persisted as a
+		// custom message, while a mid-stream parent steer is a user message; both
+		// are request candidates, but peer IRC remains ordinary agent context.
 		// Resolve from the branch journal so repeated rollovers and resume retain
 		// it too, without copying messages into compaction metadata or transcripts.
 		// Attribution follows the shared turn-initiator semantics so a
 		// user-invoked skill or writable-collab request is retained like an
 		// ordinary one instead of being skipped for an older plain user message.
-		if (
-			!options?.transcript &&
-			isRecord(compaction.details) &&
-			compaction.details.kind === "experimental-context-rollover"
-		) {
-			const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
-			for (let i = compactionIdx - 1; i > resetBoundaryIdx; i--) {
-				const entry = path[i];
-				if (!isUserRequestEntry(entry)) continue;
-				if (i < firstKeptIdx) appendMessage(entry);
-				break;
-			}
+		if (!options?.transcript) {
+			const requestIdx = rolloverRequestIndex(path, compaction, compactionIdx, resetBoundaryIdx);
+			if (requestIdx >= 0) appendMessage(path[requestIdx]);
 		}
 
 		// The remote replacement payload (OpenAI remote compaction) carries the
@@ -561,23 +636,19 @@ export function buildSessionContext(
 		// turns visible instead of showing only the summary and post-compaction.
 		if (!remoteReplacementHistory || options?.transcript) {
 			// Emit kept messages (before compaction, starting from firstKeptEntryId).
-			const firstKeptIdx = path.findIndex(
-				(entry, index) => index < compactionIdx && entry.id === compaction.firstKeptEntryId,
-			);
-			const snapshotIdx =
-				anthropicPayload && compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId
-					? path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId)
-					: -1;
-			const retainedStart = firstKeptIdx >= 0 ? firstKeptIdx : snapshotIdx >= 0 ? snapshotIdx + 1 : -1;
-			if (retainedStart >= 0 && retainedStart < compactionIdx) {
+			const retainedStart = keptTailStart(path, compaction, compactionIdx);
+			if (retainedStart >= 0) {
 				let displayStartIdx = retainedStart;
 				if (options?.transcript) {
 					// `findCutPoint` may leave the collapsed display's kept region
-					// mid-turn. Prefer the next turn boundary, but retain the original
-					// suffix when there is no later boundary: the compaction summary
+					// mid-turn. Trim only to a new turn initiated by the user:
+					// agent-authored custom messages (such as advisor notes) can
+					// follow the final answer of that same turn. Keep the original
+					// suffix when there is no later boundary, because the summary
 					// does not include that kept content.
 					for (let i = retainedStart; i < compactionIdx; i++) {
-						if (isTurnStartEntry(path[i])) {
+						const entry = path[i];
+						if (isTurnStartEntry(entry) && (entry.type !== "custom_message" || isUserRequestEntry(entry))) {
 							displayStartIdx = i;
 							break;
 						}
@@ -674,45 +745,40 @@ export function buildSessionContext(
 	// visible reasoning while removing the immutability/invalid-signature hazard. Drop a
 	// turn left with no content. (Live turns only qualify mid-turn: a transcript rebuild
 	// while the tool still executes sees the persisted assistant turn without its result.
-	// Those callers pass `keepDanglingToolCalls` so the in-flight call stays visible as
-	// a pending block instead of vanishing from the chat.)
-	const keepDangling = options?.transcript === true && options.keepDanglingToolCalls === true;
-	if (!keepDangling) {
-		const pairedToolResultIds = new Set<string>(options?.inFlightToolCallIds);
-		for (const message of messages) {
-			if (message.role === "toolResult") pairedToolResultIds.add(message.toolCallId);
+	// Those callers pass `inFlightToolCallIds` so the in-flight call stays visible as
+	// a pending block instead of vanishing from the chat, while older abandoned calls
+	// are still stripped.)
+	const pairedToolResultIds = new Set<string>(options?.inFlightToolCallIds);
+	for (const message of messages) {
+		if (message.role === "toolResult") pairedToolResultIds.add(message.toolCallId);
+	}
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "assistant") continue;
+		let strippedToolCalls = 0;
+		for (const block of message.content) {
+			if (block.type === "toolCall" && !pairedToolResultIds.has(block.id)) strippedToolCalls++;
 		}
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const message = messages[i];
-			if (message.role !== "assistant") continue;
-			let strippedToolCalls = 0;
-			for (const block of message.content) {
-				if (block.type === "toolCall" && !pairedToolResultIds.has(block.id)) strippedToolCalls++;
+		if (strippedToolCalls === 0) continue;
+		const normalized = message.content
+			.filter(
+				block =>
+					!(block.type === "toolCall" && !pairedToolResultIds.has(block.id)) && block.type !== "redactedThinking",
+			)
+			.map(block =>
+				block.type === "thinking" && block.thinkingSignature ? { ...block, thinkingSignature: undefined } : block,
+			);
+		if (normalized.length === 0 && !options?.transcript) {
+			messages.splice(i, 1);
+		} else {
+			const rewritten = { ...message, content: normalized };
+			if (options?.transcript) {
+				// Display transcript: keep the turn (even content-less) and mark
+				// how many calls were dropped so the TUI renders a placeholder
+				// row instead of silently erasing the turn's activity.
+				(rewritten as AgentMessage & StrippedToolCallsMarker).strippedToolCalls = strippedToolCalls;
 			}
-			if (strippedToolCalls === 0) continue;
-			const normalized = message.content
-				.filter(
-					block =>
-						!(block.type === "toolCall" && !pairedToolResultIds.has(block.id)) &&
-						block.type !== "redactedThinking",
-				)
-				.map(block =>
-					block.type === "thinking" && block.thinkingSignature
-						? { ...block, thinkingSignature: undefined }
-						: block,
-				);
-			if (normalized.length === 0 && !options?.transcript) {
-				messages.splice(i, 1);
-			} else {
-				const rewritten = { ...message, content: normalized };
-				if (options?.transcript) {
-					// Display transcript: keep the turn (even content-less) and mark
-					// how many calls were dropped so the TUI renders a placeholder
-					// row instead of silently erasing the turn's activity.
-					(rewritten as AgentMessage & StrippedToolCallsMarker).strippedToolCalls = strippedToolCalls;
-				}
-				messages[i] = rewritten;
-			}
+			messages[i] = rewritten;
 		}
 	}
 

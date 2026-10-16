@@ -1,5 +1,6 @@
 /**
- * Contract: a vibe worker's spawn options carry the pre-expansion model role.
+ * Contract: a vibe worker's spawn options carry the pre-expansion model role
+ * and an id built from the worker name the user passed in.
  *
  * `#resolveWorker` expands the worker's role alias (`good` -> `task` -> `@task`,
  * `fast` -> `task` on its `@smol` tier) into concrete patterns, so the role
@@ -7,6 +8,9 @@
  * `VibeRecord` -> `#buildSpawnOptions` -> `runSubprocess`. The executor keys the
  * child's inherited `retry.fallbackChains` entry off it; drop any link in that
  * chain and vibe children silently retry on the `default` role's chain.
+ *
+ * The id keeps only `[A-Za-z0-9_-]` from that name and falls back to a
+ * generated name when nothing survives.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Effort } from "@oh-my-pi/pi-ai";
@@ -20,6 +24,7 @@ import type { CreateAgentSessionOptions } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import * as nameGenerator from "@oh-my-pi/pi-coding-agent/task/name-generator";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { VibeCli } from "@oh-my-pi/pi-tui/tools/vibe";
@@ -42,7 +47,7 @@ function makeParentSession(settings: Settings): ToolSession {
 }
 
 /** Spawn one worker and capture the ExecutorOptions the vibe path hands the executor. */
-async function spawnAndCaptureOptions(cli: VibeCli, settings: Settings): Promise<ExecutorOptions> {
+async function spawnAndCaptureOptions(cli: VibeCli, settings: Settings, name?: string): Promise<ExecutorOptions> {
 	const captured = Promise.withResolvers<ExecutorOptions>();
 	vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 		captured.resolve(options);
@@ -63,11 +68,11 @@ async function spawnAndCaptureOptions(cli: VibeCli, settings: Settings): Promise
 	});
 
 	const registry = VibeSessionRegistry.global();
-	await registry.spawn(makeParentSession(settings), { cli, prompt: "work" });
+	await registry.spawn(makeParentSession(settings), { cli, name, prompt: "work" });
 	return captured.promise;
 }
 
-describe("vibe worker spawn model role", () => {
+describe("vibe worker spawn options", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		VibeSessionRegistry.resetGlobalForTests();
@@ -183,5 +188,35 @@ describe("vibe worker spawn model role", () => {
 
 		expect(options.modelOverride).toEqual(["openai-codex/sol"]);
 		expect(options.modelRole).toBeUndefined();
+	});
+
+	it("restricts the first spawn to the worker agent's account pool, as revival does", async () => {
+		// Without it a worker runs unrestricted until it is parked and revived.
+		const options = await spawnAndCaptureOptions(
+			"good",
+			Settings.isolated({
+				modelRoles: { default: "anthropic/opus", task: "anthropic/sonnet" },
+				"task.agentAccountPools": {
+					task: { anthropic: ["email:a@example.com|org:org-a"] },
+					sonic: { anthropic: [] },
+				},
+			}),
+		);
+
+		expect(options.oauthAccountPools).toEqual({ anthropic: ["email:a@example.com|org:org-a"] });
+	});
+
+	it("keeps only [A-Za-z0-9_-] from a custom worker name", async () => {
+		const options = await spawnAndCaptureOptions("good", Settings.isolated(), "../My Worker!");
+
+		expect(options.id).toBe("MyWorker");
+	});
+
+	it("falls back to a generated name when nothing in the custom name survives", async () => {
+		vi.spyOn(nameGenerator, "generateTaskName").mockReturnValue("GeneratedWorker");
+
+		const options = await spawnAndCaptureOptions("good", Settings.isolated(), "!!!");
+
+		expect(options.id).toBe("GeneratedWorker");
 	});
 });

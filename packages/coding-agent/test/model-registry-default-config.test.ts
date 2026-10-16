@@ -80,6 +80,10 @@ describe("ModelRegistry default custom models config", () => {
 			// overrides too (model compat generation).
 			streamIdleTimeoutMs: 900000,
 			streamRevision: "possible",
+			// Opus 4.7+ rejects temperature/top_p on every host (class rule).
+			supportsSamplingParams: false,
+			// Bedrock Converse keeps thinking-binding controls on unless an override opts out.
+			supportsThinkingBindingControls: true,
 		});
 	});
 
@@ -431,6 +435,8 @@ interface ModelSnapshot {
 		supportsForcedToolChoice?: boolean;
 		streamIdleTimeoutMs?: number;
 		streamRevision?: "possible";
+		supportsSamplingParams?: boolean;
+		supportsThinkingBindingControls?: boolean;
 	};
 }
 

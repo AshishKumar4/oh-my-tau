@@ -338,7 +338,7 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		);
 	const ourTurnsAfter = Array.from({ length: 5 }, (_, turn) => `our turn ${turn} after the conflict`);
 
-	/** Reports `ownedElsewhere` as held by another live process, as `claimSessionFile` does for a file a second omp writes. */
+	/** Reports session `ownedElsewhere` as held by another live process, as `claimSession` does for a session a second omp writes. */
 	class OwnedElsewhereStorage extends FileSessionStorage {
 		readonly #ownedElsewhere: string;
 
@@ -347,8 +347,8 @@ describe("SessionManager cross-process rewrite freshness", () => {
 			this.#ownedElsewhere = ownedElsewhere;
 		}
 
-		override claimSessionFile(sessionPath: string): (() => void) | null {
-			return sessionPath === this.#ownedElsewhere ? null : super.claimSessionFile(sessionPath);
+		override claimSession(sessionId: string, sessionPath: string): (() => void) | null {
+			return sessionId === this.#ownedElsewhere ? null : super.claimSession(sessionId, sessionPath);
 		}
 	}
 
@@ -524,11 +524,12 @@ describe("SessionManager cross-process rewrite freshness", () => {
 			creator.appendMessage(userTurn("our turn before the conflict"));
 			const artifactId = await creator.saveArtifact("tool output", "bash");
 			const owned = creator.getSessionFile();
+			const ownedId = creator.getSessionId();
 			if (!owned || !artifactId) throw new Error("Expected session file and artifact");
 			await creator.close();
 			const ownedBytes = await Bun.file(owned).text();
 
-			const storage = new OwnedElsewhereStorage(owned);
+			const storage = new OwnedElsewhereStorage(ownedId);
 			const ours = await SessionManager.open(owned, tempDir.path(), storage, { suppressBreadcrumb: true });
 			const ownedSessionId = ours.getSessionId();
 			const notices: SessionPersistenceNotice[] = [];
@@ -787,7 +788,7 @@ describe("SessionManager fence relaxes when flushSync supersedes the atomic rewr
 		await storage.rewriteStarted.promise;
 
 		// (1) Append X1 while the fence epoch is still current: fenced into memory
-		// and captured by flushSync's #fileBody() below.
+		// and captured by flushSync's #serializeBody() below.
 		sessionManager.appendCustomEntry("during_active_atomic", { data: "X1" });
 
 		// (2) flushSync supersedes the pending atomic (bumps #diskEpoch) and
@@ -1079,6 +1080,54 @@ describe("SessionManager atomic entry batches", () => {
 		expect(content).not.toContain('"customType":"staged-terminal"');
 		expect(content).toContain('"customType":"concurrent-survivor"');
 		await manager.close();
+	});
+
+	it("keeps a late usage marker on a surviving leaf when the staged batch rolls back", async () => {
+		const storage = new GatedAtomicFailureStorage();
+		const manager = SessionManager.create("/cwd", "/sessions", storage);
+		const rootId = manager.appendCustomEntry("root");
+		const activeId = manager.appendCustomEntry("active-tail");
+		await manager.ensureOnDisk();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+		const failure = storage.failNextAtomicWrite(new Error("batch publish failed"));
+		const commit = manager.appendEntriesAtomically(() => manager.appendCustomEntry("staged-terminal"));
+		await failure.started;
+		// A late probe for an older turn lands while the staged leaf is still current.
+		const usageId = manager.appendModelUsage(
+			{
+				purpose: "task-completion-probe",
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 },
+				},
+				stopReason: "stop",
+			},
+			{ sessionId: manager.getSessionId(), parentId: rootId },
+		);
+		if (!usageId) throw new Error("Expected late usage to be recorded");
+		failure.release();
+
+		await expect(commit).rejects.toThrow("batch publish failed");
+		expect(manager.getLeafId()).toBe(activeId);
+		expect(manager.getEntry(usageId)).toMatchObject({ parentId: rootId, activeLeafId: activeId });
+		await manager.close();
+
+		const reopened = await SessionManager.open(sessionFile, "/sessions", storage, {
+			initialCwd: "/cwd",
+			suppressBreadcrumb: true,
+		});
+		expect(reopened.getLeafId()).toBe(activeId);
+		const nextId = reopened.appendCustomEntry("after-reopen");
+		expect(reopened.getEntry(nextId)?.parentId).toBe(activeId);
+		await reopened.close();
 	});
 
 	it("repairs authoritative rollback after commit-then-throw, including a rejecting repair acknowledgement", async () => {

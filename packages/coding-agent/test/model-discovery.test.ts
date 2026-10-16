@@ -5,19 +5,23 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
+import { resolveOpenAIRequestSetup } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { resolveModelCacheProviderId, resolveOllamaModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
 import type { ModelKind, ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
+import { CODEX_CLIENT_VERSION } from "@oh-my-pi/pi-catalog/wire/codex";
 import {
+	discoverLiteLLMModels,
 	discoverOllamaModels,
 	discoverOpenAIModelsList,
 	discoveryProbeTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import { RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS } from "@oh-my-pi/pi-coding-agent/config/model-provider-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { resolveCliModel } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { ProviderDiscoverySchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -526,6 +530,123 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(registry.find("openai-codex", "runtime-codex-model")).toBeDefined();
 	});
 
+	test("Codex discovery follows a configured baseUrl and sends only the configured key there (#13830)", async () => {
+		writeRawModelsJson({
+			"openai-codex": { baseUrl: "https://codex-proxy.example/backend-api/", apiKey: "sk-gateway" },
+		});
+		await authStorage.credentials.set("openai-codex", {
+			type: "oauth",
+			access: "chatgpt-oauth-token",
+			refresh: "chatgpt-refresh",
+			expires: Date.now() + 3_600_000,
+		});
+		const requests: { url: string; authorization: string | null }[] = [];
+		const fetchMock: FetchImpl = async (input, init) => {
+			const url = String(input);
+			requests.push({ url, authorization: new Headers(init?.headers).get("Authorization") });
+			if (url.startsWith("https://codex-proxy.example/backend-api/codex/models")) {
+				return Response.json({
+					models: [
+						{
+							slug: "gpt-6.1-sol",
+							display_name: "GPT-6.1 Sol",
+							context_window: 272_000,
+							supported_in_api: true,
+							input_modalities: ["text", "image"],
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("openai-codex", "online");
+
+		expect(requests).toEqual([
+			{
+				url: `https://codex-proxy.example/backend-api/codex/models?client_version=${CODEX_CLIENT_VERSION}`,
+				authorization: "Bearer sk-gateway",
+			},
+		]);
+		expect(registry.find("openai-codex", "gpt-6.1-sol")?.baseUrl).toBe("https://codex-proxy.example/backend-api/");
+	});
+
+	/** Serve an official Codex roster; any other URL fails the test. */
+	function mockOfficialCodexRoster(requests: { url: string; authorization: string | null }[]): FetchImpl {
+		return async (input, init) => {
+			const url = String(input);
+			requests.push({ url, authorization: new Headers(init?.headers).get("Authorization") });
+			if (url.startsWith("https://chatgpt.com/backend-api/codex/models")) {
+				return Response.json({
+					models: [
+						{
+							slug: "official-live-model",
+							display_name: "Official Live Model",
+							context_window: 272_000,
+							supported_in_api: true,
+							input_modalities: ["text"],
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+	}
+
+	const officialOAuthDiscovery = {
+		url: `https://chatgpt.com/backend-api/codex/models?client_version=${CODEX_CLIENT_VERSION}`,
+		authorization: "Bearer chatgpt-oauth-token",
+	};
+
+	test("Codex discovery keeps stored ChatGPT OAuth on chatgpt.com when a relay baseUrl is configured", async () => {
+		writeRawModelsJson({ "openai-codex": { baseUrl: "https://codex-proxy.example/backend-api" } });
+		await authStorage.credentials.set("openai-codex", {
+			type: "oauth",
+			access: "chatgpt-oauth-token",
+			refresh: "chatgpt-refresh",
+			expires: Date.now() + 3_600_000,
+		});
+		const requests: { url: string; authorization: string | null }[] = [];
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: mockOfficialCodexRoster(requests) });
+
+		await registry.refreshProvider("openai-codex", "online");
+
+		expect(requests).toEqual([officialOAuthDiscovery]);
+		expect(registry.find("openai-codex", "official-live-model")).toBeDefined();
+	});
+
+	test("Codex discovery keeps a live OAuth token off a runtime provider's custom baseUrl despite a command key", async () => {
+		// An extension provider that owns /login installs its command apiKey as a
+		// fallback, so `peek` still returns the unexpired ChatGPT OAuth token.
+		await authStorage.credentials.set("openai-codex", {
+			type: "oauth",
+			access: "chatgpt-oauth-token",
+			refresh: "chatgpt-refresh",
+			expires: Date.now() + 3_600_000,
+		});
+		const requests: { url: string; authorization: string | null }[] = [];
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: mockOfficialCodexRoster(requests) });
+		const sourceId = "ext://codex-proxy";
+		try {
+			registry.registerProvider(
+				"openai-codex",
+				{
+					baseUrl: "https://codex-proxy.example/backend-api",
+					apiKey: "!printf sk-proxy-command",
+					oauth: { name: "Codex Proxy", login: async () => "proxy-login-token" },
+				},
+				sourceId,
+			);
+
+			await registry.refreshProvider("openai-codex", "online");
+
+			expect(requests).toEqual([officialOAuthDiscovery]);
+		} finally {
+			registry.clearSourceRegistrations(sourceId);
+		}
+	});
+
 	test("Codex discovery aborts (keeps bundled models) when any account credential fails to refresh", async () => {
 		// Two configured Codex accounts: the fresh one resolves, the expired one's
 		// refresh throws so getOAuthAccesses reports ok:false. A partial union would
@@ -559,6 +680,113 @@ describe("ModelRegistry runtime discovery", () => {
 
 		expect(modelListCalls).toBe(0);
 		expect(getModelsForProvider(registry, "openai-codex").length).toBeGreaterThan(0);
+	});
+
+	test("Antigravity discovery unions every account's roster and routes each model to an account serving it", async () => {
+		// Account A's plan omits Claude 5.5; account B's serves it. Discovery is
+		// authoritative, so reading only one account's roster would prune Claude
+		// 5.5 for both whenever A is the account discovery happens to pick.
+		await authStorage.credentials.set("google-antigravity", [
+			{
+				type: "oauth",
+				access: "token-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 3_600_000,
+				email: "a@example.com",
+				projectId: "project-a",
+			},
+			{
+				type: "oauth",
+				access: "token-b",
+				refresh: "refresh-b",
+				expires: Date.now() + 3_600_000,
+				email: "b@example.com",
+				projectId: "project-b",
+			},
+		]);
+		const gemini = { "gemini-3.1-pro-low": { displayName: "Gemini 3.1 Pro (Low)", supportsThinking: true } };
+		const claude = Object.fromEntries(
+			["low", "medium", "high"].map(tier => [`claude-opus-5-5-${tier}`, { supportsThinking: true }]),
+		);
+		const rosters: Record<string, object> = {
+			"Bearer token-a": { models: gemini },
+			"Bearer token-b": { models: { ...gemini, ...claude } },
+		};
+		const fetchMock: FetchImpl = async (input, init) => {
+			const url = String(input);
+			if (url.includes(":fetchAvailableModels")) {
+				const roster = rosters[new Headers(init?.headers).get("authorization") ?? ""];
+				return roster ? Response.json(roster) : new Response("Unauthorized", { status: 401 });
+			}
+			return new Response("version: 2.19.1\n");
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("google-antigravity", "online");
+
+		const opus = registry.find("google-antigravity", "claude-opus-5-5");
+		expect(opus?.accountAccess).toEqual({ "b@example.com": {} });
+		expect(registry.find("google-antigravity", "gemini-3.1-pro")?.accountAccess).toEqual({
+			"a@example.com": {},
+			"b@example.com": {},
+		});
+		// Bundled rows that no account serves stay pruned.
+		expect(registry.find("google-antigravity", "claude-sonnet-5-5")).toBeUndefined();
+
+		// A session pinned to account A moves to B for a model only B serves.
+		const sessionId = "antigravity-claude-session";
+		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
+		if (!accountA || !opus) throw new Error("expected account A and Claude Opus 5.5");
+		expect(authStorage.sessions.pin("google-antigravity", sessionId, accountA.credentialId)).toBe(true);
+		expect(await registry.getApiKey(opus, sessionId)).toContain('"token":"token-b"');
+	});
+
+	test("Antigravity routing still works for an account whose login stored no email", async () => {
+		// Google's userinfo lookup is optional at login; such a credential keeps
+		// only its project id, which must still tag and select the account.
+		await authStorage.credentials.set("google-antigravity", [
+			{
+				type: "oauth",
+				access: "token-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 3_600_000,
+				email: "a@example.com",
+				projectId: "project-a",
+			},
+			{
+				type: "oauth",
+				access: "token-b",
+				refresh: "refresh-b",
+				expires: Date.now() + 3_600_000,
+				projectId: "project-b",
+			},
+		]);
+		const gemini = { "gemini-3.1-pro-low": { displayName: "Gemini 3.1 Pro (Low)", supportsThinking: true } };
+		const claude = Object.fromEntries(
+			["low", "medium", "high"].map(tier => [`claude-opus-5-5-${tier}`, { supportsThinking: true }]),
+		);
+		const rosters: Record<string, object> = {
+			"Bearer token-a": { models: gemini },
+			"Bearer token-b": { models: { ...gemini, ...claude } },
+		};
+		const fetchMock: FetchImpl = async (input, init) => {
+			if (String(input).includes(":fetchAvailableModels")) {
+				const roster = rosters[new Headers(init?.headers).get("authorization") ?? ""];
+				return roster ? Response.json(roster) : new Response("Unauthorized", { status: 401 });
+			}
+			return new Response("version: 2.19.1\n");
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("google-antigravity", "online");
+
+		const opus = registry.find("google-antigravity", "claude-opus-5-5");
+		expect(opus?.accountAccess).toEqual({ "project-b": {} });
+		const sessionId = "antigravity-emailless-session";
+		const accountA = authStorage.oauth.accounts("google-antigravity")[0];
+		if (!accountA || !opus) throw new Error("expected account A and Claude Opus 5.5");
+		expect(authStorage.sessions.pin("google-antigravity", sessionId, accountA.credentialId)).toBe(true);
+		expect(await registry.getApiKey(opus, sessionId)).toContain('"token":"token-b"');
 	});
 
 	test("Gemini CLI discovery forwards a stored OAuth project id to the quota fallback", async () => {
@@ -776,6 +1004,53 @@ describe("ModelRegistry runtime discovery", () => {
 		const model = registry.find("ollama", "phi4-mini");
 		expect(model?.baseUrl).toBe("http://omp-ollama.example:2222/v1");
 		expect(registry.getProviderDiscoveryState("ollama")?.optional).toBe(false);
+	});
+
+	test("resolves a bare id shared with implicit ollama to the models.yml provider", async () => {
+		using _baseUrl = withEnv("OLLAMA_BASE_URL", "http://ollama.lan:11434");
+		writeRawModelsJson({
+			omlx: {
+				baseUrl: "http://omlx.lan:11434/v1",
+				api: "openai-completions",
+				apiKey: "sk-omlx-test",
+				models: [{ id: "phi-4-4bit", name: "Phi-4 4-bit", contextWindow: 128000, maxTokens: 8192 }],
+			},
+		});
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, {
+			fetch: mockOllamaDiscovery(["phi-4-4bit"], "http://ollama.lan:11434"),
+		});
+		await registry.refresh();
+		expect(registry.find("ollama", "phi-4-4bit")).toBeDefined();
+
+		const resolved = resolveCliModel({ cliModel: "phi-4-4bit", modelRegistry: registry });
+		expect(resolved.model?.provider).toBe("omlx");
+		expect(resolved.model?.baseUrl).toBe("http://omlx.lan:11434/v1");
+	});
+
+	test("warns with the env var only when an env-redirected implicit endpoint fails discovery", async () => {
+		// Echo the request URL like real fetch errors do, so credential leaks through the error are caught too.
+		const unreachable: FetchImpl = async input => {
+			throw new Error(`EHOSTUNREACH: connect failed ${String(input)}`);
+		};
+		{
+			using _baseUrl = withEnv("OLLAMA_BASE_URL", "http://reviewer:topsecret@ollama.typo:11434");
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: unreachable });
+			await registry.refresh();
+			const warnings = registry.drainConfigWarnings().filter(warning => warning.includes("ollama"));
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0]).toContain("OLLAMA_BASE_URL");
+			expect(warnings[0]).toContain("http://ollama.typo:11434");
+			expect(warnings[0]).toContain("EHOSTUNREACH");
+			expect(warnings[0]).not.toContain("topsecret");
+			expect(warnings[0]).not.toContain("reviewer");
+		}
+		{
+			// The default loopback probe is optional: a missing local Ollama stays silent.
+			using _baseUrl = withEnv("OLLAMA_BASE_URL", undefined);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: unreachable });
+			await registry.refresh();
+			expect(registry.drainConfigWarnings()).toEqual([]);
+		}
 	});
 
 	test("refreshes implicit Ollama discovery when the configured endpoint changes", async () => {
@@ -2443,6 +2718,45 @@ describe("ModelRegistry runtime discovery", () => {
 			.find(m => m.provider === "openai-test" && m.id === "openai-test/no-context-model");
 		expect(fallback?.contextWindow).toBe(128000);
 	});
+	test("openai-models-list uses top_provider.max_completion_tokens over the bundled reference", async () => {
+		writeRawModelsJson({
+			"openai-test": {
+				baseUrl: "http://127.0.0.1:9995",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9995/v1/models") {
+				return new Response(
+					JSON.stringify({
+						data: [
+							// The bundled reference for this id advertises 65,536 output tokens.
+							{
+								id: "gemini-4-argon",
+								context_length: 1_048_576,
+								top_provider: { context_length: 1_048_576, max_completion_tokens: 32_768 },
+							},
+							{
+								id: "openai-test/limits-win",
+								limits: { max_output_tokens: 16_000 },
+								top_provider: { max_completion_tokens: 32_768 },
+							},
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(registry.find("openai-test", "gemini-4-argon")?.maxTokens).toBe(32_768);
+		expect(registry.find("openai-test", "openai-test/limits-win")?.maxTokens).toBe(16_000);
+	});
 	test("openai-models-list uses nested token limits with existing context precedence", async () => {
 		writeRawModelsJson({
 			"openai-test": {
@@ -2515,6 +2829,200 @@ describe("ModelRegistry runtime discovery", () => {
 		const legacyReference = registry.find("openai-test", "gpt-6-sol");
 		expect(legacyReference?.contextWindow).toBe(1_050_000);
 		expect(legacyReference?.maxTokens).toBe(128_000);
+	});
+
+	test("openai-models-list discovery honors a top-level max_tokens output limit", async () => {
+		// A gateway that publishes a plain `max_tokens` on its `/v1/models` rows
+		// had the value discarded, so the row fell back to the 32K discovery
+		// default even though the provider advertised a higher output ceiling
+		// (#13062). Unlike llama.cpp, where a positive `max_tokens` is a per-request
+		// default the client may raise, a `/v1/models` row is a catalog entry
+		// declaring what the endpoint accepts, so the value is a cap here.
+		const ctx = {
+			fetch: (async (input: unknown) => {
+				if (String(input) !== "http://127.0.0.1:9993/v1/models") {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				return new Response(
+					JSON.stringify({
+						data: [
+							{ id: "openai-test/advertised-output-limit", max_tokens: 65_536 },
+							{
+								id: "openai-test/advertised-output-and-context",
+								context_length: 1_048_576,
+								max_tokens: 65_536,
+							},
+							// `limits.max_output_tokens` is the explicit output
+							// field, so it outranks the flat `max_tokens` the same
+							// way `max_output_length ?? entry.max_tokens` does in the
+							// Synthetic catalog mapper.
+							{
+								id: "openai-test/nested-output-wins",
+								max_tokens: 65_536,
+								limits: { max_input_tokens: 131_072, max_output_tokens: 32_768 },
+							},
+							// Advertised above the context window: the cap keeps
+							// following the provider value, bounded by the context.
+							{ id: "openai-test/output-over-context", context_length: 8_192, max_tokens: 65_536 },
+							{ id: "openai-test/no-limits" },
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}) satisfies FetchImpl,
+			getBearerApiKeyResolver: async () => undefined,
+		};
+		const models = await discoverOpenAIModelsList(
+			{
+				provider: "openai-test",
+				api: "openai-completions",
+				baseUrl: "http://127.0.0.1:9993/v1",
+				discovery: { type: "openai-models-list" },
+			},
+			ctx,
+		);
+		const maxTokensById: Record<string, number | null> = {};
+		for (const model of models) maxTokensById[model.id] = model.maxTokens;
+
+		expect(maxTokensById["openai-test/advertised-output-limit"]).toBe(65_536);
+		const withContext = models.find(model => model.id === "openai-test/advertised-output-and-context");
+		expect(withContext?.contextWindow).toBe(1_048_576);
+		expect(withContext?.maxTokens).toBe(65_536);
+		expect(maxTokensById["openai-test/nested-output-wins"]).toBe(32_768);
+		expect(maxTokensById["openai-test/output-over-context"]).toBe(8_192);
+		expect(maxTokensById["openai-test/no-limits"]).toBe(32_768);
+	});
+
+	// Runs one `/v1/models` payload through the real `openai-models-list`
+	// discovery path and returns the output cap each row ended up with, so the
+	// precedence assertions below observe the boundary a user sees rather than
+	// an internal helper.
+	async function discoverOutputLimits(data: Array<Record<string, unknown>>): Promise<Record<string, number | null>> {
+		const ctx = {
+			fetch: (async (input: unknown) => {
+				if (String(input) !== "http://127.0.0.1:9993/v1/models") {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				return new Response(JSON.stringify({ data }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}) satisfies FetchImpl,
+			getBearerApiKeyResolver: async () => undefined,
+		};
+		const models = await discoverOpenAIModelsList(
+			{
+				provider: "openai-test",
+				api: "openai-completions",
+				baseUrl: "http://127.0.0.1:9993/v1",
+				discovery: { type: "openai-models-list" },
+			},
+			ctx,
+		);
+		const maxTokensById: Record<string, number | null> = {};
+		for (const model of models) maxTokensById[model.id] = model.maxTokens;
+		return maxTokensById;
+	}
+
+	test("openai-models-list falls back to a usable flat max_tokens when the nested output limit is unusable", async () => {
+		// An invalid nested output limit must not suppress a valid flat
+		// `max_tokens`. `1.5` and `1e30` pass the positive-number check and then
+		// fail the safe-integer check; when that second check ran on the merged
+		// candidate instead of on each field, the merged value collapsed to
+		// `undefined` and the row fell back to the 32K discovery default even
+		// though a valid flat `max_tokens` sat on the same row (#13062).
+		const maxTokensById = await discoverOutputLimits([
+			{ id: "openai-test/fraction-nested", max_tokens: 65_536, limits: { max_output_tokens: 1.5 } },
+			{ id: "openai-test/unsafe-integer-nested", max_tokens: 65_536, limits: { max_output_tokens: 1e30 } },
+			{ id: "openai-test/zero-nested", max_tokens: 65_536, limits: { max_output_tokens: 0 } },
+			{ id: "openai-test/negative-nested", max_tokens: 65_536, limits: { max_output_tokens: -1 } },
+			{ id: "openai-test/text-nested", max_tokens: 65_536, limits: { max_output_tokens: "not-a-number" } },
+			{ id: "openai-test/null-nested", max_tokens: 65_536, limits: { max_output_tokens: null } },
+			{ id: "openai-test/array-nested", max_tokens: 65_536, limits: { max_output_tokens: [65_536] } },
+		]);
+
+		expect(maxTokensById["openai-test/fraction-nested"]).toBe(65_536);
+		expect(maxTokensById["openai-test/unsafe-integer-nested"]).toBe(65_536);
+		expect(maxTokensById["openai-test/zero-nested"]).toBe(65_536);
+		expect(maxTokensById["openai-test/negative-nested"]).toBe(65_536);
+		expect(maxTokensById["openai-test/text-nested"]).toBe(65_536);
+		expect(maxTokensById["openai-test/null-nested"]).toBe(65_536);
+		expect(maxTokensById["openai-test/array-nested"]).toBe(65_536);
+	});
+
+	test("openai-models-list keeps a usable nested output limit when the flat max_tokens is unusable", async () => {
+		// The mirror of the case above, so the rule is stated once and reads the
+		// same in both directions: each field is reduced to a usable output limit
+		// on its own, then `limits.max_output_tokens` outranks the flat
+		// `max_tokens` among the fields that survive. Precedence follows validity,
+		// not presence and not field order, so an unusable flat field cannot
+		// promote itself over a nested one that is fine.
+		const maxTokensById = await discoverOutputLimits([
+			{ id: "openai-test/invalid-flat", max_tokens: "not-a-number", limits: { max_output_tokens: 32_768 } },
+			{ id: "openai-test/fraction-flat", max_tokens: 1.5, limits: { max_output_tokens: 32_768 } },
+			{ id: "openai-test/zero-flat", max_tokens: 0, limits: { max_output_tokens: 32_768 } },
+			{ id: "openai-test/absent-flat", limits: { max_output_tokens: 32_768 } },
+			// Both usable: the explicit nested field still outranks the flat one.
+			{ id: "openai-test/both-usable", max_tokens: 65_536, limits: { max_output_tokens: 32_768 } },
+			// Neither usable: the 32K discovery default, unchanged.
+			{ id: "openai-test/neither-usable", max_tokens: 1.5, limits: { max_output_tokens: 2.5 } },
+		]);
+
+		expect(maxTokensById["openai-test/invalid-flat"]).toBe(32_768);
+		expect(maxTokensById["openai-test/fraction-flat"]).toBe(32_768);
+		expect(maxTokensById["openai-test/zero-flat"]).toBe(32_768);
+		expect(maxTokensById["openai-test/absent-flat"]).toBe(32_768);
+		expect(maxTokensById["openai-test/both-usable"]).toBe(32_768);
+		expect(maxTokensById["openai-test/neither-usable"]).toBe(32_768);
+	});
+
+	test("openai-models-list honors flat output caps over the bundled reference (#15811)", async () => {
+		writeRawModelsJson({
+			"openai-test": {
+				baseUrl: "http://127.0.0.1:9993",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9993/v1/models") {
+				return Response.json({
+					data: [
+						// Resolves to a bundled reference whose output limit reaches the
+						// whole window; the advertised cap must win.
+						{
+							id: "auto/deepseek-v4-flash",
+							context_length: 1_000_000,
+							max_input_tokens: 1_048_576,
+							max_output_tokens: 384_000,
+						},
+						{ id: "openai-test/completion-cap", context_length: 200_000, max_completion_tokens: 8_192 },
+						{
+							id: "openai-test/nested-wins",
+							context_length: 200_000,
+							limits: { max_output_tokens: 16_000 },
+							max_output_tokens: 64_000,
+						},
+						{
+							id: "openai-test/malformed-flat",
+							context_length: 200_000,
+							max_output_tokens: 1.5,
+							max_completion_tokens: 12_000,
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(registry.find("openai-test", "auto/deepseek-v4-flash")?.maxTokens).toBe(384_000);
+		expect(registry.find("openai-test", "openai-test/completion-cap")?.maxTokens).toBe(8_192);
+		expect(registry.find("openai-test", "openai-test/nested-wins")?.maxTokens).toBe(16_000);
+		expect(registry.find("openai-test", "openai-test/malformed-flat")?.maxTokens).toBe(12_000);
 	});
 
 	test("openai-models-list discovery enriches thin /v1/models payloads from the bundled reference catalog", async () => {
@@ -2874,14 +3382,6 @@ describe("ModelRegistry runtime discovery", () => {
 	});
 
 	test("litellm discovery maps rich model metadata and keeps runtime /v1 baseUrl", async () => {
-		writeRawModelsJson({
-			"litellm-test": {
-				baseUrl: "http://127.0.0.1:4000",
-				api: "openai-completions",
-				auth: "none",
-				discovery: { type: "litellm" },
-			},
-		});
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
 			if (url === "http://127.0.0.1:4000/model_group/info") {
@@ -2901,9 +3401,17 @@ describe("ModelRegistry runtime discovery", () => {
 			}
 			throw new Error(`Unexpected URL: ${url}`);
 		};
-		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
-		await registry.refresh();
-		const model = registry.find("litellm-test", "gpt-big");
+		const models = await discoverLiteLLMModels(
+			{
+				provider: "litellm-test",
+				baseUrl: "http://127.0.0.1:4000",
+				api: "openai-completions",
+				discovery: { type: "litellm" },
+			},
+			{ fetch: fetchMock, getBearerApiKeyResolver: async () => undefined },
+		);
+		const model = models.find(model => model.id === "gpt-big");
+		if (!model) throw new Error("Missing discovered LiteLLM model");
 
 		expect(model?.baseUrl).toBe("http://127.0.0.1:4000/v1");
 		expect(model?.contextWindow).toBe(262_144);
@@ -2911,17 +3419,19 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(model?.input).toEqual(["text", "image"]);
 		expect(model?.reasoning).toBe(true);
 		expect(model?.api).toBe("openai-responses");
+		expect(model.provider).toBe("litellm-test");
+		expect(model.providerType).toBe("litellm");
+		if (model.api !== "openai-responses") throw new Error("Expected discovered Responses API");
+		expect(
+			resolveOpenAIRequestSetup(model as Model<"openai-responses">, {
+				apiKey: "test",
+				messages: [],
+				sessionId: "rich-alias-session",
+			}).requestHeaders["x-litellm-session-id"],
+		).toBe("rich-alias-session");
 	});
 
 	test("litellm discovery falls back to /v1/models when the rich phase times out (#10964)", async () => {
-		writeRawModelsJson({
-			"litellm-test": {
-				baseUrl: "http://127.0.0.1:4013/v1",
-				api: "openai-completions",
-				auth: "none",
-				discovery: { type: "litellm", timeoutMs: 50 },
-			},
-		});
 		const { promise: richHang } = Promise.withResolvers<Response>(); // never resolves
 		const richEndpoints = ["/model_group/info", "/v2/model/info", "/model/info", "/v1/model/info"];
 		let v1ModelsHits = 0;
@@ -2941,11 +3451,31 @@ describe("ModelRegistry runtime discovery", () => {
 			}
 			throw new Error(`Unexpected URL: ${url}`);
 		};
-		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
-		await registry.refresh();
+		const models = await discoverLiteLLMModels(
+			{
+				provider: "litellm-test",
+				baseUrl: "http://127.0.0.1:4013/v1",
+				api: "openai-responses",
+				discovery: { type: "litellm", timeoutMs: 50 },
+			},
+			{ fetch: fetchMock, getBearerApiKeyResolver: async () => undefined },
+		);
+		const model = models.find(model => model.id === "vendor-7/model-7");
+		if (!model) throw new Error("Missing fallback LiteLLM model");
 
 		expect(v1ModelsHits).toBeGreaterThan(0);
-		expect(registry.find("litellm-test", "vendor-7/model-7")?.baseUrl).toBe("http://127.0.0.1:4013/v1");
+		expect(model.baseUrl).toBe("http://127.0.0.1:4013/v1");
+		expect(model.provider).toBe("litellm-test");
+		expect(model.providerType).toBe("litellm");
+		expect(model.api).toBe("openai-responses");
+		if (model.api !== "openai-responses") throw new Error("Expected fallback Responses API");
+		expect(
+			resolveOpenAIRequestSetup(model as Model<"openai-responses">, {
+				apiKey: "test",
+				messages: [],
+				sessionId: "fallback-alias-session",
+			}).requestHeaders["x-litellm-session-id"],
+		).toBe("fallback-alias-session");
 	});
 
 	test("configured litellm discovery omits non-conversational rich modes", async () => {

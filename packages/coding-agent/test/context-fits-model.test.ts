@@ -6,13 +6,29 @@
  * reasoning, in the local floor or in the provider usage that carried it, while
  * the producing model still is.
  */
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
+import * as path from "node:path";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model, ProviderSessionState } from "@oh-my-pi/pi-ai";
 import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionMaintenance, type SessionMaintenanceHost } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
+import { TempDir } from "@oh-my-pi/pi-utils";
+
+const tempDir = TempDir.createSync("@pi-context-fits-");
+const authStorage = await AuthStorage.create(":memory:");
+afterAll(() => {
+	authStorage.close();
+	tempDir.removeSync();
+});
+
+/** A registry whose catalog rows follow `settings`' window opt-ins. */
+function registryFor(settings: Settings): ModelRegistry {
+	return new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"), { settings });
+}
 
 const active = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-6.1-sol");
 // Same encoding, another model: it gets the turns re-encoded without their reasoning.
@@ -54,7 +70,7 @@ const codexTurn = (text: string, timestamp: number) => responsesTurn(active, tex
 /** The host members `contextFitsModel` reads; a missing session state replays native history. */
 type ContextFitHost = Pick<
 	SessionMaintenanceHost,
-	"agent" | "settings" | "model" | "messages" | "nonMessageTokenSource" | "getContextUsage"
+	"agent" | "settings" | "model" | "messages" | "nonMessageTokenSource" | "getContextUsage" | "modelRegistry"
 > & { providerSessionState?: SessionMaintenanceHost["providerSessionState"] };
 
 /**
@@ -64,12 +80,19 @@ type ContextFitHost = Pick<
  */
 function maintenance(
 	messages: AgentMessage[],
-	options: { usageTokens?: number; providerSessionState?: Map<string, ProviderSessionState> } = {},
+	options: {
+		usageTokens?: number;
+		providerSessionState?: Map<string, ProviderSessionState>;
+		settings?: Settings;
+		modelRegistry?: ModelRegistry;
+	} = {},
 ): SessionMaintenance {
 	const agent = new Agent({ initialState: { model: active, systemPrompt: [], tools: [], messages } });
+	const settings = options.settings ?? Settings.isolated({ "compaction.reserveTokens": 200 });
 	const host: ContextFitHost = {
 		agent,
-		settings: Settings.isolated({ "compaction.reserveTokens": 200 }),
+		settings,
+		modelRegistry: options.modelRegistry ?? registryFor(settings),
 		model: () => active,
 		messages: () => agent.state.messages,
 		nonMessageTokenSource: () => ({}),
@@ -142,5 +165,26 @@ describe("SessionMaintenance.contextFitsModel", () => {
 		const retained: AgentMessage = { role: "user", content: "x".repeat(7_600), timestamp: 0 };
 		const failed = codexTurn("Partial answer.", 1);
 		expect(maintenance([retained, failed]).contextFitsModel(candidate, failed)).toBe(false);
+	});
+
+	it("judges a candidate at the window this session's settings select, not the registry row's", () => {
+		// The registry's settings opt the candidate into its extended tier; the
+		// session's (a subagent with model thresholds off) keep it standard.
+		const modelRegistry = registryFor(
+			Settings.isolated({ "compaction.modelThresholds": { "openai/gpt-5.6-terra": 400_000 } }),
+		);
+		const row = modelRegistry.find("openai", "gpt-5.6-terra");
+		const tiers = modelRegistry.contextWindowTiers({ provider: "openai", id: "gpt-5.6-terra" });
+		if (!row || !tiers) throw new Error("Expected openai/gpt-5.6-terra with two window tiers");
+		expect(row.contextWindow).toBe(tiers.extended);
+		const retained: AgentMessage[] = [{ role: "user", content: "Question?", timestamp: 0 }];
+		// Provider usage between the tiers: past the standard window, well inside the extended one.
+		const usageTokens = Math.floor((tiers.standard + tiers.extended) / 2);
+		const fits = (settings: Settings) =>
+			maintenance(retained, { usageTokens, settings, modelRegistry }).contextFitsModel(row);
+
+		expect(fits(Settings.isolated({ "compaction.modelThresholdsEnabled": false }))).toBe(false);
+		// Control: a session whose own settings select the extended tier holds it.
+		expect(fits(Settings.isolated({ extendedContext: true }))).toBe(true);
 	});
 });

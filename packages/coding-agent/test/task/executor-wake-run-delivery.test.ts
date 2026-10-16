@@ -3,8 +3,10 @@
  * turns the lane drives itself after the wake (its own background-job results,
  * messages injected mid-turn, later wakes) belong to the same run. Its
  * owner-routed job opens with the run, and its yield reaches the parent exactly
- * once through that job. A wake that only answers, with nothing left running,
- * is relayed to the waker and settles the job without a delivery.
+ * once through that job. A wake the parent's message started that only answers
+ * hands the answer to the parent through that job too (upstream a1a410e33e), and
+ * no relay repeats it; a wake a peer started is relayed to that peer and
+ * settles the parent's job without a delivery.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
@@ -608,7 +610,7 @@ describe("IRC wake run delivery", () => {
 		expect(lane.delivered[1]).toContain("second: probe passed");
 	});
 
-	it("settles the job without a delivery when the lane only answers, and relays the answer", async () => {
+	it("answers the parent through its job when the parent's message woke a lane that only answers", async () => {
 		const lane = createLane([{ content: ["The fix is ready."] }, { content: ["Still ready."] }]);
 		const relaysTo = captureRelays();
 
@@ -616,8 +618,8 @@ describe("IRC wake run delivery", () => {
 		await lane.runEnded;
 		await lane.settle();
 
-		expect(relaysTo(MAIN_AGENT_ID)).toEqual(["The fix is ready."]);
-		expect(lane.delivered).toEqual([]);
+		expect(lane.delivered).toEqual(["The fix is ready."]);
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
 		expect(lane.manager.getRunningJobs()).toEqual([]);
 		expect(lane.manager.getRecentJobs(10, { ownerId: MAIN_AGENT_ID }).map(job => job.status)).toEqual(["completed"]);
 		expect(lane.lifecycle).toEqual(["started", "completed"]);
@@ -628,12 +630,34 @@ describe("IRC wake run delivery", () => {
 		await lane.session.waitForIdle();
 		await drainEventLoop();
 		await lane.settle();
-		expect(relaysTo(MAIN_AGENT_ID)).toEqual(["The fix is ready.", "Still ready."]);
+		expect(lane.delivered).toEqual(["The fix is ready.", "Still ready."]);
 		expect(lane.lifecycle).toEqual(["started", "completed", "started", "completed"]);
-		expect(lane.delivered).toEqual([]);
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
 	});
 
-	it("tells the parent that woke it when a run fails, without a second copy through the job", async () => {
+	it("answers the parent through its job when the parent steers a run a peer woke", async () => {
+		const lane = createLane([
+			async () => {
+				// Mid-turn, the parent's message is steered into the running turn
+				// (IrcBridge's parent-steer path): no wake observer sees it.
+				await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Also check the mask path." });
+				return { content: ["Checking line 42."] };
+			},
+			{ content: ["Line 42 is fine; the mask path is fixed."] },
+		]);
+		const relaysTo = captureRelays();
+
+		await IrcBus.global().send({ from: REVIEWER, to: LANE, body: "Is line 42 fine?" });
+		await lane.runEnded;
+		await lane.settle();
+
+		// The parent asked, so it hears the run's end once, through its job.
+		expect(lane.delivered).toEqual(["Line 42 is fine; the mask path is fixed."]);
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
+		expect(relaysTo(REVIEWER)).toEqual(["Line 42 is fine; the mask path is fixed."]);
+	});
+
+	it("tells the parent that woke it when a run fails, through its job alone", async () => {
 		const lane = createLane([{ stopReason: "error", errorMessage: "provider exploded" }]);
 		const relaysTo = captureRelays();
 
@@ -641,10 +665,9 @@ describe("IRC wake run delivery", () => {
 		await lane.runEnded;
 		await lane.settle();
 
-		const relays = relaysTo(MAIN_AGENT_ID);
-		expect(relays).toHaveLength(1);
-		expect(relays[0]).toContain("provider exploded");
-		expect(lane.delivered).toEqual([]);
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
+		expect(lane.delivered).toHaveLength(1);
+		expect(lane.delivered[0]).toContain("provider exploded");
 		expect(lane.manager.getRecentJobs(10, { ownerId: MAIN_AGENT_ID }).map(job => job.status)).toEqual(["failed"]);
 		expect(lane.lifecycle).toEqual(["started", "failed"]);
 	});

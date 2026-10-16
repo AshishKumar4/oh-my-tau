@@ -92,8 +92,14 @@
 		"prefixedToolNames": []
 	},
 	"ompFramingPerModel": {
+		"claude-opus-5-5": {
+			"why": "Opus 5.5 is prefix-bound and, since upstream fec79e4077 (#14167), resolves a prefix-mismatch behaviour in catalog compat, like Fable 5.1. Model-lineage policy, not a harness-profile difference.",
+			"deltas": {
+				"envelope.thinking": "object{block_binding,display,type}"
+			}
+		},
 		"claude-fable-5-1": {
-			"why": "Fable 5 resolves a prefix-mismatch behaviour in catalog compat, so its thinking block carries `block_binding`. Model-lineage policy, not a harness-profile difference \u2014 the other profiled model (Opus 5) must not grow the field.",
+			"why": "Fable 5 resolves a prefix-mismatch behaviour in catalog compat, so its thinking block carries `block_binding`. Model-lineage policy, not a harness-profile difference: a profiled model gets the field only where its catalog lineage resolves that behaviour.",
 			"deltas": {
 				"envelope.thinking": "object{block_binding,display,type}"
 			}

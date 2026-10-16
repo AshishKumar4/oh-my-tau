@@ -1,4 +1,5 @@
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
+import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import type {
 	AuthAccountPolicies,
@@ -9,7 +10,7 @@ import type {
 	OAuthAccountIdentity,
 	OAuthCredential,
 } from "./types";
-import { DEFAULT_CREDENTIAL_POOL_ORDER, DEFAULT_USAGE_RESERVE_PCT } from "./types";
+import { DEFAULT_CREDENTIAL_POOL_ORDER, DEFAULT_USAGE_RESERVE_PCT, oauthAccountKey } from "./types";
 
 /** Whether every identity field set on `selector` matches `identity`. */
 export function matchesAuthAccountSelector(selector: AuthAccountSelector, identity: OAuthAccountIdentity): boolean {
@@ -62,8 +63,10 @@ export function oauthEntitlementFilter(
 ): ((credential: OAuthCredential) => boolean) | undefined {
 	if (!accountIds?.length) return undefined;
 	const entitled = new Set(accountIds);
-	const isEntitled = (credential: OAuthCredential): boolean =>
-		credential.accountId !== undefined && entitled.has(credential.accountId);
+	const isEntitled = (credential: OAuthCredential): boolean => {
+		const accountKey = oauthAccountKey(credential);
+		return accountKey !== undefined && entitled.has(accountKey);
+	};
 	const anyEntitled = credentials.some(credential => credential.type === "oauth" && isEntitled(credential));
 	return anyEntitled ? isEntitled : undefined;
 }
@@ -76,6 +79,8 @@ export class AccountPolicies {
 	#accountPolicies: AuthAccountPolicies;
 	#defaultReservePct: number;
 	#poolOrders: CredentialPoolOrders;
+	/** Indexes of policies already warned as unmatched; validation runs on every selection. */
+	#warnedUnmatched = new Set<number>();
 
 	constructor(
 		policies: AuthAccountPolicies,
@@ -119,6 +124,7 @@ export class AccountPolicies {
 		this.#accountPolicies = next.#accountPolicies;
 		this.#defaultReservePct = next.#defaultReservePct;
 		this.#poolOrders = next.#poolOrders;
+		this.#warnedUnmatched = next.#warnedUnmatched;
 	}
 
 	static #validateAccountPolicyConfiguration(accountPolicies: AuthAccountPolicies): void {
@@ -172,6 +178,7 @@ export class AccountPolicies {
 		}
 	}
 
+	/** Throw on ambiguous selectors for `provider`; a selector whose account is absent is inert and warns once. */
 	validateFor(provider: string, credentials: readonly AuthCredential[]): void {
 		const policies = this.#accountPolicies
 			.map((policy, index) => ({ policy, index }))
@@ -192,7 +199,11 @@ export class AccountPolicies {
 			}
 			const path = `auth.accountPolicies[${index}].account`;
 			if (matches.length === 0) {
-				throw new AIError.ConfigurationError(`${path} matches no stored OAuth account for ${provider}`);
+				if (!this.#warnedUnmatched.has(index)) {
+					this.#warnedUnmatched.add(index);
+					logger.warn("Account policy matches no stored OAuth account; ignoring it", { provider, path });
+				}
+				continue;
 			}
 			if (matches.length > 1) {
 				throw new AIError.ConfigurationError(

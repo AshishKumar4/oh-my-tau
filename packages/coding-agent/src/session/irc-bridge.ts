@@ -45,6 +45,11 @@ export class IrcBridge {
 		return this.#interrupts.length > 0;
 	}
 
+	/** Whether an aside is ready for step-boundary injection (not a parked wake). */
+	hasAsides(): boolean {
+		return this.#asides.length > 0;
+	}
+
 	/** Whether any undelivered IRC record remains queued. */
 	hasPending(): boolean {
 		return this.#interrupts.length > 0 || this.#asides.length > 0 || this.#deferredWakes.length > 0;
@@ -186,10 +191,15 @@ export class IrcBridge {
 		if (this.#host.isDisposed()) throw new Error("Recipient session is disposed.");
 		const streaming = this.#host.isStreaming();
 		const planModeIdle = !streaming && this.#host.planModeEnabled();
+		const fromParent = AgentRegistry.global().get(msg.to)?.parentId === msg.from;
 		// An idle subagent runs a monitored wake turn whose output is relayed
 		// back to the sender (task executor `relayWakeTurnOutput`); the main
 		// agent and mid-turn asides have no such relay.
 		const relayOnStop = !streaming && !planModeIdle && msg.to !== MAIN_AGENT_ID && msg.wakeRelay !== true;
+		// The body is agent-authored (a peer's message), so it must not close the
+		// harness envelope it is rendered into or open a forged one, e.g. a parent
+		// steer; only a harness-rendered envelope (a wake relay's `<task-result>`)
+		// passes through. `details.message` keeps the raw body for the transcript card and inbox.
 		const rendered = getRenderedEnvelope(msg, msg.body);
 		const body = rendered ?? escapeHarnessText(msg.body);
 		const record: CustomMessage = {
@@ -211,6 +221,7 @@ export class IrcBridge {
 					message: msg.body,
 					...(msg.replyTo ? { replyTo: msg.replyTo } : {}),
 					...(msg.wakeRelay ? { wakeRelay: true } : {}),
+					...(fromParent ? { fromParent: true } : {}),
 				},
 				rendered,
 			),
@@ -219,8 +230,7 @@ export class IrcBridge {
 		};
 		void this.#host.emitSessionEvent({ type: "irc_message", message: record });
 		if (streaming) {
-			const recipientParentId = AgentRegistry.global().get(msg.to)?.parentId;
-			if (recipientParentId === msg.from) {
+			if (fromParent) {
 				this.#host.agent.steer({
 					role: "user",
 					content: prompt.render(parentIrcSteerTemplate, { from: escapeExpression(msg.from), message: body }),

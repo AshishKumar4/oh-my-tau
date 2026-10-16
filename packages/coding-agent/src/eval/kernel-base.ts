@@ -1,4 +1,4 @@
-import { logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { logger, readLines, Snowflake } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import { type KernelDisplayOutput, renderKernelDisplay } from "./py/display";
 import type { ShadowBarrier, ShadowControlNode, ShadowOperation } from "./speculation/types";
@@ -222,7 +222,6 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 	#exitedPromise: Promise<number> | null = null;
 	#pending = new Map<string, PendingExecution>();
 	#pendingControls = new Map<string, PromiseWithResolvers<Frame>>();
-	#readBuffer = "";
 	readonly #options: BaseKernelOptions<TExecuteOptions>;
 
 	constructor(id: string, options: BaseKernelOptions<TExecuteOptions>) {
@@ -359,21 +358,27 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 		}
 
 		requestWritten = true;
-		const transportFailed = (error: Error) => {
+		const transportFailed = (err: unknown) => {
 			if (!pending.settled) {
 				pending.status = "error";
 				pending.cancelled = true;
-				// A partially sent cell may have run; report uncertain completion when retiring its kernel.
+				// The kernel is retired below and a partial write may have run code: completion is uncertain.
 				pending.kernelKilled = true;
-				pending.error = { name: "TransportError", value: error.message, traceback: [] };
+				pending.error = {
+					name: "TransportError",
+					value: err instanceof Error ? err.message : String(err),
+					traceback: [],
+				};
 				finalize();
 			}
+			// A broken stdin pipe is terminal even if this request already settled (e.g. aborted first):
+			// retire the kernel so the session starts a fresh one.
 			void this.shutdown();
 		};
 		try {
 			await this.#writeLine(payload, transportFailed);
-		} catch (error) {
-			transportFailed(error instanceof Error ? error : new Error(String(error), { cause: error }));
+		} catch (err) {
+			transportFailed(err);
 		}
 
 		return promise;
@@ -387,8 +392,9 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 		const deferred = Promise.withResolvers<Frame>();
 		this.#pendingControls.set(id, deferred);
 		try {
-			await this.#writeLine(payload, error => {
-				deferred.reject(error);
+			// A broken stdin pipe is terminal: fail this control request and retire the kernel.
+			await this.#writeLine(payload, err => {
+				deferred.reject(err);
 				void this.shutdown();
 			});
 			return await raceControlTimeout(
@@ -512,47 +518,51 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 		}
 	}
 
-	async #writeLine(line: string, onWriteFailed?: (error: Error) => void): Promise<void> {
+	async #writeLine(line: string, onWriteFailed?: (err: unknown) => void): Promise<void> {
 		if (!this.#stdin) {
 			throw new Error(`${this.#options.languageName} kernel stdin is not open`);
 		}
 		if (this.#options.traceIpc) {
 			logger.debug(`${this.#options.languageName}Kernel send`, { preview: line.slice(0, 120) });
 		}
-		// Keep the existing admission/timer order while observing asynchronous pipe failure.
+		// Not awaited: callers' timeouts start after this returns, so a wedged pipe must not block here.
+		// A failed write (sync throw or rejection) is reported through onWriteFailed; the kernel may stay
+		// alive without an exit event.
 		const stdin = this.#stdin;
 		const write = Promise.try(() => stdin.write(`${line}\n`));
 		void write.catch(() => {});
-		void Promise.all([write, Promise.try(() => stdin.flush())]).catch(error => {
-			const failure = error instanceof Error ? error : new Error(String(error), { cause: error });
-			logger.debug(`${this.#options.languageName} kernel stdin write failed`, { error: failure.message });
-			onWriteFailed?.(failure);
+		void Promise.all([write, Promise.try(() => stdin.flush())]).catch(err => {
+			logger.debug(`${this.#options.languageName} kernel stdin write failed`, { error: String(err) });
+			onWriteFailed?.(err);
 		});
 	}
 
 	#startReader(stream: ReadableStream<Uint8Array>): void {
-		const reader = stream.getReader();
 		const decoder = new TextDecoder();
 		const loop = async () => {
 			try {
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					this.#readBuffer += decoder.decode(value, { stream: true });
-					await this.#flushFrames();
+				for await (const bytes of readLines(stream)) {
+					const line = decoder.decode(bytes);
+					if (!line.trim()) continue;
+					let frame: Frame;
+					try {
+						frame = JSON.parse(line) as Frame;
+					} catch (err) {
+						logger.warn(`${this.#options.languageName} runner emitted invalid JSON`, {
+							line: line.slice(0, 200),
+							error: err instanceof Error ? err.message : String(err),
+						});
+						continue;
+					}
+					if (this.#options.traceIpc) {
+						logger.debug(`${this.#options.languageName}Kernel recv`, { type: frame.type, id: frame.id });
+					}
+					await this.#handleFrame(frame);
 				}
-				this.#readBuffer += decoder.decode();
-				await this.#flushFrames();
 			} catch (err) {
 				logger.warn(`${this.#options.languageName} kernel reader failed`, {
 					error: err instanceof Error ? err.message : String(err),
 				});
-			} finally {
-				try {
-					reader.releaseLock();
-				} catch {
-					/* ignore */
-				}
 			}
 		};
 		void loop();
@@ -582,30 +592,6 @@ export abstract class BaseKernel<TExecuteOptions extends KernelExecuteOptions = 
 			}
 		};
 		void loop();
-	}
-
-	async #flushFrames(): Promise<void> {
-		while (true) {
-			const nl = this.#readBuffer.indexOf("\n");
-			if (nl < 0) return;
-			const line = this.#readBuffer.slice(0, nl);
-			this.#readBuffer = this.#readBuffer.slice(nl + 1);
-			if (!line.trim()) continue;
-			let frame: Frame;
-			try {
-				frame = JSON.parse(line) as Frame;
-			} catch (err) {
-				logger.warn(`${this.#options.languageName} runner emitted invalid JSON`, {
-					line: line.slice(0, 200),
-					error: err instanceof Error ? err.message : String(err),
-				});
-				continue;
-			}
-			if (this.#options.traceIpc) {
-				logger.debug(`${this.#options.languageName}Kernel recv`, { type: frame.type, id: frame.id });
-			}
-			await this.#handleFrame(frame);
-		}
 	}
 
 	async #handleFrame(frame: Frame): Promise<void> {

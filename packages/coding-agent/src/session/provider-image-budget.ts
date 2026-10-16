@@ -1,24 +1,23 @@
 import type {
 	Context,
-	DeveloperMessage,
 	ImageContent,
 	Message,
 	Model,
 	ProviderPayload,
 	TextContent,
-	ToolResultMessage,
 	ToolResultProviderMetadata,
-	UserMessage,
 } from "@oh-my-pi/pi-ai";
+import { reachesOfficialEndpoint } from "@oh-my-pi/pi-ai";
 import { decodeDataUri } from "@oh-my-pi/pi-ai/providers/openai-data-uri";
 import { inheritContextIdentity } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { resolveInlineImageByteBudget } from "@oh-my-pi/pi-catalog/compat/request-size";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
-import { providerImageBudget } from "@oh-my-pi/snapcompact";
+import { capFrameDataBytes, frameDataBytesBudget, providerImageBudget } from "@oh-my-pi/snapcompact";
 import { supportsRemoteImageUrls } from "../blob-broker/context-images";
 import { imageDecodeFailureReason } from "@oh-my-pi/pi-tui/chat/image-loading";
 
-const TOOL_RESULT_IMAGE_OMISSION: TextContent = {
+const IMAGE_OMISSION: TextContent = {
 	type: "text",
 	text: "[image omitted: provider image limit]",
 };
@@ -48,65 +47,134 @@ function countImages(context: Context): number {
 	return count;
 }
 
-/** `content` without its `drops` oldest images. */
-function withoutOldestImages(
-	content: readonly (TextContent | ImageContent)[],
-	drops: number,
-): (TextContent | ImageContent)[] {
-	let remaining = drops;
-	return content.filter(part => part.type !== "image" || remaining-- <= 0);
+function inlineImageBytes(image: ImageContent, model: Model): number {
+	// Match the reference/inline decision shared with the outbound image guard.
+	if (!sendsInlineImageBytes(image, model)) return 0;
+	return image.data.length; // Base64 is ASCII, so character count equals JSON byte count.
 }
 
 /**
- * `message` without its `drops` oldest images, standing for the same message:
- * a drop batch drops the same images on every request, and state kept per
- * message across requests (the date/cwd reminder's first turn) holds.
+ * How much of `total` to drop to fit `limit`, in steps of a quarter of the
+ * limit. Dropping exactly the excess moves the oldest kept image on every
+ * request that adds one, which rewrites the whole cached prompt each time;
+ * a stepped amount changes the dropped set, and the prompt, once per step.
  */
-function clampedMessage(message: UserMessage | DeveloperMessage | ToolResultMessage, drops: number): Message {
-	switch (message.role) {
-		case "toolResult": {
-			const content = withoutOldestImages(message.content, drops);
-			return inheritContextIdentity(
-				{ ...message, content: content.length > 0 ? content : [TOOL_RESULT_IMAGE_OMISSION] },
-				message,
-			);
+function steppedExcess(total: number, limit: number): number {
+	const step = Math.max(1, Math.floor(limit / 4));
+	return Math.ceil((total - limit) / step) * step;
+}
+
+/** Whether an input image, offered oldest first, is dropped from the request. */
+type ImageDrop = (image: ImageContent) => boolean;
+
+function clampContent(
+	content: readonly (TextContent | ImageContent)[],
+	drop: ImageDrop,
+): (TextContent | ImageContent)[] | undefined {
+	let clamped: (TextContent | ImageContent)[] | undefined;
+	for (let index = 0; index < content.length; index++) {
+		const part = content[index];
+		if (part.type === "image" && drop(part)) {
+			clamped ??= content.slice(0, index);
+			continue;
 		}
-		case "user":
-		case "developer":
-			if (typeof message.content === "string") return message;
-			return inheritContextIdentity(
-				{ ...message, content: withoutOldestImages(message.content, drops), providerPayload: undefined },
-				message,
-			);
+		clamped?.push(part);
 	}
+	// An image-only message would otherwise go out empty; converters skip
+	// zero-block messages, silently losing the turn (e.g. an oversized pasted image).
+	return clamped && clamped.length === 0 ? [IMAGE_OMISSION] : clamped;
+}
+
+/**
+ * `context` without the input images `drop` selects, oldest first. A clamped
+ * message stands for the same message: the same drops recur on every request
+ * until the next step, and state kept per message across requests (the
+ * date/cwd reminder's first turn) holds.
+ */
+function clampImages(context: Context, drop: ImageDrop): Context {
+	let messages: Message[] | undefined;
+	for (let index = 0; index < context.messages.length; index++) {
+		const message = context.messages[index];
+		// Assistant images are model outputs no serializer replays (see countImages).
+		if (message.role === "assistant" || !Array.isArray(message.content)) continue;
+		const content = clampContent(message.content, drop);
+		if (!content) continue;
+		messages ??= context.messages.slice();
+		// A replayed native user payload still carries the dropped images.
+		messages[index] = inheritContextIdentity(
+			message.role === "toolResult" ? { ...message, content } : { ...message, content, providerPayload: undefined },
+			message,
+		);
+	}
+	return messages ? { ...context, messages } : context;
 }
 
 /**
  * Drops oldest transient image blocks so outgoing vision requests fit the active provider's image cap.
  *
- * {@link countImages} counts exactly the roles this switch can drop, so the
+ * {@link countImages} counts exactly the roles {@link clampImages} can drop, so the
  * budget is always fully spendable and the clamp never evicts an input image
  * on behalf of a model output.
  */
 export function clampProviderContextImages(context: Context, model: Model): Context {
 	if (!model.input.includes("image")) return context;
-	const limit = providerImageBudget(model.provider);
+	const limit = providerImageBudget(model);
 	const totalImages = countImages(context);
 	if (totalImages <= limit) return context;
+	let drops = steppedExcess(totalImages, limit);
+	return clampImages(context, () => drops-- > 0);
+}
 
-	// Dropping exactly the excess moves the oldest kept image on every request that
-	// adds one, which rewrites the whole cached prompt each time. Dropping in steps of
-	// a quarter of the cap changes the dropped set, and the prompt, once per step.
-	const step = Math.max(1, Math.floor(limit / 4));
-	let remainingDrops = Math.min(totalImages, Math.ceil((totalImages - limit) / step) * step);
-	const messages = context.messages.map(message => {
-		if (message.role === "assistant" || remainingDrops <= 0 || !Array.isArray(message.content)) return message;
-		const drops = Math.min(remainingDrops, message.content.filter(part => part.type === "image").length);
-		if (drops === 0) return message;
-		remainingDrops -= drops;
-		return clampedMessage(message, drops);
+/**
+ * Drops oldest inline image blocks so their base64 fits the deployment's request-body budget,
+ * in the same steps as the image cap. Runs after URL/provider-file decoration: blocks the
+ * provider receives as references carry no inline bytes.
+ */
+export function clampProviderContextImageBytes(context: Context, model: Model): Context {
+	if (!model.input.includes("image")) return context;
+	const byteBudget = resolveInlineImageByteBudget(model, reachesOfficialEndpoint(model));
+	if (byteBudget === undefined) return context;
+	let inlineBytes = 0;
+	for (const message of context.messages) {
+		// Assistant images are model outputs no serializer replays (see countImages).
+		if (message.role === "assistant" || !Array.isArray(message.content)) continue;
+		for (const part of message.content) {
+			if (part.type === "image") inlineBytes += inlineImageBytes(part, model);
+		}
+	}
+	if (inlineBytes <= byteBudget) return context;
+	let excessBytes = steppedExcess(inlineBytes, byteBudget);
+	return clampImages(context, image => {
+		if (excessBytes <= 0) return false;
+		const bytes = inlineImageBytes(image, model);
+		excessBytes -= bytes;
+		return bytes > 0;
 	});
-	return { ...context, messages };
+}
+
+/**
+ * Caps snapcompact archive frames at `model`'s frame payload budget.
+ *
+ * The archive is sized when the agent context is built, for the model active then. A later switch to a host with a
+ * smaller budget (`/model`, cycling, retry and role fallbacks, prewalk hand-offs, context promotion, an advisor on
+ * another host) would otherwise resend the larger archive, and hosts without an inline byte budget have no other clamp.
+ * Archive frames are the images of summary (rewritten-history) user messages. A capped summary stands for the same
+ * message, as a clamped one does.
+ */
+export function capArchiveFrameBytes(context: Context, model: Model): Context {
+	const budget = frameDataBytesBudget(model);
+	let messages: Message[] | undefined;
+	for (let index = 0; index < context.messages.length; index++) {
+		const message = context.messages[index];
+		if (message.role !== "user" || message.historyRewriteAt === undefined || !Array.isArray(message.content)) {
+			continue;
+		}
+		const content = capFrameDataBytes(message.content, budget);
+		if (content === message.content) continue;
+		messages ??= context.messages.slice();
+		messages[index] = inheritContextIdentity({ ...message, content }, message);
+	}
+	return messages ? { ...context, messages } : context;
 }
 
 /**

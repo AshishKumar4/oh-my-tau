@@ -30,6 +30,7 @@ import {
 	getSearchProvider,
 	type SearchProvider,
 } from "./provider";
+import { rankXAIProviders, targetsX, xaiModelChain, xSearchAvailable } from "./providers/xai";
 import { applyQueryConstraints, parseSearchQuery } from "./query";
 import {
 	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
@@ -178,6 +179,17 @@ function expandHostedCandidate(
 	return models.map(model => ({ ...candidate, model }));
 }
 
+/**
+ * Move the chain's xAI-grounded candidates to the front, keeping their order,
+ * or prepend {@link xaiModelChain} when the chain has none. Unchanged without
+ * xAI credentials.
+ */
+function preferXAI(chain: RoleChainCandidate[], modelRegistry: ModelRegistry): RoleChainCandidate[] {
+	const xai = chain.filter(candidate => candidate.model.webSearch === "xai");
+	if (xai.length > 0) return [...xai, ...chain.filter(candidate => candidate.model.webSearch !== "xai")];
+	return [...xaiModelChain(modelRegistry, settings).map(model => ({ model, explicit: false })), ...chain];
+}
+
 /** Execute web search */
 async function executeSearch(
 	_toolCallId: string,
@@ -195,9 +207,14 @@ async function executeSearch(
 					: [];
 			})()
 		: resolveRoleChain("web", settings, pool);
-	const expanded = candidates.flatMap(candidate => expandHostedCandidate(candidate, options.sessionModel, pool));
-
 	const parsedQuery = parseSearchQuery(params.query);
+	let expanded = rankXAIProviders(
+		candidates.flatMap(candidate => expandHostedCandidate(candidate, options.sessionModel, pool)),
+		candidate => candidate.model,
+		settings,
+	);
+	// Only xAI reaches X posts; X-only queries try it first even when the role prefers another engine.
+	if (!params.model && targetsX(parsedQuery)) expanded = preferXAI(expanded, modelRegistry);
 
 	// Invariant across candidates; resolve once before walking the role chain.
 	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;
@@ -381,6 +398,16 @@ export async function runSearchQuery(
 	}
 }
 
+/** Description without the X operators, for hosts without a model registry. */
+const plainDescription = prompt.render(webSearchDescription);
+
+/**
+ * Description rendered on first read with a model registry, then reused for
+ * the process: re-checking xAI auth per read would rewrite the tool
+ * description, and invalidate the prompt cache, whenever auth changes.
+ */
+let registryDescription: string | undefined;
+
 /**
  * Web search tool implementation.
  *
@@ -390,11 +417,17 @@ export class WebSearchTool implements AgentTool<WebSearchInputSchema, SearchResu
 	readonly name = "web_search";
 	readonly approval = "read" as const;
 	readonly label = "Web Search";
-	/** Claude Code's `WebSearch` describes its own fields when no vendor declaration is served. */
+	/**
+	 * Claude Code's `WebSearch` describes its own fields when no vendor declaration is
+	 * served. The native description advertises X search operators when xAI credentials
+	 * existed at the process's first read.
+	 */
 	get description(): string {
-		return this.parameters === claudeCodeWebSearchSchema
-			? prompt.render(claudeCodeWebSearchDescription)
-			: this.#nativeDescription;
+		if (this.parameters === claudeCodeWebSearchSchema) return prompt.render(claudeCodeWebSearchDescription);
+		const modelRegistry = this.#session.modelRegistry;
+		if (!modelRegistry) return plainDescription;
+		registryDescription ??= prompt.render(webSearchDescription, { xSearch: xSearchAvailable(modelRegistry) });
+		return registryDescription;
 	}
 	get parameters(): WebSearchInputSchema {
 		return harnessParameters(this.#session, WEB_SEARCH_BRIDGES, webSearchSchema);
@@ -404,11 +437,9 @@ export class WebSearchTool implements AgentTool<WebSearchInputSchema, SearchResu
 	readonly summary = "Search the web for up-to-date information";
 
 	#session: ToolSession;
-	readonly #nativeDescription: string;
 
 	constructor(session: ToolSession) {
 		this.#session = session;
-		this.#nativeDescription = prompt.render(webSearchDescription);
 	}
 
 	async execute(
@@ -435,7 +466,7 @@ export class WebSearchTool implements AgentTool<WebSearchInputSchema, SearchResu
 export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchResultDetails> = {
 	name: "web_search",
 	label: "Web Search",
-	description: prompt.render(webSearchDescription),
+	description: plainDescription,
 	parameters: webSearchSchema,
 
 	approval: "read",

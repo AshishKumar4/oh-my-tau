@@ -1,6 +1,7 @@
 import { scheduler } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
 import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	applyCodexResidencyHeader,
@@ -8,6 +9,7 @@ import {
 	CODEX_CLIENT_VERSION,
 	codexRoutingHint,
 	getCodexAccountId,
+	isOfficialCodexApiUrl,
 	OPENAI_HEADER_VALUES,
 	OPENAI_HEADERS,
 } from "@oh-my-pi/pi-catalog/wire/codex";
@@ -15,6 +17,7 @@ import {
 	$env,
 	$flag,
 	asRecord,
+	cloneJsonTree,
 	fetchWithRetry,
 	getInstallId,
 	isRecord,
@@ -26,8 +29,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { parseToolCallArguments, replayableToolCallArguments } from "../utils/tool-call-arguments";
-import { getEnvApiKey, isOfficialCodexApiUrl } from "../stream";
-import { getPremiumServiceTierRequests, parseServiceTier } from "../types";
+import { getEnvApiKey } from "../env-api-key";
 import { bindResponsesReplayItem } from "../utils/block-symbols";
 import type {
 	Api,
@@ -51,7 +53,9 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "../types";
+import { getPremiumServiceTierRequests, parseServiceTier } from "../types";
 import {
+	clampOpenAIResponsesImageDetailForReplay,
 	createOpenAIResponsesHistoryPayload,
 	dropMalformedOpenAIResponsesToolCalls,
 	getOpenAIResponsesHistoryItems,
@@ -83,6 +87,7 @@ import {
 	type CodexRequestOptions,
 	type InputItem,
 	type ReasoningConfig,
+	lowestCodexWireEffort,
 	type RequestBody,
 	resolveCodexResponsesLite,
 	sanitizeCodexCallId,
@@ -104,10 +109,10 @@ import { getOpenAICodexWebSocketEnvValue, isOpenAICodexWebSocketPreferred } from
 export { setCodexAttestationProvider } from "./openai-codex-attestation";
 export type { CodexAttestationProvider } from "./openai-codex-attestation";
 import {
-	getOpenAIEffortControlState,
-	releaseOpenAIEffortControlSession,
 	type OpenAIEffortControlState,
 	planStableOpenAIEffort,
+	releaseOpenAIEffortControlSession,
+	resolveOpenAIEffortControlState,
 } from "./openai-configuration-update";
 import type {
 	NamespaceTool,
@@ -153,18 +158,26 @@ import {
 	normalizeOpenAIPromptCacheKey,
 	populateResponsesUsageFromResponse,
 	promoteResponsesToolUseStopReason,
+	settleReasoningSummary,
 	type SequentialCutoffSummaryState,
 } from "./openai-shared";
 import {
 	buildHarnessToolNames,
 	declaredToolNames,
 	type HarnessToolNames,
+	normalizeToolCallId,
 	redactSensitiveInObject,
 	transformMessages,
 } from "./transform-messages";
 
 export interface OpenAICodexResponsesOptions extends StreamOptions {
 	reasoning?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	/**
+	 * Run with the least reasoning the model allows; takes precedence over
+	 * `reasoning`. Sends the `none` tier where the catalog's disable mode is
+	 * `none-effort`, else the model's lowest supported effort.
+	 */
+	disableReasoning?: boolean;
 	reasoningSummary?: "auto" | "concise" | "detailed" | null;
 	/** Explicit `reasoning.context` replay scope. Omitted by default so Codex applies its native request policy. */
 	reasoningContext?: CodexReasoningContext;
@@ -295,7 +308,14 @@ const CODEX_WEBSOCKET_FIRST_EVENT_TIMEOUT_MS = Number($env.PI_CODEX_WEBSOCKET_FI
 const CODEX_WEBSOCKET_RETRY_BUDGET = Number($env.PI_CODEX_WEBSOCKET_RETRY_BUDGET || CODEX_MAX_RETRIES);
 const CODEX_WEBSOCKET_RETRY_DELAY_MS = Number($env.PI_CODEX_WEBSOCKET_RETRY_DELAY_MS || CODEX_RETRY_DELAY_MS);
 const CODEX_WEBSOCKET_TRANSPORT_ERROR_PREFIX = "Codex websocket transport error";
-const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
+// The native-lane steering rejection is replayable: the session stops steering
+// first, so the replay cannot trip it again.
+const CODEX_RETRYABLE_EVENT_CODES = new Set([
+	"model_error",
+	"server_error",
+	"internal_error",
+	AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE,
+]);
 const CODEX_RETRYABLE_EVENT_MESSAGE =
 	/processing your request|retry your request|temporar(?:y|ily)|overloaded|service.?unavailable|internal error|server error/i;
 const CODEX_PROVIDER_SESSION_STATE_KEY = "openai-codex-responses";
@@ -461,6 +481,8 @@ type CodexWebSocketSessionState = {
 	 * pending tool output; see {@link planSteeredRequest}.
 	 */
 	acceptedSteering?: { connection: CodexWebSocketConnection; steers: CodexAcceptedSteer[] };
+	/** The server refused steering for this session (native turn lane); later responses are not steered. */
+	steeringUnsupported?: boolean;
 	lastTransport?: CodexTransport;
 	fallbackCount: number;
 	lastFallbackAt?: number;
@@ -492,12 +514,43 @@ interface CodexMetadataSessionState {
 	compactionOperationId?: string;
 	reuseTurnForNextRequest?: boolean;
 	turnStates: Map<string, CodexTurnStateCell>;
+	/**
+	 * Fork lineage this conversation's last request projected; a side request
+	 * of the conversation routes with it too.
+	 */
+	lineage?: CodexProjectedLineage;
+}
+
+/** What a forked child's request sends in place of its own routing. */
+interface CodexProjectedLineage {
+	/** The fork root's session, sent in the session headers. */
+	sessionId: string;
+	/** The fork root's prompt-cache key, sent when the caller pinned none. */
+	promptCacheKey?: string;
+}
+
+/**
+ * Routing a side request (`parentSessionId`) shares with its parent's own
+ * requests, so the backend's prompt-cache affinity lands on the same cache.
+ */
+interface CodexSideAffinity {
+	/** The parent's transport session: its `conversation_id`. */
+	conversationId: string;
+	/** The parent's projected session: its fork root, else `conversationId`. */
+	sessionId: string;
+	/** The fork root's prompt-cache key, when the parent sends it in place of its own. */
+	promptCacheKey?: string;
 }
 
 interface CodexCompatibilityIdentity {
 	installationId: string;
 	/** Effective lineage session id — the child's own, or the shared root on forks. */
 	sessionId: string;
+	/**
+	 * A side request's parent routing, sent in the session headers in place of
+	 * its own. Turn metadata keeps `sessionId`.
+	 */
+	affinity?: CodexSideAffinity;
 	threadId: string;
 	windowId: string;
 	/** Fork source thread id; projects `x-codex-parent-thread-id`/`forked_from_thread_id`. */
@@ -648,6 +701,7 @@ function createCodexRequestMetadata(
 		 * the child keeps its own thread/window/turn cells.
 		 */
 		forkSource?: CodexRequestSnapshot;
+		affinity?: CodexSideAffinity;
 	},
 ): CodexRequestMetadata {
 	if (options.startNewTurn || !session.turnId) {
@@ -722,6 +776,7 @@ function createCodexRequestMetadata(
 		...identity,
 		sessionId: effectiveSessionId,
 		parentThreadId,
+		affinity: options.affinity,
 		turnId: session.turnId,
 		turnMetadataJson,
 		turnMetadataHeaderJson,
@@ -730,7 +785,7 @@ function createCodexRequestMetadata(
 }
 
 function applyCodexCompatibilityHeaders(headers: Headers, metadata: CodexCompatibilityIdentity): void {
-	headers.set(OPENAI_HEADERS.SCOPED_SESSION_ID, metadata.sessionId);
+	headers.set(OPENAI_HEADERS.SCOPED_SESSION_ID, metadata.affinity?.sessionId ?? metadata.sessionId);
 	headers.set(OPENAI_HEADERS.THREAD_ID, metadata.threadId);
 	headers.set(OPENAI_HEADERS.WINDOW_ID, metadata.windowId);
 	if (metadata.parentThreadId) {
@@ -1403,25 +1458,37 @@ function getCodexServiceTierCostMultiplier(
 	model: Pick<Model<"openai-codex-responses">, "serviceTierCost">,
 	serviceTier: ServiceTier | "default" | undefined,
 ): number {
+	// The subscription route draws on included plan usage, so its cost is the
+	// usage-equivalent: each tier's multiplier comes from the catalog table, which
+	// uses OpenAI's included-usage rates (Astra: Fast 2.5x, Ultrafast 8x). A tier
+	// with no entry stays at 1x rather than an invented multiplier.
 	if (serviceTier !== "flex" && serviceTier !== "priority" && serviceTier !== "ultrafast") return 1;
 	return model.serviceTierCost?.[serviceTier] ?? 1;
 }
 
 /**
- * Codex's default/auto echo does not identify a tier. Use the actual sent tier
- * for those echoes; an explicit non-default echo remains authoritative.
+ * The tier a Codex turn was served at. The Codex backend echoes
+ * `service_tier: "default"` on turns it serves at the sent tier (a `priority`
+ * turn decodes at Fast speed yet reports `default`), so a `default` or `auto`
+ * echo carries no information and, like an absent one, resolves to the sent
+ * tier, or `default` when none was sent. Any other echo (`flex`, `priority`,
+ * `ultrafast`, `scale`) is authoritative. The tier's identity is preserved even
+ * when it has no pricing entry (`scale`), because the recorded tier also drives
+ * premium-request and speed accounting. The echo cannot reveal a genuine
+ * downgrade, so a downgraded turn is recorded at the sent tier.
  */
-function resolveCodexCostServiceTier(res: ServiceTier | undefined, req?: ServiceTier): ServiceTier {
-	return res !== undefined && res !== "default" && res !== "auto" ? res : (req ?? "default");
+function resolveCodexCostServiceTier(res: ServiceTier | undefined, req?: unknown): ServiceTier {
+	if (res !== undefined && res !== "default" && res !== "auto") return res;
+	return parseServiceTier(req) ?? "default";
 }
 
 function applyCodexServiceTierPricing(
 	model: Pick<Model<"openai-codex-responses">, "provider" | "api" | "identity" | "serviceTierCost">,
 	usage: AssistantMessage["usage"],
 	resTier: ServiceTier | undefined,
-	reqTier: ServiceTier | undefined,
+	reqTier: unknown,
 ): ServiceTier {
-	const resolvedTier = resolveCodexCostServiceTier(resTier, reqTier);
+	const resolvedTier = resolveCodexCostServiceTier(resTier, reqTier) ?? "default";
 	usage.premiumRequests ??= getPremiumServiceTierRequests(resolvedTier, model, { served: true });
 	const multiplier = getCodexServiceTierCostMultiplier(model, resolvedTier);
 	if (multiplier === 1) return resolvedTier;
@@ -1470,6 +1537,41 @@ function getCodexForkSource(
 	// derives from these two ids; a blank one cannot name a lineage root.
 	if (source.sessionId.trim().length === 0 || source.threadId.trim().length === 0) return undefined;
 	return source;
+}
+
+/** Records the fork lineage a request projects, for the conversation's side requests. */
+function recordCodexProjectedLineage(
+	metadataSession: CodexMetadataSessionState,
+	forkSource: CodexRequestSnapshot | undefined,
+	options: OpenAICodexResponsesOptions | undefined,
+): void {
+	metadataSession.lineage = forkSource && {
+		sessionId: forkSource.sessionId,
+		promptCacheKey: options?.promptCacheKey === undefined ? forkSource.promptCacheKey : undefined,
+	};
+}
+
+/**
+ * A side request routes like its parent conversation's own requests: their
+ * `conversation_id`, the session id they project (a forked parent's root,
+ * recorded by its last request in this provider state), and the fork root's
+ * prompt-cache key when they send it. A side request keyed by its parent's
+ * own session id carries no pinned key, so like its parent it takes the
+ * root's. The effort state a side request copies stays keyed by
+ * `parentSessionId` itself.
+ */
+function resolveCodexSideAffinity(options: OpenAICodexResponsesOptions | undefined): CodexSideAffinity | undefined {
+	const conversationId = normalizeOpenAIPromptCacheKey(options?.parentSessionId);
+	if (!conversationId) return undefined;
+	const lineage = getCodexProviderSessionState(options?.providerSessionState)?.metadataSessions.get(
+		conversationId,
+	)?.lineage;
+	const unpinned = normalizeOpenAIPromptCacheKey(options?.promptCacheKey) === conversationId;
+	return {
+		conversationId,
+		sessionId: lineage?.sessionId ?? conversationId,
+		promptCacheKey: unpinned ? lineage?.promptCacheKey : undefined,
+	};
 }
 
 function createRequestSetup(options: OpenAICodexResponsesOptions | undefined): CodexRequestSetup {
@@ -1564,6 +1666,8 @@ function createCodexRequestContext(
 	}
 	const metadataSessionId = transportSessionId ?? crypto.randomUUID();
 	const metadataSession = getOrCreateCodexMetadataSessionState(metadataSessionId, providerSessionState);
+	const forkSource = getCodexForkSource(model, options);
+	recordCodexProjectedLineage(metadataSession, forkSource, options);
 	const compaction = options?.codexCompaction;
 	const requestKind: OpenAICodexRequestKind = compaction ? "compaction" : "turn";
 	const startNewTurn = resolveCodexStartNewTurn(metadataSession, requestKind, compaction, contextOptions.startNewTurn);
@@ -1588,7 +1692,8 @@ function createCodexRequestContext(
 				: resolveHarnessProfile(model)) === "codex"
 				? undefined
 				: options?.toolNamespacesInfo,
-		forkSource: getCodexForkSource(model, options),
+		forkSource,
+		affinity: resolveCodexSideAffinity(options),
 	});
 	transformedBody.client_metadata = requestMetadata.clientMetadata;
 	return {
@@ -1618,7 +1723,8 @@ async function buildCodexRequestContext(
 	const forkSource = getCodexForkSource(model, options);
 	const promptCacheKey = getOpenAIPromptCacheKey({
 		...options,
-		promptCacheKey: options?.promptCacheKey ?? forkSource?.promptCacheKey,
+		promptCacheKey:
+			resolveCodexSideAffinity(options)?.promptCacheKey ?? options?.promptCacheKey ?? forkSource?.promptCacheKey,
 	});
 	const transformedBody = await buildTransformedCodexRequestBody(model, context, options, promptCacheKey);
 	return createCodexRequestContext(model, transformedBody, options, {
@@ -1696,6 +1802,22 @@ function isCodexForkCatalogCompatible(
 		}
 	}
 	return true;
+}
+
+/**
+ * Codex reasoning controls for the caller's request. `forceReasoningOff` always
+ * sends the `none` tier. `disableReasoning` follows the catalog disable mode:
+ * `none` where the model accepts it, else the lowest supported effort —
+ * omitting effort would let the backend apply its default tier instead.
+ */
+function codexReasoningControls(
+	model: Model<"openai-codex-responses">,
+	options: OpenAICodexResponsesOptions | undefined,
+): Pick<CodexRequestOptions, "reasoningEffort" | "reasoningOff"> {
+	if (options?.forceReasoningOff) return { reasoningOff: true };
+	if (!options?.disableReasoning) return { reasoningEffort: options?.reasoning };
+	if (model.reasoning && model.compat.reasoningDisableMode === "none-effort") return { reasoningOff: true };
+	return { reasoningEffort: getSupportedEfforts(model)[0] };
 }
 
 /** Serialize normal Codex turns and V2 compaction with the same cacheable prefix. */
@@ -1789,8 +1911,7 @@ export async function buildTransformedCodexRequestBody(
 		params.client_metadata = { ...options.clientMetadata };
 	}
 	const codexOptions: CodexRequestOptions = {
-		reasoningEffort: options?.reasoning,
-		reasoningOff: options?.forceReasoningOff,
+		...codexReasoningControls(model, options),
 		reasoningSummary: options?.reasoningSummary,
 		reasoningContext: options?.reasoningContext,
 		textVerbosity: options?.textVerbosity,
@@ -1820,7 +1941,7 @@ function relocateCodexHarnessToolSurface(body: RequestBody): void {
 
 /**
  * Keep the request-level effort byte-stable across a conversation and carry
- * later changes as `configuration_update` items (the GPT-6 SKUs). Requires a
+ * later changes as `configuration_update` items (GPT-6 family). Requires a
  * session id and provider session state to remember the baseline; without
  * them every request stands alone and sends its own effort.
  */
@@ -1835,8 +1956,17 @@ function applyCodexStableEffort(
 	const providerState = getCodexProviderSessionState(options?.providerSessionState);
 	const sessionId = normalizeOpenAIPromptCacheKey(options?.sessionId);
 	if (!providerState || !sessionId) return;
-	const state = getOpenAIEffortControlState(providerState.effortControls, `${model.id}\u0000${sessionId}`, sessionId);
-	body.reasoning = { ...body.reasoning, effort: planStableOpenAIEffort(state, body.input, effort) };
+	const state = resolveOpenAIEffortControlState(
+		providerState.effortControls,
+		id => `${model.id}\u0000${id}`,
+		sessionId,
+		normalizeOpenAIPromptCacheKey(options?.parentSessionId),
+	);
+	const lowest = options?.minimizeEffort ? lowestCodexWireEffort(model) : undefined;
+	body.reasoning = {
+		...body.reasoning,
+		effort: planStableOpenAIEffort(state, body.input, effort, lowest === "none" ? undefined : lowest),
+	};
 }
 
 async function openInitialCodexEventStream(
@@ -2091,7 +2221,7 @@ async function openCodexWebSocketTransport(
 			liveSteers.flatMap(steer => steer.items),
 		);
 		if (plan.kind === "attach") {
-			const requestBodyForState = structuredCloneJSON(requestContext.transformedBody);
+			const requestBodyForState = cloneJsonTree(requestContext.transformedBody);
 			// Attachment consumes an existing response; it sends no new tier control.
 			if (websocketState.lastRequest?.service_tier === undefined) delete requestBodyForState.service_tier;
 			else requestBodyForState.service_tier = websocketState.lastRequest.service_tier;
@@ -2148,10 +2278,11 @@ async function openCodexWebSocketTransport(
 		websocketRequest = replacementWebsocketRequest as typeof websocketRequest;
 	}
 	recordCodexTurnRequestDiagnostics(websocketState, websocketRequest, "websocket", canAppendBeforeRequest);
-	const requestBodyForState = structuredCloneJSON(requestContext.transformedBody);
-	// `onPayload` may rewrite the outgoing frame (e.g. drop `stream_options`);
-	// recorded state must reflect what was actually sent — the sequential-cutoff
-	// summary decoder keys off it.
+	const requestBodyForState = cloneJsonTree(requestContext.transformedBody);
+	// `onPayload` may rewrite the outgoing frame (e.g. drop `stream_options` or
+	// change `service_tier`); recorded state must reflect what was actually
+	// sent — the sequential-cutoff summary decoder and the served-tier
+	// fallback key off it.
 	if (websocketRequest.stream_options === undefined) {
 		delete requestBodyForState.stream_options;
 	} else {
@@ -2253,7 +2384,17 @@ async function openCodexSseTransport(
 		wireBody = replacementWireBody as RequestBody;
 	}
 	recordCodexTurnRequestDiagnostics(state, wireBody, "sse", canAppendBeforeRequest);
-	return { eventStream: await open(wireBody), requestBodyForState: structuredCloneJSON(wireBody), transport: "sse" };
+	// SSE turns never chain, so later reads need only the per-turn knobs (summary
+	// delivery, service tier) plus what the fork snapshot records (sent input,
+	// cache key). Those are referenced, not copied: the snapshot clones them.
+	const requestBodyForState: RequestBody = {
+		model: wireBody.model,
+		input: wireBody.input,
+		prompt_cache_key: wireBody.prompt_cache_key,
+		stream_options: wireBody.stream_options ? { ...wireBody.stream_options } : undefined,
+		service_tier: wireBody.service_tier,
+	};
+	return { eventStream: await open(wireBody), requestBodyForState, transport: "sse" };
 }
 
 function isJsonWhitespaceOnly(value: string): boolean {
@@ -2718,11 +2859,13 @@ class CodexStreamProcessor {
 	/** Start delivering caller steering into the response `response.created` announced. */
 	#startSteering(rawEvent: Record<string, unknown>): void {
 		const source = this.options?.liveSteering;
-		const connection = this.runtime.websocketState?.connection;
+		const state = this.runtime.websocketState;
+		const connection = state?.connection;
 		const responseId = asRecord(rawEvent.response)?.id;
 		if (
 			!source ||
 			!connection ||
+			state?.steeringUnsupported ||
 			this.#steerPump ||
 			typeof responseId !== "string" ||
 			this.runtime.transport !== "websocket" ||
@@ -2780,6 +2923,7 @@ class CodexStreamProcessor {
 		if (entry?.block?.type !== "thinking") return;
 		for (const delta of this.runtime.takeSummaryDeltas(entry)) {
 			entry.block.thinking += delta;
+			entry.block.summary = true;
 			this.stream.push({
 				type: "thinking_delta",
 				contentIndex: entry.contentIndex,
@@ -2792,7 +2936,7 @@ class CodexStreamProcessor {
 		const { runtime, output, stream } = this;
 		const rawItem = rawEvent.item;
 		if (!rawItem || typeof rawItem !== "object") return;
-		const item = structuredCloneJSON(rawItem) as CodexEventItem;
+		const item = cloneJsonTree(rawItem) as CodexEventItem;
 		if (item.type === "image_generation_call" && item.result) item.status = "completed";
 
 		// Match the finalization to the OPEN ITEM that started this block, not the
@@ -2825,6 +2969,7 @@ class CodexStreamProcessor {
 				this.#sequentialCutoffSummaries ? this.runtime.cutoffSummaries : undefined,
 			);
 			block.thinkingSignature = JSON.stringify(item);
+			settleReasoningSummary(item, block);
 			stream.push({
 				type: "thinking_end",
 				contentIndex,
@@ -2850,11 +2995,17 @@ class CodexStreamProcessor {
 		}
 
 		if (item.type === "function_call") {
+			const partial = block?.type === "toolCall" ? block[kStreamingPartialJson] : undefined;
 			const toolCall: ToolCall = {
 				type: "toolCall",
 				id: encodeResponsesToolCallId(item.call_id, item.id),
 				name: resolveCodexNamespacedToolName(item.name, item.namespace, this.harnessToolNames),
-				arguments: parseToolCallArguments(item.arguments),
+				// An empty terminal item falls back to what `.delta`/`.done` already delivered.
+				arguments: item.arguments
+					? parseToolCallArguments(item.arguments)
+					: block?.type === "toolCall" && !partial
+						? block.arguments
+						: parseToolCallArguments(partial),
 				...(item.namespace ? { namespace: item.namespace } : {}),
 			};
 			item.arguments = replayableToolCallArguments(item.arguments, toolCall.arguments);
@@ -2928,10 +3079,7 @@ class CodexStreamProcessor {
 		const response = rawResponse && typeof rawResponse === "object" ? rawResponse : undefined;
 		const responseId = response && "id" in response && typeof response.id === "string" ? response.id : undefined;
 		const usage = response && "usage" in response ? parseCodexResponseUsage(response.usage) : undefined;
-		const serviceTier =
-			response && "service_tier" in response && typeof response.service_tier === "string"
-				? parseServiceTier(response.service_tier)
-				: undefined;
+		const serviceTier = response && "service_tier" in response ? parseServiceTier(response.service_tier) : undefined;
 		const status = response && "status" in response ? parseCodexResponseStatus(response.status) : undefined;
 		const endTurn = response && "end_turn" in response ? response.end_turn : undefined;
 
@@ -2964,10 +3112,13 @@ class CodexStreamProcessor {
 				// baseline, which no longer matches the transcript.
 				resetCodexWebSocketAppendState(state);
 			} else {
-				state.lastRequest = structuredCloneJSON(runtime.requestBodyForState);
+				// requestBodyForState is already a private copy and is not mutated after
+				// the request, so the append baseline takes ownership of it.
+				state.lastRequest = runtime.requestBodyForState;
 				const nativeOutputItems = runtime.finalizeNativeOutputItems();
 				const replayableResponseItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
-					structuredCloneJSON(nativeOutputItems),
+					cloneJsonTree(nativeOutputItems),
+					{ supportsImageDetailOriginal: model.compat.supportsImageDetailOriginal },
 				);
 				if (responseId && replayableResponseItems && replayableResponseItems.length === nativeOutputItems.length) {
 					state.lastResponseId = responseId;
@@ -2989,12 +3140,11 @@ class CodexStreamProcessor {
 		finalizePendingResponsesToolCalls(output);
 
 		calculateCost(model, output.usage, output.timestamp);
-		const sentTier = runtime.requestBodyForState.service_tier;
 		output.serviceTier = applyCodexServiceTierPricing(
 			model,
 			output.usage,
 			serviceTier,
-			parseServiceTier(typeof sentTier === "string" ? sentTier : undefined),
+			runtime.requestBodyForState.service_tier,
 		);
 		output.stopReason = mapOpenAIResponsesStopReason(steered ? "completed" : status);
 		promoteResponsesToolUseStopReason(
@@ -3054,7 +3204,28 @@ class CodexStreamProcessor {
 		}
 	}
 
+	/**
+	 * The native turn lane rejected our steering and dropped the response with
+	 * its socket: stop steering this session and forget the dead socket so the
+	 * provider retry replays on a fresh one.
+	 */
+	#stopSteeringOnNativeLaneRejection(error: unknown): void {
+		const state = this.runtime.websocketState;
+		if (
+			!state ||
+			!(error instanceof CodexProviderStreamError) ||
+			error.code !== AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE
+		) {
+			return;
+		}
+		state.steeringUnsupported = true;
+		state.connection?.close("native-lane-steer-rejected");
+		state.connection = undefined;
+		resetCodexWebSocketAppendState(state);
+	}
+
 	async #recoverStreamError(error: unknown): Promise<boolean> {
+		this.#stopSteeringOnNativeLaneRejection(error);
 		if (
 			error instanceof CodexSteerCommitError &&
 			this.runtime.websocketState &&
@@ -3424,6 +3595,9 @@ class CodexStreamProcessor {
 		this.runtime.sawTerminalEvent = false;
 		resetOutputState(this.output);
 		this.firstTokenTime = undefined;
+		if (this.requestSetup.requestAbortController.signal.aborted) {
+			this.requestSetup = createRequestSetup(this.options);
+		}
 		await scheduler.wait(CODEX_RETRY_DELAY_MS * this.runtime.providerRetryAttempt, {
 			signal: this.requestSetup.requestSignal,
 		});
@@ -3618,6 +3792,7 @@ export async function prewarmOpenAICodexResponses(
 		| "providerSessionState"
 		| "responsesLite"
 		| "codexFork"
+		| "serviceTier"
 	>,
 ): Promise<void> {
 	const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
@@ -3643,9 +3818,15 @@ export async function prewarmOpenAICodexResponses(
 	// A forked child must warm a socket bound to the shared root lineage —
 	// headers are fixed at handshake, so the later real request can only reuse
 	// this connection when it projects the same session identity.
-	const requestIdentity = createCodexCompatibilityIdentity(metadataSession, getCodexForkSource(model, options));
+	const forkSource = getCodexForkSource(model, options);
+	recordCodexProjectedLineage(metadataSession, forkSource, options);
+	const requestIdentity = createCodexCompatibilityIdentity(metadataSession, forkSource);
 	const attestation = await getCodexAttestationHeader(accountId);
 	if (state.lifetime.signal.aborted || options?.signal?.aborted) return;
+	const routedRequest: Pick<RequestBody, "model" | "service_tier"> = {
+		model: model.requestModelId ?? model.id,
+	};
+	applyOpenAIServiceTier(routedRequest, options?.serviceTier, model);
 	const headers = logger.time(
 		"prewarmCodex:createHeaders",
 		createCodexHeaders,
@@ -3660,6 +3841,7 @@ export async function prewarmOpenAICodexResponses(
 		responsesLite,
 		requestIdentity,
 		attestation,
+		routedRequest,
 	);
 	await logger.time(
 		"prewarmCodex:establishWs",
@@ -3854,13 +4036,6 @@ export function getOpenAICodexTransportDetails(
 	};
 }
 
-const codexDiagnosticsTextEncoder = new TextEncoder();
-
-function jsonByteLength(value: unknown): number {
-	const json = JSON.stringify(value);
-	return codexDiagnosticsTextEncoder.encode(json === undefined ? "undefined" : json).byteLength;
-}
-
 function hashJson(value: unknown): string {
 	const json = JSON.stringify(value);
 	return String(Bun.hash(json === undefined ? "undefined" : json));
@@ -3992,7 +4167,7 @@ function buildCodexTurnRequestDiagnostics(
 		inputItemCount: inputItems.length,
 		inputItemTypes,
 		...(inputItemTypes[0] ? { firstInputItemType: inputItemTypes[0] } : {}),
-		inputJsonBytes: jsonByteLength(inputItems),
+		inputJsonBytes: Buffer.byteLength(JSON.stringify(inputItems), "utf8"),
 		...(promptCacheKey !== undefined ? { promptCacheKey } : {}),
 		...(toolsHash !== undefined ? { toolsHash } : {}),
 		optionsHash: createCodexOptionsHash(request),
@@ -4020,6 +4195,8 @@ function recordCodexTurnRequestDiagnostics(
 		state.stats.lastDeltaInputItems = undefined;
 		state.stats.lastPreviousResponseId = undefined;
 	}
+	// Measured at send time: the request object may be reused or mutated by an
+	// `onPayload` hook afterwards, and retaining it would pin the transcript.
 	state.stats.lastTurn = {
 		request: buildCodexTurnRequestDiagnostics(request, transport, canAppendBeforeRequest),
 	};
@@ -4379,6 +4556,11 @@ class CodexWebSocketConnection {
 					this.#handleSteerEvent(parsed);
 					return;
 				}
+				// The native lane answers `response.steer` with a plain `error` that
+				// also ends the response: refuse the submission, then fail the stream.
+				if (parsed.type === "error" && parsed.code === AIError.CODEX_NATIVE_LANE_STEER_REJECTED_CODE) {
+					this.#refuseSteerWaiters(parsed.code, typeof parsed.message === "string" ? parsed.message : undefined);
+				}
 				this.#push(parsed);
 			} catch (error) {
 				notifyCodexWebSocketMalformed(this.#streamObserver, event.data, error);
@@ -4672,6 +4854,12 @@ class CodexWebSocketConnection {
 		return index < 0 ? undefined : this.#steerWaiters.splice(index, 1)[0];
 	}
 
+	#refuseSteerWaiters(code: string, message: string | undefined): void {
+		const waiters = this.#steerWaiters;
+		this.#steerWaiters = [];
+		for (const waiter of waiters) waiter.resolve({ accepted: false, code, message });
+	}
+
 	#rejectSteerWaiters(reason: string): void {
 		const waiters = this.#steerWaiters;
 		if (waiters.length === 0) return;
@@ -4932,10 +5120,12 @@ async function getOrCreateCodexWebSocketConnection(
  * compression is disabled or fails, in which case the caller sends the
  * plain JSON string without a `content-encoding` header.
  */
-function compressCodexRequestBody(bodyJson: string, baseUrl: string): Uint8Array | undefined {
+async function compressCodexRequestBody(bodyJson: string, baseUrl: string): Promise<Uint8Array | undefined> {
 	if (!isOfficialCodexApiUrl(baseUrl) || !$flag("PI_CODEX_ZSTD", true)) return undefined;
 	try {
-		return Bun.zstdCompressSync(bodyJson, { level: 3 });
+		// Off the main thread: SSE sends the full transcript, so multi-MB bodies
+		// would otherwise block the event loop for the whole compression.
+		return await Bun.zstdCompress(bodyJson, { level: 3 });
 	} catch (error) {
 		CODEX_DEBUG &&
 			logger.debug("[codex] codex request body compression failed", {
@@ -5002,7 +5192,7 @@ async function openCodexSseEventStream(
 		}
 	};
 	const bodyJson = JSON.stringify(body);
-	const compressedBody = compressCodexRequestBody(bodyJson, url);
+	const compressedBody = await compressCodexRequestBody(bodyJson, url);
 	if (compressedBody !== undefined) {
 		headers.set("content-encoding", "zstd");
 	}
@@ -5138,8 +5328,12 @@ function createCodexHeaders(
 	// `conversation_id`/`x-client-request-id` stay transport-scoped per child.
 	const forkedSessionId = requestMetadata?.parentThreadId !== undefined ? requestMetadata.sessionId : undefined;
 	if (sessionId) {
-		headers.set(OPENAI_HEADERS.CONVERSATION_ID, sessionId);
-		headers.set(OPENAI_HEADERS.SESSION_ID, forkedSessionId ?? sessionId);
+		// The backend derives prompt-cache affinity from the session headers
+		// (codex-rs `responses_session_id`): a side request shares its parent's,
+		// and a forked child keeps its source's root lineage.
+		const affinity = requestMetadata?.affinity;
+		headers.set(OPENAI_HEADERS.CONVERSATION_ID, affinity?.conversationId ?? sessionId);
+		headers.set(OPENAI_HEADERS.SESSION_ID, forkedSessionId ?? affinity?.sessionId ?? sessionId);
 		headers.set("x-client-request-id", sessionId);
 	} else {
 		headers.delete(OPENAI_HEADERS.CONVERSATION_ID);
@@ -5223,20 +5417,19 @@ export function resolveCodexResponsesUrl(baseUrl: string | undefined): string {
 function convertMessages(model: Model<"openai-codex-responses">, context: Context): ResponseInput {
 	const messages: ResponseInput = [];
 
-	const normalizeToolCallId = (id: string): string => {
+	const normalizeCodexToolCallId = (id: string): string => {
 		const sep = id.search(/[\n|]/);
 		const [callId, itemId] = sep > 0 ? [id.slice(0, sep), id.slice(sep + 1)] : [id, undefined];
 		const normalizedCallId = sanitizeCodexCallId(callId);
-		let sanitizedItemId = (itemId ?? Bun.hash(id).toString(36)).replace(/[^a-zA-Z0-9_-]/g, "_");
-		if (!sanitizedItemId.startsWith("fc")) {
-			sanitizedItemId = `fc_${sanitizedItemId}`;
-		}
-		let normalizedItemId = sanitizedItemId.length > 64 ? sanitizedItemId.slice(0, 64) : sanitizedItemId;
-		normalizedItemId = normalizedItemId.replace(/_+$/, "");
+		const rawItemId = itemId ?? Bun.hash(id).toString(36);
+		const normalizedItemId = normalizeToolCallId(rawItemId.startsWith("fc") ? rawItemId : `fc_${rawItemId}`).replace(
+			/_+$/,
+			"",
+		);
 		return `${normalizedCallId}|${normalizedItemId}`;
 	};
 
-	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
+	const transformedMessages = transformMessages(context.messages, model, normalizeCodexToolCallId);
 	// gpt-5.x reject raw Harmony control-token spellings anywhere in replayed
 	// input, including the model's own tool-call arguments (#6913).
 	const escapeControlTokens = isHarmonyDialectModel(model);
@@ -5258,10 +5451,14 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 			if (historyItems) {
 				const redactedHistoryItems = redactSensitiveInObject(historyItems).result as Array<ResponseInput[number]>;
 				const sanitizedHistoryItems = dropMalformedOpenAIResponsesToolCalls(redactedHistoryItems);
+				const clampedHistoryItems = clampOpenAIResponsesImageDetailForReplay(
+					sanitizedHistoryItems,
+					model.compat.supportsImageDetailOriginal,
+				);
 				const replayItems =
 					model.supportsComputerUse === true
-						? sanitizedHistoryItems
-						: unrollCodexComputerItems(sanitizedHistoryItems, model.compat.supportsImageDetailOriginal);
+						? clampedHistoryItems
+						: unrollCodexComputerItems(clampedHistoryItems, model.compat.supportsImageDetailOriginal);
 				for (const item of replayItems) {
 					if (item.type === "custom_tool_call") {
 						customCallIds.add(item.call_id);
@@ -5295,7 +5492,9 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 			const historyItems = providerPayload?.items as Array<Record<string, unknown>> | undefined;
 			let suppressHiddenEmptyFallback = false;
 			if (historyItems) {
-				const sanitizedHistoryItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(historyItems);
+				const sanitizedHistoryItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(historyItems, {
+					supportsImageDetailOriginal: model.compat.supportsImageDetailOriginal,
+				});
 				if (sanitizedHistoryItems) {
 					const rawReplayItems =
 						model.supportsComputerUse === true

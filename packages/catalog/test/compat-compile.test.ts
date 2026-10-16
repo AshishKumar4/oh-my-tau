@@ -475,6 +475,7 @@ describe("provider catalog grammar", () => {
 				provider("p", [
 					'\tdefault-model "m"',
 					'\tenv "P_KEY" "P_ALT"',
+					"\tautomatic-default #false",
 					"\tdynamic-models-authoritative #true",
 					'\tdiscovery label="P" oauth-provider="p" allow-unauthenticated=#true { env "P_GEN" }',
 					"\tsupports-store #false",
@@ -486,11 +487,19 @@ describe("provider catalog grammar", () => {
 			defaultModel: "m",
 			envVars: ["P_KEY", "P_ALT"],
 			dynamicModelsAuthoritative: true,
+			automaticDefault: false,
 			discovery: { label: "P", oauthProvider: "p", allowUnauthenticated: true, envVars: ["P_GEN"] },
 		});
 		// The cascade sees only the axis; catalog nodes are not directives.
 		const cascade = compileCascade(
-			src(provider("p", ['\tdefault-model "m"', '\tenv "P_KEY"', "\tsupports-store #false"])),
+			src(
+				provider("p", [
+					'\tdefault-model "m"',
+					'\tenv "P_KEY"',
+					"\tautomatic-default #false",
+					"\tsupports-store #false",
+				]),
+			),
 		);
 		expect(cascade.rules).toEqual([
 			{ source: "providers/p.kdl:1", providers: ["p"], wire: { supportsStore: false } },
@@ -515,7 +524,7 @@ describe("provider catalog grammar", () => {
 			].join("\n");
 		const text = provider("p", [
 			'\tdefault-model "local"',
-			'\tkind-apis {\n\t\timage "openai-responses"\n\t\ttts "xai-tts"\n\t\tstt "openai-speech"\n\t}',
+			'\tkind-apis {\n\t\timage "openai-responses"\n\t\ttts "xai-tts"\n\t\tstt "openai-transcriptions"\n\t}',
 			[
 				'\tseed api="local-inference" base-url="local://inference" {',
 				model("local", "Local"),
@@ -528,7 +537,7 @@ describe("provider catalog grammar", () => {
 		expect(p.kindApis).toEqual({
 			image: "openai-responses",
 			tts: "xai-tts",
-			stt: "openai-speech",
+			stt: "openai-transcriptions",
 		});
 		expect(p.seed?.models.map(entry => [entry.id, entry.api])).toEqual([
 			["local", "local-inference"],
@@ -549,6 +558,9 @@ describe("provider catalog grammar", () => {
 			/directive `image` has a malformed value/,
 		);
 		expect(() => compileKindApis('\t\timage "not-an-api"')).toThrow(/unknown api `not-an-api`/);
+		expect(() => compileKindApis('\t\ttts "openai-images"')).toThrow(
+			/kind-apis `tts` names api `openai-images`, which serves kind `image`/,
+		);
 		expect(() =>
 			compileProviders(
 				src(
@@ -560,6 +572,25 @@ describe("provider catalog grammar", () => {
 				),
 			),
 		).toThrow(/directive `kind-apis` has a malformed value/);
+	});
+
+	test("seed request-model-id becomes the row's requestModelId; duplicates and non-strings are rejected", () => {
+		const seeded = (axes: string) =>
+			compileProviders(
+				src(provider("p", ['\tdefault-model "m"', seed('api="openai-decisions" base-url="https://x"', axes)])),
+			);
+		expect(seeded('\t\t\trequest-model-id "wire-m"').p.seed?.models[0]).toMatchObject({
+			id: "m",
+			api: "openai-decisions",
+			requestModelId: "wire-m",
+		});
+		expect(seeded("").p.seed?.models[0]).not.toHaveProperty("requestModelId");
+		expect(() => seeded('\t\t\trequest-model-id "a"\n\t\t\trequest-model-id "b"')).toThrow(
+			/directive `request-model-id` has a malformed value/,
+		);
+		expect(() => seeded("\t\t\trequest-model-id #true")).toThrow(
+			/directive `request-model-id` has a malformed value/,
+		);
 	});
 
 	test("seed APIs reject values outside the known and runner API sets", () => {

@@ -5,11 +5,11 @@ import * as path from "node:path";
 import { type OAuthCredential, type UsageProvider, resolvedApiKeyBearer, withAuth } from "@oh-my-pi/pi-ai";
 import * as oauth from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthCredentials, OAuthProviderId } from "@oh-my-pi/pi-ai/oauth/types";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { createApiKeyResolver } from "../src/config/api-key-resolver";
+import { getTestModel } from "./helpers/model-fixtures";
 
 describe("AuthStorage account rotation", () => {
 	let tempDir: string;
@@ -429,10 +429,7 @@ describe("AuthStorage account rotation", () => {
 			},
 		]);
 
-		const model = getBundledModel("openai-codex", "gpt-5.5");
-		if (!model) {
-			throw new Error("Expected bundled Codex test model to exist");
-		}
+		const model = getTestModel("openai-codex");
 
 		const modelRegistry = new ModelRegistry(authStorage, undefined, { ignoreLocalModelConfig: true });
 		const attemptedKeys: string[] = [];

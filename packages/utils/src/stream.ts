@@ -6,6 +6,10 @@ import { parseStreamingJson } from "./json-parse";
 const LF = 0x0a;
 const CR = 0x0d;
 
+// Capacity above this is released once the buffered bytes no longer need it,
+// so one oversized frame does not pin its peak buffer for the stream's life.
+const CONCAT_SINK_RETAIN_BYTES = 1024 * 1024;
+
 /**
  * Split a byte stream on LF boundaries.
  *
@@ -73,31 +77,34 @@ export async function* readJsonl<T>(stream: ReadableStream<Uint8Array>, signal?:
  * framing loop (see `consume` and `flush`).
  */
 export class ConcatSink {
-	#space: Buffer = Buffer.alloc(0);
+	#space?: Buffer;
 	#length = 0;
 	#skipLeadingLf = false;
 
 	#ensureCapacity(size: number): Buffer {
 		const space = this.#space;
-		if (space.length >= size) return space;
-		const nextSize = Math.max(size, space.length * 2);
+		if (space && space.length >= size) return space;
+		const nextSize = space ? Math.max(size, space.length * 2) : size;
 		const next = Buffer.allocUnsafe(nextSize);
-		if (this.#length > 0) {
+		if (space && this.#length > 0) {
 			space.copy(next, 0, 0, this.#length);
 		}
 		this.#space = next;
 		return next;
 	}
 
+	/** Drop or right-size an oversized buffer after the buffered length shrank. */
 	#releaseCapacity(): void {
 		const space = this.#space;
-		if (space.length <= 1024 * 1024 || this.#length * 4 > space.length) return;
-		if (this.#length === 0) {
-			this.#space = Buffer.alloc(0);
+		if (!space || space.length <= CONCAT_SINK_RETAIN_BYTES) return;
+		const length = this.#length;
+		if (length === 0) {
+			this.#space = undefined;
 			return;
 		}
-		const next = Buffer.allocUnsafe(this.#length);
-		space.copy(next, 0, 0, this.#length);
+		if (length * 4 > space.length) return;
+		const next = Buffer.allocUnsafe(length);
+		space.copy(next, 0, 0, length);
 		this.#space = next;
 	}
 
@@ -130,7 +137,7 @@ export class ConcatSink {
 	 */
 	flush(): Uint8Array | undefined {
 		if (!this.#length) return undefined;
-		return this.#space.subarray(0, this.#length);
+		return this.#space!.subarray(0, this.#length);
 	}
 
 	/** Drop the first `count` buffered bytes, keeping the remainder. */
@@ -139,7 +146,7 @@ export class ConcatSink {
 		if (count >= this.#length) {
 			this.#length = 0;
 		} else {
-			this.#space.copyWithin(0, count, this.#length);
+			this.#space!.copyWithin(0, count, this.#length);
 			this.#length -= count;
 		}
 		this.#releaseCapacity();
@@ -244,7 +251,9 @@ export class ConcatSink {
 			this.#length = 0;
 		} else {
 			const rem = total - read;
-			if (rem < total) space.copyWithin(0, read, total);
+			if (rem < total) {
+				space.copyWithin(0, read, total);
+			}
 			this.#length = rem;
 		}
 		this.#releaseCapacity();

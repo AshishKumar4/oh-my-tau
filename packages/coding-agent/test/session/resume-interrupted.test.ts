@@ -4,14 +4,17 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { snapshotJobs } from "@oh-my-pi/pi-coding-agent/async/job-control";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { buildAsyncResultBatchMessage } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import {
 	createSessionOpenData,
 	INTERRUPTED_TOOL_RESULT_TEXT,
+	INTERRUPTED_TURN_ERROR,
 	SESSION_EXIT_CUSTOM_TYPE,
 	SESSION_OPEN_CUSTOM_TYPE,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
@@ -26,6 +29,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import * as executor from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -166,7 +170,8 @@ describe("/recover", () => {
 		return SessionManager.create(dir.path(), path.join(dir.path(), "children"));
 	}
 
-	async function parked(id: string, lane: SessionManager): Promise<string> {
+	/** Closes a subagent's transcript and registers it as the persisted roster would (`aborted` once killed). */
+	async function parked(id: string, lane: SessionManager, status: "parked" | "aborted" = "parked"): Promise<string> {
 		await lane.flush();
 		const file = lane.getSessionFile();
 		await lane.close();
@@ -178,7 +183,7 @@ describe("/recover", () => {
 			parentId: "Main",
 			session: null,
 			sessionFile: file,
-			status: "parked",
+			status,
 		});
 		return file;
 	}
@@ -384,6 +389,481 @@ describe("/recover", () => {
 		expect((await resumeInterruptedWork(host())).status).toBe("nothing");
 	});
 
+	// Upstream's `omp --restore` scenario, which now runs through /recover: a crash
+	// after the user stopped a turn, or after a finished one, leaves nothing to continue.
+	it("leaves a turn the user interrupted, and one that finished, as they are", async () => {
+		const persisted: Array<() => void> = [
+			() => {
+				manager.appendMessage({ role: "user", content: "run the probe", timestamp: Date.now() });
+				manager.appendMessage(toolTurn({ id: "call_1", name: "probe", args: { value: "x" } }));
+				manager.appendMessage({
+					...toolResult("call_1", "probe"),
+					content: [{ type: "text", text: "Execution interrupted" }],
+					isError: true,
+				});
+				manager.appendMessage({ ...stoppedTurn("aborted"), errorMessage: "Interrupted by user" });
+			},
+			() => {
+				manager.appendMessage({ role: "user", content: "say hi", timestamp: Date.now() });
+				manager.appendMessage(createAssistantMessage("hi"));
+			},
+		];
+		for (const persist of persisted) {
+			await manager.close();
+			manager = SessionManager.create(dir.path(), path.join(dir.path(), "sessions"));
+			persist();
+			openedBy(manager, "this");
+			const entries = manager.getBranch().length;
+
+			expect((await resumeInterruptedWork(host())).status).toBe("nothing");
+			expect(manager.getBranch().length).toBe(entries);
+		}
+	});
+
+	it.each([
+		[
+			"after its prompt",
+			() => {
+				manager.appendMessage({ role: "user", content: "run the tests", timestamp: Date.now() });
+				openedBy(manager, "this");
+			},
+		],
+		[
+			"after its tool results",
+			() => {
+				manager.appendMessage({ role: "user", content: "run the tests", timestamp: Date.now() });
+				manager.appendMessage(toolTurn({ id: "a", name: "bash", args: { command: "bun test" } }));
+				manager.appendMessage(toolResult("a", "bash"));
+				openedBy(manager, "this");
+			},
+		],
+		[
+			"behind the record resume closed it with",
+			() => {
+				manager.appendMessage({ role: "user", content: "run the tests", timestamp: Date.now() });
+				manager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+					reason: "uncaughtException",
+					kind: "fatal",
+					recordedAt: new Date().toISOString(),
+				});
+				openedBy(manager, "this");
+				manager.appendMessage({ ...stoppedTurn("aborted"), errorMessage: INTERRUPTED_TURN_ERROR });
+			},
+		],
+	])("continues a turn a crash cut off %s, before the answer", async (_label, cutOff) => {
+		cutOff();
+		const entries = manager.getBranch().length;
+
+		const outcome = await resumeInterruptedWork(host());
+
+		if (outcome.status !== "resumed") throw new Error(`expected resumed, got ${outcome.status}`);
+		expect(outcome.notice).toContain("Your last turn was cut off before you answered it.");
+		expect(outcome.summary).toStartWith("Resumed: the unanswered turn, 0 interrupted tool calls");
+		// Only the /recover record is added: nothing runs again.
+		expect(
+			manager
+				.getBranch()
+				.slice(entries)
+				.map(entry => entry.type),
+		).toEqual(["custom"]);
+		expect((await resumeInterruptedWork(host())).status).toBe("handled");
+	});
+
+	it.each([
+		[
+			"a background job's result",
+			() => {
+				manager.appendMessage(toolTurn({ id: "spawn", name: "task", args: { tasks: [] } }));
+				manager.appendMessage(
+					toolResult("spawn", "task", {
+						async: { state: "running", jobId: "Lane", type: "task" },
+						progress: [{ id: "Lane", status: "running", description: "fix the lane" }],
+					}),
+				);
+				manager.appendMessage(createAssistantMessage("Lane is on it."));
+				manager.appendCustomMessageEntry("async-result", "Lane finished.", true, {
+					jobs: [{ jobId: "Lane", type: "task", status: "completed", agentId: "Lane" }],
+				});
+			},
+		],
+		[
+			"a peer's message that woke it",
+			() => {
+				manager.appendMessage({ role: "user", content: "wait for Lane", timestamp: Date.now() });
+				manager.appendMessage(createAssistantMessage("Waiting for Lane."));
+				ircFrom(manager, "Lane", "The build is green.");
+			},
+		],
+	])("continues a turn %s started after a finished reply, once", async (_label, persist) => {
+		persist();
+		openedBy(manager, "this");
+		const entries = manager.getBranch().length;
+
+		const { outcome, restartedIds } = await recover();
+
+		expect(outcome.notice).toContain("Your last turn was cut off before you answered it.");
+		expect(restartedIds).toEqual([]);
+		expect(outcome.restarted).toEqual([]);
+		// Only the /recover record is added: no tool runs again, no result is invented.
+		expect(
+			manager
+				.getBranch()
+				.slice(entries)
+				.map(entry => entry.type),
+		).toEqual(["custom"]);
+		expect((await resumeInterruptedWork(host())).status).toBe("handled");
+	});
+
+	it.each([
+		[
+			"a background job's result",
+			() =>
+				manager.appendCustomMessageEntry("async-result", "Lane finished.", true, {
+					jobs: [{ jobId: "Lane", type: "task", status: "completed", agentId: "Lane" }],
+				}),
+		],
+		["a peer's message that woke it", () => ircFrom(manager, "Lane", "The build is green.")],
+	])("continues a turn %s started after an earlier process exited normally, once", async (_label, prompt) => {
+		// Process A finished its turn and quit normally.
+		manager.appendMessage({ role: "user", content: "wait for Lane", timestamp: Date.now() });
+		manager.appendMessage(createAssistantMessage("Waiting for Lane."));
+		sessionExit(manager);
+		// Process B reopened the session, got the prompt, and crashed before answering it.
+		openedBy(manager, 4242);
+		prompt();
+		openedBy(manager, "this");
+		const entries = manager.getBranch().length;
+
+		const { outcome, restartedIds } = await recover();
+
+		expect(outcome.notice).toContain("Your last turn was cut off before you answered it.");
+		expect(restartedIds).toEqual([]);
+		expect(outcome.restarted).toEqual([]);
+		expect(
+			manager
+				.getBranch()
+				.slice(entries)
+				.map(entry => entry.type),
+		).toEqual(["custom"]);
+		expect((await resumeInterruptedWork(host())).status).toBe("handled");
+	});
+
+	it("continues a turn a crash left on a paused reply", async () => {
+		manager.appendMessage({ role: "user", content: "fix the build", timestamp: Date.now() });
+		// A commentary-only `pause_turn` ends the response, not the turn: the loop samples again.
+		manager.appendMessage({
+			...createAssistantMessage("Reading the build config first."),
+			stopDetails: { type: "pause_turn" },
+		});
+		openedBy(manager, "this");
+		const entries = manager.getBranch().length;
+
+		const outcome = await resumeInterruptedWork(host());
+
+		if (outcome.status !== "resumed") throw new Error(`expected resumed, got ${outcome.status}`);
+		expect(outcome.notice).toContain("Your last turn was cut off before you answered it.");
+		expect(
+			manager
+				.getBranch()
+				.slice(entries)
+				.map(entry => entry.type),
+		).toEqual(["custom"]);
+		expect((await resumeInterruptedWork(host())).status).toBe("handled");
+	});
+
+	it.each([
+		["delivered", "async-result"],
+		["read by a foreground wait", "wait"],
+	] as const)(
+		"leaves a woken subagent alone once its result, under a reused job id, was %s",
+		async (_label, consumer) => {
+			// The spawn's settled row stays retained, so the woken run's job id gains a suffix.
+			const jobs = new AsyncJobManager({ retentionMs: 60_000 });
+			const spawnJob = jobs.register("task", "Lane", async () => ({ text: "first fix" }), {
+				id: "Lane",
+				agentId: "Lane",
+			});
+			await jobs.getJob(spawnJob)?.promise;
+			manager.appendMessage(toolTurn({ id: "spawn", name: "task", args: { tasks: [] } }));
+			manager.appendMessage(
+				toolResult("spawn", "task", {
+					async: { state: "running", jobId: "Lane", type: "task" },
+					progress: [{ id: "Lane", status: "running", description: "fix the lane" }],
+				}),
+			);
+			const spawned = buildAsyncResultBatchMessage([
+				{ jobId: spawnJob, result: "first fix", job: jobs.getJob(spawnJob), durationMs: 1, epoch: 0 },
+			]);
+			if (!spawned) throw new Error("expected an async-result message");
+			manager.appendCustomMessageEntry(spawned.customType, spawned.content, true, spawned.details);
+			manager.appendMessage(createAssistantMessage("First fix is in."));
+			await tick();
+
+			manager.appendMessage(toolTurn({ id: "wake", name: "write", args: { path: "agent://Lane" } }));
+			manager.appendMessage(
+				toolResult("wake", "write", {
+					message: { op: "send", from: "Main", to: "Lane", receipts: [{ to: "Lane", outcome: "woken" }] },
+				}),
+			);
+			const lane = laneSession();
+			ircFrom(lane, "Main", "Now fix the flaky test.");
+			lane.appendMessage(createAssistantMessage("Fixed the flaky test."));
+			await parked("Lane", lane);
+			const wakeJob = jobs.register("task", "Lane", async () => ({ text: "Fixed the flaky test." }), {
+				id: "Lane",
+				agentId: "Lane",
+			});
+			expect(wakeJob).toBe("Lane-2");
+			const job = jobs.getJob(wakeJob);
+			await job?.promise;
+			if (!job) throw new Error("expected the woken run's job");
+			if (consumer === "async-result") {
+				const woke = buildAsyncResultBatchMessage([
+					{ jobId: wakeJob, result: "Fixed the flaky test.", job, durationMs: 1, epoch: 0 },
+				]);
+				if (!woke) throw new Error("expected an async-result message");
+				manager.appendCustomMessageEntry(woke.customType, woke.content, true, woke.details);
+			} else {
+				manager.appendMessage(toolTurn({ id: "wait", name: "wait", args: { jobs: [wakeJob] } }));
+				manager.appendMessage(
+					toolResult("wait", "wait", { jobs: snapshotJobs({ asyncJobManager: jobs } as ToolSession, [job]) }),
+				);
+			}
+			manager.appendMessage(createAssistantMessage("Both fixes are in."));
+			await jobs.dispose();
+			openedBy(manager, "this");
+
+			const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn");
+			expect((await resumeInterruptedWork(host())).status).toBe("nothing");
+			expect(followUp).not.toHaveBeenCalled();
+		},
+	);
+
+	/** Journal the async-result the parent got for `jobId` of `jobs`. */
+	function deliveredJob(jobs: AsyncJobManager, jobId: string): void {
+		const record = buildAsyncResultBatchMessage([
+			{ jobId, result: "done", job: jobs.getJob(jobId), durationMs: 1, epoch: 0 },
+		]);
+		if (!record) throw new Error("expected an async-result message");
+		manager.appendCustomMessageEntry(record.customType, record.content, true, record.details);
+	}
+
+	/** The parent messages idle `Lane`, whose woken run gets a job in `jobs`; returns the job id. */
+	async function wokeLane(jobs: AsyncJobManager, callId: string, run: () => Promise<{ text: string }>) {
+		manager.appendMessage(toolTurn({ id: callId, name: "write", args: { path: "agent://Lane" } }));
+		await tick();
+		const jobId = jobs.register("task", "Lane", run, { id: "Lane", agentId: "Lane", ownerId: "Main" });
+		manager.appendMessage(
+			toolResult(callId, "write", {
+				message: { op: "send", from: "Main", to: "Lane", receipts: [{ to: "Lane", outcome: "woken" }] },
+			}),
+		);
+		return jobId;
+	}
+
+	it("keeps a wake pending when a job listing shows an older run of the agent completed", async () => {
+		// The manager keeps settled rows for a while; an evicted row's id goes to the next run.
+		const jobs = new AsyncJobManager({ retentionMs: 60_000 });
+		const delivered = (jobId: string): void => deliveredJob(jobs, jobId);
+		const woken = (callId: string, run: () => Promise<{ text: string }>) => wokeLane(jobs, callId, run);
+
+		manager.appendMessage(toolTurn({ id: "spawn", name: "task", args: { tasks: [] } }));
+		await tick();
+		// Its own owner lets the test evict the spawn's row alone below.
+		const spawnJob = jobs.register("task", "Lane", async () => ({ text: "first fix" }), {
+			id: "Lane",
+			agentId: "Lane",
+			ownerId: "Spawner",
+		});
+		manager.appendMessage(
+			toolResult("spawn", "task", {
+				async: { state: "running", jobId: "Lane", type: "task" },
+				progress: [{ id: "Lane", status: "running", description: "fix the lane" }],
+			}),
+		);
+		await jobs.getJob(spawnJob)?.promise;
+		delivered(spawnJob);
+		manager.appendMessage(createAssistantMessage("First fix is in."));
+		await tick();
+
+		// First wake: the spawn's row is retained, so this run is `Lane-2`.
+		const firstWake = await woken("wake1", async () => ({ text: "second fix" }));
+		expect(firstWake).toBe("Lane-2");
+		await jobs.getJob(firstWake)?.promise;
+		delivered(firstWake);
+		manager.appendMessage(createAssistantMessage("Second fix is in."));
+		await tick();
+
+		// The spawn's row is evicted, `Lane-2`'s retained: the next wake reuses `Lane`.
+		expect(jobs.evictCompletedJobs({ ownerId: "Spawner" })).toBe(1);
+		const running = Promise.withResolvers<{ text: string }>();
+		const secondWake = await woken("wake2", () => running.promise);
+		expect(secondWake).toBe("Lane");
+		await tick();
+		// A full listing reports the older run completed (agent `Lane`) beside the running one.
+		const listed = snapshotJobs({ asyncJobManager: jobs } as unknown as ToolSession, jobs.getAllJobs(), {
+			includeResults: true,
+		});
+		expect(listed.map(row => [row.id, row.status, row.agentUrlId])).toEqual([
+			["Lane-2", "completed", "Lane"],
+			["Lane", "running", "Lane"],
+		]);
+		expect(listed.every(row => typeof row.startedAt === "number")).toBe(true);
+		manager.appendMessage(toolTurn({ id: "list", name: "read", args: { path: "proc://" } }));
+		manager.appendMessage(toolResult("list", "read", { proc: { jobs: listed } }));
+		manager.appendMessage(createAssistantMessage("Lane is on the flaky test."));
+
+		// The crash cut the woken run off mid-call.
+		const lane = laneSession();
+		ircFrom(lane, "Main", "Now fix the flaky test.");
+		lane.appendMessage(toolTurn({ id: "tests", name: "bash", args: { command: "bun test --rerun-each 20" } }));
+		await parked("Lane", lane);
+		running.resolve({ text: "unused" });
+		await jobs.dispose();
+		openedBy(manager, "this");
+
+		const { outcome, restartedIds } = await recover();
+
+		expect(restartedIds).toEqual(["Lane"]);
+		expect(outcome.restarted.map(agent => agent.jobId)).toEqual(["Lane"]);
+	});
+
+	it("keeps a second wake pending when one response woke the agent twice and its listing shows the first run done", async () => {
+		const jobs = new AsyncJobManager({ retentionMs: 60_000 });
+		const lane = laneSession();
+		/** Records a call starting, as the session does once the call clears the batch's exclusive gate. */
+		const executes = async (toolCallId: string, toolName: string): Promise<void> => {
+			await tick();
+			manager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
+				toolCallId,
+				toolName,
+				startedAt: new Date().toISOString(),
+			});
+		};
+		const wokeLaneReceipt = (callId: string) =>
+			toolResult(callId, "write", {
+				message: { op: "send", from: "Main", to: "Lane", receipts: [{ to: "Lane", outcome: "woken" }] },
+			});
+
+		// One response: wake Lane, wait for that run, wake Lane again, list the jobs.
+		manager.appendMessage(
+			toolTurn(
+				{ id: "wake1", name: "write", args: { path: "agent://Lane" } },
+				{ id: "wait", name: "wait", args: {} },
+				{ id: "wake2", name: "write", args: { path: "agent://Lane" } },
+				{ id: "list", name: "read", args: { path: "proc://" } },
+			),
+		);
+		await executes("wake1", "write");
+		const firstRun = jobs.register("task", "Lane", async () => ({ text: "first brief done" }), {
+			id: "Lane",
+			agentId: "Lane",
+			ownerId: "Main",
+		});
+		ircFrom(lane, "Main", "First brief.");
+		lane.appendMessage(createAssistantMessage("First brief done."));
+		manager.appendMessage(wokeLaneReceipt("wake1"));
+		await executes("wait", "wait");
+		const first = jobs.getJob(firstRun);
+		await first?.promise;
+		if (!first) throw new Error("expected the first run's job");
+		manager.appendMessage(
+			toolResult("wait", "wait", {
+				jobs: snapshotJobs({ asyncJobManager: jobs } as unknown as ToolSession, [first]),
+			}),
+		);
+		await executes("wake2", "write");
+		const running = Promise.withResolvers<{ text: string }>();
+		const secondRun = jobs.register("task", "Lane", () => running.promise, {
+			id: "Lane",
+			agentId: "Lane",
+			ownerId: "Main",
+		});
+		expect([firstRun, secondRun]).toEqual(["Lane", "Lane-2"]);
+		manager.appendMessage(wokeLaneReceipt("wake2"));
+		await executes("list", "read");
+		const listed = snapshotJobs({ asyncJobManager: jobs } as unknown as ToolSession, jobs.getAllJobs(), {
+			includeResults: true,
+		});
+		expect(listed.map(row => [row.id, row.status, row.agentUrlId])).toEqual([
+			["Lane", "completed", "Lane"],
+			["Lane-2", "running", "Lane"],
+		]);
+		manager.appendMessage(toolResult("list", "read", { proc: { jobs: listed } }));
+
+		// The crash cut the second run off mid-call.
+		ircFrom(lane, "Main", "Second brief.");
+		lane.appendMessage(toolTurn({ id: "tests", name: "bash", args: { command: "bun test" } }));
+		await parked("Lane", lane);
+		running.resolve({ text: "unused" });
+		await jobs.dispose();
+		openedBy(manager, "this");
+
+		const { outcome, restartedIds } = await recover();
+
+		expect(restartedIds).toEqual(["Lane"]);
+		expect(outcome.restarted.map(agent => agent.jobId)).toEqual(["Lane"]);
+	});
+
+	it("recovers a woken run's answer when the previous run's result reached the parent only after it started", async () => {
+		const jobs = new AsyncJobManager({ retentionMs: 60_000 });
+		const lane = laneSession();
+		const spawnJob = jobs.register("task", "Lane", async () => ({ text: "first fix" }), {
+			id: "Lane",
+			agentId: "Lane",
+			ownerId: "Main",
+		});
+		await jobs.getJob(spawnJob)?.promise;
+		manager.appendMessage(createAssistantMessage("Lane is set up."));
+		await tick();
+
+		// One run (`Lane-2`) finishes; its result waits while the parent wakes Lane again (`Lane-3`).
+		const firstWake = await wokeLane(jobs, "wake1", async () => ({ text: "second fix" }));
+		ircFrom(lane, "Main", "Fix the flaky test.");
+		lane.appendMessage(createAssistantMessage("The flaky test is fixed."));
+		await jobs.getJob(firstWake)?.promise;
+		await tick();
+		const running = Promise.withResolvers<{ text: string }>();
+		const secondWake = await wokeLane(jobs, "wake2", () => running.promise);
+		expect([firstWake, secondWake]).toEqual(["Lane-2", "Lane-3"]);
+		await tick();
+		ircFrom(lane, "Main", "Now update the changelog.");
+		// `Lane-2`'s delayed result lands inside `Lane-3`'s run.
+		deliveredJob(jobs, firstWake);
+		manager.appendMessage(createAssistantMessage("The flaky test is fixed; waiting on the changelog."));
+		// `Lane-3` answered, and the crash came before its result was delivered.
+		lane.appendMessage(createAssistantMessage("The changelog is updated."));
+		await parked("Lane", lane);
+		running.resolve({ text: "unused" });
+		await jobs.dispose();
+		openedBy(manager, "this");
+
+		const { outcome, restartedIds, delivered } = await recover();
+
+		expect(restartedIds).toEqual([]);
+		expect(outcome.recovered.map(agent => agent.jobId)).toEqual(["Lane"]);
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]?.text).toContain("The changelog is updated.");
+	});
+
+	it("leaves a cut-off turn alone once this process moved on from it", async () => {
+		manager.appendMessage({ role: "user", content: "run the tests", timestamp: Date.now() });
+		openedBy(manager, "this");
+		manager.appendMessage({ role: "user", content: "never mind, check the docs", timestamp: Date.now() });
+		manager.appendMessage(createAssistantMessage("The docs are current."));
+
+		expect((await resumeInterruptedWork(host())).status).toBe("nothing");
+	});
+
+	it("does not continue a turn a quit aborted", async () => {
+		manager.appendMessage({ role: "user", content: "run the tests", timestamp: Date.now() });
+		sessionExit(manager);
+		manager.appendMessage(stoppedTurn("aborted"));
+		openedBy(manager, "this");
+
+		expect((await resumeInterruptedWork(host())).status).toBe("nothing");
+	});
+
 	it.each([
 		["with session_open markers", true],
 		["on a file older than the markers", false],
@@ -420,18 +900,22 @@ describe("/recover", () => {
 		expect(!scan.handled && [...scan.jobs, ...scan.agents, ...scan.toolCalls]).toEqual([]);
 	});
 
-	it("tracks parked agents woken by a message until their result arrives", () => {
-		const woke = (id: string, to: string) => {
+	it("tracks agents a message revived or woke until their result arrives", () => {
+		const woke = (id: string, to: string, outcome: "revived" | "woken" = "revived") => {
 			manager.appendMessage(toolTurn({ id, name: "write", args: { path: `agent://${to}` } }));
 			manager.appendMessage(
 				toolResult(id, "write", {
-					message: { op: "send", from: "Main", to, receipts: [{ to, outcome: "revived" }] },
+					message: { op: "send", from: "Main", to, receipts: [{ to, outcome }] },
 				}),
 			);
 		};
 		woke("a", "Lane");
 		woke("b", "Scout");
 		woke("c", "Lane");
+		// An idle live agent a message wakes runs again too; its result arrives as a job.
+		woke("e", "Idle", "woken");
+		woke("f", "Answered", "woken");
+		manager.appendCustomMessageEntry("async-result", "done", true, { jobs: [{ jobId: "Answered", type: "task" }] });
 		manager.appendMessage(toolTurn({ id: "d", name: "write", args: { path: "agent://Live" } }));
 		manager.appendMessage(
 			toolResult("d", "write", {
@@ -444,7 +928,7 @@ describe("/recover", () => {
 
 		const scan = findInterruptedWork(manager.getBranch());
 
-		expect(!scan.handled && scan.agents.map(agent => agent.jobId)).toEqual(["Lane"]);
+		expect(!scan.handled && scan.agents.map(agent => agent.jobId)).toEqual(["Lane", "Idle"]);
 	});
 
 	it("steps past a process that opened the file and did nothing", () => {
@@ -738,6 +1222,28 @@ describe("/recover", () => {
 		await jobs.dispose();
 	});
 
+	it("restarts an idle subagent a message woke when the crash cut its new run off", async () => {
+		const lane = laneSession();
+		lane.appendMessage(createAssistantMessage("The first fix is in."));
+		await tick();
+		manager.appendMessage(toolTurn({ id: "wake", name: "write", args: { path: "agent://Lane" } }));
+		manager.appendMessage(
+			toolResult("wake", "write", {
+				message: { op: "send", from: "Main", to: "Lane", receipts: [{ to: "Lane", outcome: "woken" }] },
+			}),
+		);
+		manager.appendMessage(createAssistantMessage("Lane is on the flaky test."));
+		ircFrom(lane, "Main", "Now fix the flaky test.");
+		lane.appendMessage(toolTurn({ id: "tests", name: "bash", args: { command: "bun test --rerun-each 20" } }));
+		await parked("Lane", lane);
+		openedBy(manager, "this");
+
+		const { outcome, restartedIds } = await recover();
+
+		expect(restartedIds).toEqual(["Lane"]);
+		expect(outcome.restarted.map(agent => agent.jobId)).toEqual(["Lane"]);
+	});
+
 	it("does not restart a finished subagent over a call an older process left dangling", async () => {
 		const lane = laneSession();
 		lane.appendMessage(toolTurn({ id: "old", name: "bash", args: { command: "make" } }));
@@ -862,6 +1368,23 @@ describe("/recover", () => {
 
 		expect(restartedIds).toEqual(["Lane"]);
 		expect(outcome.restarted.map(agent => agent.jobId)).toEqual(["Lane"]);
+	});
+
+	it("does not restart a subagent the user killed, though the crash left its call running", async () => {
+		const lane = laneSession();
+		revived(manager, "Lane");
+		ircFrom(lane, "Main", "Fix the build.");
+		lane.appendMessage(toolTurn({ id: "tests", name: "bash", args: { command: "bun test" } }));
+		await parked("Lane", lane, "aborted");
+		manager.appendMessage(createAssistantMessage("waiting on Lane"));
+		openedBy(manager, "this");
+
+		const { outcome, restartedIds, delivered } = await recover();
+
+		expect(restartedIds).toEqual([]);
+		expect(outcome.restarted).toEqual([]);
+		expect(delivered).toEqual([]);
+		expect(outcome.notice).toContain("`Lane`: it was killed.");
 	});
 
 	it("restarts a subagent whose last turn paused rather than ended", async () => {

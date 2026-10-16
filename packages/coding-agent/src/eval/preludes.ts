@@ -1,7 +1,7 @@
 import type { AgentToolContext, AgentToolResult, AgentToolUpdateCallback, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../tools";
-import { denyError, formatApprovalPrompt, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
+import { denyError, requestApproval, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
 
 /** Host context supplied when an eval prelude calls back out of its language VM. */
 export interface EvalPreludeContext {
@@ -107,10 +107,8 @@ async function approvePreludeInvocation(
 				`Set tools.approval.${definition.name}: allow or use an interactive UI to approve the call.`,
 		);
 	}
-	const choice = await untilAborted(context.signal, () =>
-		ui.select(formatApprovalPrompt(subject, parameters, resolved.reason), ["Approve", "Deny"]),
-	);
-	if (choice !== "Approve") throw new Error(`Eval prelude call denied by user: ${definition.name}`);
+	const approved = await untilAborted(context.signal, () => requestApproval(ui, subject, parameters, resolved.reason));
+	if (!approved) throw new Error(`Eval prelude call denied by user: ${definition.name}`);
 }
 
 /**

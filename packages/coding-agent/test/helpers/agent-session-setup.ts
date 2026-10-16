@@ -1,9 +1,11 @@
 import { Database } from "bun:sqlite";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
 
 /**
  * Shared factory for building a minimal mock `AssistantMessage`
@@ -47,4 +49,20 @@ export function createInMemoryModelRegistry(provider: string): ModelRegistry {
 		cacheDbPath: ":memory:",
 		settings: Settings.isolated({}),
 	});
+}
+
+/**
+ * Make `todo` the session's active tool. Todo stop reminders only fire while
+ * the todo tool is active, so reminder tests on tool-less sessions need this.
+ */
+export function activateTodoTool(session: AgentSession, cwd: string): void {
+	session.agent.setTools([
+		new TodoTool({
+			cwd,
+			hasUI: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: session.settings,
+		}),
+	]);
 }

@@ -92,6 +92,25 @@ The full row is always reachable by reading `memory://<memory-id>`, which resolv
 
 Retention writes a marker-free transcript projection: when the host supplies an `embedText` override alongside the stored transcript, that projection is used for embedding, working-memory FTS indexing (`COALESCE(embed_text, content)`), and rebuild-reembedding, so retention protocol markers in the stored transcript do not pollute vector and full-text recall.
 
+## Recall ranking weights
+
+Recall multiplies each memory's score by a weight for its stored `veracity` label and, for episodic memories, by a weight for its degradation tier. Each weight is read from its environment variable on every recall:
+
+| Variable                  | Default | Applies to                                                                           |
+| ------------------------- | ------- | ------------------------------------------------------------------------------------ |
+| `MNEMOPI_STATED_WEIGHT`   | `1.0`   | `veracity: stated`, which the coding agent's explicit memory save (the extension `memory.save` API) writes |
+| `MNEMOPI_UNKNOWN_WEIGHT`  | `0.8`   | `veracity: unknown`, which the coding agent's automatic transcript retention writes, and any write that names no label |
+| `MNEMOPI_INFERRED_WEIGHT` | `0.7`   | `veracity: inferred`                                                                 |
+| `MNEMOPI_IMPORTED_WEIGHT` | `0.6`   | `veracity: imported`                                                                 |
+| `MNEMOPI_TOOL_WEIGHT`     | `0.5`   | `veracity: tool`, which the coding agent's `retain` and `learn` tools write          |
+| `MNEMOPI_TIER1_WEIGHT`    | `1.0`   | episodic memories at degradation tier 1                                              |
+| `MNEMOPI_TIER2_WEIGHT`    | `0.85`  | episodic memories at degradation tier 2                                              |
+| `MNEMOPI_TIER3_WEIGHT`    | `0.7`   | episodic memories at degradation tier 3 or beyond                                    |
+
+Sleep consolidation carries a working memory's label onto the episodic memory it produces.
+
+Memories labelled `true` or `likely_true` always weigh `1.0`, and `false` weighs `0`. With `mnemopi.polyphonicRecall`, these weights order the standard ranking that becomes the fused `hybrid` voice; the vector, graph, fact and temporal voices do not apply them.
+
 ## LLM and embeddings
 
 FTS and embedding paths use the settings below. `llmMode: smol` resolves the `memory` role and its configured retry chain, fetching credentials at call time. When unset, the role reuses `tiny`, then the fast (`smol`) defaults. It supports both local-inference and online models. `llmMode: remote` uses the OpenAI-compatible endpoint settings; `llmMode: none` disables LLM calls. If no usable model or credential resolves, Mnemopi continues without LLM-backed work. The legacy `providers.memoryModel` setting is migrated into the `memory` role.
@@ -186,6 +205,7 @@ new Mnemopi({
 - Subagents do not own separate Mnemopi retain loops; they alias the parent state when a parent Mnemopi state exists, and otherwise remain inert.
 - At primary backend startup, eligible working-memory rows are promoted across owned banks before the first write can TTL-trim them. Promotion failures are logged without disabling the backend.
 - Backend startup is best-effort. If database/model initialization fails, the session continues with Mnemopi inert and logs a warning; memory tools then report that the backend is not initialized.
+- Local embedding models load once per machine, not once per session: each (model, fastembed cache dir) pair is served by one detached `omp mnemopi embed <model>` server owning an IPC endpoint under `~/.omp/run/mnemopi/` (log beside it). The first omp process that needs it spawns it; others connect. Inference runs in the server's private `onnxruntime` child. The server exits after 15 minutes without a request, freeing the model's memory, and is replaced when an omp process of another version connects. A steady-state embed that takes longer than 2 minutes fails, and the server kills and respawns its inference child.
 
 ## Shutdown and durability
 
@@ -193,7 +213,7 @@ Normal interactive and print-mode exit uses a deliberately lighter path than `/m
 
 1. The primary state retains the current transcript with new fact extraction disabled.
 2. It flushes extractions that were already in flight, but does not run per-session sleep or full cross-session promotion.
-3. Only after that drain settles does it close the owned SQLite bank handles; the embedding worker shuts down after state disposal because the drain may still use it.
+3. Only after that drain settles does it close the owned SQLite bank handles; the process drops its embedding-server connection after state disposal because the drain may still embed. The server keeps running for other sessions (and finishes a model download already in flight) until it idles out.
 
 Aliased subagent states do not own or close the shared banks; the parent state owns final retention, flushing, and handle closure.
 

@@ -43,7 +43,9 @@ describe("print mode disposes the session before terminating", () => {
 			},
 			state: { messages: [errorMsg] },
 			getLastAssistantMessage: () => errorMsg,
+			disableStopTimeTodoReminders: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
+			waitForIdle: async () => {},
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => {
 				order.push("catchup");
@@ -77,7 +79,8 @@ describe("print mode disposes the session before terminating", () => {
 		expect(stderrLines.join("")).toContain("boom");
 	});
 
-	it("disposes an active print session before SIGTERM exits", async () => {
+	// Windows cannot deliver a catchable SIGTERM via process.kill: libuv terminates the process outright.
+	it.skipIf(process.platform === "win32")("disposes an active print session before SIGTERM exits", async () => {
 		using tempDir = TempDir.createSync("@omp-print-signal-");
 		const marker = tempDir.join("disposed");
 		const fixture = path.join(import.meta.dir, "..", "fixtures", "print-mode-signal.js");
@@ -121,7 +124,9 @@ describe("print mode disposes the session before terminating", () => {
 				onPersistenceNotice: () => () => {},
 			},
 			getLastAssistantMessage: () => abortedMsg,
+			disableStopTimeTodoReminders: () => {},
 			prepareForHeadlessAdvisorDrain: () => {},
+			waitForIdle: async () => {},
 			setTextOutputCommitted: () => {},
 			waitForAdvisorCatchup: async () => true,
 			// Mimic a real mid-turn signal: the postmortem teardown fires (which

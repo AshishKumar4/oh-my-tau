@@ -6,6 +6,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { parseSessionEntries, type SessionHeader } from "@oh-my-pi/pi-coding-agent";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
+import { rejectionOf } from "./helpers/rejection";
 
 async function readSessionFile(sessionFile: string): Promise<{ header: SessionHeader; messageIds: string[] }> {
 	const entries = parseSessionEntries(await Bun.file(sessionFile).text());
@@ -22,15 +23,19 @@ describe("RPC fork", () => {
 	beforeEach(async () => {
 		directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rpc-fork-"));
 		client = new RpcClient({
-			command: [process.execPath, path.join(import.meta.dir, "fixtures", "fork-rpc-agent.ts")],
+			command: [process.execPath, path.join(import.meta.dir, "fixtures", "fork-rpc-agent.ts"), directory],
 			cwd: directory,
 			env: { PI_CODING_AGENT_DIR: directory, PI_NO_TITLE: "1" },
 		});
 	});
 
 	afterEach(async () => {
-		await client?.stop();
-		await removeWithRetries(directory);
+		// Bind this test's resources before awaiting: a stop that outlives the
+		// hook timeout resumes after the next beforeEach has reassigned both.
+		const ownClient = client;
+		const ownDirectory = directory;
+		await ownClient?.stop();
+		await removeWithRetries(ownDirectory);
 	});
 
 	/** Starts the agent and runs two finished turns; returns the [user, assistant, user, assistant] message entry ids. */
@@ -94,8 +99,12 @@ describe("RPC fork", () => {
 		const nonMessage = entries.find(entry => entry.type === "thinking_level_change");
 		expect(nonMessage).toBeDefined();
 
-		await expect(client.fork("no-such-entry")).rejects.toThrow(/Invalid entry ID for forking/);
-		await expect(client.fork(nonMessage!.id)).rejects.toThrow(/Invalid entry ID for forking/);
+		expect(await rejectionOf(client.fork("no-such-entry"))).toMatchObject({
+			message: expect.stringMatching(/Invalid entry ID for forking/),
+		});
+		expect(await rejectionOf(client.fork(nonMessage!.id))).toMatchObject({
+			message: expect.stringMatching(/Invalid entry ID for forking/),
+		});
 		expect((await client.getState()).sessionFile).toBe(source.sessionFile);
 	}, 30_000);
 
@@ -110,7 +119,7 @@ describe("RPC fork", () => {
 			await client.prompt("slow");
 			expect((await client.getState()).isStreaming).toBe(true);
 
-			await expect(client.fork(firstReply)).rejects.toMatchObject({ command: "fork", code: "session_busy" });
+			expect(await rejectionOf(client.fork(firstReply))).toMatchObject({ command: "fork", code: "session_busy" });
 
 			await withTimeout(idle.promise, 10_000, "Streaming turn did not finish");
 		} finally {

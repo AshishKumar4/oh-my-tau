@@ -112,6 +112,7 @@ describe("task async preflight", () => {
 			const result = await tool.execute("preflight", params as TaskParams);
 
 			expect(textOf(result)).toContain(expectation);
+			expect(result.isError).toBe(true);
 			expect(jobs.getJob(name)).toBeUndefined();
 		},
 	);
@@ -134,6 +135,7 @@ describe("task async preflight", () => {
 
 		const text = textOf(result);
 		expect(text).toContain('Task Invalid failed preflight: Unknown agent "missing"');
+		expect(result.isError).toBe(true);
 		expect(text).toContain('Task AlsoInvalid failed preflight: Unknown agent "also-missing"');
 		expect(register).not.toHaveBeenCalled();
 		expect(runSubprocess).not.toHaveBeenCalled();
@@ -181,7 +183,8 @@ describe("task async preflight", () => {
 			} as TaskParams);
 
 			const text = textOf(result);
-			expect(text).toContain(`Searched: ${path.join("~", "project", ".omp", "agents")}`);
+			// shortenPath renders home paths as portable `~/…` on every platform.
+			expect(text).toContain("Searched: ~/project/.omp/agents");
 			expect(text).not.toContain(home);
 		} finally {
 			await fs.rm(home, { recursive: true, force: true });

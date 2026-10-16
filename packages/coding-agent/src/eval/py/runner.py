@@ -79,6 +79,21 @@ except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
     _CAPTURE_READ_FD = None
 _OUT_LOCK = threading.Lock()
 
+# Requests likewise arrive on a private dup of the original stdin, and fd 0
+# itself is repointed at os.devnull: user code, and every process it spawns
+# without an explicit stdin, then reads immediate EOF instead of blocking on
+# (or stealing frames from) a control channel that stays open for the
+# kernel's whole life. The host still writes NDJSON requests to the
+# subprocess stdin.
+try:
+    _CONTROL_FD = os.dup(sys.__stdin__.fileno())
+    _CONTROL_IN = os.fdopen(_CONTROL_FD, "r", encoding="utf-8")
+    _devnull_fd = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(_devnull_fd, sys.__stdin__.fileno())
+    os.close(_devnull_fd)
+except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+    _CONTROL_IN = sys.__stdin__
+
 
 def _json_default(o: Any) -> Any:
     try:
@@ -933,7 +948,8 @@ def _magic_line_indices(lines: list[str]) -> set[int]:
     indices: set[int] = set()
     offset = 0
     while offset < len(lines):
-        # Enclosure avoids indentation errors when restarting inside a suite.
+        # A synthetic enclosing expression suppresses indentation checks when
+        # restarting in the middle of a suite; this pass only identifies tokens.
         stream = itertools.chain(
             ("(\n",),
             (line + "\n" for line in itertools.islice(lines, offset, None)),
@@ -952,7 +968,8 @@ def _magic_line_indices(lines: list[str]) -> set[int]:
                     tokenize.NL, tokenize.NEWLINE, tokenize.INDENT,
                     tokenize.DEDENT, tokenize.ENDMARKER, tokenize.COMMENT,
                 ) or (item.type == tokenize.ERRORTOKEN and item.string.isspace()):
-                    # Python <3.12 emits indentation before ! as ERRORTOKENs.
+                    # Python < 3.12 emits indentation before `!` as one
+                    # whitespace ERRORTOKEN per column.
                     continue
                 row = offset + item.start[0] - 2
                 if row < offset or row >= len(lines) or row == last_row:
@@ -968,13 +985,15 @@ def _magic_line_indices(lines: list[str]) -> set[int]:
                 indices.add(row)
                 if stripped.startswith("%%"):
                     return indices
+                # Shell quotes and cell/line magic arguments are not Python.
+                # Restart after the command instead of tokenizing its payload.
                 consumed = _fold_continuations(lines, row)[1] if stripped.startswith(("%", "!")) else 1
                 offset = row + consumed
                 break
             else:
                 return indices
         except (tokenize.TokenError, IndentationError):
-            # The normal Python parser reports incomplete source.
+            # Leave incomplete Python source to the ordinary syntax-error path.
             return indices
     return indices
 
@@ -993,8 +1012,9 @@ def transform_cell(source: str) -> str:
       (cell magic must be the first non-whitespace token of a top-level line and
       consumes the remainder of the cell)
 
-    Python tokenization excludes strings and comments. Real command payloads
-    are skipped so shell quoting cannot affect subsequent Python source.
+    Python tokenization identifies command lines outside strings and comments.
+    Real command payloads are skipped before resuming lexical scanning so shell
+    quoting cannot change how subsequent Python source is interpreted.
     """
 
     if "%" not in source and "!" not in source:
@@ -1535,9 +1555,10 @@ def _magic_cell_writefile(args: str, body: str) -> str:
 
 
 def _run_shell_body(body: str, *, shell_arg: str) -> int:
-    # stdin=DEVNULL: children must not inherit the runner's stdin, which is
-    # the host's NDJSON control channel (a reading child would steal frames,
-    # and inheriting the pipe deadlocks nested interpreters on Windows).
+    # stdin=DEVNULL: children must never read the host's NDJSON control
+    # channel (a reading child would steal frames, and inheriting the pipe
+    # deadlocks nested interpreters on Windows). fd 0 already points at
+    # os.devnull; this stays explicit for when that redirect failed.
     proc = subprocess.Popen(
         [shell_arg, "-c", body],
         stdin=subprocess.DEVNULL,
@@ -1664,6 +1685,18 @@ def _mime_bundle(value: Any) -> dict:
     Honors ``_repr_mimebundle_`` first, falls back to individual ``_repr_*_``
     accessors, and always provides ``text/plain``.
     """
+    # Match JS display({type: "image", ...}) without losing detail or remote
+    # references in a plain PNG/JPEG MIME representation.
+    if (
+        isinstance(value, dict)
+        and value.get("type") == "image"
+        and isinstance(value.get("mimeType"), str)
+        and isinstance(value.get("data"), (str, bytes, bytearray))
+    ):
+        image = dict(value)
+        image["data"] = _coerce_image_bytes(image["data"])
+        return {"application/x-omp-image": image}
+
     bundle: dict[str, Any] = {}
     matplotlib_png = _matplotlib_figure_png(value)
     if matplotlib_png is not None:
@@ -1706,10 +1739,32 @@ def _mime_bundle(value: Any) -> dict:
     return bundle
 
 
+_MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
+
+
+def _safe_display_json(value: Any) -> Any:
+    """Encode integers outside JavaScript's exact range as decimal strings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return (
+            str(value)
+            if value > _MAX_SAFE_JSON_INTEGER or value < -_MAX_SAFE_JSON_INTEGER
+            else value
+        )
+    if isinstance(value, dict):
+        return {key: _safe_display_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe_display_json(item) for item in value]
+    return value
+
+
 def _emit_display(bundle: dict, *, kind: str = "display") -> None:
     rid = _CURRENT_RID.get()
     if rid is None:
         return
+    if "application/json" in bundle:
+        bundle = {**bundle, "application/json": _safe_display_json(bundle["application/json"])}
     _emit({"type": kind, "id": rid, "bundle": bundle})
 
 
@@ -2358,7 +2413,7 @@ async def _serve_posix(loop: asyncio.AbstractEventLoop, stdin) -> None:
     block sibling requests: auto-backgrounded cells, user Python shortcuts, and
     kernel-defined tool calls from subagents can all be in flight on one kernel
     at once. The reader thread stays blocked in a
-    ``sys.stdin`` read for its whole life, which is safe on POSIX but wedges
+    control-channel read for its whole life, which is safe on POSIX but wedges
     native-extension imports on Windows (see ``_serve_windows``).
     """
     queue: asyncio.Queue = asyncio.Queue()
@@ -2407,7 +2462,7 @@ async def _serve_posix(loop: asyncio.AbstractEventLoop, stdin) -> None:
 async def _serve_windows(loop: asyncio.AbstractEventLoop, stdin) -> None:
     """Dispatch requests serially, serving tool requests between cells.
 
-    A thread perpetually parked in a blocking ``sys.stdin`` read deadlocks
+    A thread perpetually parked in a blocking control-channel read deadlocks
     native-extension imports (NumPy in particular) under a pipe-backed
     subprocess on Windows: the native DLL load and the concurrent stdin read
     wedge each other (numpy#24290, issue #7985). Reading each line via
@@ -2461,7 +2516,7 @@ async def _main_async() -> None:
     _start_parent_watchdog()
     _start_capture_drain()
 
-    stdin = sys.__stdin__
+    stdin = _CONTROL_IN
     if stdin is None:
         return
 

@@ -2,6 +2,129 @@
 
 ## [Unreleased]
 
+## [18.11.2] - 2026-10-16
+
+### Added
+
+- Exported `sqliteFileIdentity()`, so a caller holding a long-lived SQLite connection can tell when its path now names a different file (e.g. after a corrupt store was quarantined and replaced) ([#14361](https://github.com/can1357/oh-my-pi/pull/14361) by [@F0Rextasy](https://github.com/F0Rextasy))
+- Added `slugify()`, the shared lowercase ASCII kebab-case helper with an optional `maxLength` ([#14283](https://github.com/can1357/oh-my-pi/pull/14283) by [@jaredlyon](https://github.com/jaredlyon))
+
+### Fixed
+
+- Fixed an unhandled rejection when a subprocess is spawned with an already-aborted signal ([#15750](https://github.com/can1357/oh-my-pi/pull/15750) by [@harshaygadekar](https://github.com/harshaygadekar))
+
+## [18.10.0] - 2026-10-12
+
+### Added
+
+- Added `getMnemopiEmbedRuntimeDir()` for the shared mnemopi embedding server endpoints and logs.
+
+### Fixed
+
+- Fixed `ChildProcess.kill()` silently leaving the child running when the native process handle could not be resolved or used; it now signals the child directly and escalates to SIGKILL after the grace period.
+
+## [18.9.2] - 2026-10-11
+
+### Changed
+
+- Improved streaming JSON parsing performance for tool arguments containing many string values.
+
+### Fixed
+
+- Fixed parsing of long strings that contain closing delimiters other than double or single quotes.
+
+## [18.9.0] - 2026-10-11
+
+### Breaking Changes
+
+- Renamed `takeRecentLoopPhase()` to `takeLoopPhaseAttribution()`. The new API returns a `LoopPhaseAttribution` object (`{ label, ms }`) and reports a label only when it accounts for more time than unlabeled work within an armed measurement window.
+
+### Added
+
+- Added `withLoopPhase(label, fn)` for attributing synchronous work to a named loop phase, with automatic cleanup even when the callback throws.
+
+### Changed
+
+- Improved streaming JSON parsing performance for long tool-argument payloads.
+
+### Fixed
+
+- Fixed archive extraction on Windows systems without symlink privileges by allowing symlink entries to be extracted using supported fallbacks, while skipping unresolvable dangling links instead of failing the entire archive.
+
+## [18.8.9] - 2026-10-10
+
+### Added
+
+- Added `hueDistance`, the angular distance between two OKLCH hues
+
+## [18.8.8] - 2026-10-10
+
+### Fixed
+
+- Fixed `formatDuration` printing `60.0s` for durations just under a minute; they now read `1m` ([#15121](https://github.com/can1357/oh-my-pi/pull/15121) by [@H4vC](https://github.com/H4vC))
+
+## [18.8.7] - 2026-10-09
+
+### Added
+
+- Added `getNativeGrammarsDir()`, where the native addon loads downloaded tree-sitter grammars from (`~/.omp/natives/grammars`).
+
+### Fixed
+
+- Fixed the virtual terminal misreading private CSI sequences such as kitty keyboard `CSI < u` and modifyOtherKeys `CSI > 4;1 m` as cursor restores or text styling, which garbled replayed PTY output.
+
+## [18.8.1] - 2026-10-07
+
+### Added
+
+- Added `PI_NATIVES_DIR` support to `getNativesDir()` for configuring the native addon directory.
+- Added `ZipPackage` for lazily reading ZIP-based document packages with a total decompressed-size limit, along with `DocxImage.readBytes()` for accessing raw DOCX image data.
+
+## [18.8.0] - 2026-10-07
+
+### Added
+
+- Added `ZipPackage` to `@oh-my-pi/pi-utils/ar` for lazily reading ZIP-based document packages with a configurable total-inflation limit, plus `DocxImage.readBytes()` for accessing raw DOCX image data.
+
+### Changed
+
+- Improved DOCX conversion to inflate only the package contents it needs, reducing unnecessary work and memory use.
+- Improved performance across HTML-to-Markdown conversion, Readability extraction, Markdown lexing, terminal emulation, terminal styling, streaming tool-argument parsing, and log writing. Large-page processing and terminal workloads now use substantially less time and memory.
+
+### Fixed
+
+- Fixed memory growth in long-lived child processes, streaming readers, prompt template compilation, and retried HTTP requests by releasing buffers, cache entries, and discarded response bodies promptly.
+- Fixed prompt templates rejecting `{{else if …}}` chains as unclosed blocks; a chain now closes with its opening block's single closing tag, as in Handlebars.
+
+## [18.6.3] - 2026-10-06
+
+### Breaking Changes
+
+- Replaced the `cursorPosition` option of `TerminalQueryResponder` with `hostCursorHandshake`, which leaves only the PTY host's own session-start cursor query unanswered instead of every cursor-position query
+
+## [18.5.1] - 2026-10-03
+
+### Added
+
+- Added utilities for detecting and scanning own-line display-math blocks in growing text, including identifying possible openers and closers efficiently.
+- Added an option to `TerminalQueryResponder` that lets PTY hosts provide cursor-position reports themselves.
+- Added `refreshShellConfigCache()` to rebuild the cached shell spawn environment from the current process environment.
+
+### Fixed
+
+- Fixed the Markdown lexer dropping text preceding U+2028 or U+2029 line-separator characters.
+
+## [18.5.0] - 2026-10-03
+
+### Added
+
+- Added the public `getSessionOwnersDir()` utility, which returns the profile-independent `~/.omp/run/session-owners` directory that names session ownership leases ([#14095](https://github.com/can1357/oh-my-pi/pull/14095) by [@andrebrait](https://github.com/andrebrait))
+
+### Fixed
+
+- Fixed SQLite error messages doubling every backslash in Windows database paths
+- Fixed corrupt-database recovery failing with `EBUSY` on Windows when several in-process openers of the same store failed at once
+
 ## [18.4.12] - 2026-10-02
 
 ### Fixed

@@ -14,6 +14,7 @@ import {
 import {
 	getSkillStorePath,
 	getSkillshareStoreDir,
+	getProjectSkillsInstallPaths,
 	readSkillsLock,
 	readSkillsManifest,
 	type SkillsLock,
@@ -118,7 +119,17 @@ describe("skills manifest and lock", () => {
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skillshare-manifest-"));
 	});
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		await removeWithRetries(dir);
+	});
+
+	it("rejects a temporary ceiling as a project root without identifying it as home", async () => {
+		vi.spyOn(os, "tmpdir").mockReturnValue(dir);
+		vi.spyOn(os, "homedir").mockReturnValue(path.join(dir, "home"));
+
+		await expect(getProjectSkillsInstallPaths(dir)).rejects.toThrow(
+			"This directory is not a project root; pass --global to install for your user.",
+		);
 	});
 
 	it("round-trips entries with sorted keys", async () => {
@@ -228,7 +239,10 @@ describe("installer", () => {
 		});
 		const store = getSkillStorePath(SCOPE, NAME, "1.1.0");
 		expect(await Bun.file(path.join(store, "SKILL.md")).text()).toContain("# PDF 1.1.0");
-		expect((await fs.stat(path.join(store, "scripts", "run.sh"))).mode & 0o111).not.toBe(0);
+		// Windows file modes carry no execute bits.
+		if (process.platform !== "win32") {
+			expect((await fs.stat(path.join(store, "scripts", "run.sh"))).mode & 0o111).not.toBe(0);
+		}
 	});
 
 	it("aborts on an integrity mismatch before writing anything", async () => {

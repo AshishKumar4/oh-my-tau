@@ -59,7 +59,7 @@ export const oauthCredentialSchema: FluentType<OAuthCredential> = type({
 	refresh: type("string").narrow(
 		(value, ctx) =>
 			value !== REMOTE_REFRESH_SENTINEL ||
-			ctx.mustBe(`not equal to the remote sentinel (${REMOTE_REFRESH_SENTINEL})`),
+			ctx.mustBe(`a real refresh token, not the broker snapshot sentinel (${REMOTE_REFRESH_SENTINEL})`),
 	),
 	access: type("string").atLeastLength(1),
 	expires: "number",

@@ -55,7 +55,18 @@ import { isDemotedThinking } from "../utils/block-symbols";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { normalizeSchemaForGoogle, toolWireSchema } from "../utils/schema";
-import { transformMessages } from "./transform-messages";
+import {
+	CONNECT_COMPRESSED_FLAG,
+	CONNECT_END_STREAM_FLAG,
+	ConnectFrameDecoder,
+	frameConnectMessage,
+} from "./connect-frame";
+import {
+	isResponsesFamilyApi,
+	normalizeToolCallId,
+	responsesCallComponent,
+	transformMessages,
+} from "./transform-messages";
 
 /** Base host for Codeium/Windsurf's Cascade chat API (Connect protocol over HTTP/1.1). */
 export const DEVIN_API_URL = DEVIN_DEFAULT_BASE_URL;
@@ -73,15 +84,19 @@ const CHAT_MESSAGE_PATH = "/exa.api_server_pb.ApiServerService/GetChatMessage";
 const DEVIN_ASSIGN_MODEL_PATH = "/exa.api_server_pb.ApiServerService/AssignModel";
 const DEVIN_AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt";
 
-/** Connect streaming framing: flag byte bit 0x01 = gzip payload, 0x02 = end-of-stream JSON trailers. */
-const CONNECT_COMPRESSED_FLAG = 0x01;
-const CONNECT_END_STREAM_FLAG = 0x02;
+/**
+ * Cascade forwards replayed tool-call ids to the backend serving the chat model;
+ * OpenAI-routed models reject ids past OpenAI's 40-char cap or outside
+ * `[a-zA-Z0-9_-]` with an opaque `invalid_argument` (#15234).
+ */
+const DEVIN_TOOL_CALL_ID_MAX_LENGTH = 40;
+
 /**
  * Hard upper bound on a single Connect frame payload. The 4-byte length prefix
  * is otherwise attacker-controlled (up to `2**32 - 1`), so a malicious or buggy
- * peer could force {@link streamDevin}'s reader to buffer gigabytes via
- * `Buffer.concat` before the idle-timeout wrapper aborts. Well above any
- * legitimate Cascade response but tight enough that a corrupt length prefix
+ * peer could force {@link streamDevin}'s reader to buffer gigabytes before the
+ * idle-timeout wrapper aborts. Well above any legitimate Cascade response but
+ * tight enough that a corrupt length prefix
  * fails fast instead of consuming memory.
  */
 const MAX_CONNECT_FRAME_PAYLOAD = 16 * 1024 * 1024;
@@ -185,6 +200,8 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 		// the authoritative final parse still runs unconditionally in the
 		// toolcall_end loop below.
 		const toolLastParseLen = new Map<string, number>();
+		// Content index recorded at push, so deltas never scan `output.content`.
+		const blockIndices = new Map<TextContent | ThinkingContent | ToolCall, number>();
 		let activeToolCallId: string | undefined;
 		let latestStopReason = StopReason.UNSPECIFIED;
 
@@ -198,7 +215,7 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			currentTextBlock = null;
 			stream.push({
 				type: "text_end",
-				contentIndex: output.content.indexOf(block),
+				contentIndex: blockIndices.get(block)!,
 				content: block.text,
 				partial: output,
 			});
@@ -210,7 +227,7 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			currentThinkingBlock = null;
 			stream.push({
 				type: "thinking_end",
-				contentIndex: output.content.indexOf(block),
+				contentIndex: blockIndices.get(block)!,
 				content: block.thinking,
 				partial: output,
 			});
@@ -224,7 +241,19 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			const turn: DevinTurn = {
 				apiKey: auth.apiKey,
 				cascadeId: options?.conversationId ?? options?.sessionId ?? crypto.randomUUID(),
-				messages: transformMessages(context.messages, model),
+				// Foreign ids (cross-model calls and their results alike): Responses
+				// composites (`call_id|item_id`) keep their wire `call_id`; opaque ids
+				// from other APIs keep every segment. Both are then sanitized and capped.
+				messages: transformMessages(
+					context.messages,
+					model,
+					(id, _target, source) =>
+						normalizeToolCallId(
+							isResponsesFamilyApi(source.api) ? responsesCallComponent(id) : id,
+							DEVIN_TOOL_CALL_ID_MAX_LENGTH,
+						),
+					DEVIN_TOOL_CALL_ID_MAX_LENGTH,
+				),
 			};
 			// Router models (`adaptive`) are not valid chat model uids: the server
 			// resolves them through AssignModel and expects the returned uid plus
@@ -234,7 +263,9 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 				assignment = await assignDevinModel(model, turn, chatBaseUrl, fetchImpl, options?.signal);
 				output.upstreamModel = assignment.modelUid;
 			}
-			const request = buildDevinChatRequest(model, context, options, turn, assignment);
+			let request = buildDevinChatRequest(model, context, options, turn, assignment);
+			const replacementRequest = await options?.onPayload?.(request, model);
+			if (replacementRequest !== undefined) request = replacementRequest as typeof request;
 			const reqBytes = toBinary(GetChatMessageRequestSchema, request);
 			const gz = gzipSync(reqBytes);
 			logger.debug("devin: sending chat request", {
@@ -243,10 +274,7 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 				requestBytes: reqBytes.byteLength,
 				compressedBytes: gz.byteLength,
 			});
-			const frame = Buffer.alloc(5 + gz.length);
-			frame[0] = CONNECT_COMPRESSED_FLAG;
-			frame.writeUInt32BE(gz.length, 1);
-			frame.set(gz, 5);
+			const frame = frameConnectMessage(gz, CONNECT_COMPRESSED_FLAG);
 
 			const response = await fetchImpl(chatBaseUrl + CHAT_MESSAGE_PATH, {
 				method: "POST",
@@ -278,32 +306,21 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			stream.push({ type: "start", partial: output });
 
 			const reader = body.getReader();
-			let pending = Buffer.alloc(0);
+			const frameDecoder = new ConnectFrameDecoder({
+				limit: {
+					maxPayloadBytes: MAX_CONNECT_FRAME_PAYLOAD,
+					error: len =>
+						new AIError.ProviderResponseError(
+							`Devin Connect frame length ${len} exceeds ${MAX_CONNECT_FRAME_PAYLOAD}-byte cap`,
+							{ provider: model.provider, kind: "envelope" },
+						),
+				},
+			});
 
 			for (;;) {
 				const { done, value } = await reader.read();
-				if (value && value.length > 0) {
-					// Steady state drains fully per chunk; view the fresh reader chunk
-					// instead of copying it through Buffer.concat (see aws-eventstream.ts).
-					pending =
-						pending.length === 0
-							? Buffer.from(value.buffer, value.byteOffset, value.byteLength)
-							: Buffer.concat([pending, value]);
-				}
 
-				while (pending.length >= 5) {
-					const flag = pending[0];
-					const len = pending.readUInt32BE(1);
-					if (len > MAX_CONNECT_FRAME_PAYLOAD) {
-						throw new AIError.ProviderResponseError(
-							`Devin Connect frame length ${len} exceeds ${MAX_CONNECT_FRAME_PAYLOAD}-byte cap`,
-							{ provider: model.provider, kind: "envelope" },
-						);
-					}
-					if (pending.length < 5 + len) break;
-					const payload = pending.subarray(5, 5 + len);
-					pending = pending.subarray(5 + len);
-
+				for (const { flags: flag, payload } of frameDecoder.decode(value)) {
 					if (flag & CONNECT_END_STREAM_FLAG) {
 						const trailerBytes = flag & CONNECT_COMPRESSED_FLAG ? gunzipSync(payload) : payload;
 						const trailerError = readConnectTrailerError(trailerBytes.toString("utf8").trim());
@@ -381,9 +398,13 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 
 					if (msg.deltaThinking) {
 						markFirstToken();
-						const block: ThinkingContent = currentThinkingBlock ?? { type: "thinking", thinking: "" };
+						const block: ThinkingContent = currentThinkingBlock ?? {
+							type: "thinking",
+							thinking: "",
+							summary: false,
+						};
 						if (currentThinkingBlock !== block) {
-							output.content.push(block);
+							blockIndices.set(block, output.content.push(block) - 1);
 							currentThinkingBlock = block;
 							stream.push({
 								type: "thinking_start",
@@ -395,7 +416,7 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 						if (msg.deltaSignature) block.thinkingSignature = msg.deltaSignature;
 						stream.push({
 							type: "thinking_delta",
-							contentIndex: output.content.indexOf(block),
+							contentIndex: blockIndices.get(block)!,
 							delta: msg.deltaThinking,
 							partial: output,
 						});
@@ -406,14 +427,14 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 						endThinkingBlock();
 						const block: TextContent = currentTextBlock ?? { type: "text", text: "" };
 						if (currentTextBlock !== block) {
-							output.content.push(block);
+							blockIndices.set(block, output.content.push(block) - 1);
 							currentTextBlock = block;
 							stream.push({ type: "text_start", contentIndex: output.content.length - 1, partial: output });
 						}
 						block.text += msg.deltaText;
 						stream.push({
 							type: "text_delta",
-							contentIndex: output.content.indexOf(block),
+							contentIndex: blockIndices.get(block)!,
 							delta: msg.deltaText,
 							partial: output,
 						});
@@ -429,7 +450,7 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 							let block = toolBlocks.get(toolCallId);
 							if (!block) {
 								block = { type: "toolCall", id: toolCallId, name: tc.name, arguments: {} };
-								output.content.push(block);
+								blockIndices.set(block, output.content.push(block) - 1);
 								toolBlocks.set(toolCallId, block);
 								toolPartialJson.set(toolCallId, "");
 								stream.push({
@@ -454,7 +475,7 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 							}
 							stream.push({
 								type: "toolcall_delta",
-								contentIndex: output.content.indexOf(block),
+								contentIndex: blockIndices.get(block)!,
 								delta,
 								partial: output,
 							});
@@ -491,7 +512,7 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 				block.arguments = parseToolCallArguments(toolPartialJson.get(id));
 				stream.push({
 					type: "toolcall_end",
-					contentIndex: output.content.indexOf(block),
+					contentIndex: blockIndices.get(block)!,
 					toolCall: block,
 					partial: output,
 				});
@@ -663,7 +684,7 @@ const DEVIN_CLI_COMPLETION_CONFIGURATION = {
 	maxNewlines: 400n,
 	temperature: 1,
 	topK: 40n,
-	topP: 0.95,
+	topP: Math.fround(0.95),
 } as const;
 
 /**
@@ -726,7 +747,8 @@ function buildDevinChatRequest(
 			...DEVIN_CLI_COMPLETION_CONFIGURATION,
 			...(options?.maxTokens !== undefined ? { maxTokens: BigInt(options.maxTokens) } : undefined),
 			...(options?.temperature !== undefined ? { temperature: options.temperature } : undefined),
-			...(options?.topP !== undefined ? { topP: options.topP } : undefined),
+			// Devin's CLI sends topP as a float32 widened to double; round the same way.
+			...(options?.topP !== undefined ? { topP: Math.fround(options.topP) } : undefined),
 			...(options?.stopSequences && options.stopSequences.length > 0
 				? { stopPatterns: options.stopSequences }
 				: undefined),
@@ -791,10 +813,11 @@ function buildChatMessagePrompts(
 			if (!promptText && !thinkingText && !signature && toolCalls.length === 0) continue;
 			prompts.push(
 				create(ChatMessagePromptSchema, {
+					// Native assistant ids are bare UUIDs, like every other history row.
 					messageId:
 						isNativeDevinMessage && msg.responseId
 							? msg.responseId
-							: `bot-${deterministicUuid(`${cascadeId}\0${index}\0assistant`)}`,
+							: deterministicUuid(`${cascadeId}\0${index}\0assistant`),
 					source: ChatMessageSource.SYSTEM,
 					prompt: promptText,
 					thinking: thinkingText,

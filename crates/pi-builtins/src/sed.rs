@@ -73,8 +73,9 @@ pub struct ProcessingContext {
 	pub last_file:            bool,
 	/// Stop processing further input.
 	pub stop_processing:      bool,
-	/// Previously compiled RE, saved for reuse when specifying an empty RE
-	pub saved_regex:          Option<Regex>,
+	/// Previously compiled RE, saved for reuse when specifying an empty RE.
+	/// Shared, never cloned: a cloned `Regex` starts with an empty match cache.
+	pub saved_regex:          Option<Rc<Regex>>,
 	/// Modification of input processing action
 	// This is required to avoid doubly borrowing the reader in the 'N'
 	// command.
@@ -110,7 +111,7 @@ pub struct StringSpace {
 #[derive(Debug)]
 /// Types of address specifications that precede commands
 pub enum Address {
-	Re(Option<Regex>), // Line that matches (optional) regex
+	Re(Option<Rc<Regex>>), // Line that matches (optional) regex
 	Line(usize),       // Specific line
 	RelLine(usize),    // Relative line
 	Last,              // Last line
@@ -223,7 +224,7 @@ impl ReplacementTemplate {
 #[derive(Debug, Default)]
 /// Substitution command
 pub struct Substitution {
-	pub regex:       Option<Regex>,       // Regular expression
+	pub regex:       Option<Rc<Regex>>,   // Regular expression
 	pub replacement: ReplacementTemplate, // Specified broken-down replacement
 	pub occurrence:  usize,               // Which occurrence to substitute
 	pub print_flag:  bool,                // True if 'p' flag
@@ -1048,7 +1049,7 @@ fn compile_address(
 				line.advance();
 			}
 
-			Ok(Address::Re(compile_regex(lines, line, &re, context, icase, false)?))
+			Ok(Address::Re(compile_regex(lines, line, &re, context, icase, false)?.map(Rc::new)))
 		},
 		'$' => {
 			line.advance();
@@ -1322,7 +1323,8 @@ fn compile_subst_command(
 	}
 
 	// Compile regex with now known modifier flags.
-	subst.regex = compile_regex(lines, line, &pattern, context, subst.ignore_case, subst.multiline)?;
+	subst.regex = compile_regex(lines, line, &pattern, context, subst.ignore_case, subst.multiline)?
+		.map(Rc::new);
 
 	// Catch invalid group references at compile time, if possible.
 	if let Some(regex) = &subst.regex
@@ -3925,6 +3927,13 @@ pub fn parse_regex(
 					line.advance();
 					continue;
 				}
+				if line.current() == 'b' {
+					// In a regex `\b` is a word boundary, never a backspace; GNU sed
+					// omits the backspace escape for exactly this conflict.
+					result.push_str("\\b");
+					line.advance();
+					continue;
+				}
 				if let Some(decoded) = parse_char_escape(line) {
 					result.push(decoded);
 				} else {
@@ -5770,6 +5779,31 @@ mod tests {
 		buf
 	}
 
+	/// Truncating an input file after sed opened it must not fault the host
+	/// process; the reader keeps serving the bytes captured at open (unix
+	/// snapshots regular files; other platforms stream them).
+	#[cfg(unix)]
+	#[test]
+	fn test_file_truncated_after_open() -> io::Result<()> {
+		let mut tmp = NamedTempFile::new()?;
+		for _ in 0..4 {
+			tmp.write_all(&[b'.'; 4095])?;
+			tmp.write_all(b"\n")?;
+		}
+		tmp.flush()?;
+		let mut reader = LineReader::open(&tmp.path().to_path_buf())?;
+		tmp.as_file().set_len(0)?;
+
+		let mut lines = 0;
+		while let Some(chunk) = reader.get_line()? {
+			assert_eq!(chunk.as_bytes(), [b'.'; 4095]);
+			lines += 1;
+		}
+		assert_eq!(lines, 4);
+		Ok(())
+	}
+
+	/// The snapshot also keeps an unterminated final line unterminated.
 	#[cfg(unix)]
 	#[test]
 	fn snapshot_reader_survives_truncation_and_preserves_final_newline_state() -> io::Result<()> {
@@ -5814,7 +5848,7 @@ mod tests {
 
 	#[test]
 	#[cfg(unix)]
-	fn test_snapshot_line_output_single() -> io::Result<()> {
+	fn test_slice_line_output_single() -> io::Result<()> {
 		use std::{fs, io::Write};
 
 		use tempfile::NamedTempFile;
@@ -6101,7 +6135,7 @@ mod tests {
 
 	#[test]
 	#[cfg(unix)]
-	fn test_snapshot_read() -> std::io::Result<()> {
+	fn test_slice_read() -> std::io::Result<()> {
 		// Create temporary file with known contents
 		let mut tmp = NamedTempFile::new()?;
 		write!(tmp, "first line\nsecond line\nlast line\n")?;
@@ -6123,7 +6157,7 @@ mod tests {
 			assert!(!utf8_verified.get());
 			assert!(!reader.last_line().unwrap());
 		} else {
-			panic!("Expected IOChunkContent::MapInput");
+			panic!("Expected IOChunkContent::SliceInput");
 		}
 
 		if let Some(IOChunk {
@@ -6137,7 +6171,7 @@ mod tests {
 			assert!(!utf8_verified.get());
 			assert!(!reader.last_line().unwrap());
 		} else {
-			panic!("Expected IOChunkContent::MapInput");
+			panic!("Expected IOChunkContent::SliceInput");
 		}
 
 		if let Some(content) = reader.get_line()? {
@@ -6179,7 +6213,7 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
-	fn test_snapshot_newline_terminated() {
+	fn test_slice_newline_terminated() {
 		let content = b"line";
 		let full_span = b"line\n";
 		let chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
@@ -6188,7 +6222,7 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
-	fn test_snapshot_not_newline_terminated() {
+	fn test_slice_not_newline_terminated() {
 		let content = b"line";
 		let full_span = b"line";
 		let chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
@@ -6197,7 +6231,7 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
-	fn test_snapshot_empty() {
+	fn test_slice_empty() {
 		let content = b"";
 		let full_span = b"";
 		let chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
@@ -6226,7 +6260,7 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
-	fn test_ensure_owned_on_snapshot_valid_utf8() {
+	fn test_ensure_owned_on_slice_valid_utf8() {
 		let content = b"snapshot string";
 		let full_span = b"snapshot string\n";
 
@@ -6246,7 +6280,7 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
-	fn test_ensure_owned_on_snapshot_valid_utf8_no_newline() {
+	fn test_ensure_owned_on_slice_valid_utf8_no_newline() {
 		let content = b"no newline";
 		let full_span = b"no newline";
 
@@ -6266,7 +6300,7 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
-	fn test_ensure_owned_on_snapshot_invalid_utf8() {
+	fn test_ensure_owned_on_slice_invalid_utf8() {
 		let content = b"bad\xFFutf8";
 		let full_span = b"bad\xFFutf8\n";
 
@@ -6291,7 +6325,7 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
-	fn test_fields_mut_on_snapshot_input_valid_utf8() {
+	fn test_fields_mut_on_slice_input_valid_utf8() {
 		let content = b"foo";
 		let full_span = b"foo\n";
 		let mut chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
@@ -6348,6 +6382,15 @@ mod tests {
 		(buf, file)
 	}
 
+	/// A chunk over `range` of `data`, newline included in the span as written.
+	#[cfg(unix)]
+	fn make_slice_chunk(data: &Rc<Vec<u8>>, range: Range<usize>) -> IOChunk {
+		IOChunk {
+			utf8_verified: Cell::new(true),
+			content:       IOChunkContent::SliceInput { data: Rc::clone(data), content: range.clone(), full_span: range },
+		}
+	}
+
 	fn make_owned_chunk(s: &str, has_nl: bool) -> IOChunk {
 		IOChunk {
 			utf8_verified: Cell::new(true),
@@ -6356,6 +6399,64 @@ mod tests {
 				has_newline:                has_nl,
 			},
 		}
+	}
+
+	#[test]
+	#[cfg(unix)]
+	fn slice_new_chunk_single() {
+		let (mut outbuf, _file) = new_for_test(); // OutputBuffer
+
+		let backing = Rc::new(b"abc".to_vec());
+		let c1 = make_slice_chunk(&backing, 0..3);
+
+		outbuf.write_chunk(&c1).unwrap();
+
+		assert_eq!(outbuf.slice_chunk.as_ref().unwrap().range.len(), 3);
+	}
+
+	#[test]
+	#[cfg(unix)]
+	fn slice_new_chunk_and_coalesce() {
+		let (mut outbuf, _file) = new_for_test(); // OutputBuffer
+
+		let backing = Rc::new(b"abc\nefg\n".to_vec()); // contiguous, newline-terminated lines
+		let c1 = make_slice_chunk(&backing, 0..4); // "abc\n"
+		let c2 = make_slice_chunk(&backing, 4..8); // "efg\n"
+
+		outbuf.write_chunk(&c1).unwrap();
+		outbuf.write_chunk(&c2).unwrap();
+
+		assert_eq!(outbuf.slice_chunk.as_ref().unwrap().range.len(), 8);
+	}
+
+	#[test]
+	#[cfg(unix)]
+	fn slice_not_contiguous_triggers_flush() {
+		let (mut buf, _file) = new_for_test();
+		let backing = Rc::new(b"abcdefghi".to_vec());
+		let c1 = make_slice_chunk(&backing, 0..4); // "abcd"
+		let c2 = make_slice_chunk(&backing, 5..9); // "fghi"
+
+		buf.write_chunk(&c1).unwrap();
+		assert_eq!(buf.slice_chunk.as_ref().unwrap().range.len(), 4);
+		buf.write_chunk(&c2).unwrap();
+		// No coalescing: the pending span is now c2's alone.
+		assert_eq!(buf.slice_chunk.as_ref().unwrap().range, 5..9);
+	}
+
+	#[test]
+	#[cfg(unix)]
+	fn slice_coalesce_and_flush_blocks() {
+		let (mut buf, _file) = new_for_test();
+		buf.max_pending_write = 4;
+		let backing = Rc::new(b"abcde\nfgh\n".to_vec()); // contiguous newline-terminated lines
+		let c1 = make_slice_chunk(&backing, 0..6); // "abcde\n"
+		let c2 = make_slice_chunk(&backing, 6..10); // "fgh\n"
+
+		buf.write_chunk(&c1).unwrap();
+		buf.write_chunk(&c2).unwrap();
+		// Exceeding max_pending_write flushed the coalesced span.
+		assert!(buf.slice_chunk.is_none());
 	}
 
 	#[cfg(unix)]
@@ -7239,13 +7340,10 @@ use pi_vfs::{BlockingFs, File, TempOptions};
 use uucore::display::Quotable;
 
 use brush_core::openfiles::OpenFile;
-use crate::{
-	host::is_regular_file,
-	sed::{
-		command::ProcessingContext,
-		error_handling::{IoContext, SedError, SedResult},
-		fast_io::OutputBuffer,
-	},
+use crate::sed::{
+	command::ProcessingContext,
+	error_handling::{IoContext, SedError, SedResult},
+	fast_io::OutputBuffer,
 };
 
 /// Sibling file receiving in-place output, created through the injected
@@ -7298,6 +7396,9 @@ impl Drop for TempFile {
 // before an unpersisted temporary file is removed.
 pub struct InPlace {
 	stdout:              OpenFile,
+	/// Whether stdout is a regular file (block-buffered) rather than a pipe
+	/// or stream (line-buffered); classified once by the host.
+	stdout_is_file:      bool,
 	fs:                  BlockingFs,
 	pub output:          OutputBuffer,
 	pub in_place:        bool,
@@ -7311,16 +7412,17 @@ impl InPlace {
 	/// Create an in-place editing engine based on ProcessingContext.
 	/// Depending on its settings it may or may not perform in-place
 	/// editing, backup the original file, or follow symlinks.
-	pub fn new_with_stdout(context: ProcessingContext, stdout: OpenFile) -> Self {
+	pub fn new_with_stdout(context: ProcessingContext, stdout: OpenFile, stdout_is_file: bool) -> Self {
 		Self {
-			output:          stdout_output(&stdout),
+			output: stdout_output(&stdout, stdout_is_file),
 			stdout,
-			fs:              context.paths.fs().clone(),
-			in_place:        context.in_place,
+			stdout_is_file,
+			fs: context.paths.fs().clone(),
+			in_place: context.in_place,
 			in_place_suffix: context.in_place_suffix,
 			follow_symlinks: context.follow_symlinks,
-			temp_file:       None,
-			original_path:   None,
+			temp_file: None,
+			original_path: None,
 		}
 	}
 
@@ -7328,7 +7430,7 @@ impl InPlace {
 	#[cfg(test)]
 	pub fn new(context: ProcessingContext) -> Self {
 		let (host, _) = crate::host::Host::for_test("sed", "", ".");
-		Self::new_with_stdout(context, host.stdout_clone())
+		Self::new_with_stdout(context, host.stdout_clone(), host.stdout_is_regular_file())
 	}
 
 	/// Return an OutputBuffer for outputting the edits to the specified file.
@@ -7350,7 +7452,7 @@ impl InPlace {
 	/// to the context settings.
 	fn begin_resolved(&mut self, file_name: &Path) -> SedResult<&mut OutputBuffer> {
 		if !self.in_place {
-			self.output = stdout_output(&self.stdout);
+			self.output = stdout_output(&self.stdout, self.stdout_is_file);
 			return Ok(&mut self.output);
 		}
 
@@ -7401,7 +7503,7 @@ impl InPlace {
 
 		// Release the output's handle, then close the last one to surface
 		// deferred write errors before the file replaces the original.
-		self.output = stdout_output(&self.stdout);
+		self.output = stdout_output(&self.stdout, self.stdout_is_file);
 		temp.close()
 			.map_err_context(|| format!("error writing temporary file {}", temp.path.quote()))?;
 
@@ -7437,8 +7539,8 @@ impl InPlace {
 }
 
 /// Sed's standard output, line-buffered unless it is a regular file.
-fn stdout_output(stdout: &OpenFile) -> OutputBuffer {
-	OutputBuffer::new(Box::new(stdout.clone()), !is_regular_file(stdout))
+fn stdout_output(stdout: &OpenFile, stdout_is_file: bool) -> OutputBuffer {
+	OutputBuffer::new(Box::new(stdout.clone()), !stdout_is_file)
 }
 
 #[cfg(test)]
@@ -7926,16 +8028,19 @@ fn write_chunk(
 /// Return a reference to the current or the saved RE if the RE is None.
 /// Update the saved RE to RE.
 fn re_or_saved_re<'a>(
-	regex: Option<&Regex>,
+	regex: Option<&Rc<Regex>>,
 	context: &'a mut ProcessingContext,
 	location: &ScriptLocation,
 ) -> SedResult<&'a Regex> {
 	if let Some(re) = regex {
-		// First time we see this regex: clone it *once* into the context.
-		context.saved_regex = Some(re.clone());
+		// Share the compiled RE rather than cloning it: a cloned `Regex` gets a
+		// fresh, empty match cache, so every line would rebuild it from scratch.
+		if !context.saved_regex.as_ref().is_some_and(|saved| Rc::ptr_eq(saved, re)) {
+			context.saved_regex = Some(Rc::clone(re));
+		}
 		// Return a reference into context.saved_regex.
-		Ok(context.saved_regex.as_ref().unwrap())
-	} else if let Some(ref saved_re) = context.saved_regex {
+		Ok(context.saved_regex.as_deref().unwrap())
+	} else if let Some(saved_re) = context.saved_regex.as_deref() {
 		// We already have one: just borrow it.
 		Ok(saved_re)
 	} else {
@@ -8353,8 +8458,11 @@ fn process_file(
 					*pat_has_newline = context.hold.has_newline;
 				},
 				'h' => {
-					// Replace hold with the contents of the pattern space.
-					context.hold.content = pattern.as_str()?.to_string();
+					// Replace hold with the contents of the pattern space, reusing
+					// the hold buffer.
+					let content = pattern.as_str()?;
+					context.hold.content.clear();
+					context.hold.content.push_str(content);
 					context.hold.has_newline = pattern.is_newline_terminated();
 				},
 				'H' => {
@@ -8380,10 +8488,12 @@ fn process_file(
 					// Append to pattern `\n` and the next line
 					// Rather than reading input here, which would result
 					// in a double borrow on reader, modify the action
-					// to perform when the next line is read.
+					// to perform when the next line is read. This cycle's
+					// `pattern` is discarded, so move its buffer instead of
+					// copying the accumulated pattern space each time.
 					context.input_action = Some(InputAction {
 						next_command: command.next.clone(),
-						prepend:      pattern.as_str()?.to_string(),
+						prepend:      std::mem::take(pattern.fields_mut()?.0),
 					});
 					continue 'lines;
 				},
@@ -8528,7 +8638,8 @@ pub fn process_all_files(
 	// terminal, so upstream's stdout-tty check for auto-unbuffered output is
 	// dropped; `-u` alone controls flushing.
 
-	let mut in_place = InPlace::new_with_stdout(context.clone(), host.stdout_clone());
+	let mut in_place =
+		InPlace::new_with_stdout(context.clone(), host.stdout_clone(), host.stdout_is_regular_file());
 	let last_file_index = files.len() - 1;
 
 	for (index, path) in files.iter().enumerate() {
@@ -9588,6 +9699,42 @@ mod tests {
 		let (code, capture) = crate::host::run_util::<Sed>(&["2q42"], "one\ntwo\nthree\n", "/");
 		assert_eq!(code, 42);
 		assert_eq!(capture.out(), "one\ntwo\n");
+	}
+
+	#[test]
+	fn builtin_carries_pattern_and_hold_space_across_cycles() {
+		// `:a;N;$!ba` grows the pattern space by one line per cycle; each `N`
+		// must carry everything accumulated so far, for stdin and for file
+		// input (an in-memory snapshot on unix).
+		let dir = tempfile::tempdir().unwrap();
+		std::fs::write(dir.path().join("in.txt"), "one\ntwo\nthree\n").unwrap();
+		let join = r":a;N;$!ba;s/\n/,/g";
+		for (args, stdin) in [(&[join][..], "one\ntwo\nthree\n"), (&[join, "in.txt"][..], "")] {
+			let (code, capture) = crate::host::run_util::<Sed>(args, stdin, dir.path());
+			assert_eq!(code, 0, "{}", capture.err());
+			assert_eq!(capture.out(), "one,two,three\n", "{args:?}");
+		}
+		// `N` with no next line prints the pending pattern space (GNU).
+		let (code, capture) = crate::host::run_util::<Sed>(&[r"N;s/\n/+/"], "a\nb\nc\n", "/");
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "a+b\nc\n");
+		// `1!G;h;$!d` reverses the input through the hold space.
+		let (code, capture) = crate::host::run_util::<Sed>(&["1!G;h;$!d"], "a\nb\nc\n", "/");
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "c\nb\na\n");
+	}
+
+	#[test]
+	fn builtin_matches_word_boundaries_in_regexes() {
+		// `\b` is a word boundary in substitutions and addresses, BRE and ERE alike.
+		let (code, capture) =
+			crate::host::run_util::<Sed>(&[r"s/\bfoo\b/bar/g"], "foo foobar barfoo foo\n", "/");
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "bar foobar barfoo bar\n");
+		let (code, capture) =
+			crate::host::run_util::<Sed>(&["-E", r"/\bfoo\b/d"], "foobar\nfoo\n", "/");
+		assert_eq!(code, 0, "{}", capture.err());
+		assert_eq!(capture.out(), "foobar\n");
 	}
 
 	#[test]

@@ -12,7 +12,14 @@ export function parseToolCallArguments(json: string | undefined): ToolCall["argu
 	}
 }
 
-/** Replay repaired JSON rather than dropping its call and orphaning the executed result. Valid wire bytes remain unchanged. */
+/**
+ * Native Responses `function_call.arguments` to persist for replay.
+ *
+ * {@link parseToolCallArguments} repairs some invalid JSON (e.g. `"name": ,`) and the tool runs with the
+ * repaired value; replay must carry what was executed (#14155), not the {@link invalidToolCallArguments}
+ * diagnostic it substitutes for stored arguments that do not parse (#15568).
+ * Returns `raw` when it already parses or the arguments were unrepairable, else the executed arguments.
+ */
 export function replayableToolCallArguments(raw: string, executed: ToolCall["arguments"]): string {
 	try {
 		JSON.parse(raw);

@@ -3,10 +3,14 @@ import { stripVTControlCharacters } from "node:util";
 import {
 	clearRenderCache,
 	extractMarkdownLinks,
+	holdPartialTableRow,
 	Markdown,
+	speculativeStreamingSource,
 	renderInlineMarkdown,
 } from "@oh-my-pi/pi-tui/components/markdown";
 import { setTerminalTextSizing, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { loadTheme } from "@oh-my-pi/pi-tui/theme/loader";
+import { getSymbolTheme, setThemeInstance } from "@oh-my-pi/pi-tui/theme/theme";
 import { type Component, TUI } from "@oh-my-pi/pi-tui/tui";
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
 import { Chalk } from "@oh-my-pi/pi-utils/chalk";
@@ -374,6 +378,140 @@ Average Latency: 1,240 ms
 			const dividerLines = plainLines.filter(line => line.includes("+"));
 
 			expect(dividerLines.length >= 2, "Expected header + row divider").toBeTruthy();
+		});
+
+		it("shows a streaming table's growing row without re-laying out the rows above it", () => {
+			const table = "| PR | Title |\n| --- | --- |\n| [#1](https://example.com/pull/1) | short title |\n";
+			const plain = (md: Markdown) => md.render(60).map(line => stripVTControlCharacters(line).trimEnd());
+			const markdown = new Markdown(table, 0, 0, defaultMarkdownTheme);
+			markdown.transientRenderCache = true;
+			const settled = plain(markdown);
+			// Until its `)` arrives the link renders speculatively closed, with the URL so far.
+			for (const [partial, shown] of [
+				["| [#2](https://example.com/pull/2", "#2 (https://example.com/pull/2)"],
+				["| [#2](https://example.com/pull/2) | a much longer title than the others", "a much"],
+			]) {
+				clearRenderCache();
+				markdown.setText(table + partial);
+				const rendered = plain(markdown);
+				expect(rendered.slice(0, settled.length - 1)).toEqual(settled.slice(0, -1));
+				expect(rendered.slice(settled.length - 1).some(line => line.includes(shown))).toBe(true);
+			}
+		});
+
+		it("measures a streaming table's finished last row even without its trailing newline", () => {
+			// Assistant text reaches Markdown trimmed, so a finished row is told apart by its closing `|`.
+			const text =
+				"| PR | Title |\n| --- | --- |\n| #1 | short |\n| #2 | a considerably longer finished title here |";
+			const streaming = new Markdown(text, 0, 0, defaultMarkdownTheme);
+			streaming.transientRenderCache = true;
+			clearRenderCache();
+			const rendered = streaming.render(80);
+			clearRenderCache();
+			expect(rendered).toEqual(new Markdown(text, 0, 0, defaultMarkdownTheme).render(80));
+		});
+
+		describe("holdPartialTableRow", () => {
+			const table = "Intro.\n\n| PR | Title |\n| --- | :-: |\n| #1 | one |";
+
+			it("drops only the growing row of a table, keeping the newline before it", () => {
+				expect(holdPartialTableRow(`${table}\n| [#2](https://exa`)).toBe(`${table}\n`);
+				expect(holdPartialTableRow(`${table}\n`)).toBe(`${table}\n`);
+			});
+
+			it("holds the growing row of a table without outer pipes", () => {
+				const bare = "PR | Title\n--- | ---\n#1 | one";
+				expect(holdPartialTableRow(`${bare}\n#2 | tw`)).toBe(`${bare}\n`);
+			});
+
+			it("only grows while a blockquote table streams, whatever the chunk boundaries", () => {
+				// GFM keeps any non-blank line in the table, so the quote's prose follows a blank quoted line.
+				const stream = "> | h |\n> | - |\n> | a |\n> | b |\n>\n> after";
+				let sent = "";
+				for (let length = 1; length <= stream.length; length++) {
+					const next = holdPartialTableRow(stream.slice(0, length));
+					expect(next.startsWith(sent)).toBe(true);
+					sent = next;
+				}
+				expect(sent).toBe(stream);
+			});
+
+			it("keeps pipe lines that are not a table: no delimiter row yet, or inside an open code fence", () => {
+				for (const text of [
+					"| a |\n| b",
+					"| a |\n| --- | -",
+					`\`\`\`md\n${table}\n| #2`,
+					`~~~~\n\`\`\`\n~~~\n${table}\n| #2`,
+				]) {
+					expect(holdPartialTableRow(text)).toBe(text);
+				}
+			});
+
+			it("holds a table row again once the fence before it closes", () => {
+				expect(holdPartialTableRow(`\`\`\`ts\nx\n\`\`\`\n\n${table}\n| #2`)).toBe(
+					`\`\`\`ts\nx\n\`\`\`\n\n${table}\n`,
+				);
+				// Four columns in, outside a list item, is indented code, not a fence.
+				expect(holdPartialTableRow(`    \`\`\`\n    code\n\n${table}\n| #2`)).toBe(
+					`    \`\`\`\n    code\n\n${table}\n`,
+				);
+			});
+		});
+
+		describe("speculatively closed spans while streaming", () => {
+			const transient = (text: string) => {
+				clearRenderCache();
+				const markdown = new Markdown(text, 0, 0, defaultMarkdownTheme);
+				markdown.transientRenderCache = true;
+				return markdown.render(60);
+			};
+			const final = (text: string) => {
+				clearRenderCache();
+				return new Markdown(text, 0, 0, defaultMarkdownTheme).render(60);
+			};
+			const prose = "Opening prose long enough to wrap across a couple of terminal rows here.";
+
+			it("renders an open link, math span, or table-cell link as the closed form it streams toward", () => {
+				for (const [open, closed] of [
+					[`${prose} See [the docs](https://example.com/a/b`, `${prose} See [the docs](https://example.com/a/b)`],
+					[`${prose} Value $\\frac{a+b}{c`, `${prose} Value $\\frac{a+b}{c}$`],
+					[`${prose} Value \\(x^2 + \\sqr`, `${prose} Value \\(x^2 + \\)`],
+					[`- item\n- see [docs](https://ex`, `- item\n- see [docs](https://ex)`],
+					[`${prose} See [wiki](https://e.org/F_(m`, `${prose} See [wiki](https://e.org/F_(m))`],
+					[`${prose} Value $$x^2$`, `${prose} Value $$x^2$$`],
+				]) {
+					expect(transient(open)).toEqual(final(closed));
+				}
+			});
+
+			it("leaves currency, escapes, images, and code spans literal", () => {
+				for (const text of [
+					`${prose} It costs $5 per mo`,
+					`${prose} Escaped \\$x^2`,
+					`${prose} Escaped \\[docs](https://ex`,
+					`${prose} ![alt](https://ex`,
+					`${prose} Code \`[docs](https://ex`,
+					`${prose} Code \`$x^2`,
+					`${prose} Code \`$x^2\` and`,
+				]) {
+					expect(transient(text)).toEqual(final(text));
+				}
+			});
+
+			it("closes only the last block's span in a native terminal's source, and nothing inside an open fence", () => {
+				expect(speculativeStreamingSource("Paid $5 and $\n\nValue $x^")).toBe("Paid $5 and $\n\nValue $x$");
+				expect(speculativeStreamingSource("Value $x^\n\nNext")).toBe("Value $x^\n\nNext");
+				expect(speculativeStreamingSource("Done.\n\n```md\nSee [docs](https://ex")).toBe(
+					"Done.\n\n```md\nSee [docs](https://ex",
+				);
+				// A fence nested in a list item may sit four columns in; indented code elsewhere is no fence.
+				expect(speculativeStreamingSource("- item\n\n    ```md\n    See [docs](https://ex")).toBe(
+					"- item\n\n    ```md\n    See [docs](https://ex",
+				);
+				expect(speculativeStreamingSource("    ```\n    code\n\nSee [docs](https://ex")).toBe(
+					"    ```\n    code\n\nSee [docs](https://ex)",
+				);
+			});
 		});
 
 		it("should keep column width at least the longest word", () => {
@@ -1839,6 +1977,42 @@ describe("Inline color swatches", () => {
 	});
 });
 
+describe("themes without symbols (upstream pi-tui MarkdownTheme shape)", () => {
+	// Legacy extensions build the upstream interface, which has no `symbols` map (#12311).
+	const { symbols: _, ...upstreamTheme } = defaultMarkdownTheme;
+	const activeSymbolsTheme = { ...upstreamTheme, symbols: getSymbolTheme() };
+
+	it.each([
+		["paragraph with inline code and a swatch", "text with `inline code` and #C5FFD6"],
+		["horizontal rule", "above\n\n---\n\nbelow"],
+		["blockquote", "> quoted line"],
+		["table", "| a | b |\n|---|---|\n| 1 | 2 |"],
+	])("renders a %s with the active theme's symbols", (_label, text) => {
+		const out = new Markdown(text, 0, 0, upstreamTheme).render(40);
+		expect(out).toEqual(new Markdown(text, 0, 0, activeSymbolsTheme).render(40));
+	});
+
+	it("renders streamed appends with the active theme's symbols", () => {
+		const streamed = new Markdown("Accent", 0, 0, upstreamTheme);
+		streamed.render(40);
+		streamed.setText("Accent is #C5FFD6");
+		const reference = new Markdown("Accent", 0, 0, activeSymbolsTheme);
+		reference.render(40);
+		reference.setText("Accent is #C5FFD6");
+		expect(streamed.render(40)).toEqual(reference.render(40));
+	});
+
+	it("does not reuse cached fallback glyphs after a symbol-preset switch", async () => {
+		const text = "> quoted across a preset switch";
+		setThemeInstance(await loadTheme("dark", { symbolPresetOverride: "unicode" }));
+		const before = new Markdown(text, 0, 0, upstreamTheme).render(40);
+		setThemeInstance(await loadTheme("dark", { symbolPresetOverride: "ascii" }));
+		const after = new Markdown(text, 0, 0, upstreamTheme).render(40);
+		expect(after).not.toEqual(before);
+		expect(after).toEqual(new Markdown(text, 0, 0, { ...upstreamTheme, symbols: getSymbolTheme() }).render(40));
+	});
+});
+
 describe("Module-level LRU render cache", () => {
 	it("invokes highlightCode only once for two distinct instances with identical (text, width, theme)", () => {
 		// Build a theme with a spy on highlightCode. The theme object reference
@@ -2394,6 +2568,22 @@ describe("Inline and block HTML tag rendering", () => {
 	});
 });
 
+describe("Hard line breaks", () => {
+	const secondRow = (md: string): string =>
+		stripVTControlCharacters(new Markdown(md, 0, 0, defaultMarkdownTheme).render(60)[1]!).trimEnd();
+
+	it("keeps the space after inline code, emphasis or math that starts the next line", () => {
+		// Only the new line's own leading spaces are dropped. The space after a
+		// styled span at its start is text between two words.
+		expect(secondRow("p  \n`c` b")).toBe("c b");
+		expect(secondRow("p  \n**s** b")).toBe("s b");
+		expect(secondRow("p\\\n*e* b")).toBe("e b");
+		expect(secondRow("p  \n~~d~~ b")).toBe("d b");
+		expect(secondRow("p  \n$a$ b")).toBe("a b");
+		expect(secondRow("p  \n   b")).toBe("b");
+	});
+});
+
 describe("Math rendering", () => {
 	const plain = (c: Markdown): string =>
 		c
@@ -2559,11 +2749,9 @@ describe("math start hint", () => {
 	});
 });
 
-describe("windowed lexing (documents past WINDOWED_LEX_MIN_BYTES)", () => {
-	// Large documents are lexed in bounded windows because Bun's regex engine
-	// rescans the whole remaining source for marked's `^`-anchored block rules.
-	// Every construct below straddles window cuts; a bad cut is visible in the
-	// rendered output.
+describe("large documents", () => {
+	// Large documents lex in one pass; these pin the constructs that span many
+	// blocks and the linear cost of the display-math block scans.
 	afterEach(() => clearRenderCache());
 
 	const filler = (label: string, lines: number) =>
@@ -2576,7 +2764,11 @@ describe("windowed lexing (documents past WINDOWED_LEX_MIN_BYTES)", () => {
 			.render(width)
 			.map(line => stripVTControlCharacters(line).trimEnd());
 
-	it("resolves a reference definition that lands in a later window", () => {
+	// marked normalizes CRLF before tokenizing, so the CRLF twin is an oracle
+	// for the LF document.
+	const onePass = (text: string, width = 100) => plain(text.replaceAll("\n", "\r\n"), width);
+
+	it("resolves a reference definition at the end of a large document", () => {
 		const doc = `Follow [the label][ref] first.\n\n${filler("body", 400)}\n\n[ref]: https://example.com/late\n`;
 		expect(doc.length).toBeGreaterThan(16 * 1024);
 
@@ -2588,14 +2780,13 @@ describe("windowed lexing (documents past WINDOWED_LEX_MIN_BYTES)", () => {
 		expect(rendered.filter(line => line.includes("https://example.com/late"))).toHaveLength(1);
 	});
 
-	it("keeps a fenced block longer than one window intact", () => {
+	it("keeps a long fenced block intact", () => {
 		const code = Array.from({ length: 200 }, (_, i) => `const value${i} = ${i};`).join("\n");
 		const doc = `${filler("intro", 300)}\n\n\`\`\`ts\n${code}\n\`\`\`\n\n${filler("outro", 20)}`;
 		expect(code.length).toBeGreaterThan(2 * 1024);
 
 		const rendered = plain(doc);
-		// Exactly one fence pair: a window cut inside the block would close and
-		// reopen it (or spill code lines into prose).
+		// Exactly one fence pair: no code line spills into prose.
 		expect(rendered.filter(line => line.trimStart().startsWith("```"))).toHaveLength(2);
 		const first = rendered.findIndex(line => line.includes("const value0 = 0;"));
 		expect(first).toBeGreaterThan(-1);
@@ -2604,7 +2795,7 @@ describe("windowed lexing (documents past WINDOWED_LEX_MIN_BYTES)", () => {
 		}
 	});
 
-	it("numbers an ordered list continuously across window cuts", () => {
+	it("numbers a long ordered list continuously", () => {
 		const items = Array.from({ length: 400 }, (_, i) => `${i + 1}. item ${i} padded with extra words to add bytes`);
 		const doc = `${filler("intro", 60)}\n\n${items.join("\n")}\n`;
 		expect(doc.length).toBeGreaterThan(16 * 1024);
@@ -2613,7 +2804,128 @@ describe("windowed lexing (documents past WINDOWED_LEX_MIN_BYTES)", () => {
 		for (const n of [1, 137, 400]) {
 			expect(rendered.some(line => line.includes(`${n}. item ${n - 1} `))).toBe(true);
 		}
-		// A window cut that restarted the list would renumber later items.
+		// A restarted list would renumber later items.
 		expect(rendered.filter(line => line.includes(" 1. item 0 ")).length).toBeLessThanOrEqual(1);
+	});
+
+	const mathLines = Array.from({ length: 150 }, (_, i) => `x_{${i}} = y_{${i}} + z_{${i}}`).join("\n\n");
+
+	for (const [opener, closer] of [
+		["$$", "$$"],
+		["\\[", "\\]"],
+	] as const) {
+		it(`keeps a ${opener} display-math block with blank lines intact`, () => {
+			const doc = ["Intro line before the math.", "", opener, mathLines, closer, "", filler("outro", 250)].join(
+				"\n",
+			);
+			expect(doc.length).toBeGreaterThan(16 * 1024);
+			expect(doc.lastIndexOf(closer) - doc.indexOf(opener)).toBeGreaterThan(2 * 1024);
+
+			const rendered = plain(doc);
+			// A split block renders the delimiters (`$$`, or `[` for the escaped
+			// bracket) and the raw TeX (`x{0} = y{0} + z_{0}`) as prose.
+			expect(rendered.slice(0, 3)).toEqual(["Intro line before the math.", "", "x₀ = y₀ + z₀"]);
+			expect(rendered.filter(line => ["$$", "[", "]"].includes(line.trim()))).toEqual([]);
+			expect(rendered.filter(line => line.includes("{"))).toEqual([]);
+			expect(rendered).toEqual(onePass(doc));
+		});
+	}
+
+	it("renders an own-line $$ that never closes as the one-pass lex does", () => {
+		const doc = `Intro.\n\n$$\nx = 1\n\n${filler("body", 350)}\n`;
+		expect(doc.length).toBeGreaterThan(16 * 1024);
+		const rendered = plain(doc);
+		// No math block: the opener renders as text.
+		expect(rendered.slice(0, 4)).toEqual(["Intro.", "", "$$", "x = 1"]);
+		expect(rendered).toEqual(onePass(doc));
+	});
+
+	it("renders a $$ pair around a blank body as the one-pass lex does", () => {
+		// mathBlockAt rejects a whitespace-only body, so this is no math block.
+		const doc = `Intro.\n\n$$\n \n$$\n\n${filler("body", 350)}\n`;
+		expect(doc.length).toBeGreaterThan(16 * 1024);
+		const rendered = plain(doc);
+		expect(rendered.slice(0, 5)).toEqual(["Intro.", "", "$$", "", "$$"]);
+		expect(rendered).toEqual(onePass(doc));
+	});
+
+	// The display-math block scans must not rescan the rest of the document for
+	// every opener.
+	const displayMathScans: ReadonlyArray<readonly [string, (bytes: number) => string]> = [
+		// Each paragraph opens a `\[` block that no `\]` line ever closes.
+		[
+			"own-line `\\[` openers that never close",
+			bytes => {
+				const unit = "\\[\nprose that never closes the bracket\n\n";
+				return unit.repeat(Math.ceil(bytes / unit.length));
+			},
+		],
+		// One `\[` block spans the document.
+		[
+			"one `\\[` block whose `\\]` ends the document",
+			bytes => `Intro.\n\n\\[\n${filler("inside", Math.ceil(bytes / 60))}\n\\]\n\nOutro.\n`,
+		],
+		// Each heading is followed by a bare environment that no `\end` closes.
+		[
+			"bare math environments that never close",
+			bytes => {
+				const unit = "# heading\n\\begin{align}\na &= b\n";
+				return unit.repeat(Math.ceil(bytes / unit.length));
+			},
+		],
+		// Consecutive closed bare environments with no blank line between them.
+		[
+			"consecutive closed bare math environments",
+			bytes => {
+				const unit = "\\begin{align}\na &= b\n\\end{align}\n";
+				return unit.repeat(Math.ceil(bytes / unit.length));
+			},
+		],
+	];
+	for (const [name, doc] of displayMathScans) {
+		it(`lexes ${name} in time proportional to the document`, () => {
+			// CPU time, not wall time: a parallel run deschedules this process,
+			// which stretches wall time without adding work.
+			const cost = (text: string): number => {
+				const start = process.cpuUsage();
+				extractMarkdownLinks(text);
+				const { user, system } = process.cpuUsage(start);
+				return user + system;
+			};
+			const small = doc(32 * 1024);
+			const large = doc(512 * 1024);
+			cost(small); // warm the lexer so the first small sample is not the cold one
+			// 16 times the text: linear work costs about 16 times as much, a rescan
+			// per opener about 256 times. Interleaved best-of-five rounds keep a
+			// burst from landing on one size only.
+			let smallCost = Number.POSITIVE_INFINITY;
+			let largeCost = Number.POSITIVE_INFINITY;
+			for (let round = 0; round < 5 && !(largeCost < 48 * smallCost); round++) {
+				smallCost = Math.min(smallCost, cost(small));
+				largeCost = Math.min(largeCost, cost(large));
+			}
+			expect(largeCost).toBeLessThan(48 * smallCost);
+		});
+	}
+
+	it("continues a numbered list across a no-break-space line", () => {
+		// The lexer's blank line is any whitespace-only line, so the list goes on
+		// past the no-break-space line.
+		let list = "";
+		let count = 0;
+		while (list.length <= 2048) list += `${++count}. step ${count} of a tight numbered list\n`;
+		const doc = `${list}\n\u00a0\n1. the step after the spacer line\n\n${filler("body", 350)}\n`;
+		expect(doc.length).toBeGreaterThan(16 * 1024);
+		const rendered = plain(doc);
+		expect(rendered.some(line => line.includes(`${count + 1}. the step after the spacer line`))).toBe(true);
+		expect(rendered).toEqual(onePass(doc));
+	});
+
+	it("keeps the blank line before a bare math environment after a long tight list", () => {
+		const list = Array.from({ length: 80 }, (_, i) => `- item ${i} of a tight list`).join("\n");
+		const doc = `${list}\n\n\\begin{align}\na &= b \\\\\nc &= d\n\\end{align}\n\n${filler("body", 350)}\n`;
+		const rendered = plain(doc);
+		expect(rendered[rendered.findIndex(line => line.includes("item 79")) + 1]).toBe("");
+		expect(rendered).toEqual(onePass(doc));
 	});
 });

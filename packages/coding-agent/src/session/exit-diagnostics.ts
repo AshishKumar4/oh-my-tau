@@ -1,5 +1,6 @@
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { createSyntheticToolResultMessage, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { ASYNC_RESULT_MESSAGE_TYPE } from "./async-job-delivery";
 import type { SessionEntry } from "./session-entries";
 
 export const TOOL_EXECUTION_START_CUSTOM_TYPE = "tool_execution_start";
@@ -115,14 +116,65 @@ function readSessionExit(entry: SessionEntry): SessionExitData | undefined {
 	};
 }
 
+/** Why an interrupted-turn abort record ends a turn its process never finished. */
+export const INTERRUPTED_TURN_ERROR = "Previous OMP process exited before completing the turn.";
+
+/** How exit recovery reads a branch whose last process may have died without recording its exit. */
+export interface InterruptedTurnOptions {
+	/**
+	 * The branch's writer is gone even without a `session_exit` after its tail (a
+	 * crash, SIGKILL or power loss records none): `omp --restore` says so.
+	 */
+	assumeExit?: boolean;
+}
+
+/** Custom messages that start a model turn when they arrive: a peer's message and a background job's result. */
+const TURN_PROMPT_CUSTOM_TYPES: Readonly<Record<string, true>> = {
+	"irc:incoming": true,
+	[ASYNC_RESULT_MESSAGE_TYPE]: true,
+};
+
 /**
- * createInterruptedTurnAbortMessage returns a terminal assistant record when
- * the latest persisted process exit follows a non-terminal conversation tail.
+ * Whether `entry` asks the model for an answer: a user or developer message, or a
+ * model-visible custom message that starts a turn ({@link TURN_PROMPT_CUSTOM_TYPES}).
  */
-export function createInterruptedTurnAbortMessage(
+export function isTurnPrompt(entry: SessionEntry): boolean {
+	if (entry.type === "message") return entry.message.role === "user" || entry.message.role === "developer";
+	return entry.type === "custom_message" && Object.hasOwn(TURN_PROMPT_CUSTOM_TYPES, entry.customType);
+}
+
+/**
+ * Whether the agent loop samples again after a reply with no tool calls: a
+ * `pause_turn` stop ends the provider's response, not the turn (agent-loop
+ * resamples it). Every other tool-free reply ends the loop.
+ */
+export function isPausedReply(message: AgentMessage): boolean {
+	return (
+		message.role === "assistant" &&
+		message.stopReason === "stop" &&
+		message.stopDetails?.type === "pause_turn" &&
+		!message.content.some(isToolCallContent)
+	);
+}
+
+/** A turn its process left unfinished: the assistant turn before its tail, and when the process ended. */
+interface UnfinishedTurn {
+	previousAssistant: AssistantMessage | undefined;
+	recordedAt: string;
+}
+
+/**
+ * The turn a branch's last process left unfinished: a tail that awaits the model
+ * (a prompt or tool results it never answered, tool calls without results, a
+ * paused reply; see {@link isTurnPrompt} and {@link isPausedReply}) followed by a
+ * process exit, recorded or (with `assumeExit`) assumed. A recorded normal exit
+ * with nothing pending, a terminal assistant reply, and tool results that close an
+ * aborted or failed turn leave nothing unfinished.
+ */
+function findUnfinishedTurn(
 	entries: readonly SessionEntry[],
-	fallbackModel?: AssistantModelMetadata,
-): AssistantMessage | undefined {
+	options?: InterruptedTurnOptions,
+): UnfinishedTurn | undefined {
 	let exitIndex = -1;
 	let exit: SessionExitData | undefined;
 	for (let index = entries.length - 1; index >= 0; index--) {
@@ -132,19 +184,25 @@ export function createInterruptedTurnAbortMessage(
 		exit = candidate;
 		break;
 	}
-	if (!exit || (exit.kind === "normal" && !exit.pendingToolCalls?.length)) return undefined;
 
 	let tailIndex = -1;
-	let tail: AgentMessage | undefined;
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index]!;
-		if (entry.type !== "message") continue;
+		if (entry.type !== "message" && !isTurnPrompt(entry)) continue;
 		tailIndex = index;
-		tail = entry.message;
 		break;
 	}
-	if (!tail || tailIndex > exitIndex) return undefined;
-	if (tail.role === "assistant" && !tail.content.some(isToolCallContent)) return undefined;
+	if (tailIndex < 0) return undefined;
+	const tailEntry = entries[tailIndex]!;
+	// A custom-message prompt tail awaits an answer like a user prompt.
+	const tail = tailEntry.type === "message" ? tailEntry.message : undefined;
+	if (!exit || tailIndex > exitIndex) {
+		if (!options?.assumeExit) return undefined;
+		exit = { reason: "restore", kind: "process_exit", recordedAt: new Date().toISOString() };
+	} else if (exit.kind === "normal" && !exit.pendingToolCalls?.length) {
+		return undefined;
+	}
+	if (tail?.role === "assistant" && !tail.content.some(isToolCallContent) && !isPausedReply(tail)) return undefined;
 
 	let previousAssistant: AssistantMessage | undefined;
 	for (let index = tailIndex; index >= 0; index--) {
@@ -154,15 +212,61 @@ export function createInterruptedTurnAbortMessage(
 		break;
 	}
 	if (
-		tail.role === "toolResult" &&
+		tail?.role === "toolResult" &&
 		(previousAssistant?.stopReason === "error" || previousAssistant?.stopReason === "aborted")
 	) {
 		return undefined;
 	}
-	const model = previousAssistant ?? fallbackModel;
+	return { previousAssistant, recordedAt: exit.recordedAt };
+}
+
+/** Whether `message` is the record exit recovery closed an unfinished turn with. */
+export function isInterruptedTurnAbort(message: AgentMessage): boolean {
+	return (
+		message.role === "assistant" &&
+		message.stopReason === "aborted" &&
+		message.errorMessage === INTERRUPTED_TURN_ERROR
+	);
+}
+
+/**
+ * Whether `/recover` (and so `omp --restore`) has a turn to go on with on this branch:
+ * one its last process left unfinished ({@link findUnfinishedTurn}, the exit assumed),
+ * or one exit recovery already closed that nothing followed, not even a normal exit.
+ * A normal exit only rules that out when no message or prompt ({@link isTurnPrompt})
+ * came after it.
+ */
+export function hasRestorableTurn(entries: readonly SessionEntry[]): boolean {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index]!;
+		const exit = readSessionExit(entry);
+		if (exit?.kind === "normal") return false;
+		if (entry.type !== "message") {
+			if (isTurnPrompt(entry)) break;
+			continue;
+		}
+		if (isInterruptedTurnAbort(entry.message)) return true;
+		break;
+	}
+	return findUnfinishedTurn(entries, { assumeExit: true }) !== undefined;
+}
+
+/**
+ * createInterruptedTurnAbortMessage returns a terminal assistant record when
+ * the latest persisted process exit follows a non-terminal conversation tail
+ * ({@link findUnfinishedTurn}; with `assumeExit`, also when no exit was recorded).
+ */
+export function createInterruptedTurnAbortMessage(
+	entries: readonly SessionEntry[],
+	fallbackModel?: AssistantModelMetadata,
+	options?: InterruptedTurnOptions,
+): AssistantMessage | undefined {
+	const turn = findUnfinishedTurn(entries, options);
+	if (!turn) return undefined;
+	const model = turn.previousAssistant ?? fallbackModel;
 	if (!model) return undefined;
 
-	const recordedAt = Date.parse(exit.recordedAt);
+	const recordedAt = Date.parse(turn.recordedAt);
 	return {
 		role: "assistant",
 		content: [],
@@ -178,7 +282,7 @@ export function createInterruptedTurnAbortMessage(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "aborted",
-		errorMessage: "Previous OMP process exited before completing the turn.",
+		errorMessage: INTERRUPTED_TURN_ERROR,
 		timestamp: Number.isFinite(recordedAt) ? recordedAt : Date.now(),
 	};
 }
@@ -219,8 +323,24 @@ export function isInterruptedToolResult(
 	return message.role === "toolResult" && isObject(message.details) && message.details.__processInterrupted === true;
 }
 
-/** Pairs the last interrupted assistant turn's unresolved calls before resume builds model context. */
-export function createInterruptedToolResults(entries: readonly SessionEntry[]): ToolResultMessage[] {
+/**
+ * Whether a persisted process exit follows the branch's last message: the
+ * branch's writer is gone, so resume recovery owns its interrupted tail.
+ */
+export function sessionExitFollowsLastMessage(entries: readonly SessionEntry[]): boolean {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index]!;
+		if (entry.type === "message") return false;
+		if (readSessionExit(entry)) return true;
+	}
+	return false;
+}
+
+/** Pairs unresolved calls at the end of an interrupted turn with result messages. */
+export function createInterruptedToolResults(
+	entries: readonly SessionEntry[],
+	context: "process-exit" | "fork" = "process-exit",
+): ToolResultMessage[] {
 	let tail: AgentMessage | undefined;
 	let assistant: AssistantMessage | undefined;
 	for (let index = entries.length - 1; index >= 0; index--) {
@@ -232,12 +352,36 @@ export function createInterruptedToolResults(entries: readonly SessionEntry[]): 
 			break;
 		}
 	}
-	if (!assistant || (tail?.role !== "assistant" && tail?.role !== "toolResult")) return [];
-	const pendingIds = new Set(collectPendingToolCalls(entries).map(call => call.toolCallId));
+	if (!assistant || (context !== "fork" && tail?.role !== "assistant" && tail?.role !== "toolResult")) return [];
+	const pendingById = new Map<string, PendingToolCallDiagnostic>();
+	for (const call of collectPendingToolCalls(entries)) {
+		if (call.toolCallId) pendingById.set(call.toolCallId, call);
+	}
 	const results: ToolResultMessage[] = [];
 	for (const call of assistant.content) {
-		if (call.type !== "toolCall" || !pendingIds.has(call.id)) continue;
-		results.push(createInterruptedToolResult(call));
+		if (call.type !== "toolCall" || !pendingById.has(call.id)) continue;
+		const diagnostic = pendingById.get(call.id);
+		if (context === "fork" && assistant.stopReason === "length" && diagnostic?.startedAt === undefined) {
+			// A length stop retains its never-executed guard only without
+			// persisted evidence that the parent entered tool execution.
+			results.push(createSyntheticToolResultMessage(call, "length"));
+			continue;
+		}
+		if (context === "process-exit") {
+			results.push(createInterruptedToolResult(call));
+			continue;
+		}
+		// A fork's parent may still finish the call, so the result is no `/recover` placeholder.
+		results.push({
+			role: "toolResult",
+			toolCallId: call.id,
+			toolName: call.name,
+			content: [
+				{ type: "text", text: "The parent session may still be running this tool; its outcome is unknown." },
+			],
+			isError: true,
+			timestamp: Date.now(),
+		});
 	}
 	return results;
 }
@@ -272,7 +416,8 @@ export function summarizeToolArguments(args: unknown): ToolArgumentSummary | und
 	return summary.command !== undefined || summary.path !== undefined ? summary : undefined;
 }
 
-function readToolExecutionStart(entry: SessionEntry): ToolExecutionStartData | undefined {
+/** The `tool_execution_start` marker `entry` records, if it is one. */
+export function readToolExecutionStart(entry: SessionEntry): ToolExecutionStartData | undefined {
 	if (entry.type !== "custom" || entry.customType !== TOOL_EXECUTION_START_CUSTOM_TYPE) return undefined;
 	const data = entry.data;
 	if (!isObject(data)) return undefined;

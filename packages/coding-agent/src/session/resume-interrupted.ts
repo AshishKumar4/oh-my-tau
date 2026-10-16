@@ -6,8 +6,9 @@
  * have no result, background jobs never deliver, and interrupted subagents
  * stay parked. This module finds that work in the previous process's slice of
  * the branch and restores it: interrupted tool calls get an explicit result,
- * lost background jobs are reported, and interrupted subagents are revived as
- * background jobs that deliver to their parent like a normal spawn.
+ * lost background jobs are reported, interrupted subagents are revived as
+ * background jobs that deliver to their parent like a normal spawn, and a turn
+ * cut off before the agent answered goes on.
  *
  * The parent's journal only says which subagents it started and heard nothing
  * from since; each subagent's own transcript says whether the previous process
@@ -27,10 +28,15 @@ import { finalizeSubprocessOutput, runSubagentFollowUpTurn } from "../task/execu
 import { type SubprocessToolEvent, subprocessToolRegistry } from "../task/subprocess-tool-registry";
 import type { AgentDefinition } from "../task/types";
 import type { EventBus } from "../utils/event-bus";
+import type { AgentSession } from "./agent-session";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "./async-job-delivery";
 import {
 	createInterruptedToolResult,
+	hasRestorableTurn,
 	isInterruptedToolResult,
+	isPausedReply,
+	isTurnPrompt,
+	readToolExecutionStart,
 	SESSION_EXIT_CUSTOM_TYPE,
 	SESSION_OPEN_CUSTOM_TYPE,
 	summarizeToolArguments,
@@ -54,7 +60,7 @@ export const RECOVER_CUSTOM_TYPE = "recover";
 export const RECOVER_OUTCOME_CUSTOM_TYPE = "recover_outcome";
 
 const SUBAGENT_RESUME_MESSAGE =
-	"A system glitch stopped OMP and interrupted your run. Tool calls marked as interrupted may have partially run. Check the current state and resume your assignment from where you left off; if it is already complete, yield your final report again.";
+	"A system glitch stopped OMP and interrupted your run. Tool calls marked as interrupted may have partially run. Check the current state and resume your assignment from where you left off; if it is already complete, deliver your final report again.";
 
 const LABEL_MAX_CHARS = 120;
 
@@ -72,6 +78,13 @@ export interface InterruptedJob {
 	label: string;
 	/** When the parent last started it, in epoch ms (subagents only); unknown for legacy records. */
 	startedAt?: number;
+	/**
+	 * When the parent's call that started this run began executing, in epoch ms
+	 * (subagents only): a settled job row that began earlier is an older run
+	 * ({@link settlesRun}). Read from the call's `tool_execution_start` record, or for
+	 * transcripts without one, from when its turn was recorded.
+	 */
+	requestedAt?: number;
 }
 
 export interface InterruptedWork {
@@ -83,6 +96,11 @@ export interface InterruptedWork {
 	jobs: InterruptedJob[];
 	/** Subagent spawns that started and never finished; `jobId` is the agent id. */
 	agents: InterruptedJob[];
+	/**
+	 * The previous process's last turn ended before the agent answered it (a prompt or tool
+	 * results with no reply after them), and nothing was said in this process since.
+	 */
+	unfinishedTurn: boolean;
 	/** When the previous process began (unbounded when the file shows no earlier process) and, if it quit, when. */
 	process: ProcessSpan;
 }
@@ -193,10 +211,12 @@ function agentsOf(value: unknown, restartedAt?: number): InterruptedJob[] {
 	if (!Array.isArray(value)) return [];
 	return value.flatMap(item => {
 		if (typeof item === "string")
-			return [{ jobId: item, type: "task" as const, label: item, startedAt: restartedAt }];
+			return [{ jobId: item, type: "task" as const, label: item, startedAt: restartedAt, requestedAt: restartedAt }];
 		if (!isRecord(item) || typeof item.jobId !== "string" || typeof item.label !== "string") return [];
 		const startedAt = restartedAt ?? (typeof item.startedAt === "number" ? item.startedAt : undefined);
-		return [{ jobId: item.jobId, type: "task" as const, label: item.label, startedAt }];
+		// A restart's job is registered after the /recover record that requested it.
+		const requestedAt = restartedAt ?? (typeof item.requestedAt === "number" ? item.requestedAt : undefined);
+		return [{ jobId: item.jobId, type: "task" as const, label: item.label, startedAt, requestedAt }];
 	});
 }
 
@@ -230,6 +250,29 @@ function ownedStart(branch: readonly SessionEntry[]): number {
 	return branch.findIndex(entry => entry.type === "session_init") + 1;
 }
 
+/**
+ * The id recovery tracks a settled job under: a subagent job's agent id, since its
+ * job id gains a reuse suffix (`Lane-2`) while an earlier row of that agent is
+ * retained, else the job id. Reads async-result rows (`jobId`, `agentId`) and job
+ * snapshots (`id`, `agentUrlId`); bash and eval jobs keep their job id.
+ */
+function settledJobKey(job: Record<string, unknown>): string | undefined {
+	const agentId = job.type === "task" ? (job.agentId ?? job.agentUrlId) : undefined;
+	if (typeof agentId === "string") return agentId;
+	const id = job.jobId ?? job.id;
+	return typeof id === "string" ? id : undefined;
+}
+
+/**
+ * Whether settled job row `job` can be the run of a start requested at `requestedAt`.
+ * One agent's runs share its id, so a row whose job started before the request is an
+ * older run of that agent and settles nothing newer. Rows and starts recorded without
+ * those times match as before.
+ */
+function settlesRun(job: Record<string, unknown>, requestedAt: number | undefined): boolean {
+	return requestedAt === undefined || typeof job.startedAt !== "number" || job.startedAt >= requestedAt;
+}
+
 /** Records of jobs a `wait`, `jobs`, `cancel` or `proc://` result reports, top-level or under `proc`. */
 function reportedJobs(details: Record<string, unknown> | undefined): Record<string, unknown>[] {
 	const proc = details && isRecord(details.proc) ? details.proc : undefined;
@@ -257,6 +300,12 @@ function scanWork(
 	ownsRevived: (agentId: string) => boolean = () => true,
 ): WorkScan {
 	const calls = new Map<string, ToolCallBlock>();
+	/**
+	 * When each tool call began executing: a run it starts begins no earlier. Calls of one
+	 * turn run one after another (exclusive ones wait for those before them), so each
+	 * takes its own `tool_execution_start` time; the turn's time stands in without one.
+	 */
+	const calledAt = new Map<string, number>();
 	const open = new Map<string, InterruptedJob[]>();
 	const start = (job: InterruptedJob): void => {
 		const stack = open.get(job.jobId) ?? [];
@@ -267,6 +316,20 @@ function scanWork(
 	// the most recent open start with that id.
 	const finish = (jobId: string): void => {
 		open.get(jobId)?.pop();
+	};
+	// A settled row with its start time closes, for an agent that runs once at a
+	// time, every start it could be the run of ({@link settlesRun}), however often it
+	// is reported, and none requested after it began.
+	const settle = (job: Record<string, unknown>): void => {
+		const key = settledJobKey(job);
+		if (key === undefined) return;
+		if (job.type !== "task" || typeof job.startedAt !== "number") return finish(key);
+		const stack = open.get(key);
+		if (stack)
+			open.set(
+				key,
+				stack.filter(pending => !settlesRun(job, pending.requestedAt)),
+			);
 	};
 	let turn: WorkScan["turn"];
 
@@ -282,15 +345,23 @@ function scanWork(
 			isRecord(entry.details)
 		) {
 			const jobs = entry.details.jobs;
-			if (Array.isArray(jobs))
-				for (const job of jobs) if (isRecord(job) && typeof job.jobId === "string") finish(job.jobId);
+			if (Array.isArray(jobs)) for (const job of jobs) if (isRecord(job)) settle(job);
+			continue;
+		}
+		const executionStart = readToolExecutionStart(entry);
+		if (executionStart) {
+			const executedAt = Date.parse(executionStart.startedAt);
+			if (Number.isFinite(executedAt)) calledAt.set(executionStart.toolCallId, executedAt);
 			continue;
 		}
 		if (entry.type !== "message") continue;
 		const message = entry.message;
 		if (message.role === "assistant") {
 			const blocks = toolCallsOf(message);
-			for (const block of blocks) calls.set(block.id, block);
+			for (const block of blocks) {
+				calls.set(block.id, block);
+				calledAt.set(block.id, entryTime(entry));
+			}
 			if (blocks.length > 0) turn = { index: i, calls: blocks };
 			else if (!isAbortStub(message)) turn = undefined;
 			continue;
@@ -300,6 +371,7 @@ function scanWork(
 		const details = isRecord(message.details) ? message.details : undefined;
 		const async = details && isRecord(details.async) ? details.async : undefined;
 		const startedAt = entryTime(entry);
+		const requestedAt = calledAt.get(message.toolCallId) ?? startedAt;
 		if (async?.state === "running" && typeof async.jobId === "string") {
 			if (async.type === "bash" || async.type === "eval") {
 				start({ jobId: async.jobId, type: async.type, label: describeCall(message.toolName, call?.arguments) });
@@ -308,29 +380,28 @@ function scanWork(
 					if (!isRecord(item) || typeof item.id !== "string") continue;
 					if (item.status === "completed" || item.status === "failed" || item.status === "aborted") continue;
 					const label = typeof item.description === "string" ? item.description : item.id;
-					start({ jobId: item.id, type: "task", label: truncate(label), startedAt });
+					start({ jobId: item.id, type: "task", label: truncate(label), startedAt, requestedAt });
 				}
 			}
 		}
-		// Messaging a parked agent revives it for a new run, which delivers its result like a spawn.
+		// Messaging a parked agent revives it, and messaging an idle one wakes it, for a new
+		// run that delivers its result like a spawn.
 		const sent = details && isRecord(details.message) ? details.message : undefined;
 		if (sent && Array.isArray(sent.receipts)) {
 			for (const receipt of sent.receipts) {
 				if (
 					isRecord(receipt) &&
-					receipt.outcome === "revived" &&
+					(receipt.outcome === "revived" || receipt.outcome === "woken") &&
 					typeof receipt.to === "string" &&
 					ownsRevived(receipt.to)
 				) {
-					start({ jobId: receipt.to, type: "task", label: receipt.to, startedAt });
+					start({ jobId: receipt.to, type: "task", label: receipt.to, startedAt, requestedAt });
 				}
 			}
 		}
 		// A `wait` (or TaskOutput), job-control or `proc://` result reports the
 		// jobs it consumed or stopped, including kills through a harness facade.
-		for (const job of reportedJobs(details)) {
-			if (typeof job.id === "string" && job.status !== "running") finish(job.id);
-		}
+		for (const job of reportedJobs(details)) if (job.status !== "running") settle(job);
 		if (!message.isError && call) {
 			const killed =
 				typeof call.arguments.path === "string"
@@ -354,6 +425,7 @@ export function findInterruptedWork(branch: readonly SessionEntry[]): Interrupte
 			toolCallsRepairable: false,
 			jobs: [],
 			agents: [],
+			unfinishedTurn: false,
 			process: { since: Number.NEGATIVE_INFINITY },
 		};
 	}
@@ -418,8 +490,21 @@ export function findInterruptedWork(branch: readonly SessionEntry[]): Interrupte
 		toolCallsRepairable: toolCalls.length > 0 && toolCallsRepairable,
 		jobs,
 		agents,
+		unfinishedTurn: hasRestorableTurn(branch.slice(0, slice.end)) && !conversationSince(branch, slice.end),
 		process: { since, exitedAt },
 	};
+}
+
+/** Whether anything was said from `branch[from]` on, past the records resume leaves on an interrupted turn. */
+function conversationSince(branch: readonly SessionEntry[], from: number): boolean {
+	for (let i = from; i < branch.length; i++) {
+		const entry = branch[i]!;
+		if (entry.type === "custom_message") return true;
+		if (entry.type === "message" && !isAbortStub(entry.message) && !isInterruptedToolResult(entry.message)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 /**
@@ -443,14 +528,6 @@ type SubagentState = { status: "interrupted" } | { status: "finished"; report: S
 
 /** The output contract a subagent's result is finalized against. */
 type OutputContract = Pick<PersistedSessionInit, "outputSchema" | "outputSchemaMode"> | null | undefined;
-
-function isPrompt(entry: SessionEntry): boolean {
-	if (entry.type === "message") return entry.message.role === "user" || entry.message.role === "developer";
-	return (
-		entry.type === "custom_message" &&
-		(entry.customType === "irc:incoming" || entry.customType === ASYNC_RESULT_MESSAGE_TYPE)
-	);
-}
 
 function textOf(message: AgentMessage): string {
 	if (message.role !== "assistant") return "";
@@ -480,7 +557,7 @@ function yieldEvent(call: ToolCallBlock, result: ToolResultMessage): SubprocessT
 function endsRun(message: AgentMessage, results: ReadonlyMap<string, ToolResultMessage>): boolean {
 	if (message.role !== "assistant") return false;
 	const calls = toolCallsOf(message);
-	if (calls.length === 0) return message.stopReason === "stop" && message.stopDetails?.type !== "pause_turn";
+	if (calls.length === 0) return message.stopReason === "stop" && !isPausedReply(message);
 	const handler = subprocessToolRegistry.getHandler("yield");
 	return calls.some(call => {
 		const result = results.get(call.id);
@@ -601,7 +678,7 @@ function inspectSubagent(
 		if (entry.type === "message" && entry.message.role === "assistant") lastAssistant = i;
 	}
 	for (let i = Math.max(from, lastAssistant + 1); i < end; i++) {
-		if (isPrompt(branch[i]!)) return { status: "interrupted" };
+		if (isTurnPrompt(branch[i]!)) return { status: "interrupted" };
 	}
 	const { exitedAt } = span;
 	for (let i = from; i < end && exitedAt !== undefined; i++) {
@@ -616,7 +693,7 @@ function inspectSubagent(
 	let promptedAt: number | undefined;
 	for (let i = owned; i < end; i++) {
 		const entry = branch[i]!;
-		if (isPrompt(entry)) promptedAt = entryTime(entry);
+		if (isTurnPrompt(entry)) promptedAt = entryTime(entry);
 		if (entry.type === "message" && entry.message.role === "toolResult" && !isInterruptedToolResult(entry.message)) {
 			results.set(entry.message.toolCallId, entry.message);
 		}
@@ -633,9 +710,15 @@ function inspectSubagent(
  * `branch`: its job's result was delivered or read, or it messaged the parent.
  * A `yield` counts from when it was made; a text answer, from the prompt its
  * run last took, since a message the subagent sent the parent during that run
- * answers it (the wake relay's own already-messaged rule).
+ * answers it (the wake relay's own already-messaged rule). A job row only
+ * counts for the run requested at `requestedAt` ({@link settlesRun}).
  */
-function reachedParent(branch: readonly SessionEntry[], id: string, report: SubagentReport): boolean {
+function reachedParent(
+	branch: readonly SessionEntry[],
+	id: string,
+	report: SubagentReport,
+	requestedAt: number | undefined,
+): boolean {
 	const since = report.yielded ? report.at : (report.promptedAt ?? report.at);
 	for (let i = branch.length - 1; i >= 0; i--) {
 		const entry = branch[i]!;
@@ -646,14 +729,18 @@ function reachedParent(branch: readonly SessionEntry[], id: string, report: Suba
 			if (
 				entry.customType === ASYNC_RESULT_MESSAGE_TYPE &&
 				Array.isArray(details.jobs) &&
-				details.jobs.some(job => isRecord(job) && job.jobId === id)
+				details.jobs.some(job => isRecord(job) && settledJobKey(job) === id && settlesRun(job, requestedAt))
 			) {
 				return true;
 			}
 		}
 		if (entry.type === "message" && entry.message.role === "toolResult") {
 			const details = isRecord(entry.message.details) ? entry.message.details : undefined;
-			if (reportedJobs(details).some(job => job.id === id && job.status !== "running")) return true;
+			const reported = reportedJobs(details);
+			if (
+				reported.some(job => settledJobKey(job) === id && job.status !== "running" && settlesRun(job, requestedAt))
+			)
+				return true;
 		}
 	}
 	return false;
@@ -773,13 +860,13 @@ function count(n: number, noun: string): string {
 
 /**
  * Recover the previous process's interrupted work on `host`'s session. The
- * caller starts the main agent's turn with {@link RecoverOutcome.notice}.
+ * caller starts the main agent's turn with {@link startRecoveredTurn}.
  */
 export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverOutcome> {
 	const sessionManager = host.sessionManager;
 	const scan = findInterruptedWork(sessionManager.getBranch());
 	if (scan.handled) return { status: "handled" };
-	if (scan.toolCalls.length === 0 && scan.jobs.length === 0 && scan.agents.length === 0) {
+	if (!scan.unfinishedTurn && scan.toolCalls.length === 0 && scan.jobs.length === 0 && scan.agents.length === 0) {
 		return { status: "nothing" };
 	}
 
@@ -793,6 +880,7 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 		toolCalls: scan.toolCalls.map(call => call.toolCallId),
 		jobs: scan.jobs.map(job => job.jobId),
 		agents: scan.agents,
+		...(scan.unfinishedTurn ? { unfinishedTurn: true } : {}),
 	});
 
 	const restarted: InterruptedJob[] = [];
@@ -822,6 +910,12 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 				notResumed.push(`${jobName(interrupted)}: it is already running in this session.`);
 				continue;
 			}
+			// A killed subagent's transcript is tombstoned and comes back `aborted`:
+			// the kill ended its work, whatever the parent's journal still shows.
+			if (ref.status === "aborted") {
+				notResumed.push(`${jobName(interrupted)}: it was killed.`);
+				continue;
+			}
 			if (!manager) {
 				notResumed.push(`${jobName(interrupted)}: background jobs are disabled.`);
 				continue;
@@ -838,7 +932,10 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 				);
 				if (prepared.status === "finished") {
 					const { report } = prepared;
-					if (!report || reachedParent(sessionManager.getBranch(), interrupted.jobId, report)) {
+					if (
+						!report ||
+						reachedParent(sessionManager.getBranch(), interrupted.jobId, report, interrupted.requestedAt)
+					) {
 						skipped.push(
 							`${jobName(interrupted)}: ${report ? "its last report already reached you." : "it stopped without a report."}`,
 						);
@@ -913,6 +1010,9 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 	}
 
 	const sections: string[] = ["A system glitch stopped OMP. Resumed after the interruption:"];
+	// Interrupted tool calls already say the turn was cut off.
+	const unansweredTurn = scan.unfinishedTurn && scan.toolCalls.length === 0;
+	if (unansweredTurn) sections.push("Your last turn was cut off before you answered it.");
 	if (scan.toolCalls.length > 0) {
 		const lead = scan.toolCallsRepairable
 			? "Interrupted tool calls (each now carries an interruption result; it may have partially run):"
@@ -934,7 +1034,7 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 	if (notResumed.length > 0) sections.push(`Subagents not restarted:\n${bulletList(notResumed)}`);
 	sections.push("Continue your work.");
 	const summary = [
-		`Resumed: ${count(scan.toolCalls.length, "interrupted tool call")}`,
+		`Resumed: ${unansweredTurn ? "the unanswered turn, " : ""}${count(scan.toolCalls.length, "interrupted tool call")}`,
 		count(scan.jobs.length, "lost background job"),
 		`${count(restarted.length, "subagent")} restarted${notResumed.length > 0 ? ` (${notResumed.length} could not be)` : ""}`,
 		`${count(recovered.length, "result")} recovered`,
@@ -948,4 +1048,16 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 		recovered,
 		skipped: skippedJobs,
 	};
+}
+
+/**
+ * Start the main agent's turn on a `resumed` outcome's notice. `/recover` and
+ * `--restore` both continue this way; callers do not await the turn, so a host
+ * whose prompt turn owns the event subscription keeps it open across it.
+ */
+export function startRecoveredTurn(session: Pick<AgentSession, "sendCustomMessage">, notice: string) {
+	return session.sendCustomMessage(
+		{ customType: RECOVER_CUSTOM_TYPE, content: notice, display: true, attribution: "user" },
+		{ triggerTurn: true },
+	);
 }

@@ -77,7 +77,12 @@ export interface CompactionV2Usage {
 export interface CompactionV2Request {
 	body: OpenAICodexCompactionBody;
 	input: unknown[];
-	retainedUserItems: CompactionV2Request["input"];
+	/**
+	 * Serialized user-written turns to keep next to the compaction item. An
+	 * explicit selection is authoritative: an operator turn quoting a contextual
+	 * prefix stays. Defaults to `input` without its contextual user messages.
+	 */
+	retainedUserItems: unknown[];
 	retainedMessageBudget: number;
 	sessionId?: string;
 	promptCacheKey?: string;
@@ -191,7 +196,7 @@ export function buildCompactionV2Request(
 		sessionId?: string;
 		promptCacheKey?: string;
 		retainedMessageBudget?: number;
-		retainedUserItems?: CompactionV2Request["input"];
+		retainedUserItems?: unknown[];
 	},
 ): CompactionV2Request {
 	const cacheOptions = { sessionId: options?.sessionId, promptCacheKey: options?.promptCacheKey };
@@ -225,7 +230,7 @@ export function buildCompactionV2RequestFromBody(
 		sessionId?: string;
 		promptCacheKey?: string;
 		retainedMessageBudget?: number;
-		retainedUserItems?: CompactionV2Request["input"];
+		retainedUserItems?: unknown[];
 	},
 ): CompactionV2Request {
 	const input = Array.isArray(body.input) ? body.input : [];
@@ -412,7 +417,16 @@ function buildCompactionV2Headers(
 			: {
 					"content-type": "application/json",
 					...resolveOpenAIRequestSetup(
-						{ provider: model.provider, id: model.id, baseUrl: model.baseUrl, headers: model.headers },
+						{
+							provider: model.provider,
+							id: model.id,
+							baseUrl: model.baseUrl,
+							headers: model.headers,
+							compat: {
+								sessionHeader:
+									model.compat && "sessionHeader" in model.compat ? model.compat.sessionHeader : undefined,
+							},
+						},
 						{ apiKey, messages: [], sessionId: request.sessionId ?? routingSessionId, promptCacheSessionId },
 					).headers,
 				};
@@ -670,7 +684,7 @@ function isRetryableCompactionError(error: Error): boolean {
 // Replacement History
 // ============================================================================
 
-/** Build Codex-style V2 replacement history from prompt input plus compaction output. */
+/** Build Codex-style V2 replacement history from retention candidates plus compaction output. */
 export function buildCompactionV2ReplacementHistory(
 	input: unknown[],
 	compactionItem: Record<string, unknown>,
@@ -689,8 +703,10 @@ export function buildCompactionV2ReplacementHistory(
 }
 
 function isRetainedUserMessageForCompactionV2(item: Record<string, unknown>): boolean {
-	const message = item.type === "message" || (item.type === undefined && typeof item.role === "string");
-	return message && item.role === "user";
+	// Responses input messages may omit `type`: omp serializes turns as
+	// `{ role, content }`, which the API reads as `type: "message"`.
+	const isMessage = item.type === "message" || (item.type === undefined && typeof item.role === "string");
+	return isMessage && item.role === "user";
 }
 
 function isContextualUserMessage(item: Record<string, unknown>): boolean {

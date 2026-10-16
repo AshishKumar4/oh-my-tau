@@ -77,6 +77,8 @@ export async function createCleanseAgentRuntime(options: {
 	hooks?: CleanseAgentHooks;
 }): Promise<CleanseAgentRuntime> {
 	const cwd = options.cwd ?? getProjectDir();
+	// Shared-LSP policy stays with the process owner: `omp cleanse` sets it at its
+	// CLI boundary, and an in-process /cleanse keeps its parent session's.
 	const settings = await Settings.init({ cwd });
 	const authStorage = await discoverAuthStorage(undefined, { settings });
 	const modelRegistry = new ModelRegistry(authStorage);

@@ -378,6 +378,45 @@ describe("codex fork lineage", () => {
 		expect(snapshots[0]?.input).toEqual(input);
 	});
 
+	it("routes a forked child's side request with the child's own foreground affinity", async () => {
+		const source = createForkSource();
+		const context = createForkContext([
+			{ role: "user", content: "Say hello", timestamp: 1 },
+			{ role: "user", content: "Summarize it for the parent", timestamp: 2 },
+		]);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const foreground = await captureForkRequest(
+			"gpt-6-astra",
+			{ sessionId: "child-session", providerSessionState, codexFork: { source, messageCount: 1 } },
+			context,
+		);
+		// A side request of the child: its own transport session, the child as its
+		// parent, no fork lineage of its own (AgentSession.runEphemeralTurn).
+		const side = await captureForkRequest(
+			"gpt-6-astra",
+			{
+				sessionId: "child-session:side:1",
+				parentSessionId: "child-session",
+				// Unpinned sessions key a side request by the parent's own session id.
+				promptCacheKey: "child-session",
+				providerSessionState,
+			},
+			context,
+		);
+
+		for (const name of ["session_id", "session-id", "conversation_id"]) {
+			expect(side.headers.get(name), name).toBe(foreground.headers.get(name));
+		}
+		expect(side.headers.get("session-id")).toBe("root-session");
+		expect(side.headers.get("conversation_id")).toBe("child-session");
+		// Its own thread and turn, and the root's cache key the child's turns send.
+		expect(side.turnMetadata.thread_id).not.toBe(foreground.turnMetadata.thread_id);
+		expect(side.turnMetadata.turn_id).not.toBe(foreground.turnMetadata.turn_id);
+		expect(side.body.prompt_cache_key).toBe(foreground.body.prompt_cache_key);
+		expect(side.body.prompt_cache_key).toBe("root-cache-key");
+		for (const state of providerSessionState.values()) state.close();
+	});
+
 	it("carries the lineage and the snapshot observer through streamSimple, the path sessions use", async () => {
 		const source = createForkSource();
 		const snapshots: CodexRequestSnapshot[] = [];

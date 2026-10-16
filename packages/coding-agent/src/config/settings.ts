@@ -203,6 +203,19 @@ function setByPath(obj: RawSettings, segments: readonly string[], value: unknown
 }
 
 /**
+ * Assign `obj[key]` as an own property. Plain assignment of a parsed
+ * `__proto__` key (an agent name, say) would replace the prototype instead,
+ * silently dropping that entry.
+ */
+function setOwn(obj: RawSettings, key: string, value: unknown): void {
+	if (key === "__proto__") {
+		Object.defineProperty(obj, key, { value, enumerable: true, writable: true, configurable: true });
+	} else {
+		obj[key] = value;
+	}
+}
+
+/**
  * Removes the value at `segments`, pruning the parent objects the removal leaves empty. Every record on the
  * path below `obj` is replaced by a copy rather than edited: a merged view or a cached read may share it.
  */
@@ -1094,9 +1107,10 @@ export class Settings {
 	 * Apply on-disk edits live: watch the directories holding config.yml, the
 	 * project settings files, and `--config` overlays, and run a debounced
 	 * keep-last-good reload (a file that fails to parse or validate keeps its
-	 * layer's last good values). Only the persisting process-global instance watches; other
-	 * instances ignore the call. Stopped by {@link stopWatching} /
-	 * {@link cancelPendingSaves}.
+	 * layer's last good values). Arming a watch also schedules one reload, so
+	 * edits that landed before it went live are not lost. Only the persisting
+	 * process-global instance watches; other instances ignore the call. Stopped
+	 * by {@link stopWatching} / {@link cancelPendingSaves}.
 	 */
 	startWatching(): void {
 		if (this.#watchingFiles || !this.#persist || this.#savesCancelled || globalInstance !== this) return;
@@ -1122,12 +1136,15 @@ export class Settings {
 			else targets.set(dir, new Set([name]));
 		};
 		const addFile = (file: string) => {
+			// Walk physically so every symlink hop (including profile/ancestor
+			// directory links) is observed, not just the logical file and final
+			// realpath. Physical directory keys also re-arm a watch after retargeting.
 			const absolute = path.resolve(file);
 			let dir = path.parse(absolute).root;
 			let segments = physicalTargetSegments(absolute);
 			let hops = 0;
-			// Watch each physical link, including ancestor/profile links, so retargeting re-arms its new destination.
-			for (let segment = segments.shift(); segment !== undefined; segment = segments.shift()) {
+			while (segments.length > 0) {
+				const segment = segments.shift()!;
 				if (segment === "" || segment === ".") continue;
 				if (segment === "..") {
 					dir = path.dirname(dir);
@@ -1142,8 +1159,12 @@ export class Settings {
 						const target = fs.readlinkSync(current);
 						if (path.isAbsolute(target)) dir = path.parse(target).root;
 						segments = [...physicalTargetSegments(target), ...segments];
-					} else dir = current;
+					} else {
+						dir = current;
+					}
 				} catch {
+					// Watch the nearest existing parent, even when several
+					// directories or a symlink's referent are missing.
 					addTarget(dir, segment);
 					return;
 				}
@@ -1200,7 +1221,10 @@ export class Settings {
 			this.#fileWatchers.set(dir, { watcher, names });
 			armed = true;
 		}
-		// Changes between the last load and watch arming may produce no event.
+		// The sources were last read before this watch existed, and Bun arms macOS
+		// FSEvents asynchronously, so a write in between raises no event (a write
+		// right after a symlink retarget, or any edit during startup). Re-read once
+		// the watch is live; that reload's own sync arms nothing new, so it settles.
 		if (armed) this.#scheduleWatchReload();
 	}
 
@@ -1338,6 +1362,8 @@ export class Settings {
 			try {
 				await this.flush();
 			} catch (error) {
+				// The failed writes stay pending for the next flush and are re-applied over the
+				// layers read below, so an unwritable config never blocks a reload or reverts them.
 				logger.warn("Settings: reloading over unsaved changes", { error: String(error) });
 			}
 			const mutationGeneration = this.#persistedMutationGeneration;
@@ -1359,6 +1385,8 @@ export class Settings {
 			const refreshed: LayerRefresh[] = [];
 			if (globalResult.status === "fulfilled") {
 				const { configPath } = globalResult.value;
+				// A config this instance moved aside as malformed reads as missing until a save
+				// recreates it; keep the last good layer instead of rebuilding it from pending writes.
 				const quarantined = this.#configPath !== null && this.#quarantinedYamlTargets.has(this.#configPath);
 				const settings = globalResult.value.settings ?? (quarantined ? structuredClone(this.#global) : {});
 				this.#applyPendingGlobalWrites(settings);
@@ -1515,6 +1543,11 @@ export class Settings {
 
 	getAgentDir(): string {
 		return this.#agentDir;
+	}
+
+	/** Resolved absolute paths of the config overlays supplied to this instance. */
+	getConfigFiles(): readonly string[] {
+		return [...this.#configFiles];
 	}
 
 	/**
@@ -2381,6 +2414,8 @@ export class Settings {
 		invalidateCapabilityFsCache(path.join(projectConfigDir, "settings.json"));
 		invalidateCapabilityFsCache(path.join(discoveryCwd, ".claude", "settings.json"));
 		for (const sourcePath of this.#projectSourcePaths) invalidateCapabilityFsCache(sourcePath);
+		// A native config this instance moved aside reads as missing until a save recreates it;
+		// keep its last good contents, as `#saveProjectNow` does.
 		const nativeProject = quarantineInvalid
 			? ((await this.#loadYamlIfPresentForStartup(projectConfigPath)) ?? {})
 			: (this.#unwrapYamlLoadResult(projectConfigPath, await this.#loadYamlIfPresent(projectConfigPath)) ??
@@ -3172,6 +3207,24 @@ export class Settings {
 			delete raw["advisor.subagents"];
 		}
 
+		// task.completionProbeMs (poll period, 0 = off) → task.completionProbe
+		// (on/off with a built-in backoff schedule). Mapped IN THE SAME LAYER so a
+		// project-level `0` keeps overriding a global period; an explicit new key wins.
+		{
+			const taskObj = isRecord(raw.task) ? raw.task : undefined;
+			const legacyProbeMs =
+				taskObj && "completionProbeMs" in taskObj ? taskObj.completionProbeMs : raw["task.completionProbeMs"];
+			if (typeof legacyProbeMs === "number") {
+				const target = taskObj ?? {};
+				if (!("completionProbe" in target) && !("task.completionProbe" in raw)) {
+					target.completionProbe = legacyProbeMs > 0;
+				}
+				raw.task = target;
+			}
+			if (taskObj) delete taskObj.completionProbeMs;
+			delete raw["task.completionProbeMs"];
+		}
+
 		// Early per-agent toggles were persisted as booleans even though the
 		// runtime record contract is "on"/"off"/model pattern. Normalize each
 		// layer before merging so project-level false still overrides global true.
@@ -3774,11 +3827,12 @@ export class Settings {
 		this.#fireChangesSince(previous);
 	}
 
+	/** Re-applies every global write still pending a save onto `target`, a global layer read from disk. */
 	#applyPendingGlobalWrites(target: RawSettings): void {
 		if (this.#modifiedGlobalModelRoles.size > 0) {
 			const liveRoles = getByPath(this.#global, ["modelRoles"]);
 			const targetRoles = getByPath(target, ["modelRoles"]);
-			const roles = isRecord(targetRoles) ? targetRoles : {};
+			const roles: Record<string, unknown> = isRecord(targetRoles) ? targetRoles : {};
 			for (const role of this.#modifiedGlobalModelRoles) {
 				if (isRecord(liveRoles) && Object.hasOwn(liveRoles, role)) roles[role] = liveRoles[role];
 				else delete roles[role];
@@ -3792,6 +3846,7 @@ export class Settings {
 		}
 	}
 
+	/** Re-applies every project model role still pending a save onto `target`, a project layer read from disk. */
 	#applyPendingProjectWrites(target: RawSettings): void {
 		const liveRoles = getByPath(this.#project, ["modelRoles"]);
 		for (const role of this.#modifiedProjectModelRoles) {
@@ -3905,7 +3960,7 @@ export class Settings {
 		const result: RawSettings = {};
 		for (const key of Object.keys(overrides)) {
 			const override = overrides[key];
-			const baseVal = base[key];
+			const baseVal = Object.hasOwn(base, key) ? base[key] : undefined;
 
 			if (override === undefined) continue;
 
@@ -3917,12 +3972,12 @@ export class Settings {
 				baseVal !== null &&
 				!Array.isArray(baseVal)
 			) {
-				result[key] = this.#deepMerge(baseVal as RawSettings, override as RawSettings);
+				setOwn(result, key, this.#deepMerge(baseVal as RawSettings, override as RawSettings));
 			} else {
-				result[key] = override;
+				setOwn(result, key, override);
 			}
 		}
-		for (const key of Object.keys(base)) if (!Object.hasOwn(result, key)) result[key] = base[key];
+		for (const key of Object.keys(base)) if (!Object.hasOwn(result, key)) setOwn(result, key, base[key]);
 		return result;
 	}
 }

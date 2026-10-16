@@ -14,7 +14,8 @@ import { isRecord } from "@oh-my-pi/pi-utils";
 import codexExecGrammar from "../src/tools/eval-format/codex-exec.lark" with { type: "text" };
 
 const ASTRA = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-6-astra");
-const NATIVE_CODEX = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.5");
+// A bundled Codex model the catalog gives no harness profile.
+const NATIVE_CODEX = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.6-luna");
 
 const EXEC_SOURCE = '// @exec: {"yield_time_ms": 10}\nprint(6 * 7)';
 

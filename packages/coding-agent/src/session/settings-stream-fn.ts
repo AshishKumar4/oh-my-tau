@@ -33,6 +33,7 @@ import {
 	cfgProvidersAntigravityEndpoint,
 	cfgProvidersCacheRetention,
 	cfgProvidersMaxInFlightRequests,
+	cfgProvidersMuseCodeStoreResponses,
 	cfgProvidersOpenaiLiveSteering,
 	cfgProvidersOpenaiWebsockets,
 	cfgProvidersOpenrouterVariant,
@@ -134,6 +135,11 @@ export function createSettingsAwareStreamFn(
 						onLane: slowModeContext?.onLane,
 					})
 				: undefined;
+		// Opt-in: storage keeps prompts and outputs on Meta's side. The setting
+		// also reads PI_MUSE_STORE_RESPONSES, which overrides it while set.
+		const storeResponses =
+			streamOptions?.storeResponses ??
+			(model.provider === "muse-code" ? cfgProvidersMuseCodeStoreResponses.get(settings) : undefined);
 		const maxInFlightRequests = validateProviderMaxInFlightRequests(
 			streamOptions?.maxInFlightRequests ?? cfgProvidersMaxInFlightRequests.get(settings),
 		);
@@ -185,6 +191,7 @@ export function createSettingsAwareStreamFn(
 			// An off switch, not a default: the agent loop always offers its queue.
 			liveSteering: cfgProvidersOpenaiLiveSteering.get(settings) ? streamOptions?.liveSteering : undefined,
 			...(fallbacks !== undefined ? { fallbacks } : {}),
+			...(storeResponses !== undefined ? { storeResponses } : {}),
 			...(slowModeHooks !== undefined ? { anthropicSlowMode: slowModeHooks } : {}),
 			harnessProfile: harnessOverride,
 			...(harnessClientVersion !== undefined ? { harnessClientVersion } : {}),

@@ -146,6 +146,8 @@ describe("Amazon Bedrock Claude Opus 5", () => {
 				// reasoning:true adaptive-thinking family → 900s keepalive-free idle floor.
 				streamIdleTimeoutMs: 900_000,
 				streamRevision: "possible",
+				supportsSamplingParams: false,
+				supportsThinkingBindingControls: true,
 			});
 		}
 	});

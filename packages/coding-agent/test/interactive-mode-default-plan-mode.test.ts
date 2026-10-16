@@ -170,33 +170,6 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		expect(session?.getActiveToolNames()).toContain("read");
 	});
 
-	it("keeps the welcome banner synchronized across startup and later model switches", async () => {
-		cfgStartupQuiet.set(Settings.instance, false);
-		const settings = Settings.isolated({ "plan.defaultOnStartup": true, "compaction.enabled": false });
-		settings.setModelRole("plan", "anthropic/claude-haiku-4-5:high");
-		const created = createHarness(settings);
-		const initialModel = session?.model;
-		if (!initialModel) throw new Error("Expected initial model");
-
-		await created.init({ suppressWelcomeIntro: true });
-
-		const planModel = session?.model;
-		if (!planModel) throw new Error("Expected plan model");
-		expect(planModel.id).toBe("claude-haiku-4-5");
-		const rendered = Bun.stripANSI(created.ui.render(120).join("\n"));
-		expect(rendered).toContain(planModel.name);
-		expect(rendered).not.toContain(initialModel.name);
-
-		const requestRenderSpy = vi.spyOn(created.ui, "requestRender");
-		requestRenderSpy.mockClear();
-		await session!.setModel(initialModel);
-
-		expect(requestRenderSpy).toHaveBeenCalled();
-		const switched = Bun.stripANSI(created.ui.render(120).join("\n"));
-		expect(switched).toContain(initialModel.name);
-		expect(switched).not.toContain(planModel.name);
-	});
-
 	it("activates write when entering plan mode even if it was hidden by discoveryMode (issue #3165)", async () => {
 		// `plan-mode-active.md` instructs the agent to draft the plan file with
 		// `write` and refine it with `edit`. Under `tools.discoveryMode === "all"`
@@ -215,6 +188,30 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 
 		expect(created.planModeEnabled).toBe(true);
 		expect(session?.getActiveToolNames()).toContain("write");
+	});
+
+	it("deactivates an extension `write` on plan-mode entry so approval can dispatch (issue #14030)", async () => {
+		// An extension that registers the literal name `write` shadows the built-in
+		// tool. Plan approval is a `write` to `xd://propose`, which only the built-in
+		// tool can dispatch, so carrying the shadow into plan mode leaves the agent
+		// calling `xd://propose` forever with the overlay never opening (#14030).
+		const shadowWrite = makeTool("write");
+		const created = createHarness(Settings.isolated({ "plan.defaultOnStartup": true, "compaction.enabled": false }), {
+			extraRegistryTools: [shadowWrite],
+			initialActiveTools: [shadowWrite],
+			builtInToolNames: ["read"],
+		});
+
+		expect(session?.getActiveToolNames()).toContain("write");
+		expect(session?.hasBuiltInTool("write")).toBe(false);
+
+		await created.init({ suppressWelcomeIntro: true });
+
+		expect(created.planModeEnabled).toBe(true);
+		// The extension tool cannot carry a plan submission, so it must not stay
+		// active where plan mode promises one.
+		expect(session?.getActiveToolNames()).not.toContain("write");
+		expect(session?.getActiveToolNames()).toContain("read");
 	});
 
 	it("keeps write on the direct surface when plan mode starts under Code Mode", async () => {
@@ -442,21 +439,24 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		expect(session?.peekPlanProposalHandler()).toBeUndefined();
 	});
 
-	it("leaves plan mode and restores its prior model when starting a new empty session", async () => {
+	it("leaves plan mode when an internal reset starts a new session, despite plan.defaultOnStartup (issue #14653)", async () => {
+		const writeTool = makeTool("write");
 		const created = createHarness(
 			Settings.isolated({
 				"plan.defaultOnStartup": true,
 				"compaction.enabled": false,
 				modelRoles: { plan: "anthropic/claude-sonnet-4-6" },
 			}),
-			{ extraRegistryTools: [makeTool("write")], builtInToolNames: ["read", "write"] },
+			{ extraRegistryTools: [writeTool], builtInToolNames: ["read", "write"] },
 		);
 		await created.init({ suppressWelcomeIntro: true });
 		expect(created.planModeEnabled).toBe(true);
 		expect(session?.model?.id).toBe("claude-sonnet-4-6");
-		const previous = session?.sessionFile;
+		const previousSessionFile = session?.sessionFile;
+
 		await created.handleClearCommand();
-		expect(session?.sessionFile).not.toBe(previous);
+
+		expect(session?.sessionFile).not.toBe(previousSessionFile);
 		expect(session?.sessionManager.buildSessionContext().mode).toBe("none");
 		expect(created.planModeEnabled).toBe(false);
 		expect(created.planModePaused).toBe(false);
@@ -464,6 +464,27 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		expect(session?.peekPlanProposalHandler()).toBeUndefined();
 		expect(session?.getActiveToolNames()).toEqual(["read"]);
 		expect(session?.model?.id).toBe("claude-sonnet-4-5");
+	});
+
+	it("re-enters plan mode in the session /new starts when plan.defaultOnStartup is on (issue #15627)", async () => {
+		const created = createHarness(
+			Settings.isolated({
+				"plan.defaultOnStartup": true,
+				"compaction.enabled": false,
+				modelRoles: { plan: "anthropic/claude-sonnet-4-6" },
+			}),
+		);
+		await created.init({ suppressWelcomeIntro: true });
+		const previousSessionFile = session?.sessionFile;
+
+		await created.handleNewCommand();
+
+		expect(session?.sessionFile).not.toBe(previousSessionFile);
+		expect(created.planModeEnabled).toBe(true);
+		expect(session?.sessionManager.buildSessionContext().mode).toBe("plan");
+		expect(session?.getPlanModeState()?.enabled).toBe(true);
+		expect(session?.peekPlanProposalHandler()).toBeDefined();
+		expect(session?.model?.id).toBe("claude-sonnet-4-6");
 	});
 
 	it("enters only when enabled and the session has no conversation or explicit mode", () => {

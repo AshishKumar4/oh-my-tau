@@ -72,6 +72,7 @@ describe("browser handle enrichment — fill()", () => {
 					focus: () => {
 						node.focused = true;
 					},
+					matches: () => false,
 				});
 			},
 			type: async (text: string) => {
@@ -82,7 +83,7 @@ describe("browser handle enrichment — fill()", () => {
 
 		await toActionableHandle(stub).fill("fresh");
 
-		expect(calls).toEqual(["evaluate", "type"]);
+		expect(calls).toEqual(["evaluate", "evaluate", "type"]);
 		expect(node.focused).toBe(true);
 		expect(node.value).toBe("fresh");
 	});
@@ -109,12 +110,14 @@ describe("browser handle enrichment — guarded actions", () => {
 	};
 
 	// handle.click() resolves a stable, unoccluded click point (boundingBox + the
-	// actionability probe) and then dispatches through the page mouse, so a stub
-	// stands in for those three seams rather than a raw `click` method.
+	// actionability probe), watches for the page receiving it, and then dispatches
+	// through the page mouse, so a stub stands in for those seams rather than a
+	// raw `click` method. The watch reports the click as delivered.
 	const clickableStub = (mouseClick: () => Promise<void>, extra: Record<string, unknown> = {}): ElementHandle =>
 		({
 			boundingBox: async () => ({ x: 10, y: 10, width: 20, height: 20 }),
 			evaluate: async () => ({ ok: true, x: 20, y: 20 }),
+			evaluateHandle: async () => ({ evaluate: async () => true, dispose: async () => {} }),
 			frame: { page: () => ({ mouse: { click: mouseClick } }) },
 			type: async () => {},
 			dispose: async () => {},
@@ -167,7 +170,7 @@ describe("browser handle enrichment — guarded actions", () => {
 		const stub = {
 			type: async () => {},
 			evaluate: async (fn: (el: unknown) => unknown) => {
-				fn({ focus: () => {} });
+				fn({ focus: () => {}, matches: () => false });
 			},
 			frame: {
 				page: () => ({
@@ -197,20 +200,20 @@ describe("browser handle enrichment — guarded actions", () => {
 	});
 
 	it("passes arguments and return values through the guarded method unchanged", async () => {
-		let calls = 0;
+		const received: unknown[][] = [];
 		const stub = {
-			select: async (...values: string[]) => {
-				calls++;
-				return values;
+			drag: async (...args: unknown[]) => {
+				received.push(args);
+				return { items: [], dragOperationsMask: 1 };
 			},
 			type: async () => {},
 			evaluate: async () => {},
 		} as unknown as ElementHandle;
 		const { guard, labels } = makeGuard(1_000);
 
-		expect(await toActionableHandle(stub, guard).select("a", "b")).toEqual(["a", "b"]);
-		expect(calls).toBe(1);
-		expect(labels).toEqual(["handle.select()"]);
+		expect(await toActionableHandle(stub, guard).drag({ x: 1, y: 2 })).toEqual({ items: [], dragOperationsMask: 1 });
+		expect(received).toEqual([[{ x: 1, y: 2 }]]);
+		expect(labels).toEqual(["handle.drag()"]);
 	});
 
 	it("guards drag and touch input methods, not just click/type", async () => {
@@ -247,6 +250,7 @@ describe("browser handle enrichment — guarded actions", () => {
 					focus: () => {
 						node.focused = true;
 					},
+					matches: () => false,
 				});
 			},
 			type: async () => {},

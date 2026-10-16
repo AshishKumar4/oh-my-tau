@@ -1,3 +1,5 @@
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { DesktopCapabilities } from "@oh-my-pi/pi-natives";
 import { withTimeout } from "@oh-my-pi/pi-utils/async";
 import * as logger from "@oh-my-pi/pi-utils/logger";
@@ -31,7 +33,16 @@ export interface ComputerController {
 		timeoutMs: number,
 		snapshot: ComputerSessionSnapshot,
 		signal?: AbortSignal,
+		context?: AgentToolContext,
 	): Promise<ComputerRunOk>;
+	revokeControl?(): Promise<void>;
+	/** The owner's agent turn `turn` ended: let the display sleep now, keeping control, refs and the worker. */
+	releaseDisplay?(turn: number): void;
+	/**
+	 * Turn `from` stopped for a dialog and went on as `turn`: a run of `from` active or starting holds the display
+	 * again.
+	 */
+	resumeDisplay?(from: number, turn: number): void;
 	capabilities(snapshot: ComputerSessionSnapshot, signal?: AbortSignal): Promise<DesktopCapabilities | undefined>;
 	close(): Promise<void>;
 }
@@ -70,6 +81,7 @@ interface PendingRun {
 	reject(error: unknown): void;
 	signal?: AbortSignal;
 	toolCalls: Map<string, AbortController>;
+	context?: AgentToolContext;
 }
 
 interface PendingCapabilities {
@@ -140,7 +152,14 @@ export class ComputerSupervisor implements ComputerController {
 	#startResolve?: () => void;
 	#pendingCapabilities = new Map<string, PendingCapabilities>();
 	#pending = new Map<string, PendingRun>();
+	#revocations = new Map<string, () => void>();
+	/**
+	 * Snapshots of runs waiting for the worker to start: a resume the worker gets before their `run` would find
+	 * nothing to hold, so it moves them to the turn that went on here.
+	 */
+	readonly #startingRuns = new Set<ComputerSessionSnapshot>();
 	#nextId = 0;
+	#controlEpoch = 0;
 	#closed = false;
 	#unsubscribeMessage?: () => void;
 	#unsubscribeError?: () => void;
@@ -188,15 +207,23 @@ export class ComputerSupervisor implements ComputerController {
 		timeoutMs: number,
 		snapshot: ComputerSessionSnapshot,
 		signal?: AbortSignal,
+		context?: AgentToolContext,
 	): Promise<ComputerRunOk> {
 		if (this.#closed) throw new ToolError("Computer session is closed");
 		if (signal?.aborted) throw new ToolAbortError();
-		await this.#start();
-		if (signal?.aborted) throw new ToolAbortError();
+		const epoch = this.#controlEpoch;
+		const session = { ...snapshot };
+		this.#startingRuns.add(session);
+		try {
+			await this.#start();
+		} finally {
+			this.#startingRuns.delete(session);
+		}
+		if (signal?.aborted || epoch !== this.#controlEpoch) throw new ToolAbortError();
 
 		const id = `computer-${++this.#nextId}`;
 		const { promise, resolve, reject } = Promise.withResolvers<ComputerRunOk>();
-		const pending: PendingRun = { resolve, reject, signal, toolCalls: new Map() };
+		const pending: PendingRun = { resolve, reject, signal, context, toolCalls: new Map() };
 		this.#pending.set(id, pending);
 		const abort = (): void => {
 			this.#safeSend({ type: "abort", id });
@@ -206,7 +233,7 @@ export class ComputerSupervisor implements ComputerController {
 		else signal?.addEventListener("abort", abort, { once: true });
 
 		try {
-			this.#worker?.send({ type: "run", id, code, timeoutMs, session: snapshot });
+			this.#worker?.send({ type: "run", id, code, timeoutMs, session });
 			return await this.#raceWithGrace(promise, timeoutMs);
 		} finally {
 			signal?.removeEventListener("abort", abort);
@@ -248,9 +275,16 @@ export class ComputerSupervisor implements ComputerController {
 			this.#startReject = undefined;
 			return;
 		}
+		if (message.type === "control-revoked") {
+			this.#revocations.get(message.id)?.();
+			this.#revocations.delete(message.id);
+			return;
+		}
 		if (message.type === "result") {
 			const pending = this.#pending.get(message.id);
 			if (!pending) return;
+			for (const controller of pending.toolCalls.values())
+				controller.abort(new ToolAbortError("Computer run ended"));
 			this.#pending.delete(message.id);
 			if (message.ok) pending.resolve(message.payload);
 			else pending.reject(errorFromPayload(message.error));
@@ -264,9 +298,76 @@ export class ComputerSupervisor implements ComputerController {
 			else pending.reject(errorFromPayload(message.error));
 			return;
 		}
+		if (message.type === "control-request") {
+			void this.#confirmControl(message);
+			return;
+		}
 		if (message.type === "tool-call") {
 			void this.#dispatchToolCall(message);
 		}
+	}
+
+	async #confirmControl(message: Extract<ComputerWorkerOutbound, { type: "control-request" }>): Promise<void> {
+		const pending = this.#pending.get(message.runId);
+		if (!pending) return;
+		const controller = new AbortController();
+		pending.toolCalls.set(message.id, controller);
+		const onAbort = (): void => controller.abort(pending.signal?.reason);
+		if (pending.signal?.aborted) onAbort();
+		else pending.signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			const context = pending.context ?? this.#session.getToolContext?.();
+			let approved = false;
+			if (context?.ui && context.hasUI !== false && !controller.signal.aborted) {
+				approved =
+					(await untilAborted(controller.signal, () =>
+						context.ui!.confirm(
+							"Allow foreground computer control?",
+							`${message.reason}\n\nFor this task only. Use the host interrupt to stop and revoke control. This does not authorize external side effects.`,
+							{ signal: controller.signal },
+						),
+					)) === true;
+			}
+			if (controller.signal.aborted || this.#pending.get(message.runId) !== pending) approved = false;
+			this.#safeSend({ type: "tool-reply", id: message.id, reply: { ok: true, value: approved } });
+		} catch (error) {
+			this.#safeSend({
+				type: "tool-reply",
+				id: message.id,
+				reply: { ok: false, error: toWorkerErrorPayload(error) },
+			});
+		} finally {
+			pending.toolCalls.delete(message.id);
+			pending.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+
+	async revokeControl(): Promise<void> {
+		this.#controlEpoch += 1;
+		for (const pending of this.#pending.values()) {
+			for (const controller of pending.toolCalls.values()) controller.abort(new ToolAbortError());
+		}
+		if (!this.#worker) return;
+		const id = `computer-revoke-${++this.#nextId}`;
+		const acknowledged = Promise.withResolvers<void>();
+		this.#revocations.set(id, acknowledged.resolve);
+		this.#safeSend({ type: "revoke-control", id });
+		try {
+			await withTimeout(acknowledged.promise, CLOSE_TIMEOUT_MS, "Timed out revoking computer control");
+		} catch (error) {
+			await this.#terminate(error);
+		} finally {
+			this.#revocations.delete(id);
+		}
+	}
+
+	releaseDisplay(turn: number): void {
+		this.#safeSend({ type: "release-display", turn });
+	}
+
+	resumeDisplay(from: number, turn: number): void {
+		for (const starting of this.#startingRuns) if (starting.displayTurn === from) starting.displayTurn = turn;
+		this.#safeSend({ type: "resume-display", from, turn });
 	}
 
 	async #dispatchToolCall(message: Extract<ComputerWorkerOutbound, { type: "tool-call" }>): Promise<void> {
@@ -354,6 +455,8 @@ export class ComputerSupervisor implements ComputerController {
 		this.#pending.clear();
 		for (const pending of this.#pendingCapabilities.values()) pending.reject(reason);
 		this.#pendingCapabilities.clear();
+		for (const resolve of this.#revocations.values()) resolve();
+		this.#revocations.clear();
 		await worker?.terminate().catch(() => undefined);
 	}
 
@@ -379,6 +482,8 @@ export class ComputerSupervisor implements ComputerController {
 }
 
 const ownedSupervisors = new Map<string, Set<ComputerController>>();
+/** Per owner with agent turns: the turn in flight, or between turns the one that ended last, counted from 1. */
+const ownerTurns = new Map<string, { turn: number; inFlight: boolean }>();
 
 /** Registers a controller for owner-scoped session cleanup. */
 export function registerComputerController(ownerId: string | undefined, controller: ComputerController): () => void {
@@ -392,9 +497,62 @@ export function registerComputerController(ownerId: string | undefined, controll
 	};
 }
 
+/** Revoke task-scoped foreground ownership without resetting frames or the worker. */
+export async function revokeComputerControlForOwner(ownerId: string | undefined): Promise<void> {
+	if (!ownerId) return;
+	await Promise.allSettled(
+		Array.from(ownedSupervisors.get(ownerId) ?? [], controller => controller.revokeControl?.()),
+	);
+}
+
+/**
+ * An agent session's turn began, or went on after the user answered a dialog: computer runs keep the display awake
+ * until {@link endComputerTurnForOwner}.
+ */
+export function beginComputerTurnForOwner(ownerId: string | undefined): void {
+	if (!ownerId) return;
+	const state = ownerTurns.get(ownerId);
+	ownerTurns.set(ownerId, { turn: (state?.turn ?? 0) + 1, inFlight: true });
+}
+
+/**
+ * The turn ended or stopped to wait for the user's answer: let the display sleep now instead of a grace period later.
+ * Nothing else ends with the turn; its next computer request after the answer, or the next turn's first, holds the
+ * display again.
+ */
+export function endComputerTurnForOwner(ownerId: string | undefined): void {
+	const state = ownerId ? ownerTurns.get(ownerId) : undefined;
+	if (!ownerId || !state?.inFlight) return;
+	state.inFlight = false;
+	for (const controller of ownedSupervisors.get(ownerId) ?? []) controller.releaseDisplay?.(state.turn);
+}
+
+/**
+ * The turn went on after the dialog that ended it settled: later runs hold the display until the turn ends, and so
+ * does a run of the turn that is still active, such as one whose control confirmation the dialog was.
+ */
+export function resumeComputerTurnForOwner(ownerId: string | undefined): void {
+	const state = ownerId ? ownerTurns.get(ownerId) : undefined;
+	if (!ownerId || !state || state.inFlight) return;
+	const from = state.turn;
+	state.turn = from + 1;
+	state.inFlight = true;
+	for (const controller of ownedSupervisors.get(ownerId) ?? []) controller.resumeDisplay?.(from, state.turn);
+}
+
+/**
+ * The owner's agent turn in flight, if any. Without one (between turns, while a dialog waits for the user, in a
+ * subagent, or SDK and eval use with no agent session), a computer run keeps the native grace period.
+ */
+export function computerTurnInFlight(ownerId: string | undefined): number | undefined {
+	const state = ownerId ? ownerTurns.get(ownerId) : undefined;
+	return state?.inFlight ? state.turn : undefined;
+}
+
 /** Closes every computer session owned by an agent session. */
 export async function releaseComputerSessionsForOwner(ownerId: string | undefined): Promise<void> {
 	if (!ownerId) return;
+	ownerTurns.delete(ownerId);
 	const controllers = ownedSupervisors.get(ownerId);
 	if (!controllers) return;
 	ownedSupervisors.delete(ownerId);

@@ -55,6 +55,11 @@ function makeTempDir(prefix: string): string {
 	return dir.path();
 }
 
+/** Inert shared manager exposing the members a revived subagent reads: its tools and change feed. */
+function fakeMcpManager(getTools: () => Array<{ name: string; label: string }>): MCPManager {
+	return { getTools, addToolsChangedListener: () => () => {} } as unknown as MCPManager;
+}
+
 function createRef(sessionFile: string): AgentRef {
 	return {
 		id: "persisted-restricted",
@@ -107,6 +112,8 @@ function createRevivedSession(activeToolNames: string[][], extensionRunner?: unk
 	const session = {
 		...createSessionDefaults(),
 		getMountedXdevToolNames: () => [],
+		// The persisted contract's tools (createPersistedSession): a lane run reads its result mode from them.
+		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (names: string[]) => {
 			activeToolNames.push(names);
 		},
@@ -246,7 +253,7 @@ describe("persisted subagent revival", () => {
 	it("initializes the extension runtime on cold revival so tool_call handlers are not fail-closed blocked", async () => {
 		const cwd = makeTempDir("@pi-revive-ext-init-");
 		const sessionFile = await createPersistedSession(cwd);
-		MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);
+		MCPManager.setInstance(fakeMcpManager(() => []));
 		const initialize = vi.fn();
 		const onError = vi.fn();
 		const emit = vi.fn(async () => undefined);
@@ -387,7 +394,7 @@ describe("persisted subagent revival", () => {
 		AgentRegistry.resetGlobalForTests();
 		const cwd = makeTempDir("@pi-revive-artifacts-dir-");
 		const sessionFile = await createPersistedSession(cwd);
-		MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);
+		MCPManager.setInstance(fakeMcpManager(() => []));
 		// Run the real wake monitor (call through) so the assertion is tied to the
 		// component that actually writes <id>.md, not a stubbed seam.
 		const realAttach = executorModule.attachIrcWakeTurnMonitor;
@@ -429,7 +436,7 @@ describe("persisted subagent revival", () => {
 		const cwd = makeTempDir("@pi-restricted-revive-");
 		const sessionFile = await createPersistedSession(cwd, true);
 		const hostileMcpGetTools = vi.fn(() => [{ name: "read", label: "hostile/read" }]);
-		MCPManager.setInstance({ getTools: hostileMcpGetTools } as unknown as MCPManager);
+		MCPManager.setInstance(fakeMcpManager(hostileMcpGetTools));
 		const activeToolNames: string[][] = [];
 		let capturedOptions: CreateAgentSessionOptions | undefined;
 		const attemptedDiscovery: string[] = [];
@@ -453,6 +460,7 @@ describe("persisted subagent revival", () => {
 		expect(capturedOptions?.enableIrc).toBe(false);
 		expect(capturedOptions?.mcpManager).toBeUndefined();
 		expect(capturedOptions?.customTools).toBeUndefined();
+		expect(capturedOptions?.mcpTools).toBeUndefined();
 		expect(capturedOptions?.preloadedExtensionPaths).toEqual([]);
 		expect(capturedOptions?.preloadedCustomToolPaths).toEqual([]);
 		expect(hostileMcpGetTools).not.toHaveBeenCalled();
@@ -507,9 +515,7 @@ describe("persisted subagent revival", () => {
 	it("preserves normal revival capability wiring for contracts without the marker", async () => {
 		const cwd = makeTempDir("@pi-normal-revive-");
 		const sessionFile = await createPersistedSession(cwd);
-		const hostileMcp = {
-			getTools: () => [{ name: "mcp__server_read", label: "server/read" }],
-		} as unknown as MCPManager;
+		const hostileMcp = fakeMcpManager(() => [{ name: "mcp__server_read", label: "server/read" }]);
 		MCPManager.setInstance(hostileMcp);
 		let capturedOptions: CreateAgentSessionOptions | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
@@ -525,7 +531,8 @@ describe("persisted subagent revival", () => {
 		expect(capturedOptions?.restrictToolNames).toBeUndefined();
 		expect(capturedOptions?.enableLsp).toBe(true);
 		expect(capturedOptions?.mcpManager).toBe(hostileMcp);
-		expect(capturedOptions?.customTools?.map(tool => tool.name)).toEqual(["mcp__server_read"]);
+		expect(capturedOptions?.mcpTools?.map(tool => tool.name)).toEqual(["mcp__server_read"]);
+		expect(capturedOptions?.customTools).toBeUndefined();
 	});
 
 	it("leaves isolated sessions transcript-only even when the workspace still exists", async () => {
@@ -588,6 +595,29 @@ describe("persisted subagent revival", () => {
 		expect(captured.map(options => [options.agentName, options.toolNames])).toEqual(
 			contracts.map(contract => [contract.agent, contract.tools]),
 		);
+	});
+
+	it("restores the live account pool for the persisted agent name, so a revived agent stays restricted", async () => {
+		const cwd = makeTempDir("@pi-revive-account-pool-");
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, { agent: "scout" });
+		let capturedOptions: CreateAgentSessionOptions | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			capturedOptions = options;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+		const settings = Settings.isolated({
+			"task.agentAccountPools": {
+				scout: { anthropic: ["email:a@example.com|org:org-a"] },
+				other: { anthropic: [] },
+			},
+		});
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd, undefined, { settings })(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		expect(capturedOptions?.oauthAccountPools).toEqual({ anthropic: ["email:a@example.com|org:org-a"] });
 	});
 
 	it("falls back to the ref display name reviving a legacy session file without a persisted agent name", async () => {
@@ -678,6 +708,25 @@ describe("persisted subagent revival", () => {
 		expect(cfgAdvisorEnabled.get(unadvised)).toBe(false);
 		expect(cfgAdvisorEnabled.get(resolved)).toBe(true);
 		expect(resolved.getModelRole("advisor")).toBe("openai/gpt-5.6-sol:high");
+	});
+
+	it("keeps a nested spawn's owner-resolved advisor when reviving under root settings with a different advisor", async () => {
+		const cwd = makeTempDir("@pi-nested-advisor-revive-");
+		// What spawn persists for `@advisor:high` under a parent subagent whose advisor role is Sonnet.
+		const sessionFile = await createPersistedSession(cwd, undefined, undefined, "anthropic/claude-sonnet-4-5:high");
+		const rootSettings = Settings.isolated({ modelRoles: { advisor: "anthropic/claude-haiku-4-5" } });
+		let captured: Settings | undefined;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			captured = options?.settings;
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		const ref = createRef(sessionFile);
+		const reviver = await createFactory(cwd, undefined, { settings: rootSettings })(ref);
+		if (!reviver) throw new Error("Expected a persisted reviver");
+		await reviver(ref);
+
+		expect(captured?.getModelRole("advisor")).toBe("anthropic/claude-sonnet-4-5:high");
 	});
 
 	it("restores the persisted custom model role before reopening the session", async () => {
@@ -787,7 +836,7 @@ describe("persisted subagent revival", () => {
 		AgentLifecycleManager.resetGlobalForTests();
 		const cwd = makeTempDir("@pi-revive-frames-");
 		const sessionFile = await createPersistedSession(cwd);
-		MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);
+		MCPManager.setInstance(fakeMcpManager(() => []));
 		let handle: RevivedSessionHandle | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
 			handle = createRevivedSession([]);
@@ -848,7 +897,7 @@ describe("persisted subagent revival", () => {
 		AgentLifecycleManager.resetGlobalForTests();
 		const cwd = makeTempDir("@pi-revive-artifact-");
 		const sessionFile = await createPersistedSession(cwd);
-		MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);
+		MCPManager.setInstance(fakeMcpManager(() => []));
 		let handle: RevivedSessionHandle | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
 			handle = createRevivedSession([]);
@@ -901,7 +950,7 @@ describe("persisted subagent revival", () => {
 			AgentLifecycleManager.resetGlobalForTests();
 			IrcBus.resetGlobalForTests();
 			const sessionFile = await createPersistedSession(cwd);
-			MCPManager.setInstance({ getTools: () => [] } as unknown as MCPManager);
+			MCPManager.setInstance(fakeMcpManager(() => []));
 			let handle: RevivedSessionHandle | undefined;
 			vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
 				handle = createRevivedSession([]);

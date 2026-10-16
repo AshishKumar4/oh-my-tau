@@ -1,17 +1,18 @@
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
+import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 
-/** Only complete file views may replace earlier detailed ranges. */
+/**
+ * Whether a successful `read` result shows its whole file, so a bare-path read
+ * may supersede earlier range reads of that file (`supersedeComplete` for
+ * `pruneSupersededToolResults`). Complete needs positive proof: a scanned line
+ * count or a returned image, with no summary, truncation, or column cap.
+ * Summaries, partial pages, and notices (binary file, directory, metadata) are
+ * not complete.
+ */
 export function isCompleteReadResult(message: ToolResultMessage): boolean {
-	const details = message.details;
-	if (!isRecord(details) || details.summary !== undefined) return false;
-	const truncation = details.truncation;
-	if (truncation !== undefined && (!isRecord(truncation) || truncation.truncated !== false)) return false;
-	const meta = details.meta;
-	if (meta !== undefined) {
-		if (!isRecord(meta) || meta.truncation !== undefined) return false;
-		if (meta.limits !== undefined && (!isRecord(meta.limits) || meta.limits.columnTruncated !== undefined))
-			return false;
-	}
-	return typeof details.totalLines === "number" || message.content.some(block => block.type === "image");
+	// Typed through the producer's details so a renamed field is a compile error.
+	const details = message.details as ReadToolDetails | undefined;
+	if (!details || details.summary || details.truncation?.truncated) return false;
+	if (details.meta?.truncation || details.meta?.limits?.columnTruncated) return false;
+	return details.totalLines !== undefined || message.content.some(block => block.type === "image");
 }

@@ -680,10 +680,10 @@ export class MnemopiSessionState {
 		const flat = withLoopPhase("mnemopi.recall", () => flattenAgentMessages(messages));
 		const lastUser = flat.findLast(message => message.role === "user");
 		if (!lastUser) return undefined;
-		const query = withLoopPhase("mnemopi.recall", () =>
-			composeRecallQuery(lastUser.content, flat, this.config.recallContextTurns),
-		);
-		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+		const truncated = withLoopPhase("mnemopi.recall", () => {
+			const query = composeRecallQuery(lastUser.content, flat, this.config.recallContextTurns);
+			return truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+		});
 		return await this.recallForContext(truncated);
 	}
 
@@ -759,8 +759,7 @@ export class MnemopiSessionState {
 	#restoreRetainedTurnCursor(): void {
 		if (this.#retentionCursorLoaded) return;
 		this.#retentionCursorLoaded = true;
-		const rows = this.memory.beam.db
-			.prepare<MnemopiRetentionCursorRow, [string]>(`
+		using statement = this.memory.beam.db.prepare<MnemopiRetentionCursorRow, [string]>(`
 				SELECT
 					content,
 					json_extract(metadata_json, '$.source_id') AS sourceId,
@@ -770,8 +769,8 @@ export class MnemopiSessionState {
 				WHERE source = 'coding-agent-transcript'
 				  AND json_extract(metadata_json, '$.session_id') = ?
 				ORDER BY rowid
-			`)
-			.all(this.sessionId);
+		`);
+		const rows = statement.all(this.sessionId);
 		this.lastRetainedTurn = Math.max(this.lastRetainedTurn, deriveRetainedTurnCursor(rows, this.sessionId));
 	}
 
@@ -822,10 +821,10 @@ export class MnemopiSessionState {
 			const messages = withLoopPhase("mnemopi.recall", () => extractMessages(this.session.sessionManager));
 			const lastUser = messages.findLast(message => message.role === "user");
 			if (!lastUser) return;
-			const query = withLoopPhase("mnemopi.recall", () =>
-				composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns),
-			);
-			const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+			const truncated = withLoopPhase("mnemopi.recall", () => {
+				const query = composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns);
+				return truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+			});
 			try {
 				const recall = await this.#recallBlock(truncated);
 				record = recall && this.#deliveredRecall(recall, block => this.budgetRecallBlock(block));

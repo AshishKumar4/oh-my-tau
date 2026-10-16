@@ -13,7 +13,7 @@ interface BrowserAppOptions {
 	tern?: boolean;
 	/** Extra command-line arguments for a spawned executable. */
 	args?: string[];
-	/** URL/title substring used to select an attached tab. */
+	/** URL/title substring used to select an attached tab; inside Tern, adopts the user's browser block it matches (or whose id it is). */
 	target?: string;
 }
 
@@ -135,7 +135,7 @@ interface BrowserOpenOptions {
 	allowed_domains?: string[];
 	/** Document-start JavaScript sources or cwd-relative source-file paths. */
 	init_scripts?: string[];
-	/** Absolute or cwd-relative directory for downloads. */
+	/** Absolute or cwd-relative directory for this tab's downloads; each tab keeps its own, except in a connected or relay browser, which shares one folder. */
 	downloads?: string;
 	/** Override the tab user agent before initial navigation. */
 	user_agent?: string;
@@ -143,12 +143,36 @@ interface BrowserOpenOptions {
 	ignore_https_errors?: boolean;
 	/** Permit local file pages to read other local files in an owned browser process. */
 	allow_file_access?: boolean;
-	/** Override the configured display mode for this open. */
+	/** Override the configured Chromium display mode for this open; inside Tern the open stays a picture-in-picture (use `app.tern: false` for Chromium). */
 	headed?: boolean;
 	/** Keep the tab live across turn settle and idle close (default false). */
 	persist?: boolean;
 	/** Open timeout in seconds, excluding first-use browser installation. */
 	timeout?: number;
+}
+
+/** Options for listing the user's pages `app.target` can adopt. */
+interface BrowserTargetsOptions {
+	/** Browser selection as for `open` (e.g. `{ relay: true }`). */
+	app?: BrowserAppOptions;
+	/** Whole-operation timeout in seconds. */
+	timeout?: number;
+}
+
+/** One of the user's own pages `open({ app: { target } })` can adopt. */
+interface BrowserTarget {
+	/** The value to pass as `app.target`: a Tern block id, or a relay page's URL. */
+	target: string;
+	title: string;
+	url: string;
+	/** Whether the page is on screen (relay: the active tab of its window); omitted by older Terns. */
+	shown?: boolean;
+	/** Tern only: false for a picture-in-picture floating over another block. */
+	docked?: boolean;
+	/** Tern only: whether scripts drive the block; omitted by older Terns. */
+	driven?: boolean;
+	/** Tern only: the omp tab of this process holding the block. */
+	tab?: string;
 }
 
 /** Options for releasing managed browser tabs. */
@@ -1315,7 +1339,7 @@ interface BrowserTabHelpers {
 	type(selector: string, text: string): Promise<void>;
 	/** Replace the value of the element matching `selector`. */
 	fill(selector: string, value: string): Promise<void>;
-	/** Press a keyboard key, optionally on a matching element. */
+	/** Press a key or a `+`-joined combo (`Enter`, `Shift+Tab`, `Control+a`), optionally on a matching element. */
 	press(key: string, options?: BrowserPressOptions): Promise<void>;
 	/** Scroll by page-relative or matching-element deltas. */
 	scroll(deltaX: number, deltaY: number, options?: BrowserScrollOptions): Promise<void>;
@@ -1325,7 +1349,7 @@ interface BrowserTabHelpers {
 	evaluate<R, TArgs extends unknown[]>(fn: string | ((...args: TArgs) => R | Promise<R>), ...args: TArgs): Promise<R>;
 	/** Scroll the matching element into view. */
 	scrollIntoView(selector: string): Promise<void>;
-	/** Select values in the matching `<select>` element. */
+	/** Select options in the matching `<select>` element by value, then visible label; throws, leaving it unchanged, when a value matches no option. */
 	select(selector: string, ...values: string[]): Promise<string[]>;
 	/** Upload files through a matching file input, chooser trigger, or drop zone. */
 	uploadFile(selector: string, ...filePaths: string[]): Promise<void>;
@@ -1460,7 +1484,7 @@ interface BrowserFrame {
 	fill(selector: string, value: string): Promise<void>;
 	/** Type text into a matching element inside this frame. */
 	type(selector: string, text: string): Promise<void>;
-	/** Press a key, optionally after focusing a matching element. */
+	/** Press a key or a `+`-joined combo (`Enter`, `Shift+Tab`, `Control+a`), optionally after focusing a matching element. */
 	press(key: string, options?: BrowserPressOptions): Promise<void>;
 	/** Return a matching element's text content. */
 	text(selector: string): Promise<string>;
@@ -1488,8 +1512,8 @@ interface BrowserFrame {
 
 /** An element handle returned by `BrowserTab.id` or `BrowserTab.ref`. */
 interface BrowserElement {
-	/** Click this element. */
-	click(): Promise<void>;
+	/** Click this element; `button` picks another mouse button (`"right"` for the page's own context menu), `count: 2` double-clicks. */
+	click(options?: { button?: BrowserMouseButton; count?: number }): Promise<void>;
 	/** Double-click this element. */
 	dblclick(): Promise<void>;
 	/** Set this checkbox, radio, or ARIA switch. */
@@ -1502,13 +1526,13 @@ interface BrowserElement {
 	type(text: string): Promise<void>;
 	/** Replace this element's value. */
 	fill(value: string): Promise<void>;
-	/** Press a keyboard key on this element. */
+	/** Press a key or a `+`-joined combo (`Enter`, `Shift+Tab`, `Control+a`) on this element. */
 	press(key: string): Promise<void>;
 	/** Hover this element. */
 	hover(): Promise<void>;
 	/** Focus this element. */
 	focus(): Promise<void>;
-	/** Select values when this element is a `<select>`. */
+	/** Select options by value, then visible label, when this element is a `<select>`; throws, leaving it unchanged, when a value matches no option. */
 	select(...values: string[]): Promise<string[]>;
 	/** Upload files when this element is a file input. */
 	uploadFile(...filePaths: string[]): Promise<void>;
@@ -1619,6 +1643,8 @@ declare const browser: {
 	tab(name?: string): BrowserTab;
 	/** List the session's managed browser tabs. */
 	tabs(): Promise<BrowserManagedTab[]>;
+	/** List the user's own pages `app.target` can adopt: Tern browser blocks inside a Tern pane, or Chrome tabs via the relay. */
+	targets(options?: BrowserTargetsOptions): Promise<BrowserTarget[]>;
 	/** Release one or all managed tabs. */
 	close(options?: BrowserCloseOptions): Promise<void>;
 };

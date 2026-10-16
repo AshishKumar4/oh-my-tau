@@ -11,7 +11,7 @@ describe("resolveHarnessProfile", () => {
 
 	test("walks the rule cascade once per model object", () => {
 		const astra = getBundledModel("openai-codex", "gpt-6-astra");
-		const legacy = getBundledModel("openai-codex", "gpt-5.5");
+		const legacy = getBundledModel("openai-codex", "gpt-5.6-luna");
 		expect(resolveHarnessProfile(astra)).toBe("codex");
 		expect(resolveHarnessProfile(legacy)).toBeUndefined();
 

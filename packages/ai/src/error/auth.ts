@@ -1,17 +1,5 @@
 import { attach, create, Flag } from "./flags";
 
-/** Stored OAuth exists, but refreshing it failed temporarily. */
-export class OAuthRefreshUnavailableError extends Error {
-	readonly provider: string;
-
-	constructor(provider: string, cause: Error) {
-		super(`OAuth token refresh failed for provider ${provider}: ${cause.message}`, { cause });
-		this.name = "OAuthRefreshUnavailableError";
-		this.provider = provider;
-		attach(this, create(Flag.Transient));
-	}
-}
-
 /**
  * No API key / credential was available to dispatch a request.
  *
@@ -28,6 +16,26 @@ export class MissingApiKeyError extends Error {
 		this.name = "MissingApiKeyError";
 		this.provider = provider;
 		attach(this, create(Flag.AuthFailed));
+	}
+}
+
+/**
+ * Every usable OAuth credential for a provider failed to refresh with a
+ * retryable error (network blip, timeout, 5xx). The stored credentials are
+ * intact, so this is classified transient: retrying the request can succeed,
+ * unlike {@link MissingApiKeyError}. The refresh failure is kept as `cause`.
+ */
+export class OAuthRefreshUnavailableError extends Error {
+	readonly provider: string;
+
+	constructor(provider: string, cause: unknown) {
+		super(
+			`OAuth token refresh failed for provider ${provider}: ${cause instanceof Error ? cause.message : String(cause)}`,
+			{ cause },
+		);
+		this.name = "OAuthRefreshUnavailableError";
+		this.provider = provider;
+		attach(this, create(Flag.Transient));
 	}
 }
 

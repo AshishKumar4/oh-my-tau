@@ -226,6 +226,8 @@ function findTagEnd(source: string, start: number, triple: boolean): number {
 
 function parseTemplate(source: string): Node[] {
 	const root: Node[] = [];
+	// `chained` marks a block opened by `{{else name …}}`: it has no closing tag of
+	// its own and closes with the block it chains from, as in Handlebars.
 	const stack: { node: BlockNode; target: Node[]; inverted: boolean; chained: boolean }[] = [];
 	let target = root;
 	let cursor = 0;
@@ -283,7 +285,6 @@ function parseTemplate(source: string): Node[] {
 		}
 		if (raw.startsWith("/")) {
 			let current = stack.pop();
-			// An else-if branch shares the original block's closing tag.
 			while (current?.chained) current = stack.pop();
 			if (!current || current.node.expression.name !== raw.slice(1).trim())
 				throw new Error(`Parse error: mismatched ${raw}`);

@@ -1,8 +1,17 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
+import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import {
+	disableProvider,
+	enableProvider,
+	getDisabledProviders,
+	isProviderEnabled,
+	setDisabledProviders,
+} from "@oh-my-pi/pi-coding-agent/capability";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentCompactionThresholdOverride } from "@oh-my-pi/pi-coding-agent/config/compaction-threshold";
@@ -12,6 +21,10 @@ import {
 	resetRegisteredArtifactDirsForTests,
 } from "@oh-my-pi/pi-coding-agent/internal-urls/registry-helpers";
 import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { fingerprintForkMessage, FORK_REQUEST_CONTEXT_TYPE } from "@oh-my-pi/pi-coding-agent/session/fork-context";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -28,10 +41,10 @@ import {
 	type StructuredSubagentRequest,
 } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
-import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 import { cfgRetryModelFallback } from "@oh-my-pi/pi-coding-agent/session/settings";
@@ -150,6 +163,35 @@ describe("structured subagent primitive", () => {
 		taggedSession.getSessionAgents = () => [{ ...AGENT, name: "m1", model: ["a/x"] }];
 		const policy = await resolveEffectiveSubagentPolicy(request({ session: taggedSession, agent: "m1" }));
 		expect(policy.modelOverride).toEqual(["b/y"]);
+	});
+
+	it("rescans agents when a plugin provider is disabled while an earlier discovery is in flight", async () => {
+		const previouslyDisabled = getDisabledProviders();
+		enableProvider("omp-plugins");
+		const firstEntered = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		let scans = 0;
+		vi.spyOn(discoveryModule, "discoverAgents").mockImplementation(async () => {
+			const pluginsEnabled = isProviderEnabled("omp-plugins");
+			if (++scans === 1) {
+				firstEntered.resolve();
+				await releaseFirst.promise;
+			}
+			const agents = pluginsEnabled ? [AGENT, { ...AGENT, name: "plugin-worker" }] : [AGENT];
+			return { agents, projectAgentsDir: null };
+		});
+		try {
+			const first = resolveEffectiveSubagentPolicy(request({ agent: "plugin-worker" }));
+			await firstEntered.promise;
+			disableProvider("omp-plugins");
+			const second = resolveEffectiveSubagentPolicy(request({ agent: "plugin-worker" }));
+			releaseFirst.resolve();
+
+			expect((await first).agent.name).toBe("plugin-worker");
+			await expect(second).rejects.toThrow('Unknown agent "plugin-worker"');
+		} finally {
+			setDisabledProviders(previouslyDisabled);
+		}
 	});
 
 	it("uses caller, agent, then session schemas in precedence order", async () => {
@@ -290,6 +332,8 @@ describe("structured subagent primitive", () => {
 			expect(cfgRetryModelFallback.get(liveSettings)).toBe(false);
 		} finally {
 			liveSettings.cancelPendingSaves();
+			// `Settings.loadIsolated` opened `<agentDir>/agent.db`; Windows cannot delete it while open.
+			AgentStorage.close();
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
@@ -344,6 +388,7 @@ describe("structured subagent primitive", () => {
 			expect(second.serviceTierOverride).toBe("none");
 		} finally {
 			liveSettings.cancelPendingSaves();
+			AgentStorage.close();
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
@@ -1131,4 +1176,177 @@ describe("structured subagent primitive", () => {
 		);
 		expect(forkMarker?.data?.request?.sessionId).toBe("sess-parent");
 	});
+});
+
+describe("agent frontmatter structured opt-in", () => {
+	const MOCK_API_SOURCE = "test/structured-subagent-opt-in";
+	const ENV_KEYS = ["HOME", "PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
+	let savedEnv: Record<string, string | undefined> = {};
+	let root: string;
+
+	function restoreEnvValue(key: string, value: string | undefined): void {
+		if (value === undefined) {
+			delete process.env[key];
+			delete Bun.env[key];
+			return;
+		}
+		process.env[key] = value;
+		Bun.env[key] = value;
+	}
+
+	/** A user agent that may declare an `output` requiring `verdict` and may set frontmatter `structured: true`. */
+	function agentFile(name: string, declares: { output: boolean; flag: boolean }): string {
+		return [
+			"---",
+			`name: ${name}`,
+			"description: Reports a verdict",
+			"model: mock/mock-model",
+			...(declares.flag ? ["structured: true"] : []),
+			...(declares.output
+				? [
+						"output:",
+						"  properties:",
+						"    verdict:",
+						"      type: string",
+						"  optionalProperties:",
+						"    note:",
+						"      type: string",
+					]
+				: []),
+			"---",
+			"",
+			`Role marker ${name}.`,
+		].join("\n");
+	}
+
+	beforeEach(async () => {
+		savedEnv = Object.fromEntries(ENV_KEYS.map(key => [key, process.env[key]]));
+		root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-structured-opt-in-"));
+		const home = path.join(root, "home");
+		await fs.mkdir(home, { recursive: true });
+		restoreEnvValue("HOME", home);
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		setAgentDir(path.join(home, ".omp", "agent"));
+		AgentRegistry.resetGlobalForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+		registerMockApi(MOCK_API_SOURCE);
+	});
+
+	afterEach(async () => {
+		await AgentLifecycleManager.global().dispose();
+		AgentLifecycleManager.resetGlobalForTests();
+		AgentRegistry.resetGlobalForTests();
+		unregisterCustomApis(MOCK_API_SOURCE);
+		for (const key of ENV_KEYS) restoreEnvValue(key, savedEnv[key]);
+		__resetDirsFromEnvForTests();
+		// The child sessions opened agent.db and models.db under root; Windows cannot delete open files.
+		AgentStorage.close();
+		closeModelCache();
+		await removeWithRetries(root);
+	});
+
+	// `schema`: yield validated against the agent's `output`; `yield`: yield with no
+	// schema; `prose`: no yield, the final message is the result.
+	it.each([
+		{ setting: false, contract: { reporter: "schema", flagged: "yield", plain: "prose" } },
+		{ setting: true, contract: { reporter: "schema", flagged: "yield", plain: "yield" } },
+	] as const)(
+		"task.structured=$setting: yield and schema follow a declared output or structured: true",
+		async ({ setting, contract }) => {
+			// Under the isolated HOME so project discovery stops before the developer's real ~/.omp.
+			const cwd = path.join(root, "home", "work");
+			await fs.mkdir(cwd, { recursive: true });
+			const agentsDir = path.join(root, "home", ".omp", "agent", "agents");
+			await Bun.write(path.join(agentsDir, "reporter.md"), agentFile("reporter", { output: true, flag: false }));
+			await Bun.write(path.join(agentsDir, "flagged.md"), agentFile("flagged", { output: false, flag: true }));
+			await Bun.write(path.join(agentsDir, "plain.md"), agentFile("plain", { output: false, flag: false }));
+
+			const authStorage = createInMemoryAuthStorage();
+			authStorage.keys.setRuntime("mock", "test-key");
+			const modelRegistry = new ModelRegistry(authStorage);
+			const childTools = new Map<string, string[]>();
+			const rejections = new Map<string, string>();
+			const mock = createMockModel({
+				handler: context => {
+					const system = context.systemPrompt?.join("\n") ?? "";
+					const agent = ["reporter", "flagged", "plain"].find(name => system.includes(`Role marker ${name}.`));
+					if (!agent) return { content: ["label"] };
+					const tools = (context.tools ?? []).map(tool => tool.name);
+					if (!childTools.has(agent)) childTools.set(agent, tools);
+					if (!tools.includes("yield")) return { content: [`${agent} prose report`] };
+					const last = context.messages.at(-1);
+					if (last?.role === "toolResult" && last.toolName === "yield") {
+						if (!last.isError) return { content: ["ok"] };
+						rejections.set(agent, last.content.map(part => (part.type === "text" ? part.text : "")).join(""));
+						return { content: [{ type: "toolCall", name: "yield", arguments: { data: { verdict: agent } } }] };
+					}
+					// First attempt omits the required `verdict`.
+					return {
+						content: [{ type: "toolCall", name: "yield", arguments: { data: { note: "no verdict yet" } } }],
+					};
+				},
+			});
+			const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
+			vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [mock, ...catalogAvailable(kind)]);
+
+			const tool = await TaskTool.create({
+				cwd,
+				hasUI: false,
+				settings: Settings.isolated({
+					"task.structured": setting,
+					"async.enabled": false,
+					"task.agentIdleTtlMs": 0,
+					"compaction.enabled": false,
+					"retry.enabled": false,
+					"todo.enabled": false,
+					"todo.reminders": false,
+					"advisor.enabled": false,
+					modelRoles: { default: "mock/mock-model" },
+				}),
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				modelRegistry,
+				authStorage,
+				enableLsp: false,
+				enableMCP: false,
+				enableIrc: false,
+			} as unknown as ToolSession);
+			try {
+				const result = await tool.execute("tc-opt-in", {
+					context: "Report a verdict.",
+					tasks: [
+						{ agent: "reporter", name: "Reporter", task: "Report.", solutionSpace: "one fix: verdict given" },
+						{ agent: "flagged", name: "Flagged", task: "Report.", solutionSpace: "one fix: verdict given" },
+						{ agent: "plain", name: "Plain", task: "Report.", solutionSpace: "one fix: verdict given" },
+					],
+				} as TaskParams);
+				const results = new Map((result.details?.results ?? []).map(child => [child.agent, child]));
+				for (const [agent, expected] of Object.entries(contract)) {
+					const child = results.get(agent);
+					expect(child?.exitCode).toBe(0);
+					if (expected === "schema") {
+						expect(childTools.get(agent)).toContain("yield");
+						expect(rejections.get(agent)).toContain("does not match schema: verdict: is required");
+						expect(child?.structuredOutput).toMatchObject({
+							source: "agent",
+							status: "valid",
+							data: { verdict: agent },
+						});
+					} else if (expected === "yield") {
+						expect(childTools.get(agent)).toContain("yield");
+						expect(rejections.has(agent)).toBe(false);
+						expect(child?.output).toContain("no verdict yet");
+					} else {
+						expect(childTools.get(agent)).not.toContain("yield");
+						expect(rejections.has(agent)).toBe(false);
+						expect(child?.output).toBe(`${agent} prose report`);
+						expect(child?.structuredOutput).toBeUndefined();
+					}
+				}
+			} finally {
+				authStorage.close();
+			}
+		},
+		30_000,
+	);
 });

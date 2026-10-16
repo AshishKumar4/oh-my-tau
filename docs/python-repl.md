@@ -40,7 +40,7 @@ The session-scoped wire schema advertises only enabled runtimes ("py" and "js").
 
 ## Kernel lifecycle
 
-Each Python kernel is a single subprocess: `<resolved-python> -u <runner.py>`. The runner is bundled with the host binary (Bun text import), written to an `omp-python-runner` cache under the OS temp directory once per script hash, and reused by subsequent spawns.
+Each Python kernel is a single subprocess: `<resolved-python> -u <runner.py>`. The runner is bundled with the host binary (Bun text import), written to a per-user `omp-python-runner-<uid>` cache under the OS temp directory once per script hash, and reused by subsequent spawns.
 
 Kernel startup sequence:
 
@@ -188,7 +188,7 @@ If the runner does not emit `done` within 5s of the interrupt (`INTERRUPT_ESCALA
 
 ### stdin behavior
 
-Interactive stdin is not supported: the runner's stdin is the host's NDJSON control channel, not a user-input stream. `input()` cannot be answered through Eval and may block until cancellation. Built-in pip and shell magics give their child processes `DEVNULL` stdin so they cannot consume control frames.
+Interactive stdin is not supported: the host's NDJSON control channel arrives on the runner's original stdin, which the runner moves to a private descriptor at startup before pointing fd 0 at the null device. `input()` and `sys.stdin` reads in user code see immediate EOF, as does every process started without an explicit stdin, so none of them can consume control frames. Built-in pip and shell magics also pass `DEVNULL` explicitly.
 
 ## Output capture and rendering
 

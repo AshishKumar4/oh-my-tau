@@ -22,7 +22,8 @@ import {
 } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { MessageCreateParams } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
 import { getClaudeCodeVersion } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
-import { getEnvApiKey, streamSimple } from "@oh-my-pi/pi-ai/stream";
+import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type {
 	AssistantMessage,
 	CacheRetention,
@@ -690,6 +691,43 @@ describe("Anthropic request fingerprint alignment", () => {
 			fetch: proxy.fetchMock,
 		}).result();
 		expect(proxy.beta()).not.toContain("extended-cache-ttl-2025-04-11");
+	});
+	it("uses 1h cache TTL on Vertex without sending the extended-cache beta", async () => {
+		let capturedHeader = "";
+		let capturedBody: {
+			system?: Array<{ cache_control?: { type?: string; ttl?: string } }>;
+			messages?: Array<{ content?: Array<{ cache_control?: { type?: string; ttl?: string } }> | string }>;
+			anthropic_beta?: string[];
+		} = {};
+		const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+			capturedHeader = new Headers(init?.headers).get("anthropic-beta") ?? "";
+			capturedBody = JSON.parse(String(init?.body ?? "{}"));
+			return new Response(
+				JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
+				{ status: 400, headers: { "Content-Type": "application/json" } },
+			);
+		}) as typeof fetch;
+		const vertexModel: Model<"anthropic-messages"> = buildModel({
+			...ANTHROPIC_MODEL_SPEC,
+			id: "claude-opus-5-5@default",
+			name: "Claude Opus 5.5 via Vertex",
+			provider: "google-vertex",
+			baseUrl:
+				"https://us-east5-aiplatform.googleapis.com/v1/projects/p/locations/us-east5/publishers/anthropic/models/claude-opus-5-5@default:streamRawPredict",
+		});
+
+		await streamAnthropic(
+			vertexModel,
+			{ systemPrompt: ["Stay concise."], messages: [{ role: "user", content: "Hi", timestamp: Date.now() }] },
+			{ apiKey: "vertex-adc", cacheRetention: "long", fetch: fetchMock },
+		).result();
+
+		const breakpoint = capturedBody.messages
+			?.flatMap(message => (Array.isArray(message.content) ? message.content : []))
+			.find(block => block.cache_control)?.cache_control;
+		expect(breakpoint).toEqual({ type: "ephemeral", ttl: "1h" });
+		expect(capturedHeader).not.toContain("extended-cache-ttl-2025-04-11");
+		expect(capturedBody.anthropic_beta ?? []).not.toContain("extended-cache-ttl-2025-04-11");
 	});
 
 	it("retries once with the version a claude_code_version_too_old rejection requires", async () => {
@@ -1732,8 +1770,8 @@ describe("Anthropic request fingerprint alignment", () => {
 	it("keeps OAuth tool names behind the proxy prefix with eager streaming and strict flags", async () => {
 		const tools: Tool[] = [
 			{
-				name: "bash",
-				description: "run commands",
+				name: "edit",
+				description: "edit files",
 				strict: true,
 				parameters: {
 					type: "object",
@@ -1751,7 +1789,7 @@ describe("Anthropic request fingerprint alignment", () => {
 			tools?: Array<{ name?: string; strict?: boolean; eager_input_streaming?: boolean; cache_control?: unknown }>;
 		};
 
-		expect(payload.tools?.[0]?.name).toBe(`${claudeToolPrefix}bash`);
+		expect(payload.tools?.[0]?.name).toBe(`${claudeToolPrefix}edit`);
 		expect(payload.tools?.[0]?.strict).toBe(true);
 		expect(payload.tools?.[0]?.eager_input_streaming).toBe(true);
 		// Sole tool is also the last tool, so it carries the head breakpoint.
@@ -1803,7 +1841,7 @@ describe("Anthropic request fingerprint alignment", () => {
 
 	it("marks only the Anthropic strict allowlist strict", async () => {
 		const tools: Tool[] = [
-			...(["bash", "python", "edit", "find"] as const).map(name => ({
+			...(["python", "edit", "find", "yield"] as const).map(name => ({
 				name,
 				description: `${name} tool`,
 				strict: true,
@@ -1813,7 +1851,9 @@ describe("Anthropic request fingerprint alignment", () => {
 					required: ["requiredValue"],
 				} as TJsonSchema,
 			})),
-			...(["write", "grep", "read", "task", "todo", "web_search", "ast_grep"] as const).map(name => ({
+			// `bash` is off the allowlist: strict decoding fixes property order, which made
+			// its `timeout` unreachable once a call had written `async`.
+			...(["bash", "write", "grep", "read", "task", "todo", "web_search", "ast_grep"] as const).map(name => ({
 				name,
 				description: `${name} tool`,
 				strict: true,
@@ -1839,15 +1879,45 @@ describe("Anthropic request fingerprint alignment", () => {
 
 		const strictNames = (payload.tools ?? []).filter(tool => tool.strict === true).map(tool => tool.name);
 
-		expect(strictNames).toEqual(["bash", "python", "edit", "find"]);
-		expect(payload.tools?.find(tool => tool.name === "bash")?.input_schema?.required).toEqual(["requiredValue"]);
+		expect(strictNames).toEqual(["python", "edit", "find", "yield"]);
+		expect(payload.tools?.find(tool => tool.name === "edit")?.input_schema?.required).toEqual(["requiredValue"]);
+	});
+
+	it("sends yield with buffered input streaming while other tools stream eagerly", async () => {
+		const tools: Tool[] = (["yield", "read"] as const).map(name => ({
+			name,
+			description: `${name} tool`,
+			strict: true,
+			parameters: {
+				type: "object",
+				properties: { requiredValue: { type: "string" } },
+				required: ["requiredValue"],
+			} as TJsonSchema,
+		}));
+
+		const payload = (await captureAnthropicPayload(
+			ANTHROPIC_MODEL,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+				tools,
+			},
+			{ isOAuth: false },
+		)) as { tools?: Array<{ name?: string; strict?: boolean; eager_input_streaming?: boolean }> };
+
+		// Eager streaming skips the API's input validation, which `strict` alone did not
+		// make up for: eagerly streamed yields still arrived as invalid JSON.
+		const yieldTool = payload.tools?.find(tool => tool.name === "yield");
+		expect(yieldTool?.strict).toBe(true);
+		expect(yieldTool?.eager_input_streaming).toBe(false);
+		expect(payload.tools?.find(tool => tool.name === "read")?.eager_input_streaming).toBe(true);
 	});
 
 	it("marks regular two-field Zod object tools strict", async () => {
 		const tools: Tool[] = [
 			{
-				name: "bash",
-				description: "bash tool",
+				name: "edit",
+				description: "edit tool",
 				strict: true,
 				parameters: arkType({
 					command: "string",
@@ -1872,18 +1942,18 @@ describe("Anthropic request fingerprint alignment", () => {
 			}>;
 		};
 
-		const bashTool = payload.tools?.find(tool => tool.name === "bash");
+		const editTool = payload.tools?.find(tool => tool.name === "edit");
 
-		expect(bashTool?.strict).toBe(true);
-		expect(Object.keys(bashTool?.input_schema?.properties ?? {})).toEqual(["command", "cwd"]);
-		expect(bashTool?.input_schema?.required).toEqual(["command", "cwd"]);
+		expect(editTool?.strict).toBe(true);
+		expect(Object.keys(editTool?.input_schema?.properties ?? {})).toEqual(["command", "cwd"]);
+		expect(editTool?.input_schema?.required).toEqual(["command", "cwd"]);
 	});
 
 	it("does not mark allowlisted Anthropic tools strict when schemas contain open object maps", async () => {
 		const tools: Tool[] = [
 			{
-				name: "bash",
-				description: "bash tool",
+				name: "edit",
+				description: "edit tool",
 				strict: true,
 				parameters: {
 					type: "object",
@@ -1925,11 +1995,11 @@ describe("Anthropic request fingerprint alignment", () => {
 			}>;
 		};
 
-		const bashTool = payload.tools?.find(tool => tool.name === "bash");
+		const editTool = payload.tools?.find(tool => tool.name === "edit");
 		const pythonTool = payload.tools?.find(tool => tool.name === "python");
-		const env = bashTool?.input_schema?.properties?.env as { additionalProperties?: unknown } | undefined;
+		const env = editTool?.input_schema?.properties?.env as { additionalProperties?: unknown } | undefined;
 
-		expect(bashTool?.strict).toBeUndefined();
+		expect(editTool?.strict).toBeUndefined();
 		expect(env?.additionalProperties).toEqual({ type: "string" });
 		expect(pythonTool?.strict).toBe(true);
 		expect(pythonTool?.input_schema?.required).toEqual(["requiredValue"]);
@@ -1938,8 +2008,8 @@ describe("Anthropic request fingerprint alignment", () => {
 	it("honors strict=false and skips non-allowlisted Anthropic tools", async () => {
 		const tools: Tool[] = [
 			{
-				name: "bash",
-				description: "bash tool",
+				name: "edit",
+				description: "edit tool",
 				strict: false,
 				parameters: {
 					type: "object",
@@ -2179,6 +2249,15 @@ describe("Anthropic request fingerprint alignment", () => {
 			interleavedThinking: false,
 			hasTools: true,
 		});
+		const withIncompatibleBufferedTools = buildAnthropicClientOptions({
+			model: incompatibleModel,
+			apiKey: "sk-ant-api-test",
+			extraBetas: [],
+			stream: true,
+			interleavedThinking: false,
+			hasTools: true,
+			hasBufferedInputTools: true,
+		});
 
 		// No betas at all → the header is omitted entirely on API-key requests.
 		expect(withoutTools.defaultHeaders["anthropic-beta"]).toBeUndefined();
@@ -2186,6 +2265,8 @@ describe("Anthropic request fingerprint alignment", () => {
 		expect(withIncompatibleTools.defaultHeaders["anthropic-beta"]).toContain(
 			"fine-grained-tool-streaming-2025-05-14",
 		);
+		// The beta would stream `yield` eagerly, past the API's input validation.
+		expect(withIncompatibleBufferedTools.defaultHeaders["anthropic-beta"]).toBeUndefined();
 	});
 
 	it("uses Cloudflare AI Gateway authorization without Anthropic credential headers", () => {

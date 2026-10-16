@@ -23,7 +23,6 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgDefaultThinkingLevel } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { isolateAwsCredentialSources } from "./helpers/aws-isolation";
 
 const SONNET = "anthropic/claude-sonnet-4-5";
 const SONNET_46 = "anthropic/claude-sonnet-4-6";
@@ -320,41 +319,18 @@ describe("model presets", () => {
 	});
 
 	it("refuses a preset with no default and no authed model before writing", async () => {
-		const dir = TempDir.createSync("@pi-model-presets-noauth-");
-		tempDirs.push(dir);
-		// "No authed model" must not depend on the host: a `~/.aws` profile makes Bedrock available.
-		const restoreAwsEnv = isolateAwsCredentialSources(dir.path());
-		const noAuth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
-		const registry = new ModelRegistry(noAuth, path.join(dir.path(), "models.yml"));
-		try {
-			const settings = Settings.isolated();
-			settings.setModelRole("default", SONNET);
-			cfgModelPresets.setEntry(settings, "auto", { modelRoles: {} });
-			const agent = new Agent({
-				initialState: {
-					model: bundled(SONNET),
-					systemPrompt: ["Test"],
-					tools: [],
-					messages: [],
-					thinkingLevel: Effort.High,
-				},
-			});
-			const session = new AgentSession({
-				agent,
-				sessionManager: SessionManager.inMemory(),
-				settings,
-				modelRegistry: registry,
-			});
-			sessions.push(session);
+		const settings = Settings.isolated();
+		settings.setModelRole("default", SONNET);
+		cfgModelPresets.setEntry(settings, "auto", { modelRoles: {} });
+		const session = createSession(settings);
+		vi.spyOn(session, "getAvailableModels").mockReturnValue([bundled(OPUS)]);
+		vi.spyOn(modelRegistry, "hasConfiguredAuth").mockReturnValue(false);
 
-			const result = await applyModelPreset(settings, session, "auto");
+		const result = await applyModelPreset(settings, session, "auto");
 
-			expect(result.kind).toBe("unavailable");
-			expect(settings.getModelRole("default")).toBe(SONNET);
-		} finally {
-			noAuth.close();
-			restoreAwsEnv();
-		}
+		expect(result.kind).toBe("unavailable");
+		expect(settings.getModelRole("default")).toBe(SONNET);
+		expect(session.model?.id).toBe("claude-sonnet-4-5");
 	});
 
 	it("reports when a higher layer still defines a just-saved preset name", async () => {

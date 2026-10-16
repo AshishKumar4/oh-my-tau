@@ -80,7 +80,7 @@ describe("Python tool bridge HTTP server", () => {
 		}
 	});
 
-	it("removes harness intent before calling tools whose schema does not declare it", async () => {
+	it("drops explicit caller intent for tools whose schema does not declare it", async () => {
 		const calls: FakeCall[] = [];
 		const tool = makeFakeTool("inspect", calls, {
 			content: [{ type: "text", text: "done" }],

@@ -21,16 +21,6 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 
-/** Non-regular targets can block indefinitely or produce unbounded input. */
-export function specialFileKind(stat: fs.Stats): string | undefined {
-	if (stat.isFile() || stat.isDirectory()) return undefined;
-	if (stat.isCharacterDevice()) return "character device";
-	if (stat.isBlockDevice()) return "block device";
-	if (stat.isFIFO()) return "FIFO";
-	if (stat.isSocket()) return "socket";
-	return "special file";
-}
-
 /** POSIX absolute, Windows drive, or UNC (`\\server\share` / `//server/share`). */
 export function isFilesystemSourcePath(value: string): boolean {
 	return path.posix.isAbsolute(value) || path.win32.isAbsolute(value);
@@ -205,6 +195,19 @@ export function isLineInRanges(lineNumber: number, ranges: readonly LineRange[])
 		if (range.endLine === undefined || lineNumber <= range.endLine) return true;
 	}
 	return false;
+}
+
+/**
+ * Kind of a non-regular, non-directory file, or undefined. Reading one in-process can block
+ * forever (a FIFO, `/dev/stdin` on the TUI's terminal) or never end (`/dev/zero`).
+ */
+export function specialFileKind(stat: fs.Stats): string | undefined {
+	if (stat.isFile() || stat.isDirectory()) return undefined;
+	if (stat.isCharacterDevice()) return "character device";
+	if (stat.isBlockDevice()) return "block device";
+	if (stat.isFIFO()) return "FIFO";
+	if (stat.isSocket()) return "socket";
+	return "special file";
 }
 
 /** Windows path naming an NTFS stream: a colon after the root (`C:\`, `\\?\C:\`, UNC). */

@@ -30,6 +30,7 @@ function assistantEntry(opts: {
 	provider: string;
 	api?: string;
 	premiumRequests?: number;
+	serviceTier?: string;
 }): Record<string, unknown> {
 	return {
 		type: "message",
@@ -44,6 +45,7 @@ function assistantEntry(opts: {
 			model: "gpt-5.4",
 			stopReason: "stop",
 			timestamp: Date.now(),
+			...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),
 			usage: {
 				input: 10,
 				output: 5,
@@ -144,6 +146,28 @@ describe("priority service-tier premium-request backfill", () => {
 		const overall = await getOverallStats();
 		expect(overall.totalRequests).toBe(4);
 		expect(overall.totalPremiumRequests).toBe(3);
+	});
+
+	it("counts a Codex ultrafast turn from the served tier recorded on the message", async () => {
+		await writeSession("--tmp--proj", "04.jsonl", {
+			lines: [
+				{ type: "session", version: 1, id: "s4", timestamp: new Date().toISOString(), cwd: "/tmp/proj" },
+				// No `service_tier_change` and no discovery metadata: the message's own
+				// served tier is the only signal, and it is proof the tier reached the
+				// wire, so the Codex advertised-tier gate must not zero it out.
+				assistantEntry({
+					id: "d1",
+					provider: "openai-codex",
+					api: "openai-codex-responses",
+					serviceTier: "ultrafast",
+				}),
+			],
+		});
+
+		await syncAllSessions();
+
+		const request = getRecentRequests(1)[0];
+		expect(request?.usage.premiumRequests).toBe(1);
 	});
 
 	it("preserves an existing non-zero premiumRequests value (Copilot multiplier) even under priority tier", async () => {

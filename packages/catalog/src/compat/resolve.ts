@@ -17,6 +17,7 @@
  */
 import { Effort, THINKING_EFFORTS } from "../effort";
 import { hostMatchesUrl, modelMatchesHost } from "../hosts";
+import { withoutUnverifiedThinking } from "../model-thinking";
 import type {
 	Api,
 	CompatOf,
@@ -26,11 +27,13 @@ import type {
 	ResolvedBedrockCompat,
 	ResolvedDevinCompat,
 	ResolvedGoogleCompat,
+	ResolvedOllamaCompat,
 	ResolvedOpenAICompat,
 	ResolvedOpenAIResponsesCompat,
 	ResolvedOpenAISharedCompat,
 	ThinkingConfig,
 } from "../types";
+import { isOfficialCodexApiUrl } from "../wire/codex";
 import {
 	isAnthropicSigningProxyUrl,
 	isAzureAnthropicRoute,
@@ -107,20 +110,34 @@ class IdentityFacts {
 		return this.is("kimi") && this.family("k2.7-code", "k3");
 	}
 
-	/** Adaptive-thinking Claude generation floor (Opus ≥ min; Sonnet/Fable/Mythos ≥ 5). */
+	/** Adaptive-thinking Claude generation floor (Opus ≥ min; Sonnet/Fable/Mythos ≥ 5; Haiku ≥ 5.5). */
 	anthropicAdaptiveGenAtLeast(opusMin: string): boolean {
 		if (!this.is("anthropic")) return false;
 		if (this.family("opus")) return this.revGte(opusMin);
 		if (this.family("sonnet", "fable", "mythos")) return this.revGte("5");
+		if (this.family("haiku")) return this.revGte("5.5");
 		return false;
 	}
+}
+
+/**
+ * The id a spec resolves identity and rules under: its own, unless that names
+ * no model and the row sends a model that does on the wire. A Devin Fusion
+ * pairing runs only its lead, so the lead's reviewed rules (cache-write rate,
+ * long-context tier) apply to it at build time.
+ */
+function policyModelId<TApi extends Api>(spec: ModelSpec<TApi>): string {
+	const wireId = spec.requestModelId;
+	if (wireId === undefined || wireId === spec.id) return spec.id;
+	if (classifyModel(spec.provider, spec.id).class !== "unknown") return spec.id;
+	return classifyModel(spec.provider, wireId).class === "unknown" ? spec.id : wireId;
 }
 
 function resolveIdentity<TApi extends Api>(spec: ModelSpec<TApi>): ModelIdentity {
 	// Strict on purpose: ambiguous identity is a rule-authoring defect surfaced
 	// at build/CI time, never silently degraded to `unknown`. Discovery
 	// normalization opts into leniency through `classifyModel` directly.
-	return classifyModel(spec.provider, spec.id);
+	return classifyModel(spec.provider, policyModelId(spec));
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +196,7 @@ function overlayEffortMapAxis(
 }
 
 function effortList(value: unknown): readonly Effort[] | undefined {
-	if (!Array.isArray(value) || value.length === 0) return undefined;
+	if (!Array.isArray(value)) return undefined;
 	const out: Effort[] = [];
 	for (const entry of value) {
 		const effort = THINKING_EFFORTS.find(candidate => candidate === entry);
@@ -260,6 +277,7 @@ function hasLocalLoopbackBaseUrl(baseUrl: string | undefined): boolean {
 	let hostname: string;
 	try {
 		hostname = new URL(baseUrl).hostname.toLowerCase();
+		if (hostname.endsWith(".")) hostname = hostname.slice(0, -1);
 	} catch {
 		return false;
 	}
@@ -502,10 +520,11 @@ function detectOpenAICompat(
 		supportsDeveloperRole: isOpenAIHost || isAzureHost,
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
 		supportsReasoningEffort: !isGrok && !d.isXiaomiMimo && (!(d.isZai || d.isZhipu) || supportsZaiReasoningEffort),
+		trustExplicitThinkingOnly: undefined,
 		// API-conditional: this completions-only Copilot exclusion cannot be a
 		// provider rule without changing Copilot Responses rows.
 		supportsReasoningParams: provider !== "github-copilot",
-		supportsSamplingParams: !(facts.is("openai") && (facts.family("o-series") || facts.revGte("5"))),
+		supportsSamplingParams: true,
 		supportsPenaltyAndStopParams: !(isGrok && reasoningCapable),
 		reasoningEffortMap: {},
 		supportsUsageInStreaming: !isCerebrasHost,
@@ -598,26 +617,12 @@ function detectOpenAICompat(
 	};
 }
 
-const DSML_HEALING_PROVIDERS: Record<string, true> = {
-	ollama: true,
-	"ollama-cloud": true,
-	nvidia: true,
-	deepseek: true,
-	fireworks: true,
-	nanogpt: true,
-	"opencode-go": true,
-	openrouter: true,
-	// Transparent gateways / user-configured hosts forward the upstream model's
-	// native chat template unchanged, so a deepseek-classed model behind them
-	// still emits DSML tool-call envelopes and needs the DSML healer.
-	litellm: true,
-	nous: true,
-};
-
 /**
  * Default leaked-markup healer. Kimi/DeepSeek dedicated grammars are keyed on
  * identity class; official OpenAI heals nothing; everything else defaults to
- * the generic `thinking` healer.
+ * the generic `thinking` healer. DSML is DeepSeek's own tool-call grammar, so
+ * every host serving a DeepSeek model gets it — gateways, local backends, and
+ * custom providers alike.
  */
 function detectStreamMarkupHealing(
 	provider: string,
@@ -628,7 +633,7 @@ function detectStreamMarkupHealing(
 	// Kimi ids keep the generic healer, matching the census.
 	const isKimiK2 = facts.is("kimi") && facts.identity.family?.startsWith("k2") === true;
 	if (provider === "kimi-code" || provider === "moonshot" || isKimiK2) return "kimi";
-	if (facts.is("deepseek") && DSML_HEALING_PROVIDERS[provider] === true) return "dsml";
+	if (facts.is("deepseek")) return "dsml";
 	if (isOfficialOpenAIEndpoint(provider, baseUrl)) return undefined;
 	return "thinking";
 }
@@ -745,12 +750,20 @@ function resolveOpenAIResponsesPolicy(
 			hostMatchesUrl(baseUrl, "openrouter") ||
 			hostMatchesUrl(baseUrl, "deepseekFamily"),
 		supportsReasoningEffort: !isXaiHost,
+		trustExplicitThinkingOnly: undefined,
 		supportsLongPromptCacheRetention: isOpenAIUrl,
 		supportsPromptCacheBreakpoints,
 		promptCacheBreakpointTtl: supportsPromptCacheBreakpoints ? "30m" : undefined,
 		strictResponsesPairing: isAzure || provider === "github-copilot",
-		supportsImageDetailOriginal: !isXaiHost && !modelMatchesHost(hostModel, "githubCopilot"),
+		// Azure's provider id alone only implies support while its endpoint is
+		// resolved at runtime; an explicit non-Azure baseUrl is a proxy, like Codex.
+		supportsImageDetailOriginal:
+			isOpenAIUrl ||
+			hostMatchesUrl(baseUrl, "azureOpenAI") ||
+			(isAzure && !baseUrl) ||
+			hostMatchesUrl(baseUrl, "openaiCodex"),
 		supportsReasoningSummary: !isXaiHost,
+		statefulResponses: undefined,
 		supportsAllTurnsReasoningContext: false,
 		supportsConfigurationUpdate: false,
 		supportsSteering: false,
@@ -759,7 +772,7 @@ function resolveOpenAIResponsesPolicy(
 		thinkingLoopGuard: undefined,
 		reasoningEffortMap: {},
 		supportsReasoningParams: true,
-		supportsSamplingParams: !(facts.is("openai") && (facts.family("o-series") || facts.revGte("5"))),
+		supportsSamplingParams: true,
 		supportsPenaltyAndStopParams: !isXaiHost,
 		thinkingFormat,
 		reasoningDisableMode: resolveReasoningDisableMode(thinkingFormat),
@@ -798,7 +811,13 @@ function resolveOpenAIResponsesPolicy(
 			PROXY_OPENAI_COMPAT_PROVIDERS[backendProvider] !== true &&
 			(LOCAL_OPENAI_COMPAT_PROVIDERS[backendProvider] === true || hasLocalLoopbackBaseUrl(baseUrl)),
 		supportsObfuscationOptOut: isOpenAIUrl || provider === "openai",
-		officialEndpoint: isOfficialOpenAIEndpoint(provider, baseUrl),
+		storeResponses: false,
+		connectionBoundNativeHistory: false,
+		// The Codex backend is official at the URL its requests default to when `baseUrl` is unset, and at paths
+		// under it such as `/codex` and `/codex/responses`, which its requests resolve to the same endpoint.
+		officialEndpoint:
+			isOfficialOpenAIEndpoint(provider, baseUrl) ||
+			(api === "openai-codex-responses" && isOfficialCodexApiUrl(baseUrl)),
 		harmonyLeakMitigation: false,
 		rejectRootObjectUnion: false,
 		retryWithoutStrictOnGrammarError: false,
@@ -859,6 +878,8 @@ function pickResponsesOnly(compat: ResolvedOpenAIResponsesCompat): ResponsesOnly
 		strictResponsesPairing: compat.strictResponsesPairing,
 		supportsImageDetailOriginal: compat.supportsImageDetailOriginal,
 		supportsObfuscationOptOut: compat.supportsObfuscationOptOut,
+		storeResponses: compat.storeResponses,
+		connectionBoundNativeHistory: compat.connectionBoundNativeHistory,
 		supportsAllTurnsReasoningContext: compat.supportsAllTurnsReasoningContext,
 		supportsConfigurationUpdate: compat.supportsConfigurationUpdate,
 		supportsSteering: compat.supportsSteering,
@@ -867,6 +888,7 @@ function pickResponsesOnly(compat: ResolvedOpenAIResponsesCompat): ResponsesOnly
 		cacheControlFormat: compat.cacheControlFormat,
 		requiresReasoningOffJuiceInstruction: compat.requiresReasoningOffJuiceInstruction,
 		supportsReasoningSummary: compat.supportsReasoningSummary,
+		statefulResponses: compat.statefulResponses,
 		isVercelGatewayHost: compat.isVercelGatewayHost,
 	} satisfies ResponsesOnlyCompat;
 }
@@ -891,6 +913,7 @@ function resolveAnthropicPolicy(
 		supportsContextManagement: true,
 		supportsServerCompaction: false,
 		firstPartyProvider: false,
+		honorsClaudeCodeBetaKillSwitch: false,
 		supportsOutputEffort: true,
 		disableStrictTools: rejectsStrictTools,
 		// Present as a key so models.yml `compat` can set it; unset unless detected.
@@ -906,7 +929,7 @@ function resolveAnthropicPolicy(
 		supportsThinkingBindingControls: false,
 		supportsBetweenToolsThinking: false,
 		supportsForcedToolChoice: !requiresThinkingEnabled && !facts.family("fable", "mythos"),
-		supportsSamplingParams: !facts.anthropicAdaptiveGenAtLeast("4.7"),
+		supportsSamplingParams: true,
 		requiresToolResultId: false,
 		requiresThinkingEnabled,
 		replayUnsignedThinking:
@@ -914,6 +937,11 @@ function resolveAnthropicPolicy(
 		escapeBuiltinToolNames: false,
 		injectClaudeCodeInstruction: true,
 		stripImageInput: false,
+		// Unset means "canonical Anthropic image contract"; the request builder
+		// owns those numbers. The keys must exist for a KDL rule or a
+		// user-authored `compat` block to override them.
+		maxImageDimension: undefined,
+		maxImagePayloadBytes: undefined,
 		thinkingLoopGuard: undefined,
 		// Present as keys so models.yml `compat` can set them; unset unless a rule assigns them.
 		stripThinkingHistory: undefined,
@@ -936,10 +964,20 @@ function resolveBedrockPolicy(spec: ModelSpec<"bedrock-converse-stream">, axes: 
 		promptCacheMinimumTokens: 0,
 		promptCacheMaximumCheckpoints: 0,
 		supportsForcedToolChoice: true,
+		// Opt-out: every prefix-bound Claude line on Converse takes the controls,
+		// including custom Bedrock-wire providers; KDL or models.yml sets `false`.
+		supportsThinkingBindingControls: true,
 	};
 	// Reasoning capability is a mechanism gate; adaptive-lineage duration is rule-owned.
 	compat.streamIdleTimeoutMs = compatReasoning(spec, axes) ? BEDROCK_REASONING_STREAM_IDLE_TIMEOUT_MS : undefined;
 	applyWireAxes(compat, axes.wire, "bedrock-converse-stream");
+	applyCompatOverrides(compat, spec.compat);
+	return compat;
+}
+
+function resolveOllamaPolicy(spec: ModelSpec<"ollama-chat">, axes: ResolvedAxes): ResolvedOllamaCompat {
+	const compat: ResolvedOllamaCompat = { stripThinkingHistory: false };
+	applyWireAxes(compat, axes.wire, "ollama-chat");
 	applyCompatOverrides(compat, spec.compat);
 	return compat;
 }
@@ -970,6 +1008,10 @@ function resolveGooglePolicy(
 		claudeThinkingBetaHeader: false,
 		antigravityClaudeToolMode: false,
 		stripImageInput: false,
+		// Unset means "no image contract": images go out as sent. Keys exist so
+		// a KDL rule or a user `compat` block can declare one.
+		maxImageDimension: undefined,
+		maxImagePayloadBytes: undefined,
 	};
 	applyWireAxes(compat, axes.wire, spec.api);
 	applyCompatOverrides(compat, spec.compat);
@@ -1006,14 +1048,16 @@ function defaultThinkingMode<TApi extends Api>(spec: ModelSpec<TApi>, facts: Ide
 		case "google-generative-ai":
 		case "google-gemini-cli":
 		case "google-vertex":
-			return facts.is("gemini") && facts.revMajor() === 3 ? "google-level" : "budget";
+			// Gemini 3+ `google-level` is a `thinking-mode` rule in classes/gemini.kdl.
+			return "budget";
 		case "anthropic-messages":
 			if (facts.is("minimax") && facts.family("m2", "m3")) return "anthropic-adaptive";
 			if (facts.is("glm") && facts.revGte("5.2") && (spec.provider === "umans" || spec.provider === "zai")) {
 				return "anthropic-budget-effort";
 			}
 			if (facts.is("anthropic")) {
-				if (facts.revGte("4.6") && !facts.family("haiku")) return "anthropic-adaptive";
+				// Haiku stays on budget thinking until 5.5, its first adaptive generation.
+				if (facts.revGte(facts.family("haiku") ? "5.5" : "4.6")) return "anthropic-adaptive";
 				if (facts.family("opus") && facts.revGte("4.5")) return "anthropic-budget-effort";
 			}
 			return "budget";
@@ -1078,6 +1122,7 @@ interface RuleThinking {
 	supportsDisplay?: boolean;
 	prefixBinding?: boolean;
 	upgradeNeutral?: boolean;
+	unverified?: boolean;
 }
 
 function readRuleThinking(axes: ResolvedAxes): RuleThinking {
@@ -1098,6 +1143,7 @@ function readRuleThinking(axes: ResolvedAxes): RuleThinking {
 	if (typeof raw.supportsDisplay === "boolean") out.supportsDisplay = raw.supportsDisplay;
 	if (typeof raw.prefixBinding === "boolean") out.prefixBinding = raw.prefixBinding;
 	if (typeof raw.upgradeNeutral === "boolean") out.upgradeNeutral = raw.upgradeNeutral;
+	if (typeof raw.unverified === "boolean") out.unverified = raw.unverified;
 	return out;
 }
 
@@ -1145,8 +1191,16 @@ function resolveThinkingPolicy<TApi extends Api>(
 	// not re-expand it into an unadvertised ladder. Absent metadata is
 	// repaired only where KDL opts in with `thinking-upgrade-neutral`
 	// alongside a reviewed `thinking-efforts` ladder (the cascade upgrade for
-	// stale source capability data); otherwise the neutral default holds.
-	if (!spec.reasoning && (explicitThinking !== undefined || rule.upgradeNeutral !== true)) return undefined;
+	// stale source capability data). On deployments whose discovery reports no
+	// capabilities (`thinking-unverified`), an unclassified neutral spec — nothing
+	// says whether it reasons — gets an unverified ladder the user may opt into.
+	const unverified = !compatReasoning(spec, axes);
+	if (
+		unverified &&
+		(explicitThinking !== undefined || facts.identity.class !== "unknown" || rule.unverified !== true)
+	) {
+		return undefined;
+	}
 	if (
 		spec.provider === "cline-pass" &&
 		compat !== undefined &&
@@ -1162,6 +1216,7 @@ function resolveThinkingPolicy<TApi extends Api>(
 	if (compat !== undefined && "trustExplicitThinkingOnly" in compat && compat.trustExplicitThinkingOnly === true) {
 		return undefined;
 	}
+	if (rule.efforts?.length === 0) return undefined;
 	const config: ThinkingConfig = {
 		mode: rule.mode ?? defaultThinkingMode(spec, facts),
 		efforts: rule.efforts ?? fallbackEfforts(spec, compat),
@@ -1169,9 +1224,14 @@ function resolveThinkingPolicy<TApi extends Api>(
 	if (config.efforts.length === 0) {
 		throw new Error(`Model ${spec.provider}/${spec.id} resolved to an empty thinking range`);
 	}
-	if (rule.defaultLevel !== undefined) config.defaultLevel = rule.defaultLevel;
 	const effortMap = mergeEffortMap(spec, rule.effortMap, compat, config.efforts);
 	if (effortMap !== undefined) config.effortMap = effortMap;
+	if (unverified) {
+		// Off-by-default opt-in: no default level, mandatory effort, or wire off-switch.
+		config.unverified = true;
+		return config;
+	}
+	if (rule.defaultLevel !== undefined) config.defaultLevel = rule.defaultLevel;
 	if (rule.effortBudgets !== undefined) config.effortBudgets = rule.effortBudgets;
 	const supportsDisplay = rule.supportsDisplay ?? defaultSupportsDisplay(spec, facts);
 	if (supportsDisplay) config.supportsDisplay = true;
@@ -1268,7 +1328,7 @@ function buildResolveTarget<TApi extends Api>(
 		provider: providerType,
 		api: spec.api,
 		class: identity.class,
-		model: spec.id,
+		model: policyModelId(spec),
 		reasoning: Boolean(spec.reasoning),
 	};
 	if (identity.family !== undefined) target.family = identity.family;
@@ -1304,7 +1364,8 @@ export function resolveModelPolicy<TApi extends Api>(
 	spec: ModelSpec<TApi>,
 	route?: ResolveRoute,
 ): ResolvedModelPolicy<TApi>;
-export function resolveModelPolicy(spec: ModelSpec<Api>, route?: ResolveRoute): ResolvedModelPolicy<Api> {
+export function resolveModelPolicy(input: ModelSpec<Api>, route?: ResolveRoute): ResolvedModelPolicy<Api> {
+	const spec = withoutUnverifiedThinking(input);
 	const identity = resolveIdentity(spec);
 	const facts = new IdentityFacts(identity);
 	const target = buildResolveTarget(spec, identity);
@@ -1327,6 +1388,8 @@ export function resolveModelPolicy(spec: ModelSpec<Api>, route?: ResolveRoute): 
 		compat = resolveAnthropicPolicy(spec, facts, axes);
 	} else if (specUsesApi(spec, "bedrock-converse-stream")) {
 		compat = resolveBedrockPolicy(spec, axes);
+	} else if (specUsesApi(spec, "ollama-chat")) {
+		compat = resolveOllamaPolicy(spec, axes);
 	} else if (specUsesApi(spec, "devin-agent")) {
 		compat = resolveDevinPolicy(spec, axes);
 	} else if (

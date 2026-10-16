@@ -220,6 +220,36 @@ impl GitRepo {
 			.map(|status| !status.is_empty())
 	}
 
+	/// Whether a merge, rebase, cherry-pick, revert, or `am` is underway in
+	/// this checkout: the index holds unmerged entries, or the operation's
+	/// state files remain because it is resolved but not yet committed or
+	/// aborted (a phase `git ls-files --unmerged` no longer reports).
+	pub fn operation_in_progress(&self) -> Result<bool> {
+		const STATE: [&str; 6] = [
+			"MERGE_HEAD",
+			"CHERRY_PICK_HEAD",
+			"REVERT_HEAD",
+			"REBASE_HEAD",
+			"rebase-merge",
+			"rebase-apply",
+		];
+		if STATE
+			.iter()
+			.any(|name| self.info.git_dir.join(name).exists())
+		{
+			return Ok(true);
+		}
+		if self.is_reftable() {
+			return Ok(!cli_text(self.root(), &["ls-files", "--unmerged"])?.is_empty());
+		}
+		let repo = self.gix()?;
+		let index = load_index_or_empty(&repo, "git ls-files")?;
+		Ok(index
+			.entries()
+			.iter()
+			.any(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted))
+	}
+
 	/// Render git status in porcelain-v1 form.
 	///
 	/// Prefers the git CLI: whole-worktree status is the one read whose peak
@@ -1270,6 +1300,9 @@ fn path_matches(path: &str, wanted: &str) -> bool {
 			.strip_prefix(wanted)
 			.is_some_and(|rest| rest.starts_with('/'))
 }
+/// `path =` values from `.gitmodules`, keeping only plain relative paths:
+/// like Git, reject absolute, `.`, and `..` components, which could escape
+/// the checkout or make the recursive walk revisit a parent forever.
 fn parse_gitmodules(path: &Path) -> Vec<String> {
 	let Ok(content) = std::fs::read_to_string(path) else {
 		return Vec::new();
@@ -1279,7 +1312,13 @@ fn parse_gitmodules(path: &Path) -> Vec<String> {
 		.filter_map(|line| {
 			let line = line.trim();
 			let (key, value) = line.split_once('=')?;
-			(key.trim().eq_ignore_ascii_case("path")).then(|| value.trim().to_owned())
+			let value = value.trim();
+			(key.trim().eq_ignore_ascii_case("path")
+				&& !value.is_empty()
+				&& Path::new(value)
+					.components()
+					.all(|component| matches!(component, std::path::Component::Normal(_))))
+			.then(|| value.to_owned())
 		})
 		.collect()
 }
@@ -1325,6 +1364,31 @@ mod tests {
 		fs::write(cwd.join(name), contents)?;
 		git(cwd, &["add", name])?;
 		git(cwd, &["commit", "-m", subject])?;
+		Ok(())
+	}
+
+	#[test]
+	fn submodule_paths_skip_escaping_and_self_referential_entries() -> TestResult {
+		let outer = tempfile::tempdir()?;
+		let root = outer.path().join("root");
+		fs::create_dir_all(root.join("sub"))?;
+		fs::create_dir_all(outer.path().join("victim"))?;
+		git(&root, &["init", "-q"])?;
+		git(&root.join("sub"), &["init", "-q"])?;
+		git(&outer.path().join("victim"), &["init", "-q"])?;
+		// `.` and `a/..` would re-enqueue the root forever; `../victim` and the
+		// absolute path point at a real checkout outside the repository.
+		let absolute = outer.path().join("victim");
+		fs::write(
+			root.join(".gitmodules"),
+			format!(
+				"[submodule \"self\"]\n\tpath = .\n[submodule \"up\"]\n\tpath = sub/..\n[submodule \
+				 \"escape\"]\n\tpath = ../victim\n[submodule \"abs\"]\n\tpath = {}\n[submodule \
+				 \"sub\"]\n\tpath = sub\n",
+				absolute.display()
+			),
+		)?;
+		assert_eq!(GitRepo::require(&root)?.submodule_paths()?, ["sub"]);
 		Ok(())
 	}
 
@@ -1649,7 +1713,9 @@ mod tests {
 		let worktrees = repo.worktrees()?;
 		assert_eq!(worktrees.len(), 2);
 		assert_eq!(worktrees[0].path, dir.path());
-		assert_eq!(worktrees[1].path, linked.canonicalize()?);
+		// git records the real path, with `/` separators on Windows; compare
+		// resolved locations rather than spellings.
+		assert_eq!(worktrees[1].path.canonicalize()?, linked.canonicalize()?);
 		assert_eq!(worktrees[1].branch.as_deref(), Some("refs/heads/linked-branch"));
 		Ok(())
 	}

@@ -9,10 +9,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:te
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { deflateSync } from "node:zlib";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Context, Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -79,6 +82,41 @@ function requestContent(messages: readonly Message[] | undefined): { text: strin
 		}
 	}
 	return { text: texts.join("\n"), images };
+}
+
+/** A valid `size`×`size` RGB PNG of noise from `seed`: incompressible, so its base64 runs about 4·size² bytes. */
+function noisePng(seed: number, size: number): string {
+	const stride = 1 + size * 3;
+	const raw = new Uint8Array(stride * size);
+	let state = seed * 0x9e3779b1 || 1;
+	for (let row = 0; row < size; row++) {
+		// Each row's filter byte stays 0 (none).
+		for (let at = row * stride + 1; at < (row + 1) * stride; at++) {
+			state ^= state << 13;
+			state ^= state >>> 17;
+			state ^= state << 5;
+			raw[at] = state & 0xff;
+		}
+	}
+	const chunk = (type: string, data: Uint8Array): Buffer => {
+		const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+		const out = Buffer.alloc(4 + body.length + 4);
+		out.writeUInt32BE(data.length, 0);
+		body.copy(out, 4);
+		out.writeUInt32BE(Bun.hash.crc32(body) >>> 0, 4 + body.length);
+		return out;
+	};
+	const header = Buffer.alloc(13);
+	header.writeUInt32BE(size, 0);
+	header.writeUInt32BE(size, 4);
+	header[8] = 8; // bit depth
+	header[9] = 2; // truecolor RGB
+	return Buffer.concat([
+		Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+		chunk("IHDR", header),
+		chunk("IDAT", deflateSync(raw)),
+		chunk("IEND", new Uint8Array()),
+	]).toString("base64");
 }
 
 function preservedArchive(preserveData: Record<string, unknown> | undefined): snapcompact.Archive {
@@ -359,6 +397,124 @@ describe("snapcompact archive read by a Claude model", () => {
 		const entry = latestCompaction(sessionManager);
 		expect(snapcompact.getPreservedArchive(entry.preserveData)?.withoutThinking).toBeUndefined();
 		expectOriginalIntact(entry, original);
+	});
+
+	/**
+	 * Appends a GPT archive whose stored no-reasoning variant carries `count`
+	 * distinct ~1 MB frames. Returns the variant's frame payloads, oldest first.
+	 */
+	function seedLargeVariant(sessionManager: SessionManager, count: number): string[] {
+		const frame = (seed: number, size: number) => ({
+			data: noisePng(seed, size),
+			mimeType: "image/png",
+			cols: 4,
+			rows: 2,
+			chars: 8,
+		});
+		const variantFrames = Array.from({ length: count }, (_, index) => frame(index + 1, 512));
+		const keptId = sessionManager.appendMessage({ role: "user", content: "Kept turn.", timestamp: Date.now() });
+		sessionManager.appendCompaction(
+			`- \`¶user:\`, \`¶think:\`, \`¶ai:\`, \`¶call:\`: user, assistant reasoning, assistant reply, tool call.\nHISTORY`,
+			undefined,
+			keptId,
+			100_000,
+			{
+				method: "snapcompact",
+				preserveData: {
+					[snapcompact.PRESERVE_KEY]: {
+						frames: [frame(1_000, 16)],
+						totalChars: 100,
+						truncatedChars: 0,
+						textHead: `¶user: ask\n¶think: ${REASONING}\n`,
+						textTail: "¶ai: answer",
+						withoutThinking: {
+							summary: `- ${PLAIN_LEGEND}\nHISTORY`,
+							archive: {
+								frames: variantFrames,
+								totalChars: 100,
+								truncatedChars: 0,
+								textHead: "¶user: ask\n",
+								textTail: "¶ai: answer",
+							},
+						},
+					},
+				},
+			},
+		);
+		sessionManager.appendMessage(assistant(gpt, [{ type: "text", text: "Kept reply." }]));
+		return variantFrames.map(entry => entry.data);
+	}
+
+	it("reads the no-reasoning view at each reader's own frame budget on switch, side conversion and resume", async () => {
+		const official = claude;
+		const proxy = buildModel({ ...toModelSpec(claude), baseUrl: "https://anthropic-proxy.example.com" });
+		const proxyBudget = snapcompact.frameDataBytesBudget(proxy);
+		expect(snapcompact.frameDataBytesBudget(official)).toBe(12_000_000);
+		expect(proxyBudget).toBe(snapcompact.DEFAULT_FRAME_DATA_BYTES_BUDGET);
+		const cwd = path.join(tempDir, "frame-budget");
+		const sessionDir = path.join(cwd, "sessions");
+		const sessionManager = SessionManager.create(cwd, sessionDir);
+		const frames = seedLargeVariant(sessionManager, 8);
+		const variantBytes = frames.reduce((bytes, data) => bytes + data.length, 0);
+		expect(variantBytes).toBeGreaterThan(proxyBudget);
+		expect(variantBytes).toBeLessThan(12_000_000);
+		expect(new Set(frames).size).toBe(frames.length);
+		// The newest frames that fit the proxy's budget.
+		const proxyFrames: string[] = [];
+		let proxyBytes = 0;
+		for (const data of frames.toReversed()) {
+			if (proxyBytes + data.length > proxyBudget) continue;
+			proxyBytes += data.length;
+			proxyFrames.unshift(data);
+		}
+		expect(proxyFrames.length).toBeLessThan(frames.length);
+		const summaryOf = (messages: readonly Message[] | undefined) =>
+			messages?.find(message => message.role === "user" && JSON.stringify(message.content).includes("HISTORY"));
+		const { session, mock } = startSession(sessionManager, gpt);
+
+		// A switch to official Claude sends every frame of the view.
+		await session.setModel(official);
+		await session.prompt("Continue.");
+		const switched = requestContent(mock.calls[0]?.context.messages);
+		expect(switched.images).toEqual(frames);
+		expect(switched.text).toContain(PLAIN_LEGEND);
+		expect(switched.text).not.toContain(REASONING);
+
+		// Side conversion: the proxy reader gets the frames its budget holds, and
+		// repeated official conversions keep one summary message and its bytes.
+		const messages = session.messages;
+		const forProxy = requestContent(await session.convertMessagesToLlm(messages, undefined, proxy));
+		expect(forProxy.images).toEqual(proxyFrames);
+		expect(forProxy.text).not.toContain(REASONING);
+		const first = summaryOf(await session.convertMessagesToLlm(messages, undefined, official));
+		const second = summaryOf(await session.convertMessagesToLlm(messages, undefined, official));
+		expect(second).toBe(first);
+		expect(requestContent(first ? [first] : []).images).toEqual(frames);
+
+		// A live switch to the proxy caps the frames; switching back regains them
+		// under the summary message official Claude was sent before.
+		await session.setModel(proxy);
+		await session.prompt("Through the proxy.");
+		expect(requestContent(mock.calls[1]?.context.messages).images).toEqual(proxyFrames);
+		await session.setModel(official);
+		await session.prompt("Back on the official API.");
+		const regained = mock.calls[2]?.context.messages;
+		expect(requestContent(regained).images).toEqual(frames);
+		expect(summaryOf(regained)).toBe(summaryOf(mock.calls[0]?.context.messages));
+		expect(requestContent(regained).text).not.toContain(REASONING);
+
+		// A resume under official Claude reads every frame from the persisted blobs.
+		await sessionManager.flush();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		const resumedManager = await SessionManager.open(sessionFile, sessionDir, undefined, {
+			suppressBreadcrumb: true,
+		});
+		const resumed = startSession(resumedManager, official);
+		await resumed.session.prompt("Continue.");
+		const afterResume = requestContent(resumed.mock.calls[0]?.context.messages);
+		expect(afterResume.images).toEqual(frames);
+		expect(afterResume.text).not.toContain(REASONING);
 	});
 
 	it("checks only messages appended since the previous model call of a tool loop", async () => {

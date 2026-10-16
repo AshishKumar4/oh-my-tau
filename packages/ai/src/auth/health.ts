@@ -92,18 +92,26 @@ export class CredentialHealth implements HealthApi {
 	 * one healthy member makes the model healthy, while any unknown member (a
 	 * pooled key with no usage report, for one) prevents a depleted/reserve
 	 * conclusion. Static runtime/config/env credentials return unknown because
-	 * they bypass the managed pools.
+	 * they bypass the managed pools. A session restricted to an account pool
+	 * never uses those, and counts only the accounts it may use.
 	 */
 	async model(provider: Provider, options: ModelUsageHealthOptions): Promise<ModelUsageHealth> {
 		options.signal?.throwIfAborted();
-		const origin = this.#deps.keys.source(provider);
+		// A session restricted to an account pool resolves only its OAuth accounts,
+		// whatever runtime or env key serves the provider otherwise. Past a config
+		// key (a models.yml proxy) it fails closed, so no pooled account is probed
+		// with that endpoint.
+		const restricted = this.#deps.affinity.isRestricted(provider, options.sessionId);
+		if (restricted && this.#deps.overrides.suppressesOAuth(provider, restricted)) {
+			return { state: "unknown", accounts: [] };
+		}
+		const originKind = restricted ? "oauth" : this.#deps.keys.source(provider)?.kind;
 		const strategy = this.#deps.strategies(provider);
 		const usageProvider = this.#deps.usage.providerFor(provider);
 		const canFetchOAuthUsage = usageProvider !== undefined || this.#deps.store.getUsageReport !== undefined;
 		if (
-			!origin ||
-			(origin.kind !== "oauth" && origin.kind !== "api_key") ||
-			(strategy === undefined && (origin.kind !== "oauth" || !canFetchOAuthUsage))
+			(originKind !== "oauth" && originKind !== "api_key") ||
+			(strategy === undefined && (originKind !== "oauth" || !canFetchOAuthUsage))
 		) {
 			return { state: "unknown", accounts: [] };
 		}
@@ -111,7 +119,11 @@ export class CredentialHealth implements HealthApi {
 		const pool = this.#deps.pool
 			.entries(provider)
 			.map((entry, index) => ({ entry, index }))
-			.filter(({ entry }) => isPoolCredential(provider, entry.credential));
+			.filter(
+				({ entry }) =>
+					isPoolCredential(provider, entry.credential) &&
+					this.#deps.affinity.allows(provider, options.sessionId, entry.credential),
+			);
 		if (pool.length === 0) return { state: "unknown", accounts: [] };
 		const sessionCredential = this.#deps.affinity.get(provider, options.sessionId);
 		const selectedCredentialId =
@@ -271,6 +283,7 @@ export class CredentialHealth implements HealthApi {
 		const results: CredentialHealthResult[] = [];
 		for (const row of stored) {
 			options?.signal?.throwIfAborted();
+			if (options?.excludeProviders?.has(row.provider)) continue;
 			const base: CredentialHealthResult = {
 				id: row.id,
 				provider: row.provider,

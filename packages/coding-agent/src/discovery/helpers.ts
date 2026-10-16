@@ -8,6 +8,8 @@ import {
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
+	logger,
+	normalizePathForComparison,
 	parseFrontmatter,
 	tryParseJson,
 } from "@oh-my-pi/pi-utils";
@@ -299,6 +301,8 @@ export interface ParsedAgentFields {
 	readSummarize?: boolean;
 	blocking?: boolean;
 	pinModel?: boolean;
+	/** `true` = keep `yield` and the output schema when `task.structured` is off. */
+	structured?: boolean;
 	/** `true` = prewalk into the default target; string = prewalk into that model pattern. */
 	prewalk?: boolean | string;
 	/** `true` = advise with the default advisor-role model; string = advise with that model pattern. */
@@ -329,14 +333,17 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		return null;
 	}
 
-	let tools =
-		Array.isArray(frontmatter.tools) && frontmatter.tools.length === 0 ? [] : parseArrayOrCSV(frontmatter.tools);
-	if (tools) tools = normalizeToolNames(tools);
-
-	// Subagents with explicit tool lists always need yield
-	if (tools && !tools.includes("yield")) {
-		tools = [...tools, "yield"];
+	// Only absent or null tools select defaults; malformed restrictions must not widen access.
+	const rawTools = frontmatter.tools;
+	let tools = rawTools == null ? undefined : (parseArrayOrCSV(rawTools) ?? []);
+	if (tools?.length === 0 && !(Array.isArray(rawTools) && rawTools.length === 0)) {
+		const valueType = Array.isArray(rawTools) ? "array" : typeof rawTools;
+		logger.warn("Agent tools declaration names no tools; using an empty built-in allowlist", {
+			agent: name,
+			valueType,
+		});
 	}
+	if (tools) tools = normalizeToolNames(tools);
 
 	// Parse spawns field (array, "*", or CSV)
 	let spawns: string[] | "*" | undefined;
@@ -369,6 +376,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const thinkingLevel = parseConfiguredThinkingLevel(rawThinkingLevel);
 	const model = parseModelList(frontmatter.model);
 	const blocking = parseBoolean(frontmatter.blocking);
+	const structured = parseBoolean(frontmatter.structured);
 	const readSummarize = parseBoolean(frontmatter.readSummarize);
 	const pinModel = parseBoolean(frontmatter.pinModel);
 	// prewalk: true → hand off to the default prewalk target; "<pattern>" → custom target.
@@ -396,6 +404,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		output,
 		thinkingLevel,
 		blocking,
+		structured,
 		autoloadSkills,
 		readSummarize,
 		prewalk,
@@ -1031,6 +1040,41 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
 	return data;
 }
 
+/** Project discovery never examines home or shared temporary roots, or their ancestors. */
+export function getProjectDiscoveryCeilings(): ReadonlySet<string> {
+	const ceilings = new Set<string>();
+	ceilings.add(normalizePathForComparison(os.homedir()));
+	ceilings.add(normalizePathForComparison(os.tmpdir()));
+	if (process.platform !== "win32") {
+		ceilings.add(normalizePathForComparison("/tmp"));
+		ceilings.add(normalizePathForComparison("/var/tmp"));
+	}
+	return ceilings;
+}
+
+/** The current user's config roots are never project anchors. */
+export function isUserConfigRoot(root: string): boolean {
+	const configDir = normalizePathForComparison(path.join(root, getConfigDirName()));
+	return (
+		configDir === normalizePathForComparison(path.join(os.homedir(), getConfigDirName())) ||
+		configDir === normalizePathForComparison(path.dirname(getPluginsDir()))
+	);
+}
+
+/**
+ * An inactive default user layout (`<configDirName>/agent/`) is not a project anchor above a git
+ * root or without a repo. `configDirName` is the project config dir the caller would load from.
+ */
+export async function isForeignUserConfigRoot(root: string, configDirName: string): Promise<boolean> {
+	try {
+		const agentDir = path.join(root, configDirName, "agent");
+		const stat = await fs.promises.stat(agentDir);
+		return stat.isDirectory() && normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir());
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Resolve the active project registry path by walking up from `cwd`.
  *
@@ -1039,21 +1083,30 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
  *    The first match returns `<dir>/.omp/plugins/installed_plugins.json`.
  * 2. If no `.omp/` is found, rescan from `cwd` upward looking for `.git`.
  *    The git root is used as an anchor: `<gitRoot>/.omp/plugins/installed_plugins.json`.
- * 3. If neither is found, return `null` — no project context is active.
+ * 3. Stop before home or a temporary root in either pass. If neither anchor is
+ *    found below that ceiling, return `null` — no project context is active.
+ * Inactive `.omp/agent/` layouts are skipped only above the nearest git root,
+ * or throughout an unanchored walk, so repo-local agent directories stay project scope.
  *
  * This is the single source of truth for "active project root" used by install,
  * uninstall, list, upgrade, discovery, and doctor. Deterministic for a given `cwd`.
  */
 export async function resolveActiveProjectRegistryPath(cwd: string): Promise<string | null> {
-	// Pass 1: walk up looking for an existing .omp/ directory (nearest wins).
-	// Stop before os.homedir() — ~/.omp/ is the user-level config dir, not a project root.
-	const homeDir = os.homedir();
+	return resolveProjectRegistryPath(cwd, getProjectDiscoveryCeilings());
+}
+
+async function resolveProjectRegistryPath(cwd: string, ceilings: ReadonlySet<string>): Promise<string | null> {
+	// Find the nearest git root once, retaining the existing user-root exclusion for fallback.
+	let nearestGitRoot: string | null = null;
+	let gitAnchor: string | null = null;
 	let dir = path.resolve(cwd);
-	while (dir !== homeDir) {
+	while (!ceilings.has(normalizePathForComparison(dir))) {
 		try {
-			const stat = await fs.promises.stat(path.join(dir, getConfigDirName()));
-			if (stat.isDirectory()) {
-				return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
+			await fs.promises.stat(path.join(dir, ".git"));
+			nearestGitRoot ??= dir;
+			if (!isUserConfigRoot(dir)) {
+				gitAnchor = dir;
+				break;
 			}
 		} catch {
 			// not found at this level — continue up
@@ -1063,21 +1116,30 @@ export async function resolveActiveProjectRegistryPath(cwd: string): Promise<str
 		dir = parent;
 	}
 
-	// Pass 2: walk up looking for .git as a fallback anchor.
+	// Existing .omp/ directories still win, even above the git root, except foreign user roots.
+	const configDirName = getConfigDirName();
+	let aboveGitRoot = nearestGitRoot === null;
 	dir = path.resolve(cwd);
-	while (dir !== homeDir) {
+	while (!ceilings.has(normalizePathForComparison(dir))) {
 		try {
-			await fs.promises.stat(path.join(dir, ".git"));
-			return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
+			const stat = await fs.promises.stat(path.join(dir, configDirName));
+			if (
+				stat.isDirectory() &&
+				!isUserConfigRoot(dir) &&
+				(!aboveGitRoot || !(await isForeignUserConfigRoot(dir, configDirName)))
+			) {
+				return path.join(dir, configDirName, "plugins", "installed_plugins.json");
+			}
 		} catch {
 			// not found at this level — continue up
 		}
+		if (dir === nearestGitRoot) aboveGitRoot = true;
 		const parent = path.dirname(dir);
 		if (parent === dir) break; // filesystem root
 		dir = parent;
 	}
 
-	return null; // not inside any project
+	return gitAnchor ? path.join(gitAnchor, getConfigDirName(), "plugins", "installed_plugins.json") : null;
 }
 
 /**
@@ -1088,16 +1150,20 @@ export async function resolveActiveProjectRegistryPath(cwd: string): Promise<str
  * bootstrapped directory (no .omp/ or .git/ yet) works: writeInstalledPluginsRegistry auto-creates
  * the directory tree on first write.
  *
- * Returns undefined when cwd is os.homedir() — that path is already the user registry and must
- * never alias as the project registry.
+ * Returns undefined when cwd is a discovery ceiling or user config root, so the
+ * fallback never creates a shared temporary registry or aliases the user registry.
  */
 export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<string | undefined> {
-	const resolved = await resolveActiveProjectRegistryPath(cwd);
+	const ceilings = getProjectDiscoveryCeilings();
+	const resolved = await resolveProjectRegistryPath(cwd, ceilings);
 	if (resolved) return resolved;
-	// Home directory must not be treated as a project root: the fallback path would alias
-	// getInstalledPluginsRegistryPath(), causing MarketplaceManager to load the same file
-	// as both user and project registry and producing duplicates / disambiguation errors.
-	if (path.resolve(cwd) === os.homedir()) return undefined;
+	// A cwd containing .omp/ at or below a git root already resolved above.
+	if (
+		ceilings.has(normalizePathForComparison(cwd)) ||
+		isUserConfigRoot(cwd) ||
+		(await isForeignUserConfigRoot(cwd, getConfigDirName()))
+	)
+		return undefined;
 	return path.join(cwd, getConfigDirName(), "plugins", "installed_plugins.json");
 }
 
@@ -1143,7 +1209,9 @@ async function readClaudeEnabledPlugins(
 	return { enabled, sources };
 }
 
-const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
+type PluginRootsResult = { roots: ClaudePluginRoot[]; warnings: string[] };
+
+const pluginRootsCache = new Map<string, Promise<PluginRootsResult>>();
 
 const pluginCacheInvalidators = new Set<() => void>();
 
@@ -1164,7 +1232,11 @@ export async function listClaudePluginRoots(
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
 	const claudeConfigDir = resolveClaudePaths(home).configDir;
 	const ompRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
-	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
+	const projectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
+	const resolvedProjectPath =
+		projectPath && normalizePathForComparison(projectPath) !== normalizePathForComparison(ompRegistryPath)
+			? projectPath
+			: null;
 	const projectRoot = resolvedProjectPath ? path.dirname(path.dirname(path.dirname(resolvedProjectPath))) : cwd;
 	const activeClaudeProjectPath = projectRoot ? await canonicalClaudeProjectPath(projectRoot) : null;
 	const canonicalCwd = cwd ? await canonicalClaudeProjectPath(cwd) : null;
@@ -1174,6 +1246,36 @@ export async function listClaudePluginRoots(
 	const cached = pluginRootsCache.get(cacheKey);
 	if (cached) return cached;
 
+	// Cache the in-flight promise so concurrent callers share one computation.
+	const pending = loadClaudePluginRoots({
+		claudeConfigDir,
+		ompRegistryPath,
+		resolvedProjectPath,
+		activeClaudeProjectPath,
+		enabledOverrides,
+	});
+	pluginRootsCache.set(cacheKey, pending);
+	try {
+		return await pending;
+	} catch (error) {
+		if (pluginRootsCache.get(cacheKey) === pending) pluginRootsCache.delete(cacheKey);
+		throw error;
+	}
+}
+
+async function loadClaudePluginRoots({
+	claudeConfigDir,
+	ompRegistryPath,
+	resolvedProjectPath,
+	activeClaudeProjectPath,
+	enabledOverrides,
+}: {
+	claudeConfigDir: string;
+	ompRegistryPath: string;
+	resolvedProjectPath: string | null;
+	activeClaudeProjectPath: string | null;
+	enabledOverrides: { enabled: Map<string, boolean>; sources: string[] };
+}): Promise<PluginRootsResult> {
 	const roots: ClaudePluginRoot[] = [];
 	const warnings: string[] = [];
 	const projectRoots: ClaudePluginRoot[] = [];
@@ -1346,9 +1448,9 @@ export async function listClaudePluginRoots(
 		roots.push(...injectedPluginDirRoots, ...filtered);
 	}
 
-	const result = { roots, warnings };
-	pluginRootsCache.set(cacheKey, result);
-	return result;
+	// Runs once per cached promise, so each warning is logged once per computation.
+	for (const warning of warnings) logger.warn(warning);
+	return { roots, warnings };
 }
 
 /**

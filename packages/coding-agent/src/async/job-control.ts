@@ -238,6 +238,7 @@ export function snapshotJobs(
 			status: latest.status as JobSnapshot["status"],
 			label: latest.label,
 			durationMs: Math.max(0, (latest.endTime ?? now) - latest.startTime),
+			startedAt: latest.startTime,
 			...(exitCode !== undefined ? { exitCode } : {}),
 			...(resolvedModel ? { resolvedModel } : {}),
 			...(resolvedModelIdentity ? { resolvedModelIdentity } : {}),

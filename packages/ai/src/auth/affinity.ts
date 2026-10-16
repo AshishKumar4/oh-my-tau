@@ -1,10 +1,12 @@
 import { logger } from "@oh-my-pi/pi-utils";
-import { getEnvApiKey } from "../stream";
-import type { AuthCredential, OAuthCredential, SessionsApi } from "./types";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
+import { getEnvApiKey } from "../env-api-key";
+import type { AuthCredential, OAuthCredential, SessionRestrictionLease, SessionsApi } from "./types";
 import type { AuthCredentialStore } from "./store";
 import type { CredentialBlocks } from "./blocks";
 import type { CredentialPool } from "./pool";
 import type { KeyOverrides } from "./cascade";
+import { resolveCredentialIdentityKey } from "./sqlite-credential-store";
 
 /** Prefix for persisted session-to-credential affinity. */
 export const SESSION_STICKY_CACHE_PREFIX = "session:sticky:";
@@ -15,12 +17,16 @@ const SESSION_STICKY_TTL_SEC = 30 * 24 * 60 * 60;
  * in-memory sticky stays exact; only the copy other processes resume from lags.
  */
 const SESSION_STICKY_PERSIST_INTERVAL_MS = 60_000;
+/**
+ * In-memory pin records kept per provider, each with both pools' pins.
+ * Long-lived gateways mint a session id per conversation; evicted sessions
+ * resume from their persisted sticky row.
+ */
+const SESSION_AFFINITY_MAX_SESSIONS_PER_PROVIDER = 256;
 
-/** What this process last wrote (or read) for one persisted sticky row. */
+/** What this process last wrote (or read) for one persisted sticky row: its pins' identities and last use. */
 type PersistedSticky = {
-	type: AuthCredential["type"];
-	credentialId: number;
-	explicit: boolean;
+	pins: string;
 	lastUsedAtMs: number;
 };
 
@@ -45,22 +51,114 @@ type SessionPins = {
 	byPool: Partial<Record<AuthCredential["type"], SessionCredential>>;
 };
 
+/**
+ * One persisted sticky row: the session's current pin, with its pin in the
+ * other pool alongside, so a record the in-memory bound evicted resumes both.
+ */
+type PersistedSessionPins = SessionCredential & { other?: SessionCredential };
+
+/** The provider's other stored pool. */
+function otherPool(type: AuthCredential["type"]): AuthCredential["type"] {
+	return type === "oauth" ? "api_key" : "oauth";
+}
+
+/** Identity of the pins one persisted row holds, last-use times aside: equal keys need no rewrite. */
+function persistedPinsKey(current: SessionCredential, other: SessionCredential | undefined): string {
+	return [current, other].map(pin => pin && `${pin.type}:${pin.credentialId}:${pin.explicit === true}`).join("|");
+}
+
+/** One installed restriction: the allowed OAuth identity keys and the lease that lifts it. */
+type SessionRestriction = { readonly allowed: ReadonlySet<string>; readonly lease: SessionRestrictionLease };
+
+/**
+ * Provider → session id → installed restriction. Owned by `AuthStorage` so
+ * restrictions outlive store replacement, which rebuilds every store-bound
+ * module (pins included) around the same identities.
+ */
+export type SessionRestrictions = Map<string, Map<string, SessionRestriction>>;
+
 /** Session → credential affinity (pins), persisted in the store cache. */
 export class SessionAffinity implements SessionsApi {
 	/** Each session's pins per provider (used for rate-limit switching). */
-	#sessionPins: Map<string, Map<string, SessionPins>> = new Map();
-	/** Persisted sticky rows keyed by cache key, so unchanged re-records skip the write. */
-	#persistedSticky: Map<string, PersistedSticky> = new Map();
+	#sessionPins: Map<string, LRUCache<string, SessionPins>> = new Map();
+	/** Persisted sticky rows per provider, keyed by session id, so unchanged re-records skip the write. */
+	#persistedSticky: Map<string, LRUCache<string, PersistedSticky>> = new Map();
 	#store: AuthCredentialStore;
 	#pool: CredentialPool;
 	#overrides: KeyOverrides;
 	#blocks: CredentialBlocks;
+	#restrictions: SessionRestrictions;
 
-	constructor(store: AuthCredentialStore, pool: CredentialPool, overrides: KeyOverrides, blocks: CredentialBlocks) {
+	constructor(
+		store: AuthCredentialStore,
+		pool: CredentialPool,
+		overrides: KeyOverrides,
+		blocks: CredentialBlocks,
+		restrictions: SessionRestrictions,
+	) {
 		this.#store = store;
 		this.#pool = pool;
 		this.#overrides = overrides;
 		this.#blocks = blocks;
+		this.#restrictions = restrictions;
+	}
+
+	restrict(provider: string, sessionId: string, identityKeys: readonly string[]): SessionRestrictionLease {
+		if (!provider || !sessionId) throw new Error("sessions.restrict requires a provider and a session id");
+		const lease = Symbol("sessions.restrict");
+		const sessions = this.#restrictions.get(provider) ?? new Map<string, SessionRestriction>();
+		sessions.set(sessionId, { allowed: new Set(identityKeys), lease });
+		this.#restrictions.set(provider, sessions);
+		return lease;
+	}
+
+	unrestrict(provider: string, sessionId: string, lease: SessionRestrictionLease): void {
+		const sessions = this.#restrictions.get(provider);
+		if (sessions?.get(sessionId)?.lease !== lease) return;
+		sessions.delete(sessionId);
+		if (sessions.size === 0) this.#restrictions.delete(provider);
+	}
+
+	/** True when {@link restrict} limits `sessionId` for `provider`. */
+	isRestricted(provider: string, sessionId: string | undefined): boolean {
+		return sessionId !== undefined && this.#restrictions.get(provider)?.has(sessionId) === true;
+	}
+
+	/**
+	 * True when `credential` may serve `sessionId`: always for an unrestricted
+	 * session, otherwise only an OAuth credential whose identity key is allowed.
+	 * The one eligibility predicate: selection, pool order, rotation, pins,
+	 * inheritance, and usage health all apply it before anything else.
+	 */
+	allows(provider: string, sessionId: string | undefined, credential: AuthCredential): boolean {
+		const allowed = sessionId === undefined ? undefined : this.#restrictions.get(provider)?.get(sessionId)?.allowed;
+		if (allowed === undefined) return true;
+		if (credential.type !== "oauth") return false;
+		const identityKey = resolveCredentialIdentityKey(provider, credential);
+		return identityKey !== null && allowed.has(identityKey);
+	}
+
+	/** Whether the stored row at `index` may serve `sessionId` (see {@link allows}). */
+	#permits(provider: string, sessionId: string, index: number): boolean {
+		if (!this.isRestricted(provider, sessionId)) return true;
+		const credential = this.#pool.credentials(provider)[index];
+		return credential !== undefined && this.allows(provider, sessionId, credential);
+	}
+
+	permits(provider: string, sessionId: string, credentialId: number): boolean {
+		if (!this.isRestricted(provider, sessionId)) return true;
+		const entry = this.#pool.entries(provider).find(candidate => candidate.id === credentialId);
+		return entry !== undefined && this.allows(provider, sessionId, entry.credential);
+	}
+
+	/** Bounded per-provider session map, created on first use. */
+	static #sessionsFor<V>(maps: Map<string, LRUCache<string, V>>, provider: string): LRUCache<string, V> {
+		let sessions = maps.get(provider);
+		if (!sessions) {
+			sessions = new LRUCache<string, V>({ max: SESSION_AFFINITY_MAX_SESSIONS_PER_PROVIDER });
+			maps.set(provider, sessions);
+		}
+		return sessions;
 	}
 
 	/** Drop only this session's in-memory pins after OAuth selection falls through. */
@@ -72,13 +170,15 @@ export class SessionAffinity implements SessionsApi {
 	 * Records which credential was used for a session (for rate-limit switching).
 	 * `lastUsedAtMs` backdates the sticky (session-file pin restores on resume);
 	 * it defaults to now for live selections. Automatic re-recording of the same
-	 * durable row preserves an explicit user pin. A held account is never
-	 * pinned: returns whether the pin was recorded.
+	 * durable row preserves an explicit user pin. A held account, and one outside
+	 * a restricted session's pool, is never pinned: returns whether the pin was
+	 * recorded.
 	 *
-	 * The in-memory sticky is always exact. The persisted row is rewritten only
-	 * when the credential, its type, or explicitness changes, or when the stored
-	 * last-use drifts by {@link SESSION_STICKY_PERSIST_INTERVAL_MS} — per-request
-	 * rewrites were pure database churn.
+	 * The in-memory sticky is always exact. The persisted row, which carries both
+	 * pools' pins, is rewritten only when a pin's credential, type, or
+	 * explicitness changes, or when the stored last-use drifts by
+	 * {@link SESSION_STICKY_PERSIST_INTERVAL_MS} — per-request rewrites were pure
+	 * database churn.
 	 */
 	record(
 		provider: string,
@@ -88,11 +188,12 @@ export class SessionAffinity implements SessionsApi {
 		lastUsedAtMs?: number,
 		explicit = false,
 	): boolean {
-		if (!sessionId || this.#blocks.isHeld(provider, index)) return false;
+		if (!sessionId || this.#blocks.isHeld(provider, index) || !this.#permits(provider, sessionId, index)) {
+			return false;
+		}
 		const nowMs = lastUsedAtMs ?? Date.now();
 		const credentialId = this.#pool.entries(provider)[index]?.id;
-		const sessionMap = this.#sessionPins.get(provider) ?? new Map<string, SessionPins>();
-		const pins = sessionMap.get(sessionId);
+		const pins = this.#pins(provider, sessionId);
 		const previous = pins?.byPool[type];
 		const sameCredential =
 			previous?.type === type &&
@@ -105,34 +206,43 @@ export class SessionAffinity implements SessionsApi {
 			lastUsedAtMs: nowMs,
 			...(isExplicit ? { explicit: true as const } : {}),
 		};
-		sessionMap.set(sessionId, { current: type, byPool: { ...pins?.byPool, [type]: sessionCredential } });
-		this.#sessionPins.set(provider, sessionMap);
-		if (credentialId !== undefined) this.#persist(provider, sessionId, sessionCredential, credentialId);
+		SessionAffinity.#sessionsFor(this.#sessionPins, provider).set(sessionId, {
+			current: type,
+			byPool: { ...pins?.byPool, [type]: sessionCredential },
+		});
+		this.#persist(provider, sessionId);
 		return true;
 	}
 
-	/** Writes the pin other processes resume from: the session's current one. */
-	#persist(provider: string, sessionId: string, sessionCredential: SessionCredential, credentialId: number): void {
-		const { type } = sessionCredential;
+	/**
+	 * Writes the pins other processes, and this one after an eviction, resume
+	 * from: the session's current pin, with its pin in the other pool alongside.
+	 * Only pins with a durable row id are written.
+	 */
+	#persist(provider: string, sessionId: string): void {
+		const pins = this.#sessionPins.get(provider)?.get(sessionId);
+		const current = pins?.byPool[pins.current];
+		if (!pins || current?.credentialId === undefined) return;
+		const otherPin = pins.byPool[otherPool(pins.current)];
+		const other = otherPin?.credentialId !== undefined ? otherPin : undefined;
 		const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
-		const lastUsedAtMs = sessionCredential.lastUsedAtMs ?? Date.now();
-		const explicit = sessionCredential.explicit === true;
+		const lastUsedAtMs = current.lastUsedAtMs ?? Date.now();
 		const expiresAtSec = Math.floor(lastUsedAtMs / 1000) + SESSION_STICKY_TTL_SEC;
-		const persisted = this.#persistedSticky.get(cacheKey);
+		const persistedPins = persistedPinsKey(current, other);
+		const persistedSessions = SessionAffinity.#sessionsFor(this.#persistedSticky, provider);
+		const persisted = persistedSessions.get(sessionId);
 		if (
-			persisted &&
-			persisted.type === type &&
-			persisted.credentialId === credentialId &&
-			persisted.explicit === explicit &&
+			persisted?.pins === persistedPins &&
 			Math.abs(lastUsedAtMs - persisted.lastUsedAtMs) < SESSION_STICKY_PERSIST_INTERVAL_MS
 		) {
 			return;
 		}
+		const row: PersistedSessionPins = { ...current, ...(other ? { other } : {}) };
 		try {
-			this.#store.setCache(cacheKey, JSON.stringify(sessionCredential), expiresAtSec);
-			this.#persistedSticky.set(cacheKey, { type, credentialId, explicit, lastUsedAtMs });
+			this.#store.setCache(cacheKey, JSON.stringify(row), expiresAtSec);
+			persistedSessions.set(sessionId, { pins: persistedPins, lastUsedAtMs });
 		} catch (err) {
-			this.#persistedSticky.delete(cacheKey);
+			persistedSessions.delete(sessionId);
 			logger.debug("Failed to write session sticky credential to persistent store cache", { err });
 		}
 	}
@@ -146,13 +256,11 @@ export class SessionAffinity implements SessionsApi {
 		const pins = sessionMap?.get(sessionId);
 		if (!sessionMap || !pins) return;
 		delete pins.byPool[type];
-		if (pins.current !== type) return;
-		const remaining = Object.values(pins.byPool).find(pin => pin !== undefined);
-		if (remaining) {
-			pins.current = remaining.type;
-			if (remaining.credentialId !== undefined) {
-				this.#persist(provider, sessionId, remaining, remaining.credentialId);
-			}
+		const remaining = pins.byPool[otherPool(type)];
+		if (pins.current !== type || remaining) {
+			if (remaining) pins.current = remaining.type;
+			// The persisted row no longer carries the dropped pin.
+			this.#persist(provider, sessionId);
 			return;
 		}
 		sessionMap.delete(sessionId);
@@ -161,79 +269,99 @@ export class SessionAffinity implements SessionsApi {
 
 	/**
 	 * Retrieves the credential a session used last, or with `pool` its pin in that
-	 * pool: the account a selection from that pool keeps while it stays usable.
+	 * pool: the account a selection from that pool keeps while it stays usable. A
+	 * restricted session never sees a pin outside its allowlist — inherited,
+	 * restored, or recorded before the restriction — so it re-ranks inside the
+	 * allowlist instead. When the restriction hides the current pin, the other
+	 * pool's pin, if allowed, is the one the session uses.
 	 */
 	get(provider: string, sessionId: string | undefined, pool?: AuthCredential["type"]): SessionCredential | undefined {
 		if (!sessionId) return undefined;
-		let sessionMap = this.#sessionPins.get(provider);
-		const pins = sessionMap?.get(sessionId);
-		if (pins) {
-			const type = pool ?? pins.current;
-			const live = pins.byPool[type];
-			if (!live) return undefined;
-			// Another process can add or drop rows mid-session and the pool is an
-			// index-ordered snapshot, so re-resolve the pin through its durable row
-			// id: a compacted array must not point the session at a different
-			// account, and a deleted account must not hand its slot to a sibling.
-			if (live.credentialId === undefined) return live;
-			const stored = this.#pool.entries(provider);
-			const actualIndex = stored.findIndex(entry => entry.id === live.credentialId);
-			if (actualIndex === -1 || stored[actualIndex]?.credential.type !== live.type) {
-				this.#drop(provider, sessionId, type);
-				// Dropping the current pin made the other pool's pin current; read that one.
-				return pool === undefined ? this.get(provider, sessionId) : undefined;
-			}
-			live.index = actualIndex;
-			return live;
+		const credential = this.#lookup(provider, sessionId, pool);
+		if (!credential || this.#permits(provider, sessionId, credential.index)) return credential;
+		if (pool !== undefined) return undefined;
+		const other = this.#lookup(provider, sessionId, otherPool(credential.type));
+		return other && this.#permits(provider, sessionId, other.index) ? other : undefined;
+	}
+
+	#lookup(provider: string, sessionId: string, pool?: AuthCredential["type"]): SessionCredential | undefined {
+		const pins = this.#pins(provider, sessionId);
+		if (!pins) return undefined;
+		const type = pool ?? pins.current;
+		const live = pins.byPool[type];
+		if (!live) return undefined;
+		// Another process can add or drop rows mid-session and the pool is an
+		// index-ordered snapshot, so re-resolve the pin through its durable row
+		// id: a compacted array must not point the session at a different
+		// account, and a deleted account must not hand its slot to a sibling.
+		if (live.credentialId === undefined) return live;
+		const stored = this.#pool.entries(provider);
+		const actualIndex = stored.findIndex(entry => entry.id === live.credentialId);
+		if (actualIndex === -1 || stored[actualIndex]?.credential.type !== live.type) {
+			this.#drop(provider, sessionId, type);
+			// Dropping the current pin made the other pool's pin current; read that one.
+			return pool === undefined ? this.#lookup(provider, sessionId) : undefined;
 		}
+		live.index = actualIndex;
+		return live;
+	}
+
+	/**
+	 * The session's pins: the in-memory record, else the one restored from its
+	 * persisted row. Every read and every mutation starts here, so a session the
+	 * in-memory bound evicted keeps both pools' pins through its next pin,
+	 * record, or clear, not only through its next lookup.
+	 */
+	#pins(provider: string, sessionId: string): SessionPins | undefined {
+		const live = this.#sessionPins.get(provider)?.get(sessionId);
+		if (live) return live;
 		try {
 			const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
 			const raw = this.#store.getCache(cacheKey);
-			if (raw) {
-				const val = JSON.parse(raw) as SessionCredential;
-
-				if (val.credentialId !== undefined) {
-					const stored = this.#pool.entries(provider);
-					const actualIndex = stored.findIndex(entry => entry.id === val.credentialId);
-					if (actualIndex === -1 || stored[actualIndex]?.credential.type !== val.type) {
-						this.#persistedSticky.delete(cacheKey);
-						this.#store.setCache(cacheKey, "", 0);
-						return undefined;
-					}
-					val.index = actualIndex;
-				} else {
-					// Fallback: drop unsafe index-only cache rows to prevent wrong-account routing
-					this.#persistedSticky.delete(cacheKey);
-					this.#store.setCache(cacheKey, "", 0);
-					return undefined;
-				}
-
-				if (!sessionMap) {
-					sessionMap = new Map();
-					this.#sessionPins.set(provider, sessionMap);
-				}
-				const sessionVal: SessionCredential = {
-					type: val.type,
-					index: val.index,
-					credentialId: val.credentialId,
-					lastUsedAtMs: val.lastUsedAtMs,
-					...(val.explicit === true ? { explicit: true } : {}),
-				};
-				if (typeof val.lastUsedAtMs === "number") {
-					this.#persistedSticky.set(cacheKey, {
-						type: val.type,
-						credentialId: val.credentialId,
-						explicit: val.explicit === true,
-						lastUsedAtMs: val.lastUsedAtMs,
-					});
-				}
-				sessionMap.set(sessionId, { current: sessionVal.type, byPool: { [sessionVal.type]: sessionVal } });
-				return pool === undefined || pool === sessionVal.type ? sessionVal : undefined;
+			if (!raw) return undefined;
+			const row = JSON.parse(raw) as PersistedSessionPins;
+			const current = this.#resolvePersistedPin(provider, row);
+			const other =
+				row.other?.type === otherPool(row.type) ? this.#resolvePersistedPin(provider, row.other) : undefined;
+			const restored = current ?? other;
+			if (!restored) {
+				// Its rows are gone, or it is an unsafe index-only row: never route by a stale slot.
+				this.#persistedSticky.get(provider)?.delete(sessionId);
+				this.#store.setCache(cacheKey, "", 0);
+				return undefined;
 			}
+			const pins: SessionPins = { current: restored.type, byPool: {} };
+			for (const pin of [other, current]) if (pin) pins.byPool[pin.type] = pin;
+			SessionAffinity.#sessionsFor(this.#sessionPins, provider).set(sessionId, pins);
+			if (!current) {
+				// The row's current pin is gone: write the promoted one.
+				this.#persist(provider, sessionId);
+			} else if (typeof row.lastUsedAtMs === "number") {
+				SessionAffinity.#sessionsFor(this.#persistedSticky, provider).set(sessionId, {
+					pins: persistedPinsKey(current, other),
+					lastUsedAtMs: row.lastUsedAtMs,
+				});
+			}
+			return pins;
 		} catch (err) {
 			logger.debug("Failed to read session sticky credential from persistent store cache", { err });
 		}
 		return undefined;
+	}
+
+	/** A persisted pin re-resolved through its durable row id; undefined once that row is gone or changed type. */
+	#resolvePersistedPin(provider: string, pin: SessionCredential | undefined): SessionCredential | undefined {
+		if (pin?.credentialId === undefined) return undefined;
+		const stored = this.#pool.entries(provider);
+		const index = stored.findIndex(entry => entry.id === pin.credentialId);
+		if (index === -1 || stored[index]?.credential.type !== pin.type) return undefined;
+		return {
+			type: pin.type,
+			index,
+			credentialId: pin.credentialId,
+			lastUsedAtMs: pin.lastUsedAtMs,
+			...(pin.explicit === true ? { explicit: true } : {}),
+		};
 	}
 
 	/**
@@ -242,7 +370,7 @@ export class SessionAffinity implements SessionsApi {
 	 */
 	clear(provider: string, sessionId: string | undefined): void {
 		if (!sessionId) return;
-		const pins = this.#sessionPins.get(provider)?.get(sessionId);
+		const pins = this.#pins(provider, sessionId);
 		if (pins) this.#drop(provider, sessionId, pins.current);
 		// A promoted pin with a durable row id was persisted by the drop.
 		const remaining = this.#sessionPins.get(provider)?.get(sessionId);
@@ -252,7 +380,7 @@ export class SessionAffinity implements SessionsApi {
 
 	#clearPersisted(provider: string, sessionId: string): void {
 		const cacheKey = `${SESSION_STICKY_CACHE_PREFIX}${provider}:${sessionId}`;
-		this.#persistedSticky.delete(cacheKey);
+		this.#persistedSticky.get(provider)?.delete(sessionId);
 		try {
 			this.#store.setCache(cacheKey, "", 0);
 		} catch (err) {
@@ -262,11 +390,21 @@ export class SessionAffinity implements SessionsApi {
 
 	activeOAuth(provider: string, sessionId?: string): OAuthCredential | undefined {
 		const allCredentials = this.#pool.credentials(provider);
-		if (!allCredentials.some(credential => credential.type === "oauth")) return undefined;
+		const usable = (credential: AuthCredential, index: number): credential is OAuthCredential =>
+			credential.type === "oauth" &&
+			!this.#blocks.isHeld(provider, index) &&
+			this.allows(provider, sessionId, credential);
+		if (
+			!allCredentials.some(credential => credential.type === "oauth" && this.allows(provider, sessionId, credential))
+		)
+			return undefined;
 
 		// Runtime / config overrides bypass OAuth account_uuid attribution — the
 		// caller is authenticating with an explicit key, not the broker's OAuth.
-		if (this.#overrides.has(provider)) return undefined;
+		// A restricted session skips a runtime key, and a config key fails it
+		// closed (see `KeyCascade.get`).
+		const restricted = this.isRestricted(provider, sessionId);
+		if (this.#overrides.suppressesOAuth(provider, restricted)) return undefined;
 
 		// Prefer the session-sticky credential when available.
 		const sessionPref = this.get(provider, sessionId);
@@ -278,8 +416,8 @@ export class SessionAffinity implements SessionsApi {
 		// path in getApiKey(), which is not OAuth-authenticated, so account_uuid injection
 		// would misattribute traffic. Only apply this guard when sessionPref is absent; a
 		// recorded OAuth sticky (sessionPref.type === "oauth") must NOT be blocked even if an
-		// env key also happens to exist.
-		if (!sessionPref && getEnvApiKey(provider)) return undefined;
+		// env key also happens to exist. A restricted session never falls through to it.
+		if (!restricted && !sessionPref && getEnvApiKey(provider)) return undefined;
 		// Resolve the sticky index against the full credential list — the index is
 		// recorded against the unfiltered provider array (by record /
 		// CredentialSelector.tryOAuth), not the OAuth-only subset, so dereferencing it into the
@@ -288,15 +426,11 @@ export class SessionAffinity implements SessionsApi {
 		// A held account is never the active one, even when a pin (live, or
 		// restored from a session file) names it: the next request resolves
 		// around it and re-records the pin.
-		const stickyCredential =
-			sessionPref?.type === "oauth" && !this.#blocks.isHeld(provider, sessionPref.index)
-				? allCredentials[sessionPref.index]
-				: undefined;
-		if (stickyCredential?.type === "oauth") return stickyCredential;
-		return allCredentials.find(
-			(credential, index): credential is OAuthCredential =>
-				credential.type === "oauth" && !this.#blocks.isHeld(provider, index),
-		);
+		if (sessionPref !== undefined) {
+			const stickyCredential = allCredentials[sessionPref.index];
+			if (stickyCredential !== undefined && usable(stickyCredential, sessionPref.index)) return stickyCredential;
+		}
+		return allCredentials.find(usable);
 	}
 
 	/**
@@ -321,10 +455,12 @@ export class SessionAffinity implements SessionsApi {
 	 * `options.restoredAtMs` instead restores an automatic affinity recorded by a
 	 * persisted session, backdated to its last use, so it keeps the provider's
 	 * warm-window semantics: a resume inside the prompt-cache TTL reuses the
-	 * account, a stale resume re-ranks. A held account is never pinned.
+	 * account, a stale resume re-ranks. A held account, and one outside a
+	 * restricted session's pool, is never pinned: an explicit pin does not
+	 * override an allowlist.
 	 */
 	pin(provider: string, sessionId: string, credentialId: number, options?: { restoredAtMs?: number }): boolean {
-		if (!sessionId || this.#overrides.has(provider)) {
+		if (!sessionId || this.#overrides.suppressesOAuth(provider, this.isRestricted(provider, sessionId))) {
 			return false;
 		}
 		const stored = this.#pool.entries(provider);
@@ -341,8 +477,9 @@ export class SessionAffinity implements SessionsApi {
 	 * The target receives its own sticky entries, so request resolution, usage
 	 * blocking, credential rotation, metadata, and persisted pins all continue
 	 * through the target session id without retaining a live dependency on the
-	 * source session. `include` selects providers by whether the source affinity
-	 * is an explicit user pin.
+	 * source session. `include` limits the copy to the providers it accepts,
+	 * given whether the source's affinity is an explicit user pin. A pin outside
+	 * the target's restriction is not copied.
 	 */
 	inherit(
 		sourceSessionId: string,
@@ -356,7 +493,7 @@ export class SessionAffinity implements SessionsApi {
 			if (!current) continue;
 			// Every pool's pin, the current one last so it stays current: a child forked
 			// during a pooled-key detour still knows the subscription account to return to.
-			const other = this.get(provider, sourceSessionId, current.type === "oauth" ? "api_key" : "oauth");
+			const other = this.get(provider, sourceSessionId, otherPool(current.type));
 			let recorded = false;
 			for (const credential of other ? [other, current] : [current]) {
 				if (include && !include(provider, credential.explicit === true)) continue;

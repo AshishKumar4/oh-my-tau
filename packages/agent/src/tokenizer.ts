@@ -1,9 +1,4 @@
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
-import {
-	type ImageTokenization,
-	type ImageTokenizationTarget,
-	resolveImageTokenization,
-} from "@oh-my-pi/pi-catalog/compat/image-tokenization";
 import { isColdReplayableResponsesTurn } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { shouldDropTruncatedThinkingOnlyAssistant } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import {
@@ -41,7 +36,7 @@ export function tokenizerEncodingForModel(model: Pick<Model, "tokenizer"> | null
 }
 
 type TokenizerModel = Pick<Model, "tokenizer"> &
-	ImageTokenizationTarget & { compat?: Model["compat"]; thinking?: Model["thinking"] };
+	snapcompact.ShapeTarget & { compat?: Model["compat"]; thinking?: Model["thinking"] };
 
 /** The model an assistant turn's native reasoning (signed thinking, Responses history) is replayed to. */
 interface ReasoningReplayReader {
@@ -61,8 +56,8 @@ function reasoningReplayReader(model: TokenizerModel | null | undefined): Reason
 /** Everything a {@link Tokenizer}'s counts depend on, resolved from the model reading the request. */
 interface CountingPolicy {
 	encoding: natives.Encoding | null;
-	/** The reader's catalog image rule; undefined prices images at the OpenAI wire's rule. */
-	imageRule: ImageTokenization | undefined;
+	/** The reader's catalog image rule and the detail hint its snapcompact frames carry. */
+	frameBilling: snapcompact.FrameBilling;
 	reasoningReader: ReasoningReplayReader | undefined;
 	/** Claude's own API and prefix-bound hosts keep another model's signature from their deployment. */
 	readsDeploymentSignatures: boolean;
@@ -76,7 +71,7 @@ function resolveCountingPolicy(model: TokenizerModel | null | undefined, options
 	const compat = model?.compat;
 	return {
 		encoding: tokenizerEncodingForModel(model),
-		imageRule: model ? resolveImageTokenization(model) : undefined,
+		frameBilling: snapcompact.frameBilling(model ?? undefined),
 		reasoningReader: reasoningReplayReader(model),
 		readsDeploymentSignatures:
 			model?.api === "anthropic-messages" &&
@@ -326,7 +321,7 @@ export class Tokenizer {
 	 */
 	countMessage(message: AgentMessage, options?: MessageCountOptions): number {
 		const floored = options?.excludeEncryptedReasoning === true;
-		if (!isEstimateCacheable(message)) return this.#measureMessage(message, floored);
+		if (!isEstimateCacheable(message)) return this.#measureMessage(message, floored, false);
 		const version = messageEstimateVersion(message);
 		let entry = this.#estimates.get(message);
 		if (entry === undefined || entry.version !== version) {
@@ -335,10 +330,23 @@ export class Tokenizer {
 		}
 		const cached = floored ? entry.floored : entry.default;
 		if (cached !== undefined) return cached;
-		const result = this.#measureMessage(message, floored);
+		const result = this.#measureMessage(message, floored, false);
 		if (floored) entry.floored = result;
 		else entry.default = result;
 		return result;
+	}
+
+	/**
+	 * {@link countMessage} for the transcript's latest surviving assistant turn
+	 * (`isSurvivingAssistant`), which an Anthropic Messages replay keeps
+	 * byte-for-byte (`transformMessages`): a turn whose tool calls ended without
+	 * a tool-use stop keeps its signatures then, so its reasoning is charged. A
+	 * count of one message cannot see its position; a caller walking back from
+	 * the end of the transcript counts that turn here. Not memoized: it differs
+	 * from {@link countMessage} only for that one turn.
+	 */
+	countLatestTurn(message: AgentMessage, options?: MessageCountOptions): number {
+		return this.#measureMessage(message, options?.excludeEncryptedReasoning === true, true);
 	}
 
 	/** Sum of {@link countMessage} over `messages`. */
@@ -353,7 +361,7 @@ export class Tokenizer {
 	 * catalog image rule, or the generic estimate when it has none.
 	 */
 	imageTokens(size: ImageSize | null | undefined, detail?: ImageDetail): number {
-		return estimateImageTokens(size, detail, this.#policy.imageRule);
+		return estimateImageTokens(size, detail, this.#policy.frameBilling.rule);
 	}
 
 	/**
@@ -389,7 +397,7 @@ export class Tokenizer {
 		return total;
 	}
 
-	#measureMessage(message: AgentMessage, excludeEncryptedReasoning: boolean): number {
+	#measureMessage(message: AgentMessage, excludeEncryptedReasoning: boolean, latestTurn: boolean): number {
 		const fragments: string[] = [];
 		let extra = 0;
 		// Declaration-merged app roles (the coding-agent's bashExecution) are
@@ -437,14 +445,20 @@ export class Tokenizer {
 				// The replay's signature rule (`transformMessages`): an aborted or
 				// errored turn's final block can hold a partial signature, and a turn
 				// whose tool calls ended without a tool-use stop is abandoned, so all
-				// its signatures are stripped. Every other block completed. The latest
-				// assistant turn keeps an abandoned turn's signatures byte-for-byte;
-				// a per-message count cannot see position, so it follows the rule for
-				// older turns, and that latest turn's own usage anchors transcript counts.
+				// its signatures are stripped. Every other block completed. On the
+				// Anthropic Messages API the latest assistant turn keeps an abandoned
+				// turn's signatures byte-for-byte (Bedrock's Converse replay strips
+				// them too); a per-message count cannot see position, so it follows
+				// the rule for older turns unless the caller says it is the latest
+				// (`countLatestTurn`).
 				const content = message.content;
 				const invalidStop = message.stopReason === "aborted" || message.stopReason === "error";
+				const keepsLatestSignatures = latestTurn && message.api === "anthropic-messages";
 				const abandonedToolUse =
-					!invalidStop && message.stopReason !== "toolUse" && content.some(block => block.type === "toolCall");
+					!keepsLatestSignatures &&
+					!invalidStop &&
+					message.stopReason !== "toolUse" &&
+					content.some(block => block.type === "toolCall");
 				const untrustedIndex = invalidStop ? content.length - 1 : -1;
 				let signedReasoning = false;
 				for (let index = 0; index < content.length; index++) {
@@ -523,11 +537,12 @@ export class Tokenizer {
 					if (message.blocks) {
 						for (const block of message.blocks) {
 							if (block.type === "text") fragments.push(block.text);
-							else extra += snapcompact.FRAME_TOKEN_ESTIMATE;
+							else extra += this.#frameTokens(block.data);
 						}
 					} else if (message.images) {
-						// Snapcompact frames render at ≥1568px; providers bill the downscaled cap.
-						extra += message.images.length * snapcompact.FRAME_TOKEN_ESTIMATE;
+						for (const image of message.images) {
+							extra += this.#frameTokens(image.data);
+						}
 					}
 				}
 				break;
@@ -569,5 +584,11 @@ export class Tokenizer {
 		if (!this.#policy.nativeHistoryReplay && !isColdReplayableResponsesTurn(replay)) return nothing;
 		const tokens = message.usage?.reasoningTokens;
 		return tokens === undefined ? { ciphertext: reasoning.map(item => stringifyJson(item) ?? "") } : { tokens };
+	}
+
+	/** One snapcompact frame at the active model's price for its pixel size; unreadable frames cost the ceiling. */
+	#frameTokens(data: string): number {
+		const size = base64ImageSize(data);
+		return size ? snapcompact.frameTokens(this.#policy.frameBilling, size) : snapcompact.FRAME_TOKEN_ESTIMATE;
 	}
 }

@@ -48,6 +48,7 @@ export interface SessionHandoffHost {
 	model(): Model | undefined;
 	thinkingLevel(): ThinkingLevel | undefined;
 	sessionId(): string;
+	getPromptCacheKeyForModel(model: Model): string | undefined;
 	baseSystemPrompt(): string[];
 	setSkipPostTurnMaintenance(timestamp: number | undefined): void;
 	obfuscateTextForProvider(text: string | undefined): string | undefined;
@@ -135,11 +136,11 @@ export class SessionHandoff {
 			// effective provider cache key with a unique side `sessionId` so
 			// OpenAI/Codex append-only state never mixes with the live turn.
 			const cacheSessionId = this.#host.sessionId();
-			// The loop sends `promptCacheKey` (providerPromptCacheKey) and falls back to
+			// The loop sends an explicit or model-gated Task key, falling back to
 			// the provider session id; providers route on `promptCacheKey ?? sessionId`.
 			// Both can diverge from this.#host.sessionId() (tan/subagent/shared sessions), so
 			// mirror exactly what the live turn populated the cache under.
-			const handoffPromptCacheKey = this.#host.agent.promptCacheKey ?? this.#host.agent.sessionId;
+			const handoffPromptCacheKey = this.#host.getPromptCacheKeyForModel(model) ?? this.#host.agent.sessionId;
 			const handoffPromptText = renderHandoffPrompt(this.#host.obfuscateTextForProvider(customInstructions));
 			const handoffSnapshot: AgentMessage[] = [
 				...this.#host.agent.state.messages,

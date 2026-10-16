@@ -102,25 +102,26 @@ struct Stamp {
 	special_kind: Option<&'static str>,
 }
 
-/// Metadata follows symlinks; refuse targets whose reads may block or never
-/// end.
-fn special_file_kind(kind: FileType) -> Option<&'static str> {
-	if kind.is_file() || kind.is_dir() {
+/// Kind of a non-regular, non-directory file, or `None`. Reading one can block
+/// forever (a FIFO, a terminal) or never end (`/dev/zero`). `metadata` follows
+/// symlinks, so a link reports its target's kind.
+fn special_file_kind(file_type: FileType) -> Option<&'static str> {
+	if file_type.is_file() || file_type.is_dir() {
 		return None;
 	}
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::FileTypeExt;
-		if kind.is_char_device() {
+		if file_type.is_char_device() {
 			return Some("character device");
 		}
-		if kind.is_block_device() {
+		if file_type.is_block_device() {
 			return Some("block device");
 		}
-		if kind.is_fifo() {
+		if file_type.is_fifo() {
 			return Some("FIFO");
 		}
-		if kind.is_socket() {
+		if file_type.is_socket() {
 			return Some("socket");
 		}
 	}

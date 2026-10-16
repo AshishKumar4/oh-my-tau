@@ -382,7 +382,7 @@ export async function fetchWithRetry(
 		if (hint !== undefined && hint > maxDelayMs) return response;
 
 		const delayMs = Math.min(hint ?? resolveDefaultDelay(defaultDelayMs, attempt, maxDelayMs), maxDelayMs);
-		// Only the response being retried is discarded; early returns remain readable.
+		// The retried response is discarded; release its unread tee branch.
 		if (!response.bodyUsed) response.body?.cancel().catch(() => {});
 		await waitForRetry(delayMs, signal);
 	}

@@ -58,6 +58,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.agentsHelp,
 	},
 	{
+		name: "anonymize",
+		load: () => import("./commands/anonymize").then(m => m.default),
+		help: commandHelp.anonymizeHelp,
+	},
+	{
 		name: "bench",
 		load: () => import("./commands/bench").then(m => m.default),
 		help: commandHelp.benchHelp,
@@ -205,6 +210,11 @@ export const commands: CommandEntry[] = [
 		name: "share",
 		load: () => import("./commands/share").then(m => m.default),
 		help: commandHelp.shareHelp,
+	},
+	{
+		name: "session",
+		load: () => import("./commands/session").then(m => m.default),
+		help: commandHelp.sessionHelp,
 	},
 	{
 		name: "setup",

@@ -275,6 +275,11 @@ export interface AgentDefinition {
 	thinkingLevel?: ConfiguredThinkingLevel;
 	output?: unknown;
 	blocking?: boolean;
+	/**
+	 * `true` = task spawns keep the `yield` tool even when `task.structured` is
+	 * off. Declaring `output` already does; this opts in an agent without one.
+	 */
+	structured?: boolean;
 	autoloadSkills?: string[];
 	/** When `false`, the agent's `read` tool returns verbatim file content instead of structural summaries. */
 	readSummarize?: boolean;

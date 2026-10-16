@@ -64,6 +64,8 @@ describe("WebSearch under the claude-code harness", () => {
 	});
 
 	it("folds allowed and blocked domains into site: operators the query pipeline enforces", async () => {
+		// The search pipeline ranks providers through the process settings.
+		await Settings.init({ inMemory: true, cwd: process.cwd() });
 		const captured = captureProvider();
 		await new WebSearchTool(PROFILED).execute("call-1", {
 			query: "rust async",

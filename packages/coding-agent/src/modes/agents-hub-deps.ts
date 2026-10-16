@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { Model, ServiceTier } from "@oh-my-pi/pi-ai";
 import type { AgentsHubDeps, HubAgent } from "@oh-my-pi/pi-tui/overlays/agents-hub";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { isEnoent, prompt } from "@oh-my-pi/pi-utils";
@@ -110,9 +111,10 @@ export function createAgentsHubDeps(
 	extensionRoots: () => EffectiveExtensionRoots,
 	activeModelPattern?: string,
 	defaultModelPattern?: string,
+	sessionServiceTier?: (model: Model) => ServiceTier | undefined,
 ): AgentsHubDeps {
 	return {
-		browserSource: createModelBrowserSource(settings),
+		browserSource: createModelBrowserSource(settings, sessionServiceTier),
 		loadAgents: () => loadHubAgents(cwd, settings, extensionRoots()),
 		getAvailableModels: () => modelRegistry.getAvailable(),
 		effectiveModelPatterns: agent =>

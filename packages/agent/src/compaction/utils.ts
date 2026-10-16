@@ -78,8 +78,12 @@ export function stripReadSelector(path: string): string {
 	return splitReadSelector(path).path;
 }
 
-export function isAlternateFormReadSelector(selector: string): boolean {
-	return selector.split(":").some(part => READ_ALTERNATE_FORM_RE.test(part));
+/**
+ * Whether a selector from {@link splitReadSelector} shows the file in a form other
+ * than its plain lines: verbatim `raw` bytes or the merge `conflicts` view.
+ */
+export function isAlternateFormReadSelector(sel: string): boolean {
+	return sel.split(":").some(part => READ_ALTERNATE_FORM_RE.test(part));
 }
 
 /**

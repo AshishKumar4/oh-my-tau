@@ -10,8 +10,19 @@ import {
 	type UsageLimit,
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
-import { Loader, Markdown, padding, Spacer, Text, visibleWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui";
+import {
+	type Component,
+	Loader,
+	Markdown,
+	padding,
+	Spacer,
+	Text,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@oh-my-pi/pi-tui";
 import { formatDuration, formatPercent, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
+import { getActiveProfile, getConfigDirName } from "@oh-my-pi/pi-utils/dirs";
+import { classifyTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
 import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
@@ -34,23 +45,30 @@ import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../../memor
 import { BashExecutionComponent, bashPtyViewport } from "@oh-my-pi/pi-tui/chat/bash-execution";
 import { appKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { BorderedLoader } from "@oh-my-pi/pi-tui/overlays/bordered-loader";
-import { DynamicBorder } from "@oh-my-pi/pi-tui/chrome/dynamic-border";
 import { EvalExecutionComponent } from "@oh-my-pi/pi-tui/chat/eval-execution";
 import { MoveOverlay, type MoveOverlayResult } from "@oh-my-pi/pi-tui/overlays/move-overlay";
 import { moveDirectorySource } from "../move-directory-source";
-import { TranscriptBlock } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { getMarkdownTheme, getSymbolTheme, theme, type Theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../../modes/types";
-import { ContextUsageView } from "@oh-my-pi/pi-tui/status-line/context-usage";
-import { JobsPanel } from "@oh-my-pi/pi-tui/overlays/jobs-panel";
+import { ContextUsageView, contextUsageHead } from "@oh-my-pi/pi-tui/status-line/context-usage";
+import type { OverlayHandle } from "@oh-my-pi/pi-tui";
+import { ReportPanel } from "@oh-my-pi/pi-tui/overlays/report-panel";
+import type { TspText } from "@oh-my-pi/pi-wire";
 import { computeSessionContextBreakdown } from "../../session/context-usage-runtime";
 import { buildHotkeysMarkdown, HotkeysSheetComponent } from "@oh-my-pi/pi-tui/hotkeys-markdown";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { buildToolsMarkdown } from "@oh-my-pi/pi-tui/prompt/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
+import { buildJobTree, jobTreeGuide, jobTreeIndent } from "@oh-my-pi/pi-tui/overlays/job-tree";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
 import { promptTokenTotal } from "../../session/prompt-cache-stats";
+import {
+	currentRuntimeIdentity,
+	formatRuntimeIdentity,
+	runtimeIdentityHistory,
+	sameRuntimeIdentity,
+} from "../../session/runtime-identity";
 import type { NewSessionOptions } from "../../session/session-entries";
 import {
 	cleanSourceCheckoutIfConfigured,
@@ -68,6 +86,8 @@ import {
 } from "../../slash-commands/helpers/active-oauth-account";
 import { formatProviderName } from "@oh-my-pi/pi-tui/chrome/format";
 import { formatCompactQuota } from "@oh-my-pi/pi-tui/overlays/advisor-config";
+import { resolveTernPane } from "../../tools/browser/tern/kind";
+import { TernError, type TernErrorKind, TernSocketClient } from "../../tools/browser/tern/wire";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs, shortenPath, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -79,6 +99,7 @@ import {
 	selectChangelogEntries,
 } from "../../utils/changelog";
 import { copyToClipboard } from "../../utils/clipboard";
+import { formatDumpArchiveReport, type SessionDumpArchive } from "../../session/session-dump-format";
 import { openPath } from "../../utils/open";
 import { resumeCommand } from "../../utils/resume-command";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
@@ -93,26 +114,181 @@ import type { UnavailableUsageAccount } from "@oh-my-pi/pi-tui/overlays/usage-da
 import { cfgTerminalShowImages } from "../settings";
 import { cfgProviderAppendOnlyContext } from "../../session/settings";
 import { cfgShareRedactSecrets, cfgShareServerUrl, cfgShareStore } from "../../commands/settings";
+import { flagConsumesValue, restartArgv } from "../../cli/flag-tables";
+import {
+	createDefaultTerminalLaunchRequest,
+	getTerminalLaunchPlacement,
+	launchTerminal,
+	TerminalLaunchError,
+	type TerminalLaunchRequest,
+	type TerminalLaunchResult,
+} from "../../subprocess/terminal-launch";
+import { resolveCliEntryCmd } from "../../subprocess/worker-client";
+
+/** How long `/fork` waits for Tern to open the fork's pane. */
+const TERN_FORK_TIMEOUT_MS = 10_000;
+
+/** Fork failures after which Tern may still open the pane, so `/fork` must not also fork in place. */
+const TERN_FORK_UNCONFIRMED: Partial<Record<TernErrorKind, true>> = { closed: true, timeout: true, protocol: true };
+
+/** Rows `/session` spends on the builds that wrote the session, including the elision row. */
+const MAX_LISTED_BUILDS = 5;
 
 function formatCreditValue(value: number): string {
 	return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
 }
 
-function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown: string): void {
-	const block = new TranscriptBlock();
-	block.addChild(new DynamicBorder());
-	block.addChild(new Text(theme.bold(theme.fg("accent", title)), 1, 0));
-	block.addChild(new Spacer(1));
-	block.addChild(new Markdown(markdown.trim(), 1, 1, getMarkdownTheme()));
-	block.addChild(new DynamicBorder());
-	ctx.presentCommandOutput(block);
+interface ForkTerminalDependencies {
+	classifyTerminalMultiplexer: typeof classifyTerminalMultiplexer;
+	environment: () => NodeJS.ProcessEnv;
+	launchTerminal: (request: TerminalLaunchRequest) => Promise<TerminalLaunchResult>;
+	resolveCliEntryCmd: typeof resolveCliEntryCmd;
+	getActiveProfile: typeof getActiveProfile;
+	argv: () => string[];
+}
+
+/**
+ * Startup flags the fork child re-supplies from the parent's live state
+ * (`--profile`, `--model`, `--thinking`, `--prompt-cache-key`) or that would
+ * re-point it at a stale scope (`--config`/`--cwd`/`--provider`; the child
+ * gets the effective overlays via `PI_CONFIG_FILES` and the session cwd).
+ */
+const FORK_LAUNCH_OVERRIDES: Readonly<Record<string, true>> = {
+	"--config": true,
+	"--cwd": true,
+	"--model": true,
+	"--profile": true,
+	"--prompt-cache-key": true,
+	"--provider": true,
+	"--thinking": true,
+};
+
+/**
+ * `env` prefix pinning each scope variable for the fork child. Multiplexer
+ * servers keep stale environment snapshots, so every variable is pinned:
+ * defined values are assigned, absent (or empty) ones are unset with `-u`
+ * (which must precede the assignments) rather than exported as empty strings
+ * that `??`-style consumers would treat as a set, relative path.
+ */
+function forkScopeEnvCommand(scope: Readonly<Record<string, string | undefined>>): string[] {
+	const unset: string[] = [];
+	const assignments: string[] = [];
+	for (const [name, value] of Object.entries(scope)) {
+		if (value) assignments.push(`${name}=${value}`);
+		else unset.push("-u", name);
+	}
+	return ["env", ...unset, ...assignments];
+}
+
+function hasForkApiKeyOverride(argv: string[]): boolean {
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]!;
+		if (arg === "--api-key" || arg.startsWith("--api-key=")) return true;
+		if (flagConsumesValue(arg, argv[i + 1])) i++;
+	}
+	return false;
 }
 
 export class CommandController {
-	/** The last `/context` card mounted, reused so repeated runs never stack cards. */
-	#contextView: ContextUsageView | undefined;
+	/** The open native report sheet. */
+	#reportSheet: OverlayHandle | undefined;
+	#forkTerminalDependencies: ForkTerminalDependencies;
 
-	constructor(private readonly ctx: InteractiveModeContext) {}
+	constructor(
+		private readonly ctx: InteractiveModeContext,
+		forkTerminalDependencies: Partial<ForkTerminalDependencies> = {},
+	) {
+		this.#forkTerminalDependencies = {
+			classifyTerminalMultiplexer,
+			environment: () => process.env,
+			launchTerminal,
+			resolveCliEntryCmd,
+			getActiveProfile,
+			argv: () => process.argv.slice(2),
+			...forkTerminalDependencies,
+		};
+	}
+
+	/** Esc: take away the report shown above the editor (text mode); false when none is shown. */
+	dismissCommandReport(): boolean {
+		return this.#clearReport();
+	}
+
+	/**
+	 * Drop any report — the one above the editor, or a focused sheet/page —
+	 * because the transcript or session under it was reset, and its contents
+	 * describe what is gone.
+	 */
+	clearCommandReport(): void {
+		this.#clearReport();
+		this.#closeReportSheet();
+	}
+
+	#clearReport(): boolean {
+		const docked = this.ctx.reportContainer;
+		if (docked.children.length === 0) return false;
+		docked.dispose();
+		docked.clear();
+		this.ctx.ui.requestRender();
+		return true;
+	}
+
+	#closeReportSheet(): void {
+		const sheet = this.#reportSheet;
+		if (!sheet) return;
+		this.#reportSheet = undefined;
+		sheet.hide();
+		this.ctx.ui.setFocus(this.ctx.editorContainer.children[0] ?? this.ctx.editor);
+		this.ctx.ui.requestRender();
+	}
+
+	/**
+	 * Show a read-only report, replacing the previous one. In text mode one that
+	 * fits the rows above the editor shows there like `/btw`: the editor keeps
+	 * focus and its Esc takes the report away. A taller one opens as a
+	 * full-screen page on the terminal's alternate screen, scrolled with the
+	 * arrow/page keys and the wheel, so the main screen is never touched and
+	 * Esc returns to it as it was. Natively it is a focused sheet like
+	 * `/usage`, its body scrolled by the terminal once it is long, closed by
+	 * Esc or Close.
+	 */
+	showCommandReport(options: { title: string; head?: TspText; body: Component }): void {
+		this.#clearReport();
+		this.#closeReportSheet();
+		const terminal = this.ctx.ui.terminal;
+		const inline = this.ctx.commandReportRows() ?? terminal.rows;
+		let fullScreen = false;
+		const report = new ReportPanel({
+			...options,
+			closeKey: appKey(this.ctx.keybindings, "app.interrupt"),
+			onClose: () => this.#closeReportSheet(),
+			maxRows: () => (fullScreen ? terminal.rows : this.ctx.commandReportRows()),
+		});
+		if (isNativeRendering()) {
+			report.holdFocus();
+			this.#reportSheet = this.ctx.ui.showOverlay(report, { anchor: "center", width: "90%", maxHeight: "90%" });
+			this.ctx.ui.setFocus(report);
+		} else if (report.heightAt(terminal.columns) > inline) {
+			fullScreen = true;
+			report.holdFocus();
+			this.#reportSheet = this.ctx.ui.showOverlay(report, {
+				anchor: "bottom-center",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+				fullscreen: true,
+			});
+			this.ctx.ui.setFocus(report);
+		} else {
+			this.ctx.reportContainer.addChild(report);
+		}
+		this.ctx.ui.requestRender();
+	}
+
+	/** A titled markdown report; see {@link showCommandReport}. */
+	#showMarkdownPanel(title: string, markdown: string): void {
+		this.showCommandReport({ title, body: new Markdown(markdown.trim(), 0, 0, getMarkdownTheme()) });
+	}
 
 	async #restoreAfterMoveFailure(
 		previousState: Parameters<InteractiveModeContext["sessionManager"]["rollbackMove"]>[0],
@@ -230,6 +406,30 @@ export class CommandController {
 			this.ctx.showStatus(statusParts.join("\n"));
 		} catch (error: unknown) {
 			this.ctx.showError(`Failed to copy session: ${error instanceof Error ? error.message : "Unknown error"}`);
+		}
+	}
+
+	handleDumpAllCommand(): Promise<void> {
+		return this.#writeDumpArchive(() => this.ctx.session.dumpSessionArchiveToTmpDir());
+	}
+
+	handleDumpAnonCommand(): Promise<void> {
+		return this.#writeDumpArchive(() => this.ctx.session.dumpAnonymizedArchiveToTmpDir());
+	}
+
+	async #writeDumpArchive(write: () => Promise<SessionDumpArchive | undefined>): Promise<void> {
+		try {
+			const archive = await write();
+			if (!archive) {
+				this.ctx.showError("No messages to dump yet.");
+				return;
+			}
+			await copyToClipboard(archive.path);
+			this.ctx.showStatus([...formatDumpArchiveReport(archive), "Archive path copied to clipboard"].join("\n"));
+		} catch (error: unknown) {
+			this.ctx.showError(
+				`Failed to write session dump: ${error instanceof Error ? error.message : "Unknown error"}`,
+			);
 		}
 	}
 
@@ -367,6 +567,23 @@ export class CommandController {
 		let info = "";
 		info += `${theme.fg("dim", "File:")} ${stats.sessionFile ?? "In-memory"}\n`;
 		info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n`;
+		const builds = runtimeIdentityHistory(this.ctx.session.sessionManager.getEntries());
+		const running = currentRuntimeIdentity();
+		// A source checkout's diff hash changes with each edit, so a long-lived session can collect
+		// many builds: keep the first and the latest few. Every row is keyed so the overlay never
+		// mistakes a colourless continuation row for a section heading.
+		const hidden = builds.length > MAX_LISTED_BUILDS ? builds.length - MAX_LISTED_BUILDS + 1 : 0;
+		for (const [index, build] of builds.entries()) {
+			if (hidden > 0 && index > 0 && index <= hidden) {
+				if (index === 1) info += `${theme.fg("dim", `Builds 2–${hidden + 1}:`)} ${hidden} more\n`;
+				continue;
+			}
+			const key = builds.length === 1 ? "Build:" : `Build ${index + 1}:`;
+			info += `${theme.fg("dim", key)} ${replaceTabs(sanitizeText(formatRuntimeIdentity(build)))}\n`;
+		}
+		if (!sameRuntimeIdentity(builds[builds.length - 1], running)) {
+			info += `${theme.fg("dim", "Running:")} ${replaceTabs(sanitizeText(formatRuntimeIdentity(running)))}\n`;
+		}
 		info += `\n${theme.bold("Provider")}\n`;
 		const model = this.ctx.session.model;
 		if (!model) {
@@ -500,20 +717,19 @@ export class CommandController {
 	async handleAdvisorStatusCommand(): Promise<void> {
 		const stats = this.ctx.session.getAdvisorStats();
 		if (!stats.configured) {
-			this.ctx.presentCommandOutput([new Spacer(1), new Text("Advisor is disabled.", 1, 0)]);
+			this.showCommandReport({ title: "Advisor Status", body: new Text("Advisor is disabled.", 0, 0) });
 			return;
 		}
-		// Fetch live quota data (cached 5 min by the auth-gateway) so we can show
-		// real usage windows/reset timers per advisor provider. Non-fatal when absent.
-		const usageProvider = this.ctx.session as { fetchUsageReports?: () => Promise<UsageReport[] | null> };
-		let usageReports: UsageReport[] | null = null;
-		if (usageProvider.fetchUsageReports) {
-			try {
-				usageReports = await usageProvider.fetchUsageReports();
-			} catch {
-				// Network/auth failure is non-fatal — just skip the quota line.
-			}
-		}
+		// Render cached quota data without waiting for the network. Quota lines
+		// are optional, and the refresh below serves the next invocation.
+		const usageProvider = this.ctx.session as {
+			cachedUsageReports?: UsageReport[];
+			fetchUsageReports?: () => Promise<UsageReport[] | null>;
+		};
+		const usageReports: UsageReport[] | null = usageProvider.cachedUsageReports ?? null;
+		// Warm the snapshot for the next invocation. The fetch logs its own
+		// failures, and a missing quota line is non-fatal by design.
+		void usageProvider.fetchUsageReports?.().catch(() => {});
 		// Resolve the active OAuth identity for each advisor's provider so quota
 		// filtering matches the credential actually in use (not sibling accounts).
 		const resolveActiveAdvisorAccount = (provider: string, sessionId?: string): OAuthAccountIdentity | undefined =>
@@ -523,7 +739,7 @@ export class CommandController {
 		// none are live (all paused/no-model). The old code returned a generic
 		// message that hid the per-advisor state the user needs to act on.
 		if (stats.advisors.length > 1 || (stats.configured && !stats.active)) {
-			let info = `${theme.bold("Advisor Status")} (${stats.advisors.length} advisors)\n`;
+			let info = "";
 			for (const a of stats.advisors) {
 				const glyph = CommandController.#advisorStatusGlyph[a.status] ?? "?";
 				const label = CommandController.#advisorStatusLabel[a.status] ?? a.status;
@@ -564,12 +780,15 @@ export class CommandController {
 				info += `${theme.fg("dim", "Tokens:")} ${stats.tokens.total.toLocaleString()}\n`;
 				if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
 			}
-			this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
+			this.showCommandReport({
+				title: `Advisor Status (${stats.advisors.length} advisors)`,
+				body: new Text(info.trim(), 0, 0),
+			});
 			return;
 		}
 		// Single active advisor — detailed view.
 		const model = stats.model;
-		let info = `${theme.bold("Advisor Status")}\n\n`;
+		let info = "";
 		if (stats.advisors.length === 1) {
 			const a = stats.advisors[0];
 			const glyph = CommandController.#advisorStatusGlyph[a.status] ?? "?";
@@ -611,58 +830,68 @@ export class CommandController {
 			info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
 		}
 		if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
-		this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
+		this.showCommandReport({ title: "Advisor Status", body: new Text(info.trim(), 0, 0) });
 	}
 
+	/**
+	 * `/jobs`: natively the live jobs sheet the jobs pill opens (inspect and
+	 * cancel included); `/jobs full`, and text mode, a report of the running
+	 * and recent jobs (see {@link showCommandReport}). Both list the viewed
+	 * session's jobs and its subagents' as a tree (see {@link buildJobTree}).
+	 */
 	async handleJobsCommand(options?: { full?: boolean }): Promise<void> {
 		const full = options?.full === true;
-		const snapshot = this.ctx.session.getAsyncJobSnapshot({ recentLimit: 5 });
-		if (!snapshot) {
+		const tree = this.ctx.viewSession.getAsyncJobTree();
+		if (!tree) {
 			this.ctx.showWarning("Async background jobs are unavailable in this session.");
+			return;
+		}
+		if (isNativeRendering() && !full) {
+			this.ctx.showJobsSheet();
 			return;
 		}
 
 		const now = Date.now();
-		const lineWidth = Math.max(24, (this.ctx.ui.terminal.columns ?? 100) - 24);
-		let info = `${theme.bold("Background Jobs")}\n\n`;
-		info += `${theme.fg("dim", "Running:")} ${snapshot.running.length}\n`;
-
-		if (snapshot.running.length === 0 && snapshot.recent.length === 0) {
-			info += `\n${theme.fg("dim", "No async jobs yet.")}\n`;
-			this.ctx.presentCommandOutput(new JobsPanel(snapshot, now, [new Spacer(1), new Text(info, 1, 0)]));
+		const columns = this.ctx.ui.terminal.columns ?? 100;
+		let info = `${theme.fg("dim", "Running:")} ${tree.running.length}\n`;
+		if (tree.running.length === 0 && tree.recent.length === 0) {
+			info += `\n${theme.fg("dim", "No async jobs yet.")}`;
+			this.showCommandReport({ title: "Background Jobs", body: new Text(info, 0, 0) });
 			return;
 		}
 
-		// Full mode wraps here so every line, including heredoc lines and wrap
-		// continuations, keeps the two-column indent under its job row.
-		const commandWidth = Math.max(1, (this.ctx.ui.terminal.columns ?? 100) - 4);
-		const describe = (job: AsyncJobSnapshotItem): string => {
-			if (!full) return `  ${theme.fg("dim", truncateJobLabel(job.label, lineWidth))}`;
-			const command = replaceTabs(sanitizeText(job.command ?? job.label));
-			return wrapTextWithAnsi(command, commandWidth)
-				.map(line => `  ${theme.fg("dim", line)}`)
-				.join("\n");
-		};
-
-		if (snapshot.running.length > 0) {
-			info += `\n${theme.bold("Running Jobs")}\n`;
-			for (const job of snapshot.running) {
-				info += `${renderJobLine(job, now)}\n`;
-				info += `${describe(job)}\n`;
+		// Lines under a row hang off its tree rails. Full mode wraps here so
+		// every line, including heredoc lines and wrap continuations, keeps that
+		// indent inside the report box.
+		info += "\n";
+		for (const row of buildJobTree([...tree.running, ...tree.recent], tree.agents, tree.rootId)) {
+			const guide = theme.fg("dim", jobTreeGuide(row, theme));
+			if (row.kind === "agent") {
+				info += `${guide}${theme.bold(row.agent.id)}\n`;
+				continue;
+			}
+			const { job } = row;
+			// A spawned subagent's task job takes the agent's id as its id and label: name it once.
+			const agent = row.agent && row.agent.id !== job.id ? ` ${theme.bold(row.agent.id)}` : "";
+			info += `${guide}${renderJobLine(job, now)}${agent}\n`;
+			const text = full ? (job.command ?? job.label) : job.label;
+			if (text === job.id) continue;
+			const indent = jobTreeIndent(row, theme);
+			const prefix = theme.fg("dim", indent);
+			if (!full) {
+				const label = truncateJobLabel(text, Math.max(24, columns - 22 - visibleWidth(indent)));
+				info += `${prefix}${theme.fg("dim", label)}\n`;
+				continue;
+			}
+			for (const line of wrapTextWithAnsi(
+				replaceTabs(sanitizeText(text)),
+				Math.max(1, columns - 4 - visibleWidth(indent)),
+			)) {
+				info += `${prefix}${theme.fg("dim", line)}\n`;
 			}
 		}
 
-		if (snapshot.recent.length > 0) {
-			info += `\n${theme.bold("Recent Jobs")}\n`;
-			for (const job of snapshot.recent) {
-				info += `${renderJobLine(job, now)}\n`;
-				info += `${describe(job)}\n`;
-			}
-		}
-
-		// The native jobs panel truncates labels, so full mode renders plain text only
-		const body = [new Spacer(1), new Text(info.trimEnd(), 1, 0)];
-		this.ctx.presentCommandOutput(full ? body : new JobsPanel(snapshot, now, body));
+		this.showCommandReport({ title: "Background Jobs", body: new Text(info.trimEnd(), 0, 0) });
 	}
 
 	async handleUsageCommand(reports?: UsageReport[] | null): Promise<void> {
@@ -709,19 +938,13 @@ export class CommandController {
 				? ""
 				: `\n\n${theme.fg("dim", "Use")} ${theme.bold("/changelog full")} ${theme.fg("dim", "to view the complete changelog.")}`;
 
-		const block = new TranscriptBlock();
-		block.addChild(new DynamicBorder());
-		block.addChild(new Text(theme.bold(theme.fg("accent", title)), 1, 0));
-		block.addChild(new Spacer(1));
-		block.addChild(new Markdown(changelogMarkdown + hint, 1, 1, getMarkdownTheme()));
-		block.addChild(new DynamicBorder());
-		this.ctx.presentCommandOutput(block);
+		this.#showMarkdownPanel(title, changelogMarkdown + hint);
 	}
 
 	handleHotkeysCommand(): void {
 		const bindings = { keybindings: this.ctx.keybindings };
 		if (isNativeRendering()) {
-			// A native terminal gets a dismissable sheet with keycaps instead of a transcript table.
+			// A native terminal gets a dismissable sheet with keycaps instead of a markdown table.
 			const sheet = new HotkeysSheetComponent(bindings, () => {
 				handle.hide();
 				this.ctx.ui.setFocus(this.ctx.editorContainer.children[0] ?? this.ctx.editor);
@@ -732,7 +955,7 @@ export class CommandController {
 			this.ctx.ui.requestRender();
 			return;
 		}
-		showMarkdownPanel(this.ctx, "Keyboard Shortcuts", buildHotkeysMarkdown(bindings));
+		this.#showMarkdownPanel("Keyboard Shortcuts", buildHotkeysMarkdown(bindings));
 	}
 
 	handleToolsCommand(): void {
@@ -740,7 +963,7 @@ export class CommandController {
 			tools: this.ctx.session.agent.state.tools,
 			xdevTools: this.ctx.session.getXdevToolEntries(),
 		});
-		showMarkdownPanel(this.ctx, "Available Tools", tools);
+		this.#showMarkdownPanel("Available Tools", tools);
 	}
 
 	handleContextCommand(): void {
@@ -749,25 +972,12 @@ export class CommandController {
 			this.ctx.showWarning("Context usage is unavailable: no model is selected for this session.");
 			return;
 		}
-		const chat = this.ctx.chatContainer;
-		const prev = this.#contextView;
-		// Identity check: a handle left over from a cleared/switched transcript is ignored.
-		if (prev && chat.children.includes(prev) && chat.canRemoveBlock(prev)) {
-			if (chat.children.at(-1) === prev) {
-				prev.setBreakdown(breakdown);
-				this.ctx.ui.requestRender();
-				return;
-			}
-			chat.removeChild(prev);
-		}
-		const view = new ContextUsageView(breakdown, theme);
-		this.ctx.presentCommandOutput(view);
-		this.#contextView = view;
-	}
-
-	/** Forget the tracked `/context` card (the transcript it lived in was reset). */
-	resetContextView(): void {
-		this.#contextView = undefined;
+		// Natively the body is `/context`'s own card (meters, legend, compaction mark).
+		this.showCommandReport({
+			title: "Context Usage",
+			head: contextUsageHead(breakdown),
+			body: new ContextUsageView(breakdown, theme),
+		});
 	}
 
 	async handleMemoryCommand(text: string): Promise<void> {
@@ -777,18 +987,17 @@ export class CommandController {
 		const backend = await resolveMemoryBackend(this.ctx.settings);
 
 		if (action === "view") {
-			const payload = await backend.buildDeveloperInstructions(agentDir, this.ctx.settings, this.ctx.session);
+			const payload = await backend.buildDeveloperInstructions(
+				agentDir,
+				this.ctx.sessionManager.getCwd(),
+				this.ctx.settings,
+				this.ctx.session,
+			);
 			if (!payload) {
 				this.ctx.showWarning("Memory payload is empty (memory backend off, disabled, or no memory available).");
 				return;
 			}
-			const block = new TranscriptBlock();
-			block.addChild(new DynamicBorder());
-			block.addChild(new Text(theme.bold(theme.fg("accent", "Memory Injection Payload")), 1, 0));
-			block.addChild(new Spacer(1));
-			block.addChild(new Markdown(payload, 1, 1, getMarkdownTheme()));
-			block.addChild(new DynamicBorder());
-			this.ctx.presentCommandOutput(block);
+			this.#showMarkdownPanel("Memory Injection Payload", payload);
 			return;
 		}
 
@@ -823,7 +1032,7 @@ export class CommandController {
 					this.ctx.showWarning(`Memory queue is not available for the ${backend.id} backend.`);
 					return;
 				}
-				showMarkdownPanel(this.ctx, "Memory Queue", payload);
+				this.#showMarkdownPanel("Memory Queue", payload);
 			} catch (error) {
 				this.ctx.showError(`Memory queue failed: ${error instanceof Error ? error.message : String(error)}`);
 			}
@@ -848,7 +1057,7 @@ export class CommandController {
 					this.ctx.showWarning(memoryStatsUnavailableMessage(backend.id, action));
 					return;
 				}
-				showMarkdownPanel(this.ctx, `Memory ${action === "stats" ? "Stats" : "Diagnostics"}`, payload);
+				this.#showMarkdownPanel(`Memory ${action === "stats" ? "Stats" : "Diagnostics"}`, payload);
 			} catch (error) {
 				this.ctx.showError(`Memory ${action} failed: ${error instanceof Error ? error.message : String(error)}`);
 			}
@@ -924,7 +1133,7 @@ export class CommandController {
 				.slice()
 				.sort((a, b) => a.id.localeCompare(b.id))
 				.map(summarizeMentalModel);
-			showMarkdownPanel(this.ctx, `Mental Models — ${state.bankId}`, lines.join("\n"));
+			this.#showMarkdownPanel(`Mental Models — ${state.bankId}`, lines.join("\n"));
 		} catch (error) {
 			this.ctx.showError(`mm list failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -941,11 +1150,7 @@ export class CommandController {
 			const refreshed = model.last_refreshed_at ? `\n_last refreshed: ${model.last_refreshed_at}_` : "";
 			const sourceQuery = model.source_query ? `\n\n**Source query:** ${model.source_query}` : "";
 			const content = (model.content ?? "_(empty — background reflect may still be running)_").trim();
-			showMarkdownPanel(
-				this.ctx,
-				model.name,
-				`**id:** \`${model.id}\`${tags}${refreshed}${sourceQuery}\n\n${content}`,
-			);
+			this.#showMarkdownPanel(model.name, `**id:** \`${model.id}\`${tags}${refreshed}${sourceQuery}\n\n${content}`);
 		} catch (error) {
 			this.ctx.showError(`mm show failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -1032,7 +1237,7 @@ export class CommandController {
 				const diff = diffMentalModelContent(before, after);
 				sections.push(`### ${history[i].changed_at}\n\n\`\`\`diff\n${diff}\n\`\`\``);
 			}
-			showMarkdownPanel(this.ctx, `History — ${model.name}`, sections.join("\n\n"));
+			this.#showMarkdownPanel(`History — ${model.name}`, sections.join("\n\n"));
 		} catch (error) {
 			this.ctx.showError(`mm history failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -1193,7 +1398,17 @@ export class CommandController {
 		await this.#runNewSessionFlow({ drop: true }, "Session deleted");
 	}
 
-	async handleForkCommand(): Promise<void> {
+	async handleForkCommand(placement?: "pane" | "window"): Promise<void> {
+		if (placement !== undefined) {
+			await this.#handleForkTerminalCommand(placement);
+			return;
+		}
+
+		// A Tern pane fork leaves this session untouched, so it may run mid-turn.
+		if (await this.#forkIntoTernPane()) return;
+
+		// An in-place fork moves this process onto the new file; a running turn
+		// would finish there and leave the original transcript cut mid-turn.
 		if (this.ctx.session.isStreaming) {
 			this.ctx.showWarning("Wait for the current response to finish or abort it before forking.");
 			return;
@@ -1232,6 +1447,182 @@ export class CommandController {
 				1,
 			),
 		]);
+	}
+
+	async #handleForkTerminalCommand(placement: "pane" | "window"): Promise<void> {
+		const dependencies = this.#forkTerminalDependencies;
+		const environment = dependencies.environment();
+		const multiplexer = dependencies.classifyTerminalMultiplexer(environment);
+		const placementInfo = getTerminalLaunchPlacement(multiplexer, placement);
+		if ("error" in placementInfo) {
+			this.ctx.showError(placementInfo.error);
+			return;
+		}
+
+		if (this.ctx.session.isStreaming) {
+			const confirmed = await this.ctx.showHookConfirm(
+				"Fork while a response is running?",
+				"The child may not include the partial response. Continue opening a fork? The current session will keep running here.",
+			);
+			if (!confirmed) return;
+		}
+
+		const initialSessionFile = this.ctx.sessionManager.getSessionFile();
+		if (!initialSessionFile) {
+			this.ctx.showError("Cannot open a fork in another terminal: the current session has not been persisted yet.");
+			return;
+		}
+
+		const childArgs = restartArgv(dependencies.argv(), undefined, FORK_LAUNCH_OVERRIDES);
+		if (hasForkApiKeyOverride(childArgs)) {
+			this.ctx.showError(
+				"Cannot open a fork in another terminal when --api-key was supplied at startup; the key cannot be forwarded without exposing it in the multiplexer command. Configure provider credentials in the auth store and retry.",
+			);
+			return;
+		}
+		const shellGrammar = placementInfo.shellGrammar;
+		if (shellGrammar === "posix") {
+			const confirmed = await this.ctx.showHookConfirm(
+				"Confirm destination shell compatibility",
+				"This fork command uses POSIX shell syntax. Continue only if the destination's configured interactive shell accepts POSIX syntax; this cannot be inferred from the current terminal.",
+			);
+			if (!confirmed) {
+				this.ctx.showWarning("Fork cancelled: POSIX shell compatibility was not confirmed for the destination.");
+				return;
+			}
+		}
+
+		try {
+			await this.ctx.sessionManager.flush();
+		} catch (error) {
+			logger.error("Failed to flush the session before opening a terminal fork", { error });
+			this.ctx.showError("Cannot open a fork in another terminal: failed to save the current session.");
+			return;
+		}
+
+		const sessionFile = this.ctx.sessionManager.getSessionFile();
+		if (!sessionFile) {
+			this.ctx.showError("Cannot open a fork in another terminal: the current session is no longer persisted.");
+			return;
+		}
+		const sourceSessionFile = path.resolve(sessionFile);
+		try {
+			await fs.access(sourceSessionFile);
+		} catch {
+			this.ctx.showError("Cannot open a fork in another terminal: the persisted session transcript is unavailable.");
+			return;
+		}
+
+		try {
+			const activeProfile = dependencies.getActiveProfile();
+			const activeModel = this.ctx.session.model;
+			if (activeProfile) childArgs.push("--profile", activeProfile);
+			if (activeModel) childArgs.push("--model", `${activeModel.provider}/${activeModel.id}`);
+			const activeThinkingLevel = this.ctx.session.configuredThinkingLevel();
+			if (activeThinkingLevel !== undefined) childArgs.push("--thinking", activeThinkingLevel);
+			// Forcing --model/--thinking marks the fork's cache shape as changed, which would
+			// drop the inherited key. Automatic candidates travel in the source header;
+			// forwarding them as --prompt-cache-key would bypass their model gate.
+			if (
+				this.ctx.session.agent.promptCacheKey !== undefined ||
+				this.ctx.sessionManager.getHeader()?.taskPromptCacheKey === undefined
+			) {
+				childArgs.push("--prompt-cache-key", this.ctx.session.agent.promptCacheKey ?? this.ctx.session.sessionId);
+			}
+			childArgs.push("--fork", sourceSessionFile);
+			// Pin only non-secret scope variables.
+			const command = [
+				...forkScopeEnvCommand({
+					PI_CODING_AGENT_DIR: this.ctx.settings.getAgentDir(),
+					PI_CONFIG_DIR: getConfigDirName(),
+					OMP_PROFILE: activeProfile,
+					PI_PROFILE: activeProfile,
+					PI_CONFIG_FILES: this.ctx.settings.getConfigFiles().join(path.delimiter),
+					PI_CODING_AGENT_SESSION_DIR: environment.PI_CODING_AGENT_SESSION_DIR,
+					XDG_DATA_HOME: environment.XDG_DATA_HOME,
+					XDG_STATE_HOME: environment.XDG_STATE_HOME,
+					XDG_CACHE_HOME: environment.XDG_CACHE_HOME,
+				}),
+				...dependencies.resolveCliEntryCmd(),
+				...childArgs,
+			];
+			const launchPlan = createDefaultTerminalLaunchRequest(
+				multiplexer,
+				placement,
+				command,
+				this.ctx.sessionManager.getCwd(),
+				shellGrammar,
+			);
+			if ("error" in launchPlan) {
+				this.ctx.showError(launchPlan.error);
+				return;
+			}
+
+			const result = await dependencies.launchTerminal(launchPlan.request);
+			if (result.warning) {
+				this.ctx.showWarning(
+					`Opened a fork in ${placementInfo.displayName}, but ${result.warning} This session continues here.`,
+				);
+				return;
+			}
+			this.ctx.showStatus(
+				`Opened a fork in ${placementInfo.displayName} (${placementInfo.placementLabel}); this session continues here.`,
+			);
+		} catch (error) {
+			logger.error("Failed to open a terminal fork", { multiplexer, error });
+			this.ctx.showError(
+				error instanceof TerminalLaunchError
+					? `Could not open a fork in ${placementInfo.displayName}: ${error.message}`
+					: `Could not open a fork in ${placementInfo.displayName}. See logs for details.`,
+			);
+		}
+	}
+
+	/**
+	 * `/fork` inside a Tern pane: ask Tern to run `omp --fork` of this session in a new pane beside
+	 * this one, which keeps the original session. False means fork in place instead: outside Tern,
+	 * an unsaved session, a Tern without `fork`, or Tern refusing it. Once the request is out, an
+	 * unconfirmed one is reported rather than retried in place, since Tern may still open the pane.
+	 */
+	async #forkIntoTernPane(): Promise<boolean> {
+		const tern = resolveTernPane();
+		if (!tern || !this.ctx.sessionManager.isSessionOnDisk()) return false;
+		const client = new TernSocketClient({ socketPath: tern.socketPath });
+		try {
+			try {
+				await client.connect();
+			} catch (error) {
+				logger.debug("Tern unreachable for /fork; forking in place", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return false;
+			}
+			if (!client.supports("fork")) return false;
+			// The new pane's omp reads the session file as it starts.
+			await this.ctx.session.flushToDisk();
+			try {
+				await client.fork({ block: tern.pane }, { timeoutMs: TERN_FORK_TIMEOUT_MS });
+			} catch (error) {
+				if (error instanceof TernError && !TERN_FORK_UNCONFIRMED[error.kind]) {
+					const details = { kind: error.kind, error: error.message };
+					if (error.kind === "failed") logger.warn("Tern could not open the fork pane; forking in place", details);
+					else logger.debug("Tern refused the fork; forking in place", details);
+					return false;
+				}
+				this.ctx.showError(
+					`Tern did not confirm the fork: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				return true;
+			}
+		} finally {
+			client.close();
+		}
+		const note = this.ctx.session.isStreaming ? " · the running response continues here, not in the fork" : "";
+		this.ctx.present([
+			new Spacer(1),
+			new Text(theme.fg("accent", `${theme.status.success} Session forked into a new pane${note}`), 1, 1),
+		]);
+		return true;
 	}
 
 	/**
@@ -1318,14 +1709,19 @@ export class CommandController {
 
 	/**
 	 * `/wt [<branch>]` — fork the checkout into a new linked git worktree on
-	 * `branch` (default `wt/<timestamp>`), carrying uncommitted changes along,
-	 * then relocate the session there like `/move`.
+	 * `branch` (default `wt/<timestamp>`), carrying uncommitted changes along
+	 * unless `keepChanges` is false, then relocate the session there like `/move`.
+	 * Returns the worktree only when the session now lives in it.
 	 */
-	async handleWorktreeCommand(branch?: string): Promise<void> {
+	async handleWorktreeCommand(
+		branch?: string,
+		options: { keepChanges?: boolean } = {},
+	): Promise<SessionWorktree | undefined> {
 		if (this.ctx.session.isStreaming) {
 			this.ctx.showWarning("Wait for the current response to finish or abort it before creating a worktree.");
-			return;
+			return undefined;
 		}
+		let created: SessionWorktree | undefined;
 		await this.#withSessionMove(async () => {
 			const branchName = branch?.trim() || defaultSessionWorktreeBranch();
 			const cwd = this.ctx.sessionManager.getCwd();
@@ -1341,7 +1737,7 @@ export class CommandController {
 			this.ctx.ui.requestRender();
 			let worktree: SessionWorktree;
 			try {
-				worktree = await createSessionWorktree(cwd, this.ctx.settings, branchName);
+				worktree = await createSessionWorktree(cwd, this.ctx.settings, branchName, options);
 			} catch (err) {
 				this.ctx.showError(`Worktree creation failed: ${err instanceof Error ? err.message : String(err)}`);
 				return false;
@@ -1356,7 +1752,10 @@ export class CommandController {
 				});
 			}
 			if (!(await this.#relocateSession(worktree.path))) return false;
-			const cleanup = await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings);
+			created = worktree;
+			const cleanup = worktree.keptChanges
+				? await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings)
+				: { cleaned: false, errorMessage: undefined };
 			if (cleanup.errorMessage !== undefined) {
 				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
 			}
@@ -1370,6 +1769,7 @@ export class CommandController {
 			]);
 			return true;
 		});
+		return created;
 	}
 
 	/** Save source settings before acquiring the gate for a complete relocation operation. */
@@ -1642,7 +2042,7 @@ export class CommandController {
 		}
 		this.ctx.rebuildChatFromMessages();
 		this.ctx.statusLine.invalidate();
-		this.ctx.ui.requestRender();
+		this.ctx.ui.requestRender(true, { clearScrollback: true });
 		this.ctx.showStatus(formatShakeSummary(result));
 	}
 
@@ -1806,6 +2206,7 @@ export class CommandController {
 			}
 		} finally {
 			this.#finishHandoffUi(handoffLoader);
+			await this.ctx.flushCompactionQueue({ willRetry: false });
 		}
 		this.ctx.ui.requestRender(true, { clearScrollback: true });
 	}

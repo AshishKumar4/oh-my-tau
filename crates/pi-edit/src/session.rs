@@ -326,7 +326,8 @@ impl Session {
 
 			let mut tag: Option<String> = None;
 			// Updated files register their response rows (plus still-valid prior
-			// provenance) against the minted tag: (store key, carried lines, drifted).
+			// provenance) against the minted tag: (store key, carried lines,
+			// drifted).
 			let mut provenance: Option<(PathBuf, Vec<u32>, bool)> = None;
 			match file.op {
 				FileOp::Delete => self.store.invalidate(&canonical),
@@ -379,8 +380,9 @@ impl Session {
 				.map_or_else(|| format!("[{header_path}]"), |tag| format!("[{header_path}#{tag}]"));
 			let text = format_file_text(&file, &header);
 			if let (Some((key, mut seen_lines, drifted)), Some(tag)) = (provenance, &response_tag) {
-				// A drifted write shows rows of the previewed text, not of the recorded
-				// version the tag names, so only carried lines stay anchorable.
+				// A drifted write shows rows of the previewed text, not of the
+				// recorded version the tag names, so only carried lines
+				// stay anchorable.
 				if !drifted {
 					seen_lines.extend(seen_lines_from_body(&text));
 				}
@@ -543,16 +545,8 @@ fn prune_snapshots(
 /// errors. Unknown languages never "parse", so they never regress.
 pub fn source_parses(code: &str, path: &str) -> bool {
 	let code = if code.is_empty() { "\n" } else { code };
-	pi_ast::summary::summarize_code(pi_ast::summary::SummaryOptions {
-		code:               code.to_owned(),
-		lang:               None,
-		path:               Some(path.to_owned()),
-		min_body_lines:     None,
-		min_comment_lines:  None,
-		unfold_until_lines: None,
-		unfold_limit_lines: None,
-	})
-	.is_ok_and(|summary| summary.parsed)
+	pi_ast::summary::parse_code_status(code, None, Some(path))
+		.is_ok_and(|language| language.is_some())
 }
 
 /// The persisted bytes differ from what was sent (an editor reformatted on

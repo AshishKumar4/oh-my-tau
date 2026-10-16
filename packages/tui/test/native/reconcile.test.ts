@@ -220,6 +220,43 @@ describe("Reconciler", () => {
 		expect(scrolls(reconciler.reconcile(regions, { ...cx, feature: () => false }))).toEqual([]);
 	});
 
+	it("reveals a node with a repeatable reveal when its `n` moves, never on its own add or re-add", () => {
+		const comp = new Described();
+		const reveals = (ops: readonly TspOp[]) => ops.filter(op => op[0] === "reveal");
+		const reconciler = new Reconciler("s:t");
+		const regions = { main: [comp], dock: [], layer: [] };
+		comp.current = { ...node("md", { text: "## Beta" }), reveal: { at: "start", n: 1 } };
+		expect(reveals(reconciler.reconcile(regions, cx))).toEqual([]);
+		comp.current = { ...node("md", { text: "## Beta" }), reveal: { at: "start", n: 2 } };
+		expect(reveals(reconciler.reconcile(regions, cx))).toEqual([["reveal", nativeComponentId(comp), "start"]]);
+		// Annotated, the section is re-added as a column: still where it was.
+		comp.current = { ...node("col", {}), reveal: { at: "start", n: 2 } };
+		expect(reveals(reconciler.reconcile(regions, cx))).toEqual([]);
+	});
+
+	it("focuses a field inside a sheet a dock component hoists into the layer", () => {
+		const sheet = new Described();
+		sheet.current = node("col", undefined, [
+			node(
+				"overlay",
+				{ modal: true },
+				[node("col", undefined, [node("input", { text: "linear" }, undefined, "field")])],
+				"sheet",
+			),
+		]);
+		const reconciler = new Reconciler("s:t");
+		const ops = reconciler.reconcile({ main: [], dock: [sheet], layer: [] }, cx);
+		const inputIds: string[] = [];
+		const collect = (n: { id?: string; k?: string; c?: readonly unknown[] }) => {
+			if (n.k === "input" && n.id) inputIds.push(n.id);
+			for (const child of n.c ?? []) collect(child as typeof n);
+		};
+		for (const op of ops) if (op[0] === "add") collect(op[4]);
+		expect(inputIds).toHaveLength(1);
+		expect(inputIds[0]).toContain("^sheet");
+		expect(reconciler.focusTarget(sheet)).toBe(inputIds[0]!);
+	});
+
 	it("moves a component to a new parent instead of re-adding it", () => {
 		const child = new Described();
 		child.current = node("text", { text: "kept" });

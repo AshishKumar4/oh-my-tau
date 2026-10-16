@@ -1,4 +1,4 @@
-import { logger, prompt } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import workpoolBatchTemplate from "../prompts/tools/workpool-batch.md" with { type: "text" };
 import workpoolTurnResultTemplate from "../prompts/tools/workpool-turn-result.md" with { type: "text" };
@@ -8,6 +8,7 @@ import type { CustomMessage } from "../session/messages";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { isCompletionProbeEnabled } from "./completion-probe";
 import { runSubagentFollowUpTurn } from "./executor";
 import {
 	type EffectiveSubagentPolicy,
@@ -18,7 +19,7 @@ import { type AgentProgress, oneLineLabel, type SingleResult, type TaskToolDetai
 import { buildWorkPoolOutputSchema, type WorkPoolYieldItem } from "./workpool-yield";
 
 import { cfgEvalWorkpoolFreshAgents } from "../eval/settings";
-import { cfgTaskCompletionProbeMs, cfgTaskMaxConcurrency, cfgTaskMaxRuntimeMs } from "./settings";
+import { cfgTaskMaxConcurrency, cfgTaskMaxRuntimeMs } from "./settings";
 
 /** One user-supplied unit tracked through a workpool batch. */
 export interface WorkPoolItem {
@@ -98,6 +99,7 @@ interface TurnOutcome {
 	output: string;
 	error?: string;
 	aborted?: boolean;
+	extractedToolData?: Record<string, unknown[]>;
 	abortReason?: string;
 }
 
@@ -411,7 +413,7 @@ export class WorkPool {
 							artifactsDir: this.session.getSessionFile()?.slice(0, -6),
 							maxRuntimeMs: cfgTaskMaxRuntimeMs.get(this.session.settings),
 							resultOwnerId: this.ownerId,
-							completionProbeMs: cfgTaskCompletionProbeMs.get(this.session.settings),
+							completionProbe: isCompletionProbeEnabled(this.session.settings, this.session.taskDepth ?? 0),
 						});
 					}
 				} catch (error) {
@@ -437,7 +439,15 @@ export class WorkPool {
 	async #finishTurn(agent: WorkPoolAgent, batch: WorkPoolBatch, result: TurnOutcome): Promise<void> {
 		batch.status = result.aborted ? "cancelled" : result.exitCode !== 0 || result.error ? "failed" : "completed";
 		batch.output = result.output;
-		for (const item of batch.items) item.status = batch.status;
+		const failedItems = new Set<string>();
+		for (const yielded of result.extractedToolData?.yield ?? []) {
+			if (!isRecord(yielded) || yielded.status !== "success" || typeof yielded.error !== "string") continue;
+			if (Array.isArray(yielded.type) && yielded.type.length === 1 && typeof yielded.type[0] === "string") {
+				failedItems.add(yielded.type[0]);
+			}
+		}
+		for (const item of batch.items)
+			item.status = batch.status === "completed" && failedItems.has(item.id) ? "failed" : batch.status;
 		agent.turns++;
 		agent.jobId = undefined;
 		const ref = AgentRegistry.global().get(agent.id);

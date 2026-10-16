@@ -1,5 +1,5 @@
-import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { toolWireSchema, validateToolArguments } from "@oh-my-pi/pi-ai";
+import { type AgentTool, type AgentToolResult, validateAgentToolArguments } from "@oh-my-pi/pi-agent-core";
+import { type ImageContent, toolWireSchema } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { type CodexNestedValue, codexNestedAliasForModel, codexNestedTargetEnabled } from "../../harness/codex-nested";
@@ -58,7 +58,7 @@ type ToolValue =
 	| {
 			text: string;
 			details?: unknown;
-			images?: Array<{ mimeType: string; data: string }>;
+			images?: Omit<ImageContent, "type">[];
 			hasError?: boolean;
 	  }
 	| CodexNestedValue;
@@ -161,7 +161,7 @@ export function bridgeValueFromToolResult(
 			content.type === "text" && typeof content.text === "string",
 	);
 	const imageBlocks = result.content.filter(
-		(content): content is { type: "image"; mimeType: string; data: string } =>
+		(content): content is ImageContent =>
 			content.type === "image" && typeof content.mimeType === "string" && typeof content.data === "string",
 	);
 	const text = textBlocks.map(block => block.text).join("");
@@ -173,7 +173,7 @@ export function bridgeValueFromToolResult(
 	if (result.details === undefined && imageBlocks.length === 0 && !hasError) return text;
 	const value: Exclude<ToolValue, string> = { text, details: result.details };
 	if (imageBlocks.length > 0) {
-		value.images = imageBlocks.map(block => ({ mimeType: block.mimeType, data: block.data }));
+		value.images = imageBlocks.map(({ type: _type, ...image }) => image);
 	}
 	if (hasError) value.hasError = true;
 	return value;
@@ -290,33 +290,25 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 	const toolCallId = `js-${name}-${crypto.randomUUID()}`;
 	// A schema-owned name stays tool data across alternatives. Deleting an
 	// invalid value to make another branch match could select a different operation.
+	// Harness `i` is dropped here exactly as `extractIntent` drops it on the direct
+	// path, so tools see identical args from both entry points.
 	const intentIsDeclared = schemaDeclaresIntentField(toolWireSchema(tool));
 	const validationArgs = isRecord(args) ? { ...args } : args;
 	if (isRecord(validationArgs) && !intentIsDeclared) delete validationArgs[INTENT_FIELD];
 	let validatedArgs: unknown;
 	try {
-		validatedArgs = validateToolArguments(tool, {
-			type: "toolCall",
-			id: toolCallId,
-			name,
-			arguments: validationArgs as Record<string, unknown>,
-		});
+		// Script-written args: `__parseError`/`__rawJson` keys are forged, so lenience strips them.
+		validatedArgs = validateAgentToolArguments(
+			tool,
+			{ type: "toolCall", id: toolCallId, name, arguments: validationArgs as Record<string, unknown> },
+			"payload",
+		);
 	} catch (error) {
-		if (!tool.lenientArgValidation) {
-			options.emitStatus?.({
-				op: name,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			throw error;
-		}
-		if (isRecord(validationArgs)) {
-			const fallback = { ...validationArgs };
-			delete fallback.__parseError;
-			delete fallback.__rawJson;
-			validatedArgs = fallback;
-		} else {
-			validatedArgs = validationArgs;
-		}
+		options.emitStatus?.({
+			op: name,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		throw error;
 	}
 	const shadowCell = options.shadowCell ?? getActiveEvalShadowCell();
 	if (shadowCell && options.identity) {

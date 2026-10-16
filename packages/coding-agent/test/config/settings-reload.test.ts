@@ -127,37 +127,82 @@ describe("Settings layer refresh", () => {
 		}
 	});
 
+	// Root ignores directory permissions and Windows ignores POSIX modes, so the save could not fail.
 	it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
-		"reloads over unsaved changes and writes them after the target becomes writable",
+		"reloads over a save that fails, keeping the unsaved change live until a later save lands",
 		async () => {
-			const directory = tempDir.join("readonly");
-			fs.mkdirSync(directory);
-			const target = path.join(directory, "config.yml");
-			fs.writeFileSync(target, YAML.stringify({ temperature: 0.1, modelRoles: { default: "openai/base" } }));
-			fs.symlinkSync(target, configPath());
-			fs.chmodSync(directory, 0o555);
+			// config.yml is a symlink into a read-only directory (e.g. a Nix store file).
+			const storeDir = tempDir.join("store");
+			const storeConfig = path.join(storeDir, "config.yml");
+			fs.mkdirSync(storeDir);
+			fs.writeFileSync(storeConfig, YAML.stringify({ temperature: 0.1, modelRoles: { default: "openai/base" } }));
+			fs.symlinkSync(storeConfig, configPath());
+			fs.chmodSync(storeDir, 0o555);
 			const settings = await Settings.init({ cwd: startProject, agentDir });
 			try {
 				cfgTemperature.set(settings, 0.5);
 				settings.setModelRole("default", "openai/session");
 				settings.setProjectModelRole("slow", "openai/project");
 				await expect(settings.flush()).rejects.toThrow();
+
+				// Every later reload (task preflight) must still succeed with the in-memory values.
 				await settings.reloadFromDisk();
 				await settings.reloadFromDisk();
 				expect(cfgTemperature.get(settings)).toBe(0.5);
 				expect(settings.getModelRole("default")).toBe("openai/session");
 				expect(settings.getProjectModelRole("slow")).toBe("openai/project");
-				fs.chmodSync(directory, 0o755);
+
+				fs.chmodSync(storeDir, 0o755);
 				await settings.reloadFromDisk();
-				expect(YAML.parse(await Bun.file(target).text())).toEqual({
+				expect(YAML.parse(await Bun.file(storeConfig).text())).toEqual({
 					temperature: 0.5,
 					modelRoles: { default: "openai/session" },
 				});
+				expect(cfgTemperature.get(settings)).toBe(0.5);
+				expect(settings.getModelRole("default")).toBe("openai/session");
+				expect(settings.getProjectModelRole("slow")).toBe("openai/project");
 			} finally {
-				fs.chmodSync(directory, 0o755);
+				fs.chmodSync(storeDir, 0o755);
 			}
 		},
 	);
+
+	it("keeps the last good global layer when a reload's save moves a malformed config aside", async () => {
+		await writeConfig({ temperature: 0.1, compaction: { enabled: false }, modelRoles: { default: "openai/base" } });
+		const settings = await Settings.init({ cwd: startProject, agentDir });
+		cfgTemperature.set(settings, 0.5);
+		await Bun.write(configPath(), "temperature: [\n");
+
+		await settings.reloadFromDisk();
+		expect(cfgTemperature.get(settings)).toBe(0.5);
+		expect(cfgCompactionEnabled.get(settings)).toBe(false);
+		expect(settings.getModelRole("default")).toBe("openai/base");
+
+		await settings.flush();
+		expect(YAML.parse(await Bun.file(configPath()).text())).toEqual({
+			temperature: 0.5,
+			compaction: { enabled: false },
+			modelRoles: { default: "openai/base" },
+		});
+	});
+
+	it("keeps the last good project model roles when a reload's save moves a malformed project config aside", async () => {
+		const projectConfig = path.join(getProjectAgentDir(startProject), "config.yml");
+		fs.mkdirSync(path.dirname(projectConfig), { recursive: true });
+		await Bun.write(projectConfig, YAML.stringify({ modelRoles: { plan: "openai/plan" } }));
+		const settings = await Settings.init({ cwd: startProject, agentDir });
+		settings.setProjectModelRole("slow", "openai/project");
+		await Bun.write(projectConfig, "modelRoles: [\n");
+
+		await settings.reloadFromDisk();
+		expect(settings.getProjectModelRole("plan")).toBe("openai/plan");
+		expect(settings.getProjectModelRole("slow")).toBe("openai/project");
+
+		await settings.flush();
+		expect(YAML.parse(await Bun.file(projectConfig).text())).toEqual({
+			modelRoles: { plan: "openai/plan", slow: "openai/project" },
+		});
+	});
 
 	it.each([false, true])(
 		"keeps each quarantined file at its normal precedence, fresh foreign source=%s",

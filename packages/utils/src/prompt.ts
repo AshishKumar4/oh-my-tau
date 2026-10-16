@@ -1,5 +1,5 @@
-import type { HelperDelegate, Template } from "./template";
 import { LRUCache } from "./lru";
+import type { HelperDelegate, Template } from "./template";
 import * as Handlebars from "./template";
 
 export type { HelperDelegate, HelperOptions, Template, TemplateDelegate } from "./template";
@@ -527,6 +527,7 @@ export function registerPartial(name: string, fn: Template): void {
 	handlebars.registerPartial(name, fn);
 }
 
+// Bounded: some callers compile template text that already embeds user arguments.
 const compiledTemplateCache = new LRUCache<string, (context: TemplateContext) => string>({ max: 256 });
 
 export function compile(template: string): (context: TemplateContext) => string {

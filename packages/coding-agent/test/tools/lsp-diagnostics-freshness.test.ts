@@ -9,8 +9,8 @@ import { formatContent, INLINE_DIAGNOSTICS_WAIT_TIMEOUT_MS } from "@oh-my-pi/pi-
 import type { Diagnostic, LinterClient, LspClient, ServerConfig } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import { EquivalentUriMap, fileToUri } from "@oh-my-pi/pi-coding-agent/lsp/utils";
 import type { DeferredDiagnosticsEntry, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
+import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { type ptree, TempDir } from "@oh-my-pi/pi-utils";
 
 const TEST_SERVER: ServerConfig = {
@@ -54,7 +54,6 @@ function createClient(cwd: string, config: ServerConfig): LspClient {
 		diagnosticsVersion: 0,
 		openFiles: new Map(),
 		pendingRequests: new Map(),
-		messageBuffer: new Uint8Array(),
 		isReading: false,
 		status: "ready",
 		lastActivity: Date.now(),
@@ -845,9 +844,12 @@ describe("LSP diagnostics freshness", () => {
 	});
 
 	it("suppresses TypeScript project diagnostics for orphan files but keeps syntax errors", async () => {
+		// Use a marker that cannot exist above the OS temp dir: real markers like package.json are
+		// common in home directories (e.g. C:\Users\<name>\package.json), which would make the
+		// "orphan" file look like it belongs to a project.
 		const server: ServerConfig = {
 			...TEST_SERVER,
-			rootMarkers: ["package.json", "tsconfig.json", "jsconfig.json"],
+			rootMarkers: ["omp-lsp-orphan-test-root.marker"],
 		};
 		const orphanDir = TempDir.createSync("@omp-lsp-orphan-");
 		try {

@@ -169,7 +169,7 @@ export function resolveUsedFraction(limit: UsageLimit): number | undefined {
 	return undefined;
 }
 
-// Inverting a used fraction can round an exact reserve boundary slightly upward.
+/** Float slack so a remaining fraction derived as `1 - used` still matches a reserve it sits exactly on. */
 const RESERVE_BOUNDARY_EPSILON = 1e-9;
 
 /** Whether remaining quota is at or below the reserve (both 0..1 fractions). */

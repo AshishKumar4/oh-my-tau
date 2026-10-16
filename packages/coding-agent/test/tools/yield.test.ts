@@ -82,6 +82,57 @@ describe("YieldTool", () => {
 		expect(next.details).toMatchObject({ type: ["next#1"], complete: true });
 	});
 
+	it("keeps a failed workpool item in the batch output and accepts its independent sibling", async () => {
+		const items = [
+			{ id: "review#1", index: 1 },
+			{ id: "review#2", index: 2 },
+		];
+		const tool = new YieldTool(createSession({ getWorkPoolYieldItems: () => items }));
+		const failed = await tool.execute("pool-failed", { key: 1, error: "review unavailable" });
+		expect(failed.details).toMatchObject({
+			status: "success",
+			error: "review unavailable",
+			data: { error: "review unavailable" },
+			type: ["review#1"],
+			complete: undefined,
+		});
+		expect(failed.content[0]).toMatchObject({ text: expect.stringContaining("Remaining item(s): 2") });
+		await expect(tool.execute("pool-duplicate", { key: 1, error: "again" })).rejects.toThrow("already submitted");
+		const completed = await tool.execute("pool-completed", { key: 2, data: { ok: true } });
+		if (!failed.details || !completed.details) throw new Error("yield details missing");
+		expect(completed.details.complete).toBe(true);
+		const assembled = assembleYieldResult(
+			[failed.details, completed.details],
+			undefined,
+			yieldSectionShapes(buildWorkPoolOutputSchema(items)),
+		);
+		expect(assembled?.data).toEqual({
+			"review#1": { error: "review unavailable" },
+			"review#2": { ok: true },
+		});
+		expect(buildOutputValidator(buildWorkPoolOutputSchema(items)).validator?.validate(assembled?.data).success).toBe(
+			true,
+		);
+	});
+
+	it("ends a workpool turn when its last item reports an error", async () => {
+		const items = [{ id: "review#1", index: 1 }];
+		const tool = new YieldTool(createSession({ getWorkPoolYieldItems: () => items }));
+		const failed = await tool.execute("pool-final-error", { key: 1, error: "review unavailable" });
+		if (!failed.details) throw new Error("yield details missing");
+		expect(failed.details).toMatchObject({
+			status: "success",
+			data: { error: "review unavailable" },
+			type: ["review#1"],
+			complete: true,
+		});
+		expect(
+			assembleYieldResult([failed.details], undefined, yieldSectionShapes(buildWorkPoolOutputSchema(items)))?.data,
+		).toEqual({
+			"review#1": { error: "review unavailable" },
+		});
+	});
+
 	it("assembles per-key workpool yields into the batch output schema", () => {
 		const items = [
 			{ id: "review#1", index: 1 },
@@ -743,16 +794,66 @@ describe("YieldTool", () => {
 		);
 	});
 
-	it("accepts data alongside an empty-string error (non-strict OpenAI-compatible backends)", async () => {
-		const tool = new YieldTool(createSession());
-		const result = await tool.execute("call-empty-error", { type: "result", data: { ok: true }, error: "" } as never);
-		expect(result.details?.status).toBe("success");
-		expect(result.details?.data).toEqual({ ok: true });
-		expect(result.details?.error).toBeUndefined();
+	it("accepts data alongside empty or placeholder errors (non-strict OpenAI-compatible backends)", async () => {
+		for (const error of ["", "   ", "unused", "n/a", "None", "  placeholder\n"]) {
+			const tool = new YieldTool(createSession());
+			const result = await tool.execute("call-placeholder-error", {
+				type: "result",
+				data: { ok: true },
+				error,
+			} as never);
+			expect(result.details?.status).toBe("success");
+			expect(result.details?.data).toEqual({ ok: true });
+			expect(result.details?.error).toBeUndefined();
+		}
+	});
 
-		const failure = await tool.execute("call-only-empty-error", { error: "" } as never).catch(err => err);
+	it("treats a blank error without data as an empty result, but keeps filler text as an error-only failure reason", async () => {
+		for (const error of ["", "   "]) {
+			const tool = new YieldTool(createSession());
+			await expect(tool.execute("call-blank-error-only", { error } as never)).rejects.toThrow(
+				"yield must contain either `data` or `error`",
+			);
+		}
+		const tool = new YieldTool(createSession());
+		const unused = await tool.execute("call-unused-error-only", { error: "unused" } as never);
+		expect(unused.details?.status).toBe("aborted");
+		expect(unused.details?.error).toBe("unused");
+		const padded = await tool.execute("call-padded-error-only", { error: "  boom\n" } as never);
+		expect(padded.details?.error).toBe("boom");
+	});
+
+	it("rejects data alongside a real error with resend payloads that keep the type", async () => {
+		const typed = await new YieldTool(createSession())
+			.execute("call-conflict-typed", { type: "result", data: { ok: true }, error: "invalid output shape" } as never)
+			.catch(err => err);
+		expect(typed).toBeInstanceOf(Error);
+		expect(String(typed.message)).toContain("yield cannot contain both data and error");
+		expect(String(typed.message)).toContain('{"type":"result","data":<your output>}');
+		expect(String(typed.message)).toContain('{"error":"invalid output shape"}');
+
+		const incremental = await new YieldTool(createSession())
+			.execute("call-conflict-incremental", {
+				type: ["findings"],
+				data: { title: "real finding" },
+				error: "contradictory source",
+			} as never)
+			.catch(err => err);
+		expect(incremental).toBeInstanceOf(Error);
+		expect(String(incremental.message)).toContain('{"type":["findings"],"data":<your output>}');
+		expect(String(incremental.message)).toContain('{"error":"contradictory source"}');
+	});
+
+	it("keeps the workpool key in data/error conflict resend guidance", async () => {
+		const tool = new YieldTool(createSession({ getWorkPoolYieldItems: () => [{ id: "review#2", index: 2 }] }));
+		const failure = await tool
+			.execute("pool-conflict", { key: 2, data: { ok: true }, error: "boom" })
+			.catch(err => err);
 		expect(failure).toBeInstanceOf(Error);
-		expect(String(failure.message)).toContain("yield must contain either `data` or `error`");
+		expect(String(failure.message)).toContain("workpool yield requires exactly one of data or error");
+		expect(String(failure.message)).toContain('{"key":2,"data":<your output>}');
+		expect(String(failure.message)).toContain('{"key":2,"error":"boom"}');
+		expect(String(failure.message)).not.toContain('"type"');
 	});
 
 	it("aborts instead of throwing forever after repeated untyped empty results", async () => {
@@ -892,6 +993,111 @@ describe("YieldTool", () => {
 			type: "summary",
 			useLastTurn: true,
 		});
+	});
+
+	it("omits nested strict-mode null optionals while retaining explicit nullable values", async () => {
+		const tool = new YieldTool(
+			createSession({
+				outputSchema: {
+					properties: {
+						status: { type: "string" },
+						steps: {
+							elements: {
+								properties: { name: { type: "string" } },
+								optionalProperties: {
+									blocker: { type: "string" },
+									blocker_details: { type: "string", nullable: true },
+								},
+							},
+						},
+					},
+					optionalProperties: { landing_receipt: { type: "string" } },
+				},
+			}),
+		);
+		const result = await tool.execute("call-nested-optionals", {
+			data: {
+				status: "done",
+				steps: [{ name: "completed", blocker: null, blocker_details: null }],
+				landing_receipt: null,
+			},
+			error: null,
+		});
+		expect(result.details?.status).toBe("success");
+		expect(result.details?.data).toEqual({
+			status: "done",
+			steps: [{ name: "completed", blocker_details: null }],
+		});
+		await expect(
+			tool.execute("call-required-null", { data: { status: null, steps: [{ name: "completed" }] } }),
+		).rejects.toThrow(/status: expected string, received null/);
+	});
+
+	it("omits optional nulls in strict prefixItems and trailing items without changing required fields", async () => {
+		const tool = new YieldTool(
+			createSession({
+				outputSchema: {
+					type: "object",
+					properties: {
+						tuple: {
+							type: "array",
+							prefixItems: [
+								{
+									type: "object",
+									properties: { id: { type: "string" }, note: { type: "string" } },
+									required: ["id"],
+									additionalProperties: false,
+								},
+							],
+							items: {
+								type: "object",
+								properties: { label: { type: "string" }, note: { type: "string" } },
+								required: ["label"],
+								additionalProperties: false,
+							},
+							minItems: 2,
+							maxItems: 2,
+						},
+					},
+					required: ["tuple"],
+					additionalProperties: false,
+				},
+			}),
+		);
+		expect(tool.strict).toBe(true);
+		const result = await tool.execute("call-tuple", {
+			data: {
+				tuple: [
+					{ id: "done", note: null },
+					{ label: "next", note: null },
+				],
+			},
+		});
+		expect(result.details?.data).toEqual({ tuple: [{ id: "done" }, { label: "next" }] });
+		await expect(
+			tool.execute("call-tuple-required", { data: { tuple: [{ id: null }, { label: "next" }] } }),
+		).rejects.toThrow(/tuple\/0\/id: expected string, received null/);
+	});
+
+	it("normalizes optional nulls inside JTD discriminator variants", async () => {
+		const tool = new YieldTool(
+			createSession({
+				outputSchema: {
+					discriminator: "kind",
+					mapping: {
+						done: {
+							properties: { status: { type: "string" } },
+							optionalProperties: { blocker: { type: "string" } },
+						},
+						blocked: { properties: { reason: { type: "string" } } },
+					},
+				},
+			}),
+		);
+		const result = await tool.execute("call-variant-optional", {
+			data: { kind: "done", status: "complete", blocker: null },
+		});
+		expect(result.details?.data).toEqual({ kind: "done", status: "complete" });
 	});
 
 	it("accepts arbitrary data when outputSchema is null", async () => {

@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
 import { Agent, CompactionCancelledError, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UserMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -32,6 +33,7 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 const authStorage = createInMemoryAuthStorage();
 authStorage.keys.setRuntime("anthropic", "test-key");
 authStorage.keys.setRuntime("openai-codex", "test-key");
+authStorage.keys.setRuntime("mock", "test-key");
 const modelRegistry = new ModelRegistry(authStorage);
 
 afterAll(() => {
@@ -62,6 +64,34 @@ function assistant(text: string): AssistantMessage {
 	};
 }
 
+const STREAMING_PARENT_ASSIGNMENT = "ASSIGNMENT_A_STREAMING_PARENT_STEER";
+const IDLE_IRC_ASSIGNMENT = "ASSIGNMENT_B_IDLE_IRC";
+
+function appendIdleIrcRolloverScenario(manager: SessionManager, fromParent: boolean): void {
+	manager.appendMessage({
+		...user(STREAMING_PARENT_ASSIGNMENT),
+		attribution: "agent",
+		steering: true,
+	});
+	manager.appendMessage(assistant("Assignment A completed."));
+	manager.appendCustomMessageEntry(
+		"irc:incoming",
+		IDLE_IRC_ASSIGNMENT,
+		true,
+		{
+			id: "idle-irc-b",
+			from: fromParent ? "Parent" : "Peer",
+			message: IDLE_IRC_ASSIGNMENT,
+			...(fromParent ? { fromParent: true } : {}),
+		},
+		"agent",
+	);
+	const firstKeptEntryId = manager.appendMessage(assistant("Assignment B work in progress."));
+	manager.appendCompaction("Context rollover", undefined, firstKeptEntryId, 100, {
+		details: { kind: "experimental-context-rollover", version: 1 },
+	});
+}
+
 describe("experimental context management", () => {
 	let session: AgentSession | undefined;
 
@@ -75,7 +105,7 @@ describe("experimental context management", () => {
 		session = undefined;
 	});
 
-	async function createCodeModeSession() {
+	async function createRolloverSession({ codeMode }: { codeMode: boolean }) {
 		const mock = createMockModel({
 			responses: [
 				{
@@ -91,7 +121,7 @@ describe("experimental context management", () => {
 			"compaction.experimentalContextManagement": true,
 			"compaction.keepRecentTokens": 128,
 			"compaction.midTurnEnabled": false,
-			"providers.openai-codex.codeMode": "on",
+			...(codeMode && { "providers.openai-codex.codeMode": "on" }),
 		});
 		const toolSession: ToolSession = {
 			cwd: process.cwd(),
@@ -107,9 +137,9 @@ describe("experimental context management", () => {
 			new GrepTool(toolSession),
 			new ContextNotesTool(toolSession),
 			new NewContextTool(toolSession),
-			new EvalTool(toolSession),
+			...(codeMode ? [new EvalTool(toolSession)] : []),
 		];
-		const model = { ...mock.model, provider: "openai-codex" };
+		const model = codeMode ? { ...mock.model, provider: "openai-codex" } : mock.model;
 		const agent = new Agent({
 			initialState: { model, systemPrompt: ["test"], tools, messages: history },
 			getApiKey: () => "test-key",
@@ -127,37 +157,41 @@ describe("experimental context management", () => {
 		return { session, manager, mock };
 	}
 
-	it("exposes new_context directly in Code Mode and rolls over once below the automatic threshold", async () => {
-		const { session, manager, mock } = await createCodeModeSession();
-		const events: AgentSessionEvent[] = [];
-		session.subscribe(event => {
-			events.push(event);
-		});
-		expect(session.getActiveToolNames()).toContain("new_context");
-		expect(session.getActiveToolNames()).not.toContain("read");
-		const request = "Implement the task; preserve the public API and do not deploy.";
-		await session.prompt(request);
-		await session.waitForIdle();
+	it.each([true, false])(
+		"rolls over once on new_context below the automatic threshold (Code Mode: %p)",
+		async codeMode => {
+			const { session, manager, mock } = await createRolloverSession({ codeMode });
+			const events: AgentSessionEvent[] = [];
+			session.subscribe(event => {
+				events.push(event);
+			});
+			// Code Mode keeps new_context on the direct surface and demotes the rest behind eval.
+			expect(session.getActiveToolNames()).toContain("new_context");
+			expect(session.getActiveToolNames().includes("read")).toBe(!codeMode);
+			const request = "Implement the task; preserve the public API and do not deploy.";
+			await session.prompt(request);
+			await session.waitForIdle();
 
-		expect(mock.calls).toHaveLength(2);
-		expect(mock.calls[0].context.tools?.some(tool => tool.name === "new_context")).toBe(true);
-		expect(manager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(1);
-		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(1);
-		expect(events.filter(event => event.type === "auto_compaction_end")).toMatchObject([
-			{ aborted: false, willRetry: false },
-		]);
-		expect(
-			mock.calls[1].context.messages.filter(
-				message => message.role === "user" && JSON.stringify(message.content).includes(request),
-			),
-		).toHaveLength(1);
-		expect(
-			mock.calls[1].context.messages.some(message => message.role === "user" && message.content === "old task"),
-		).toBe(false);
-	});
+			expect(mock.calls).toHaveLength(2);
+			expect(mock.calls[0].context.tools?.some(tool => tool.name === "new_context")).toBe(true);
+			expect(manager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(1);
+			expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(1);
+			expect(events.filter(event => event.type === "auto_compaction_end")).toMatchObject([
+				{ aborted: false, willRetry: false },
+			]);
+			expect(
+				mock.calls[1].context.messages.filter(
+					message => message.role === "user" && JSON.stringify(message.content).includes(request),
+				),
+			).toHaveLength(1);
+			expect(
+				mock.calls[1].context.messages.some(message => message.role === "user" && message.content === "old task"),
+			).toBe(false);
+		},
+	);
 
 	it("retains the latest request through successive rollovers and context reconstruction without notes", async () => {
-		const { session, manager, mock } = await createCodeModeSession();
+		const { session, manager, mock } = await createRolloverSession({ codeMode: true });
 		const request = "Keep the API compatible; implement this task without deploying.";
 		await session.prompt(request);
 		await session.waitForIdle();
@@ -178,8 +212,54 @@ describe("experimental context management", () => {
 		).toHaveLength(1);
 	});
 
+	it("retains a newer idle parent assignment instead of an older streaming parent steer", () => {
+		const manager = SessionManager.inMemory();
+		appendIdleIrcRolloverScenario(manager, true);
+
+		const rebuilt = JSON.stringify(manager.buildSessionContext().messages);
+		expect(rebuilt).toContain(IDLE_IRC_ASSIGNMENT);
+		expect(rebuilt).not.toContain(STREAMING_PARENT_ASSIGNMENT);
+	});
+
+	it("does not elevate newer peer IRC above the latest user request", () => {
+		const manager = SessionManager.inMemory();
+		appendIdleIrcRolloverScenario(manager, false);
+
+		const rebuilt = JSON.stringify(manager.buildSessionContext().messages);
+		expect(rebuilt).toContain(STREAMING_PARENT_ASSIGNMENT);
+		expect(rebuilt).not.toContain(IDLE_IRC_ASSIGNMENT);
+	});
+
+	it("retains an idle parent assignment through repeated rollover and resume from the journal", async () => {
+		using tempDir = TempDir.createSync("@pi-parent-irc-rollover-");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const manager = SessionManager.create(tempDir.path(), sessionDir);
+		appendIdleIrcRolloverScenario(manager, true);
+		const nextFirstKeptEntryId = manager.appendMessage(assistant("More work on assignment B."));
+		manager.appendCompaction("Second context rollover", undefined, nextFirstKeptEntryId, 50, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		await manager.ensureOnDisk();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted rollover session");
+
+		const repeated = JSON.stringify(manager.buildSessionContext().messages);
+		expect(repeated).toContain(IDLE_IRC_ASSIGNMENT);
+		expect(repeated).not.toContain(STREAMING_PARENT_ASSIGNMENT);
+
+		const resumed = await SessionManager.open(sessionFile, sessionDir);
+		try {
+			const rebuilt = JSON.stringify(resumed.buildSessionContext().messages);
+			expect(rebuilt).toContain(IDLE_IRC_ASSIGNMENT);
+			expect(rebuilt).not.toContain(STREAMING_PARENT_ASSIGNMENT);
+		} finally {
+			await resumed.close();
+			await manager.close();
+		}
+	});
+
 	it("closes the lifecycle when cancellation occurs during awaited start dispatch", async () => {
-		const { session, manager } = await createCodeModeSession();
+		const { session, manager } = await createRolloverSession({ codeMode: true });
 		const events: AgentSessionEvent[] = [];
 		const started = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();

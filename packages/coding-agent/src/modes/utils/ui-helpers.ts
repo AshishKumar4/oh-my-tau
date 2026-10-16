@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, Usage } from "@oh-my-pi/pi-ai";
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -6,10 +8,12 @@ import { StatusNotice } from "@oh-my-pi/pi-tui/chrome/status-notice";
 import { QueuedMessagesBand } from "@oh-my-pi/pi-tui/prompt/queued-messages";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AdvisorMessageDetails } from "../../advisor";
+import { InternalUrlRouter } from "../../internal-urls";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
 import { settings } from "../../config/settings";
 import { createAdvisorMessageCard } from "@oh-my-pi/pi-tui/chat/advisor-message";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { readMediaPath } from "@oh-my-pi/pi-tui/native/blobs";
 import { createBackgroundTanDispatchBlock } from "@oh-my-pi/pi-tui/chat/background-tan-message";
 import { BashExecutionComponent } from "@oh-my-pi/pi-tui/chat/bash-execution";
 import { detectCacheInvalidation } from "@oh-my-pi/pi-tui/chat/cache-invalidation-marker";
@@ -21,7 +25,6 @@ import {
 	createHandoffSummaryMessageComponent,
 } from "@oh-my-pi/pi-tui/chat/compaction-summary-message";
 import { CustomMessageComponent } from "@oh-my-pi/pi-tui/chat/custom-message";
-import { DynamicBorder } from "@oh-my-pi/pi-tui/chrome/dynamic-border";
 import { EvalExecutionComponent } from "@oh-my-pi/pi-tui/chat/eval-execution";
 import {
 	type LateDiagnosticsFile,
@@ -37,15 +40,32 @@ import { SkillMessageComponent } from "@oh-my-pi/pi-tui/chat/skill-message";
 import { StrippedToolCallsPlaceholder } from "@oh-my-pi/pi-tui/chat/stripped-tool-calls-placeholder";
 import { imageContent, textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { ToolActivityContainer } from "@oh-my-pi/pi-tui/chrome/tool-activity";
-import { ToolExecutionComponent, type ToolExecutionHandle, toolRenderName } from "@oh-my-pi/pi-tui/chat/tool-execution";
-import { TranscriptBlock, TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
+import {
+	isSettledJobFrame,
+	parksAsBackground,
+	settleWithJobFrame,
+	ToolExecutionComponent,
+	type ToolExecutionHandle,
+	toolRenderName,
+} from "@oh-my-pi/pi-tui/chat/tool-execution";
+import { TranscriptContainer } from "@oh-my-pi/pi-tui/chrome/transcript-container";
 import { createUsageRowBlock, turnElapsedMs } from "@oh-my-pi/pi-tui/overlays/usage-row";
 import { UserMessageComponent } from "@oh-my-pi/pi-tui/chat/user-message";
 import { decodeStreamedToolArgs, streamingStringKeysForTool } from "../../modes/controllers/tool-args-reveal";
-import { materializeImageReferenceLinksSync } from "@oh-my-pi/pi-tui/prompt/image-references";
+import {
+	materializeImageReferenceLinks,
+	materializeImageReferenceLinksSync,
+} from "@oh-my-pi/pi-tui/prompt/image-references";
+import { normalizeBlobExtension } from "@oh-my-pi/pi-tui/prompt/image-format";
 import { imageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
 import { theme } from "@oh-my-pi/pi-tui/theme";
-import type { CompactionQueuedMessage, InteractiveModeContext, RenderSessionContextOptions } from "../../modes/types";
+import type {
+	CompactionQueuedMessage,
+	InteractiveModeContext,
+	RenderSessionContextOptions,
+	ShowStatusOptions,
+} from "../../modes/types";
+import { extractVisibleAssistantText } from "../rpc/rpc-live";
 import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "../../session/launch-completion";
 import {
 	BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE,
@@ -56,6 +76,8 @@ import {
 	type SkillPromptDetails,
 } from "../../session/messages";
 import type { SessionContext, StrippedToolCallsMarker } from "../../session/session-context";
+import { executeBuiltinSlashCommand, lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
+import { parseSlashCommand } from "../../slash-commands/helpers/parse";
 import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillCommand } from "../skill-command";
 import {
 	createAssistantMessageComponent,
@@ -112,19 +134,95 @@ function waitForImmediate(): Promise<void> {
 type QueuedMessages = {
 	steering: string[];
 	followUp: string[];
+	liveSteered: number;
 };
 type AddMessageOptions = {
 	imageLinks?: readonly (string | undefined)[];
 	reuseSettledComponent?: boolean;
 };
 
+type ImageChipSessionManager = Pick<
+	InteractiveModeContext["sessionManager"],
+	"putBlob" | "putBlobSync" | "getArtifactsDir" | "getSessionId"
+>;
+
+/** Where an image chip's bytes live: a file the chip opens directly, or the file behind an internal URL. */
+type ImageChipSource = { kind: "file"; path: string } | { kind: "internal"; path: string };
+
+/**
+ * Internal URLs (`local://`) stay on the image for the model but resolve against the
+ * session root, which `/move` relocates, so a chip cannot point at them. Their backing
+ * file holds the original pasted bytes (the payload may be auto-resized), so the chip
+ * opens a stable blob copy of that file. Undefined when no file backs the image.
+ */
+function imageChipSource(image: ImageContent, sessionManager: ImageChipSessionManager): ImageChipSource | undefined {
+	const sourcePath = imageAttachmentSource(image)?.path;
+	if (!sourcePath) return undefined;
+	const router = InternalUrlRouter.instance();
+	if (!router.canHandle(sourcePath)) return { kind: "file", path: sourcePath };
+	try {
+		const located = router.locateSync(sourcePath, {
+			localProtocolOptions: {
+				getArtifactsDir: () => sessionManager.getArtifactsDir(),
+				getSessionId: () => sessionManager.getSessionId(),
+			},
+		});
+		return located === undefined ? undefined : { kind: "internal", path: located };
+	} catch {
+		return undefined;
+	}
+}
+
+/** Chip targets for attached images: each file on disk, else a blob copy of the original bytes (or the payload). */
+export async function materializeImageChipLinks(
+	images: readonly ImageContent[],
+	sessionManager: ImageChipSessionManager,
+): Promise<(string | undefined)[]> {
+	const putBlob = sessionManager.putBlob.bind(sessionManager);
+	return Promise.all(
+		images.map(async image => {
+			const source = imageChipSource(image, sessionManager);
+			if (source?.kind === "file") return source.path;
+			if (source) {
+				try {
+					const bytes = await fs.promises.readFile(source.path);
+					return (await putBlob(bytes, { extension: normalizeBlobExtension(path.extname(source.path)) }))
+						.displayPath;
+				} catch (error) {
+					logger.warn("Failed to copy original image for its chip", {
+						path: source.path,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			return (await materializeImageReferenceLinks([image], putBlob))?.[0];
+		}),
+	);
+}
+
+/** Synchronous {@link materializeImageChipLinks} for transcript rebuilds. */
 function imageLinksForMessage(
 	images: readonly ImageContent[],
-	putBlobSync: InteractiveModeContext["sessionManager"]["putBlobSync"],
+	sessionManager: ImageChipSessionManager,
 ): (string | undefined)[] | undefined {
 	if (images.length === 0) return undefined;
-	const materialized = materializeImageReferenceLinksSync(images, putBlobSync);
-	return images.map((image, index) => imageAttachmentSource(image)?.path ?? materialized?.[index]);
+	const putBlobSync = sessionManager.putBlobSync.bind(sessionManager);
+	return images.map(image => {
+		const source = imageChipSource(image, sessionManager);
+		if (source?.kind === "file") return source.path;
+		if (source) {
+			try {
+				const bytes = fs.readFileSync(source.path);
+				return putBlobSync(bytes, { extension: normalizeBlobExtension(path.extname(source.path)) }).displayPath;
+			} catch (error) {
+				logger.warn("Failed to copy original image for its chip", {
+					path: source.path,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return materializeImageReferenceLinksSync([image], putBlobSync)?.[0];
+	});
 }
 
 export class UiHelpers {
@@ -136,23 +234,24 @@ export class UiHelpers {
 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
 	 * we update the previous status line instead of appending new ones to avoid log spam.
 	 */
-	showStatus(message: string, options?: { dim?: boolean }): void {
+	showStatus(message: string, options?: ShowStatusOptions): void {
 		const children = this.ctx.chatContainer.children;
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const useDim = options?.dim ?? true;
 		// Resolve the dim color lazily so a later theme change re-shapes the line
 		// instead of leaving the palette that was active when it was presented.
 		const styleFn = useDim ? (t: string) => theme.fg("dim", t) : undefined;
+		const notice = { styleFn, toast: options?.toast };
 
 		if (last && last === this.ctx.lastStatus) {
-			this.ctx.lastStatus.setMessage(message, styleFn);
+			this.ctx.lastStatus.setMessage(message, notice);
 			this.ctx.ui.requestRender();
 			return;
 		}
 
-		const notice = new StatusNotice(message, styleFn);
-		this.ctx.present([notice]);
-		this.ctx.lastStatus = notice;
+		const status = new StatusNotice(message, notice);
+		this.ctx.present([status]);
+		this.ctx.lastStatus = status;
 	}
 
 	addMessageToChat(message: AgentMessage, options?: AddMessageOptions): Component[] {
@@ -289,11 +388,7 @@ export class UiHelpers {
 					} else {
 						const images = imageContent(message.content);
 						const imageLinks =
-							options?.imageLinks ??
-							imageLinksForMessage(
-								images,
-								this.ctx.viewSession.sessionManager.putBlobSync.bind(this.ctx.viewSession.sessionManager),
-							);
+							options?.imageLinks ?? imageLinksForMessage(images, this.ctx.viewSession.sessionManager);
 						userComponent = new UserMessageComponent(userText, {
 							synthetic: isSynthetic,
 							imageLinks,
@@ -468,9 +563,7 @@ export class UiHelpers {
 			}
 			if (previous.canBeDisplacedBy(nextToolName)) {
 				todoSnapshot = null;
-				if (this.ctx.chatContainer.canRemoveBlock(previous)) {
-					this.ctx.chatContainer.removeChild(previous);
-				}
+				this.ctx.chatContainer.removeChild(previous);
 				previous.seal();
 				return;
 			}
@@ -478,11 +571,11 @@ export class UiHelpers {
 			todoSnapshot = null;
 			previous.seal();
 		};
-		// Detached task calls persist their initial `async.state === "running"`
+		// Background job calls persist their initial `async.state === "running"`
 		// result, but the job keeps streaming progress afterwards. Parked here
 		// (not finalized) so replayed and live frames still route to the card;
 		// the ids are handed back to the controller after the loop (#10447).
-		const backgroundTaskCallIds = new Set<string>();
+		const backgroundCallIds = new Set<string>();
 		const messages = sessionContext.messages;
 		const count = messages.length;
 		for (let i = 0; i < count; i++) {
@@ -668,8 +761,11 @@ export class UiHelpers {
 					const images: ImageContent[] = message.content.filter(
 						(content): content is ImageContent => content.type === "image",
 					);
+					const mediaPath = readMediaPath(message.details);
+					if (mediaPath && images.length === 0)
+						assistantComponent?.setToolResultImages(message.toolCallId, [], mediaPath);
 					if (images.length > 0 && assistantComponent) {
-						assistantComponent.setToolResultImages(message.toolCallId, images);
+						assistantComponent.setToolResultImages(message.toolCallId, images, mediaPath);
 						const hasText = message.content.some(c => c.type === "text");
 						if (!hasText && cfgTerminalShowImages.get(settings)) {
 							if (pendingReadComponent) {
@@ -707,21 +803,29 @@ export class UiHelpers {
 				// Match tool results to pending tool components
 				const component = this.ctx.pendingTools.get(message.toolCallId);
 				if (component) {
-					const asyncDetails = (message.details as { async?: { state?: string; jobId?: string } } | undefined)
-						?.async;
-					const isBackgroundTask =
-						message.toolName === "task" &&
-						asyncDetails?.state === "running" &&
-						(activeToolExecutionUpdates.some(event => event.toolCallId === message.toolCallId) ||
-							runningAsyncJobs.some(job => job.id === asyncDetails.jobId));
-					// A detached task's persisted result is only its "still running"
-					// snapshot. Keep the card partial, parked, and in `pendingTools` so
-					// the snapshot replay and later live progress frames land on it
-					// instead of hitting the no-pending-component early return (#10447).
-					component.updateResult(message, isBackgroundTask, message.toolCallId);
-					if (isBackgroundTask) {
+					const jobId = (message.details as { async?: { jobId?: string } } | undefined)?.async?.jobId;
+					const frame = activeToolExecutionUpdates.find(
+						event => event.toolCallId === message.toolCallId,
+					)?.partialResult;
+					const isBackground =
+						parksAsBackground(message.toolName, message.details) &&
+						(frame !== undefined || runningAsyncJobs.some(job => job.id === jobId));
+					const settled = isBackground && isSettledJobFrame(frame?.details);
+					// A background job call's persisted result is only its "still running"
+					// snapshot; the job's latest frame supersedes it. Until that frame
+					// settles, keep the card partial, parked, and in `pendingTools` so
+					// later live progress frames land on it instead of hitting the
+					// no-pending-component early return (#10447).
+					if (settled) {
+						settleWithJobFrame(component, frame, message.toolCallId);
+					} else if (frame && isBackground) {
+						component.updateResult(frame, true, message.toolCallId);
+					} else {
+						component.updateResult(message, isBackground, message.toolCallId);
+					}
+					if (isBackground && !settled) {
 						component.parkAsBackground();
-						backgroundTaskCallIds.add(message.toolCallId);
+						backgroundCallIds.add(message.toolCallId);
 					} else {
 						this.ctx.pendingTools.delete(message.toolCallId);
 						if (
@@ -796,17 +900,17 @@ export class UiHelpers {
 		if (this.ctx.viewSession.isStreaming) {
 			this.ctx.eventController?.inheritTurnStart(turnStartedAt);
 		}
-		// Re-register parked background task cards with the controller: focus
-		// attach resets its `#backgroundTaskCallIds` before replaying, and unlike
+		// Re-register parked background cards with the controller: focus
+		// attach resets its `#backgroundCallIds` before replaying, and unlike
 		// the todo/turn handoffs this must run whether or not the session streams
-		// — a detached task keeps running while the main session sits idle
+		// — a background job keeps running while the main session sits idle
 		// (#10447). Membership is re-checked against `pendingTools`.
-		if (backgroundTaskCallIds.size > 0) {
-			this.ctx.eventController?.markBackgroundTaskCalls(backgroundTaskCallIds);
+		if (backgroundCallIds.size > 0) {
+			this.ctx.eventController?.markBackgroundCalls(backgroundCallIds);
 		}
 
 		// Entries still in `pendingTools` are toolCalls whose result never landed
-		// during the replay — with `keepDanglingToolCalls` these are exactly the
+		// during the replay — with `keepInFlightToolCalls` these are exactly the
 		// turn's in-flight calls (assistant turn persisted at message_end, tool
 		// still executing). While the viewed session streams, keep them tracked so
 		// the live event stream routes `tool_execution_update`/`_end` into the
@@ -826,10 +930,10 @@ export class UiHelpers {
 			}
 		} else {
 			for (const [toolCallId, component] of this.ctx.pendingTools) {
-				// A parked background task keeps running even while the main session
+				// A parked background job keeps running even while the main session
 				// is idle, so leave its card pending — sealing and clearing it would
 				// drop the replayed snapshot and every later job frame (#10447).
-				if (backgroundTaskCallIds.has(toolCallId)) {
+				if (backgroundCallIds.has(toolCallId)) {
 					component.setArgsComplete(toolCallId);
 					continue;
 				}
@@ -922,7 +1026,7 @@ export class UiHelpers {
 		// Collapsed replay keeps in-flight calls so pending tools remain routable during mid-turn rebuilds.
 		let context = this.ctx.viewSession.buildTranscriptSessionContext({
 			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
-			keepDanglingToolCalls: this.ctx.viewSession.isStreaming,
+			keepInFlightToolCalls: this.ctx.viewSession.isStreaming,
 		});
 		let replayEntryCount = this.ctx.viewSession.sessionManager.getEntries().length;
 
@@ -991,7 +1095,7 @@ export class UiHelpers {
 				// more instead of letting a reentrant synchronous rebuild interleave.
 				context = this.ctx.viewSession.buildTranscriptSessionContext({
 					collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
-					keepDanglingToolCalls: this.ctx.viewSession.isStreaming,
+					keepInFlightToolCalls: this.ctx.viewSession.isStreaming,
 				});
 				replayEntryCount = this.ctx.viewSession.sessionManager.getEntries().length;
 				await refreshAssistantMessageLinkTargets(
@@ -1072,34 +1176,17 @@ export class UiHelpers {
 		this.ctx.present(options?.hideWithToolActivity ? new ToolActivityContainer(content) : content);
 	}
 
-	showNewVersionNotification(newVersion: string): void {
-		const block = new TranscriptBlock();
-		block.addChild(new DynamicBorder(text => theme.fg("warning", text)));
-		const title = "Update Available";
-		const prefix = `New version ${newVersion} is available. Run: `;
-		const command = "omp update";
-		block.addChild(
-			new Text(`${title}\n${prefix}${command}`, 1, 0).setStyleFn(
-				() =>
-					`${theme.bold(theme.fg("warning", title))}\n${theme.fg("muted", prefix)}${theme.fg("accent", command)}`,
-			),
-		);
-		block.addChild(new DynamicBorder(text => theme.fg("warning", text)));
-		this.ctx.present(block);
-	}
-
 	updatePendingMessagesDisplay(): void {
 		this.ctx.pendingMessagesContainer.disposeChildren();
 		const queuedMessages = this.ctx.viewSession.getQueuedMessages() as QueuedMessages;
 
 		const steeringMessages = [...queuedMessages.steering];
-		for (const entry of this.ctx.compactionQueuedMessages as CompactionQueuedMessage[]) {
-			if (entry.mode === "steer") steeringMessages.push(entry.text);
-		}
-
 		const followUpMessages = [...queuedMessages.followUp];
-		for (const entry of this.ctx.compactionQueuedMessages as CompactionQueuedMessage[]) {
-			if (entry.mode === "followUp") followUpMessages.push(entry.text);
+		if (!this.ctx.focusedAgentId) {
+			for (const entry of this.ctx.compactionQueuedMessages as CompactionQueuedMessage[]) {
+				if (entry.mode === "steer") steeringMessages.push(entry.text);
+				else followUpMessages.push(entry.text);
+			}
 		}
 
 		const groups = [
@@ -1141,6 +1228,22 @@ export class UiHelpers {
 	}
 
 	async #deliverQueuedMessage(message: CompactionQueuedMessage): Promise<void> {
+		const builtin = await executeBuiltinSlashCommand(message.text, {
+			ctx: this.ctx,
+			input: message.images ? { images: message.images } : undefined,
+		});
+		if (builtin === true) {
+			this.#parkLoopOnLocalConsume(message.text, false);
+			return;
+		}
+		if (typeof builtin === "string") {
+			const forwarded = await this.ctx.session.prompt(builtin, {
+				streamingBehavior: message.mode,
+				images: message.images,
+			});
+			this.#parkLoopOnLocalConsume(message.text, forwarded);
+			return;
+		}
 		if (
 			await invokeSkillCommandFromText(this.ctx, message.text, message.mode, {
 				propagateErrors: true,
@@ -1167,6 +1270,9 @@ export class UiHelpers {
 
 	isKnownSlashCommand(text: string): boolean {
 		if (!text.startsWith("/")) return false;
+		const parsed = parseSlashCommand(text);
+		const builtin = parsed && lookupBuiltinSlashCommand(parsed.name);
+		if (builtin && (builtin.allowArgs || !parsed.args)) return true;
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
 		if (!commandName) return false;
@@ -1222,8 +1328,7 @@ export class UiHelpers {
 			}
 			if (firstPromptIndex === -1) {
 				for (const message of queuedMessages) {
-					const forwarded = await this.ctx.session.prompt(message.text);
-					this.#parkLoopOnLocalConsume(message.text, forwarded);
+					await this.#deliverQueuedMessage(message);
 				}
 				return;
 			}
@@ -1309,12 +1414,6 @@ export class UiHelpers {
 	}
 
 	extractAssistantText(message: AssistantMessage): string {
-		let text = "";
-		for (const content of message.content) {
-			if (content.type === "text") {
-				text += content.text;
-			}
-		}
-		return text.trim();
+		return extractVisibleAssistantText(message);
 	}
 }

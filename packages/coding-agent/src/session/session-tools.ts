@@ -7,6 +7,7 @@ import { isRecord, logger, prompt, stringProperty, structuredCloneJSON, untilAbo
 
 import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
+import { shouldInlineToolDescriptors } from "../config/inline-tool-descriptors-mode";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelString } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -37,6 +38,7 @@ import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md"
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
+import { denyError, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
 import { isFilesystemSourcePath } from "../tools/path-utils";
 import { supportsExternalThinking } from "../tools/think";
@@ -64,6 +66,7 @@ import { cfgDisabledExtensions, cfgSkills, type SkillsSettings } from "../extens
 import {
 	cfgExternalThinking,
 	cfgIncludeModelInPrompt,
+	cfgInlineToolDescriptors,
 	cfgProvidersOpenaiCodexCodeMode,
 	cfgProvidersOpenaiCodexCodeModeDirectTools,
 	cfgSkillful,
@@ -102,6 +105,8 @@ export interface SessionToolsHost {
 	setCodeModeNamespacesInfo?(info: unknown): void;
 	/** The tool context this session's tools run with; facades that post-process a call read it. */
 	toolSession?(): ToolSession | undefined;
+	/** Runs a wait for the user's answer, such as an ACP client's permission request. */
+	waitForUser<T>(dialog: () => Promise<T>): Promise<T>;
 }
 
 /** Registry delta applied by the SDK's settings-gated tool reconcile. */
@@ -353,6 +358,17 @@ export class SessionTools {
 	#capturedPromptDigest: string | undefined;
 	/** Base-prompt digest each primary reply with provider output was produced under. */
 	readonly #replyPromptDigests = new WeakMap<AgentMessage, string>();
+	/**
+	 * Digest records found in a branch view and how much of it was scanned. The
+	 * session manager's memoized view only grows in place, so a later read of
+	 * the same array scans just the appended entries. `latest` is the newest
+	 * record; `replied` is the newest record a reply with provider output
+	 * follows. The digest and its reply are separate appends, so a crash can
+	 * leave only a trailing digest durable.
+	 */
+	#digestScan:
+		| { branch: readonly SessionEntry[]; scanned: number; latest: string | undefined; replied: string | undefined }
+		| undefined;
 	/**
 	 * Dynamic (`xd://`) devices the model has already been told are mounted.
 	 * Seeded lazily from persisted history on resume (see
@@ -912,7 +928,13 @@ export class SessionTools {
 		const harness = this.#harnessProfile() ?? "native";
 		if (cfgIncludeModelInPrompt.get(this.#host.settings))
 			return `${formatModelString(activeModel)}|harness:${harness}|mode:${cfgHarnessMode.get(this.#host.settings)}`;
-		return `delegation-bias:${resolveDelegationBias(activeModel)}|harness:${harness}`;
+		// The inline-descriptor decision is per model and selects both the prompt's
+		// tool catalog and provider-side description pruning (see `sdk.ts`).
+		const inlineDescriptors = shouldInlineToolDescriptors(
+			cfgInlineToolDescriptors.get(this.#host.settings),
+			activeModel.id,
+		);
+		return `delegation-bias:${resolveDelegationBias(activeModel)}|inline-descriptors:${inlineDescriptors}|harness:${harness}`;
 	}
 
 	/** Rebuilds model-dependent tool prompts after a model change. */
@@ -1076,21 +1098,19 @@ export class SessionTools {
 	 * Only wraps tools whose name is in PERMISSION_REQUIRED_TOOLS and only when
 	 * the bridge exposes `requestPermission`. No-ops for all other cases.
 	 *
-	 * When the user has explicitly opted into `yolo` / auto-approve behavior (via
-	 * the SDK/CLI `autoApprove` flag or a configured `tools.approvalMode: yolo`),
-	 * skips the gate unless the per-tool policy explicitly requires a prompt or
-	 * deny. The schema default is also `yolo`, so an explicit configuration or
-	 * explicit session flag is required: default-config ACP sessions keep the
-	 * client-side permission gate.
+	 * Bash follows its own approval resolution, including pattern allows, denials,
+	 * and critical overrides. The schema's implicit yolo default retains ACP's
+	 * client permission gate for unmatched bash commands; explicitly selecting
+	 * yolo opts out. Other tools keep their existing ACP gate behavior.
 	 */
 	#wrapToolForAcpPermission<T extends AgentTool>(tool: T): T {
 		const bridge = this.#host.clientBridge();
 		// Match the capability+method gating pattern used by read/write/bash.
 		if (!bridge?.capabilities.requestPermission || !bridge.requestPermission) return tool;
 		if (PERMISSION_REQUIRED_TOOLS[tool.name] !== true) return tool;
-		// Skip the gate only on explicit yolo opt-in; honour per-tool policies
-		// that require a prompt or deny (matching the normal approval wrapper).
-		if (this.#isExplicitAutoApproveMode()) {
+		// Default-config ACP sessions still ask for executable calls even though
+		// the schema defaults to yolo; explicit yolo is an intentional opt-in.
+		if (tool.name !== "bash" && this.#isExplicitAutoApproveMode()) {
 			const userPolicies: Record<string, unknown> = cfgToolsApproval.get(this.#host.settings);
 			const toolPolicy = userPolicies[tool.name];
 			if (!toolPolicy || toolPolicy === "allow") return tool;
@@ -1105,6 +1125,23 @@ export class SessionTools {
 					onUpdate: never,
 					ctx: AgentToolContext | undefined,
 				) => {
+					let cacheable = true;
+					if (target.name === "bash") {
+						const explicitAutoApprove = this.#isExplicitAutoApproveMode();
+						const { approvalMode, userPolicies } = resolveApprovalFromContext({
+							autoApprove: this.#autoApprove,
+							settings: this.#host.settings,
+						});
+						const mode = approvalMode === "yolo" && !explicitAutoApprove ? "always-ask" : approvalMode;
+						const resolved = resolveApproval(target, args, mode, userPolicies);
+						if (resolved.policy === "deny") throw denyError(resolved, target.name);
+						if (resolved.policy === "allow") {
+							return await target.execute(toolCallId, args as never, signal, onUpdate, ctx as never);
+						}
+						// A prompt forced by a critical command or an explicit pattern
+						// remains per-call, even after the client selects Always allow.
+						cacheable = !resolved.override;
+					}
 					const permissionIntent = getPermissionIntent(target.name, args);
 					if (!permissionIntent) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx as never);
@@ -1120,7 +1157,7 @@ export class SessionTools {
 						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
 						: undefined;
 					// Short-circuit on persisted decisions.
-					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
+					const persisted = cacheable ? this.#acpPermissionDecisions.get(permissionIntent.cacheKey) : undefined;
 					if (persisted === "allow_always") {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, approvedCtx);
 					}
@@ -1138,25 +1175,27 @@ export class SessionTools {
 					signal?.addEventListener("abort", onAbort, { once: true });
 					let raced: PermissionRaceResult;
 					try {
-						const permissionPromise = bridge.requestPermission!(
-							{
-								toolCallId,
-								toolName: target.name,
-								title: permissionIntent.title,
-								...(target.name === "bash" ? { kind: "execute" } : {}),
-								status: "pending",
-								rawInput: args,
-								...(commandContent ? { content: commandContent } : {}),
-								locations: extractPermissionLocations(
-									args,
-									this.#host.sessionManager.getCwd(),
-									permissionIntent.paths,
-								),
-							},
-							PERMISSION_OPTIONS,
-							signal,
-						).then(outcome => ({ kind: "permission" as const, outcome }));
-						raced = await Promise.race([permissionPromise, abortPromise]);
+						raced = await this.#host.waitForUser(() => {
+							const permissionPromise = bridge.requestPermission!(
+								{
+									toolCallId,
+									toolName: target.name,
+									title: permissionIntent.title,
+									...(target.name === "bash" ? { kind: "execute" } : {}),
+									status: "pending",
+									rawInput: args,
+									...(commandContent ? { content: commandContent } : {}),
+									locations: extractPermissionLocations(
+										args,
+										this.#host.sessionManager.getCwd(),
+										permissionIntent.paths,
+									),
+								},
+								PERMISSION_OPTIONS,
+								signal,
+							).then(outcome => ({ kind: "permission" as const, outcome }));
+							return Promise.race([permissionPromise, abortPromise]);
+						});
 					} finally {
 						signal?.removeEventListener("abort", onAbort);
 					}
@@ -1171,9 +1210,9 @@ export class SessionTools {
 					if (!selectedOption) {
 						throw new ToolError(`Tool permission response used unknown option ID: ${outcome.optionId}`);
 					}
-					if (selectedOption.kind === "allow_always") {
+					if (cacheable && selectedOption.kind === "allow_always") {
 						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "allow_always");
-					} else if (selectedOption.kind === "reject_always") {
+					} else if (cacheable && selectedOption.kind === "reject_always") {
 						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "reject_always");
 					}
 					if (selectedOption.kind === "reject_once" || selectedOption.kind === "reject_always") {
@@ -1536,19 +1575,25 @@ export class SessionTools {
 
 	/** Digest of the base prompt the current branch's newest reply with provider output was produced under. */
 	recordedPromptDigest(): string | undefined {
-		const branch = this.#host.sessionManager.getBranch();
-		// The digest and reply are separate appends; a crash can leave only the trailing digest durable.
-		let foundReply = false;
-		for (let index = branch.length - 1; index >= 0; index--) {
-			if (!foundReply) {
-				const entry = branch[index];
-				foundReply = entry.type === "message" && replyHasProviderOutput(entry.message);
-				continue;
-			}
-			const digest = promptDigestOfEntry(branch[index]);
-			if (digest !== null) return digest;
+		return this.#scanDigests().replied;
+	}
+
+	/** Brings {@link #digestScan} up to date with the current branch view. */
+	#scanDigests(): { latest: string | undefined; replied: string | undefined } {
+		const branch = this.#host.sessionManager.getBranchView();
+		let scan = this.#digestScan;
+		if (scan?.branch !== branch) {
+			scan = { branch, scanned: 0, latest: undefined, replied: undefined };
+			this.#digestScan = scan;
 		}
-		return undefined;
+		for (let index = scan.scanned; index < branch.length; index++) {
+			const entry = branch[index];
+			const digest = promptDigestOfEntry(entry);
+			if (digest !== null) scan.latest = digest;
+			else if (entry.type === "message" && replyHasProviderOutput(entry.message)) scan.replied = scan.latest;
+		}
+		scan.scanned = branch.length;
+		return scan;
 	}
 
 	/**
@@ -1590,11 +1635,9 @@ export class SessionTools {
 
 	/** Records `digest` on the current branch unless it is already the branch's newest record. */
 	recordPromptDigest(digest: string | undefined): void {
-		if (digest === undefined) return;
-		// A pending/orphan marker must not retarget the previous reply, but must be
+		// A pending/orphan record must not retarget the previous reply, but must be
 		// superseded when the next reply is produced under a different prompt.
-		const previous = this.#host.sessionManager.getBranch().findLast(entry => promptDigestOfEntry(entry) !== null);
-		if (previous === undefined || promptDigestOfEntry(previous) !== digest) {
+		if (digest !== undefined && digest !== this.#scanDigests().latest) {
 			this.#host.sessionManager.appendCustomEntry(SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE, digest);
 		}
 	}
@@ -1602,6 +1645,7 @@ export class SessionTools {
 	/** Drops retained transcript references when the session is disposed. */
 	releaseRestoredTranscript(): void {
 		this.#restoredTranscript = undefined;
+		this.#digestScan = undefined;
 	}
 
 	/**
@@ -1621,8 +1665,7 @@ export class SessionTools {
 		}
 		const latest = this.#latestReply();
 		if (latest === undefined) return "free";
-		const restored = this.#restoredTranscript;
-		return restored && latest === restored.reply ? restored : "frozen";
+		return latest === this.#restoredTranscript?.reply ? this.#restoredTranscript : "frozen";
 	}
 
 	#notifyToolRosterDelta(previousActiveToolNames: readonly string[], appliedNames: readonly string[]): void {

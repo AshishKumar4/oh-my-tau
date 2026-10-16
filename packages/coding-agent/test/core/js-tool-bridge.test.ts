@@ -186,6 +186,29 @@ describe("callSessionTool", () => {
 		expect(result).toBe('{"value":"x"}');
 	});
 
+	it("executes a closed-schema tool with schema-shaped args whether or not the caller supplies harness intent", async () => {
+		const received: unknown[] = [];
+		const tool: AgentTool = {
+			name: "strict-extension",
+			label: "strict extension",
+			description: "rejects undeclared keys like a strict backing server",
+			parameters: { type: "object", properties: { value: { type: "string" } }, additionalProperties: false },
+			concurrency: "parallel",
+			execute: async (_id: string, args: unknown) => {
+				const extra = Object.keys(args as Record<string, unknown>).filter(key => key !== "value");
+				if (extra.length > 0) throw new Error(`Invalid params: unexpected parameters: ${JSON.stringify(extra)}`);
+				received.push(args);
+				return { content: [{ type: "text" as const, text: "ok" }] };
+			},
+		} as unknown as AgentTool;
+		const session = createSession([tool]);
+		expect(await callSessionTool("strict-extension", { value: "x" }, { session })).toBe("ok");
+		expect(
+			await callSessionTool("strict-extension", { value: "x", [INTENT_FIELD]: "caller intent" }, { session }),
+		).toBe("ok");
+		expect(received).toEqual([{ value: "x" }, { value: "x" }]);
+	});
+
 	it("validates and preserves a schema-declared intent field", async () => {
 		const execute = async (_id: string, args: unknown) => ({
 			content: [
@@ -262,7 +285,7 @@ describe("callSessionTool", () => {
 		expect(execute).not.toHaveBeenCalled();
 	});
 
-	it("strips harness intent when propertyNames does not open a closed schema", async () => {
+	it("drops harness intent when propertyNames does not open a closed schema", async () => {
 		const tool = createSchemaTool("closed-property-names", {
 			type: "object",
 			properties: { value: {} },

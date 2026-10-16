@@ -311,6 +311,25 @@ describe("countMessage replayed thinking", () => {
 		expect(tokenizer.countMessage(ranTools)).toBe(OUTPUT_TOKENS);
 	});
 
+	test("charges the reasoning of the latest turn that abandoned its tool calls on the Claude API only", () => {
+		// The Anthropic Messages replay keeps the latest assistant turn
+		// byte-for-byte, signatures included; Bedrock's Converse replay strips them.
+		const toolCall = { type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } } as const;
+		for (const stop of ["stop", "length"] as const) {
+			const tokenizer = new Tokenizer(opus);
+			const turn = signedTurn(opus, VISIBLE, SIGNATURE, stop);
+			turn.content = [...turn.content, toolCall];
+			expect(tokenizer.countLatestTurn(turn)).toBe(OUTPUT_TOKENS);
+			// An older position, counted after it, still gets the stripped count.
+			expect(tokenizer.countMessage(turn)).toBe(tokenizer.countMessage(turn, { excludeEncryptedReasoning: true }));
+
+			const bedrock = new Tokenizer(bedrockOpus);
+			const bedrockTurn = signedTurn(bedrockOpus, VISIBLE, SIGNATURE, stop);
+			bedrockTurn.content = [...bedrockTurn.content, toolCall];
+			expect(bedrock.countLatestTurn(bedrockTurn)).toBe(bedrock.countMessage(bedrockTurn));
+		}
+	});
+
 	test("lowers a native Claude replay by the visible text a shake rewrite removes, after a reload too", () => {
 		// The turn's output was mostly a 2,000-token code block; shake replaces it
 		// in place, the reasoning still replays.

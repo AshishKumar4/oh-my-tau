@@ -5,8 +5,8 @@ import {
 	type AuthCredential,
 	type AuthCredentialStore,
 	parseServiceTier,
-	type ServiceTier,
 	SqliteAuthCredentialStore,
+	type ServiceTier,
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai";
 import { modelPerfKey } from "@oh-my-pi/pi-catalog/identity/metrics";
@@ -53,6 +53,7 @@ type StatsMessageRow = {
 	output_tokens: number;
 	duration: number;
 	ttft: number | null;
+	/** Served service tier; absent on stats databases written before the column existed. */
 	service_tier?: string | null;
 };
 
@@ -102,6 +103,12 @@ export interface ModelPerfStats {
 const MODEL_PERF_DECAY_AT = 256;
 /** meta-table marker set once historical stats.db rows have been imported into model_perf. */
 const MODEL_PERF_BACKFILL_KEY = "model_perf_backfill_v2";
+/**
+ * Marker the v1 import wrote. Its presence means the aggregates already hold
+ * the stats history (tierless, so blended into the bare rows), so the v2 pass
+ * keeps the live aggregates and only records itself complete instead of adding
+ * the same history again.
+ */
 const MODEL_PERF_BACKFILL_V1_KEY = "model_perf_backfill";
 /**
  * Batch window for deferred model_perf writes. Perf aggregates are advisory, so
@@ -204,8 +211,10 @@ ON CONFLICT(model_key) DO UPDATE SET
 	ttft_ms = (CASE WHEN model_perf.samples >= ${MODEL_PERF_DECAY_AT} THEN model_perf.ttft_ms * 0.5 ELSE model_perf.ttft_ms END) + excluded.ttft_ms,
 	updated_at = ${SQLITE_NOW_EPOCH}`,
 		);
+		// `model_key TEXT PRIMARY KEY` admits NULL (SQLite rowid-table quirk); a NULL
+		// key would break every consumer that treats perf keys as selectors.
 		this.#listModelPerfStmt = this.#db.prepare(
-			"SELECT model_key, samples, output_tokens, gen_ms, ttft_samples, ttft_ms FROM model_perf",
+			"SELECT model_key, samples, output_tokens, gen_ms, ttft_samples, ttft_ms FROM model_perf WHERE model_key IS NOT NULL",
 		);
 		this.#usageStmts = {
 			command: this.#prepareUsageStatements("command"),
@@ -565,6 +574,8 @@ FROM model_usage_legacy
 	 * the turn-completion hot path. Fire-and-forget safe — flush failures are
 	 * logged, never thrown; await the returned promise only to observe the flush.
 	 * @param modelKey - Model key in "provider/modelId" format
+	 * @param serviceTier - Tier the turn ran on; non-default tiers aggregate in
+	 * their own row (see {@link modelPerfKey})
 	 */
 	recordModelPerf(modelKey: string, sample: ModelPerfSample, serviceTier?: ServiceTier | null): Promise<void> {
 		const row = normalizeModelPerfSample(modelPerfKey(modelKey, serviceTier), sample);
@@ -633,11 +644,13 @@ FROM model_usage_legacy
 			using markerStmt = this.#db.prepare("SELECT value FROM meta WHERE key = ?");
 			const marker = markerStmt.get(MODEL_PERF_BACKFILL_KEY);
 			if (marker) return;
-			// Existing aggregates include live, possibly unsynced samples. Never wipe
-			// or re-import those rows merely to add tier-aware accounting.
+			// The v1 import already folded the stats history into the bare rows, and no
+			// stats row written before the served-tier field carries a tier, so
+			// re-importing would only double-count it. Keep the live aggregates (blended
+			// history decays out of them) and just record v2.
 			if (markerStmt.get(MODEL_PERF_BACKFILL_V1_KEY)) {
-				using complete = this.#db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)");
-				complete.run(MODEL_PERF_BACKFILL_KEY, "complete");
+				using markCompleteStmt = this.#db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)");
+				markCompleteStmt.run(MODEL_PERF_BACKFILL_KEY, "complete");
 				return;
 			}
 			const statsDbPath = getStatsDbPath();
@@ -675,6 +688,9 @@ FROM model_usage_legacy
 		const statsDb = new Database(statsDbPath, { readonly: true });
 		try {
 			statsDb.run(`PRAGMA busy_timeout = ${getDbBusyTimeoutMs()}`);
+			// Stats databases written before the served-tier column existed cannot
+			// separate a fast serving path's samples from standard ones; those rows
+			// import as standard-tier history.
 			const hasTier = statsDb
 				.prepare<{ name: string }, []>("PRAGMA table_info(messages)")
 				.all()

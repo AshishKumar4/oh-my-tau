@@ -11,6 +11,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import type { SessionEntry } from "../session/session-entries";
@@ -714,7 +715,6 @@ export class TodoTool implements AgentTool<typeof todoSchema, TodoToolDetails> {
 	readonly approval = "read" as const;
 	readonly label = "Todo";
 	readonly summary = "Write a structured todo list to track progress within a session";
-	readonly description: string;
 	readonly parameters = todoSchema;
 	readonly concurrency = "exclusive";
 	readonly strict = true;
@@ -723,8 +723,12 @@ export class TodoTool implements AgentTool<typeof todoSchema, TodoToolDetails> {
 	readonly lenientArgValidation = true;
 
 	readonly loadMode = "discoverable";
-	constructor(private readonly session: ToolSession) {
-		this.description = prompt.render(todoDescription);
+	constructor(private readonly session: ToolSession) {}
+
+	/** Codex-profiled turns serialize tool calls, so the advice to send `todo` beside another call is left out. */
+	get description(): string {
+		const profile = effectiveHarnessProfile(this.session.settings, this.session.getActiveModel?.());
+		return prompt.render(todoDescription, { serialToolCalls: profile === "codex" });
 	}
 
 	async execute(

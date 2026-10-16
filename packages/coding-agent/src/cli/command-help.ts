@@ -6,8 +6,14 @@ export const acpHelp = {
 
 export const agentsHelp = { description: "Manage bundled task agents" } satisfies CommandMetadata;
 
+export const anonymizeHelp = {
+	description:
+		"Write a shareable copy of a session and its subagents: turn contents redacted, metadata kept, paths and literals replaced by consistent mock tokens",
+} satisfies CommandMetadata;
+
 export const authHelp = {
-	description: "Manage pooled provider API keys (auth keys add|list|remove <provider>)",
+	description:
+		"Manage provider credentials: pooled API keys (auth keys add|list|remove <provider>), and export or import stored credentials (API keys and OAuth logins) as JSON",
 } satisfies CommandMetadata;
 
 export const authBrokerHelp = {
@@ -125,6 +131,10 @@ export const sayHelp = {
 
 export const searchHelp = { description: "Test web search providers" } satisfies CommandMetadata;
 
+export const sessionHelp = {
+	description: "Hand a session to another machine: pack it, unpack it, or mark the local copy moved",
+} satisfies CommandMetadata;
+
 export const shareHelp = {
 	description: "Share a saved session via an encrypted link (same as /share)",
 } satisfies CommandMetadata;
@@ -161,7 +171,9 @@ export const ttsrHelp = {
 	description: "Inspect and test Time-Traveling Stream Rules (TTSR)",
 } satisfies CommandMetadata;
 
-export const updateHelp = { description: "Check for and install updates" } satisfies CommandMetadata;
+export const updateHelp = {
+	description: "Say how to update this oh-my-tau build (./scripts/install-harness.sh), or update installed plugins",
+} satisfies CommandMetadata;
 
 export const usageHelp = {
 	description: "Show provider usage limits for every authenticated account",

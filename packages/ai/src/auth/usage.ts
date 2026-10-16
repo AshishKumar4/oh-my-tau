@@ -1,7 +1,7 @@
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import { $pickenv, logger } from "@oh-my-pi/pi-utils";
+import { getEnvApiKey } from "../env-api-key";
 import * as AIError from "../error";
-import { getEnvApiKey } from "../stream";
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import { resolveUsedFraction } from "../usage";
@@ -346,7 +346,7 @@ export class UsageService implements UsageApi {
 
 		const failure = this.#deps.cache.get<null>(failureKey);
 		if (failure && failure.expiresAt > now) {
-			return this.#deps.cache.getStale<UsageReport | null>(cacheKey)?.value ?? null;
+			return this.#deps.cache.lastGood(cacheKey);
 		}
 
 		// Invalidation must not fork an already-running credential probe. Share it;
@@ -390,9 +390,7 @@ export class UsageService implements UsageApi {
 			// so an expired login does not display stale quota indefinitely.
 			const providerImpl = this.providerFor(request.provider);
 			const retainLastGood = !invalidated && providerImpl?.retainLastGoodOnFailure !== false;
-			const lastGood = retainLastGood
-				? (this.#deps.cache.getStale<UsageReport | null>(cacheKey)?.value ?? null)
-				: null;
+			const lastGood = retainLastGood ? this.#deps.cache.lastGood(cacheKey) : null;
 			const failureBackoffMs = providerImpl?.failureBackoffMs ?? USAGE_FAILURE_BACKOFF_MS;
 			const backoffJitter = failureBackoffMs * (Math.random() * 0.5 - 0.25);
 			const coolDown = Date.now() + failureBackoffMs + backoffJitter;
@@ -884,7 +882,7 @@ export class UsageService implements UsageApi {
 		await this.#deps.cache.clearReports(provider, () => this.#collectUsageRequests());
 
 		if (this.#deps.store.invalidateUsageCache) {
-			await this.#deps.store.invalidateUsageCache(signal).catch(err => {
+			await this.#deps.store.invalidateUsageCache(provider, signal).catch(err => {
 				logger.debug("Failed to notify store of stale usage", { err });
 			});
 		}
