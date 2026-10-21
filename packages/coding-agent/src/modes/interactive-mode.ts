@@ -2107,7 +2107,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// signal arriving mid-Ctrl+C no-ops instead of racing a second dispose.
 		this.#signalTeardown = createSessionTeardown({
 			getDraftText: () => this.#inputController.getDraftText(),
-			beginDispose: () => this.session.beginDispose(),
+			beginDispose: () => {
+				this.session.beginDispose();
+				this.statusLine.dispose();
+			},
 			saveDraft: text => this.sessionManager.saveDraft(text),
 			disposeSession: async reason => {
 				await this.#btwController.dispose();

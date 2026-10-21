@@ -167,7 +167,7 @@ function matchesPayloadRejectionText(text: string): boolean {
 
 const TIMEOUT_PATTERN = /\b(?:operation\s+)?timed?\s*out\b|\btimeout\b|\bstream stall\b/i;
 const TRANSIENT_ENVELOPE_PATTERN = /anthropic stream envelope error:/i;
-const TRANSIENT_ENVELOPE_TRUNCATION_PATTERN = /before message_(?:start|stop)/i;
+const TRANSIENT_ENVELOPE_TRUNCATION_PATTERN = /before message_(?:start|delta|stop)/i;
 export const STREAM_READ_ERROR_PATTERN = /stream[_ -]?read[_ -]?error/i;
 /** Python h2/httpx diagnostics forwarded through provider or proxy error events. */
 export const PYTHON_HTTP2_STREAM_RESET_PATTERN = /<StreamReset stream_id:\d+, error_code:(?:2|7), remote_reset:True>/;
@@ -1151,7 +1151,7 @@ export function isTransientStreamParseError(error: unknown): boolean {
  * non-terminal status treat it as transient (#11805).
  */
 const STREAM_DROP_PATTERN =
-	/stream disconnected before completion|(?:stream|websocket) closed before response\.completed|stream was interrupted|stream ended before terminal (?:chunk|completion event)|socket disconnected before secure tls connection/i;
+	/stream disconnected before completion|(?:stream|websocket) closed before response\.completed|stream was interrupted|stream ended before (?:terminal (?:chunk|completion event)|message_(?:start|delta|stop))|socket disconnected before secure tls connection/i;
 
 /**
  * Transport stream-drop diagnostic (see {@link STREAM_DROP_PATTERN}). Unlike

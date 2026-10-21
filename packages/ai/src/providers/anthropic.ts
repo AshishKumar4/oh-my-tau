@@ -1096,11 +1096,18 @@ type AnthropicToolResultContent =
 	| Array<{ type: "text"; text: string } | { type: "image"; source: AnthropicImageSource }>;
 
 /**
- * Convert content blocks to Anthropic API format
+ * Convert content blocks to Anthropic API format.
+ *
+ * Inline media Claude cannot read (video, PDF, HEIC, …) fails the request when
+ * `rejectUnsupportedMedia` is set, so the turn that attached it errors instead
+ * of being answered as if nothing were attached. Elsewhere it becomes a text
+ * note: an older turn has already been answered, and failing on it would fail
+ * every later request of the conversation.
  */
 function convertContentBlocks(
 	content: (TextContent | ImageContent)[],
 	supportsImages = true,
+	rejectUnsupportedMedia = false,
 ): AnthropicToolResultContent {
 	const blocks: Array<{ type: "text"; text: string } | { type: "image"; source: AnthropicImageSource }> = [];
 	let sawText = false;
@@ -1128,7 +1135,12 @@ function convertContentBlocks(
 		} else {
 			const mediaType = normalizeAnthropicImageMediaType(block.mimeType);
 			if (!mediaType) {
-				blocks.push({ type: "text", text: `[unsupported image: ${block.mimeType}]` });
+				if (rejectUnsupportedMedia) {
+					throw new AIError.ValidationError(
+						`Claude does not accept ${block.mimeType} attachments; send JPEG, PNG, GIF or WebP images instead`,
+					);
+				}
+				blocks.push({ type: "text", text: `[${block.mimeType} attachment omitted: not supported by this model]` });
 				continue;
 			}
 			source = { type: "base64", media_type: mediaType, data: block.data };
@@ -5988,6 +6000,21 @@ export function convertAnthropicMessages(
 		undefined,
 		opts?.credentialId,
 	);
+	// The user turn this request answers: the last `user` message with no
+	// assistant reply after it. Media Claude cannot read fails the request there
+	// (see convertContentBlocks); a compaction request only summarizes, so it
+	// never fails on an attachment.
+	let unansweredUserIndex = -1;
+	if (!opts?.compactionRequest) {
+		for (let index = transformedMessages.length - 1; index >= 0; index--) {
+			const role = transformedMessages[index].role;
+			if (role === "assistant") break;
+			if (role === "user") {
+				unansweredUserIndex = index;
+				break;
+			}
+		}
+	}
 
 	for (let i = 0; i < transformedMessages.length; i++) {
 		const msg = transformedMessages[i];
@@ -6051,7 +6078,11 @@ export function convertAnthropicMessages(
 					content = msg.content.toWellFormed();
 				}
 			} else {
-				const contentBlocks = convertContentBlocks(msg.content, model.input.includes("image"));
+				const contentBlocks = convertContentBlocks(
+					msg.content,
+					model.input.includes("image"),
+					i === unansweredUserIndex,
+				);
 				if (typeof contentBlocks === "string") {
 					if (contentBlocks.trim().length === 0) {
 						if (!hasProviderControls) continue;
