@@ -226,6 +226,19 @@ function imageLinksForMessage(
 }
 
 export class UiHelpers {
+	/**
+	 * Tail of the transcript-replay chain. Replays swap `ctx.chatContainer` and the
+	 * live component maps for their whole duration, so two overlapping replays would
+	 * capture each other's staged state as "visible" and commit interleaved trees.
+	 */
+	#replayTail: Promise<void> = Promise.resolve();
+	/** Bumped by every replay request; a queued or in-flight replay is stale once it moves on. */
+	#replayGeneration = 0;
+	/** Requested replays that have not settled yet. */
+	#replaysInFlight = 0;
+	/** `initialChatRendered` to restore when the latest replay ends without committing. */
+	#chatRenderedBeforeReplay = false;
+
 	constructor(private ctx: InteractiveModeContext) {}
 
 	/**
@@ -1022,7 +1035,29 @@ export class UiHelpers {
 		return true;
 	}
 
-	async renderInitialMessages(options: RenderInitialMessagesOptions = {}): Promise<void> {
+	/**
+	 * Rebuild the transcript from the view session. Calls run one at a time; a call
+	 * superseded by a newer one before or during its replay rolls back without
+	 * committing or clearing terminal history, so only the latest request paints.
+	 */
+	renderInitialMessages(options: RenderInitialMessagesOptions = {}): Promise<void> {
+		const generation = ++this.#replayGeneration;
+		// Close the display gate at request time, not when the queued replay starts:
+		// a display message persisted in between must reach the chat only through
+		// the replay, never also live (issue #1955).
+		if (this.#replaysInFlight++ === 0) this.#chatRenderedBeforeReplay = this.ctx.initialChatRendered;
+		this.ctx.initialChatRendered = false;
+		const run = this.#replayTail
+			.then(() => this.#renderInitialMessages(options, generation))
+			.finally(() => {
+				this.#replaysInFlight--;
+			});
+		this.#replayTail = run.catch(() => {});
+		return run;
+	}
+
+	async #renderInitialMessages(options: RenderInitialMessagesOptions, generation: number): Promise<void> {
+		if (generation !== this.#replayGeneration) return;
 		// Collapsed replay keeps in-flight calls so pending tools remain routable during mid-turn rebuilds.
 		let context = this.ctx.viewSession.buildTranscriptSessionContext({
 			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
@@ -1043,19 +1078,18 @@ export class UiHelpers {
 		const previousPendingPythonComponents = this.ctx.pendingPythonComponents;
 		const previousLastAssistantUsage = this.ctx.lastAssistantUsage;
 		const previousServedModelTracker = this.ctx.servedModelTracker;
-		const chatWasAlreadyRendered = this.ctx.initialChatRendered;
 		const renderOptions = {
 			updateFooter: true,
 		};
 		let committed = false;
 		let replayAttempts = 0;
-		this.ctx.initialChatRendered = false;
 		try {
 			// Resolve before replacing live component maps: streaming events may arrive during filesystem I/O.
 			await refreshAssistantMessageLinkTargets(
 				this.ctx,
 				context.messages.filter((message): message is AssistantMessage => message.role === "assistant"),
 			);
+			if (generation !== this.#replayGeneration) return;
 
 			this.ctx.chatContainer = stagedChatContainer;
 			this.ctx.transcriptMessageComponents = new WeakMap<AgentMessage, Component>();
@@ -1074,6 +1108,7 @@ export class UiHelpers {
 				} else {
 					await this.ctx.renderSessionContextIncrementally(context, renderOptions);
 				}
+				if (generation !== this.#replayGeneration) return;
 				if (this.ctx.viewSession.sessionManager.getEntries().length === replayEntryCount) {
 					break;
 				}
@@ -1102,6 +1137,7 @@ export class UiHelpers {
 					this.ctx,
 					context.messages.filter((message): message is AssistantMessage => message.role === "assistant"),
 				);
+				if (generation !== this.#replayGeneration) return;
 				stagedChatContainer.disposeChildren();
 				this.ctx.transcriptMessageComponents = new WeakMap<AgentMessage, Component>();
 				this.ctx.pendingTools.clear();
@@ -1155,7 +1191,9 @@ export class UiHelpers {
 				this.ctx.servedModelTracker = previousServedModelTracker;
 				stagedChatContainer.disposeChildren();
 			}
-			this.ctx.initialChatRendered = committed ? true : chatWasAlreadyRendered;
+			// A superseded replay leaves the gate closed for the newer one still queued.
+			if (committed) this.#chatRenderedBeforeReplay = true;
+			this.ctx.initialChatRendered = generation === this.#replayGeneration && this.#chatRenderedBeforeReplay;
 		}
 	}
 
