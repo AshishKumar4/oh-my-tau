@@ -1365,6 +1365,30 @@ export class SelectorController {
 	}
 
 	/**
+	 * Drop the last turn: the esc-esc rewind with the latest user request picked,
+	 * so the old path stays as a branch and the prompt returns to the editor. A
+	 * turn still running stops first, as the first Esc of esc-esc stops it.
+	 */
+	async undoLastTurn(): Promise<void> {
+		if (this.ctx.session.isStreaming) await this.ctx.session.abort();
+		const last = this.ctx.sessionManager
+			.getBranch()
+			.findLast(entry => isTranscriptEntry(entry) && isUserRequestEntry(entry));
+		if (!last) {
+			this.ctx.showStatus("Nothing to undo");
+			return;
+		}
+		await this.#rewindFromTranscript(
+			last.id,
+			() => {
+				this.focusActiveEditorArea();
+				this.ctx.ui.requestRender();
+			},
+			"Dropped the last turn",
+		);
+	}
+
+	/**
 	 * Alternate branches of `entryId`'s turn for the rewind selector's strip:
 	 * every other child of its parent, each unrolled along its most-recent
 	 * descendants (children are timestamp-ordered, so the last child chain is
@@ -1408,7 +1432,7 @@ export class SelectorController {
 	 * closes the fullscreen selector after the transcript is rebuilt so the
 	 * alternate screen never flashes a stale transcript.
 	 */
-	async #rewindFromTranscript(entryId: string, done: () => void): Promise<void> {
+	async #rewindFromTranscript(entryId: string, done: () => void, status = "Rewound to selected point"): Promise<void> {
 		const entry = this.ctx.sessionManager.getEntry(entryId);
 		if (!entry || !isTranscriptEntry(entry)) {
 			done();
@@ -1442,7 +1466,7 @@ export class SelectorController {
 				this.ctx.editor.setDraft(result.editorText, result.editorImages);
 			}
 			done();
-			this.ctx.showStatus("Rewound to selected point");
+			this.ctx.showStatus(status);
 		} catch (error) {
 			done();
 			this.ctx.showError(error instanceof Error ? error.message : String(error));

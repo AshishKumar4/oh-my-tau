@@ -508,6 +508,8 @@ export interface InteractiveModeContext {
 	switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel): Promise<void>;
 	showPluginSelector(mode?: "install" | "uninstall"): void;
 	showUserMessageSelector(): void;
+	/** Drop the last turn, putting its prompt back in the editor; see `/undo`. */
+	undoLastTurn(): Promise<void>;
 	showCopySelector(): void;
 	showTreeSelector(): void;
 	/** Open the `/effort` picker over the levels the current model accepts. */

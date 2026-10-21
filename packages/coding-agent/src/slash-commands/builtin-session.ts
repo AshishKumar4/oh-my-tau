@@ -607,6 +607,16 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "undo",
+		icon: "history",
+		description: "Drop the last turn and put its prompt back in the editor",
+		handleTui: async (_command, runtime) => {
+			// Cleared first: the rewind puts the dropped prompt in the editor.
+			clearSubmittedText(runtime);
+			await runtime.ctx.undoLastTurn();
+		},
+	},
+	{
 		name: "fork",
 		icon: "branch",
 		description: "Fork this session, or open it in a multiplexer pane or window",

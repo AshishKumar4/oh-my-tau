@@ -8333,6 +8333,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showUserMessageSelector();
 	}
 
+	undoLastTurn(): Promise<void> {
+		return this.#selectorController.undoLastTurn();
+	}
+
 	showCopySelector(): void {
 		this.#selectorController.showCopySelector();
 	}
