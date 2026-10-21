@@ -1780,17 +1780,21 @@ export class AgentSession implements SettingsScope {
 		this.#subagentEventBus = config.subagentEventBus;
 		const initialEvalStateContext = this.#buildEvalStateContextMessage(this.agent.state.messages);
 		if (initialEvalStateContext) {
-			// Persist the startup snapshot at the slot this process sends it from, so
-			// the next resumed process rebuilds the same request prefix (#15736).
 			this.agent.appendMessage(initialEvalStateContext);
-			this.sessionManager.appendCustomMessageEntry(
-				initialEvalStateContext.customType,
-				initialEvalStateContext.content,
-				initialEvalStateContext.display,
-				undefined,
-				initialEvalStateContext.attribution,
-				initialEvalStateContext.timestamp,
-			);
+			// Persist the startup snapshot at the slot this process sends it from, so
+			// the next resumed process rebuilds the same request prefix (#15736). Not
+			// after calls a crash left without results: /recover appends their results
+			// right after the turn that issued them, and nothing may sit in between.
+			if (collectPendingToolCalls(this.sessionManager.getBranch()).length === 0) {
+				this.sessionManager.appendCustomMessageEntry(
+					initialEvalStateContext.customType,
+					initialEvalStateContext.content,
+					initialEvalStateContext.display,
+					undefined,
+					initialEvalStateContext.attribution,
+					initialEvalStateContext.timestamp,
+				);
+			}
 		}
 		const ircHost: IrcBridgeHost = {
 			agent: this.agent,

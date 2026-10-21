@@ -30,6 +30,7 @@ import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-c
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import * as executor from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { isEvalStateContext } from "@oh-my-pi/pi-coding-agent/eval/state";
 import type { SingleResult, StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -1655,5 +1656,90 @@ describe("/recover after the SDK's resume repair", () => {
 		expect(notice.join("\n")).toContain("`call_1` bash: bun test");
 		expect(mock.calls).toHaveLength(1);
 		expect(resultsOf()).toHaveLength(1);
+	});
+
+	it("repairs a crash-interrupted call in a session with eval history", async () => {
+		// The previous process crashed while `bash` ran after an earlier eval call:
+		// no session_exit, so opening leaves the call for /recover to repair.
+		const previous = SessionManager.create(dir.path(), path.join(dir.path(), "sessions"));
+		previous.appendMessage({ role: "user", content: "eval something", timestamp: Date.now() });
+		previous.appendMessage(toolTurn({ id: "call_eval", name: "eval", args: { code: "1" } }));
+		previous.appendMessage(toolResult("call_eval", "eval"));
+		previous.appendMessage({ ...createAssistantMessage("evaluated"), stopReason: "stop" });
+		previous.appendMessage({ role: "user", content: "run the tests", timestamp: Date.now() });
+		previous.appendMessage(toolTurn({ id: "call_1", name: "bash", args: { command: "bun test" } }));
+		previous.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
+			toolCallId: "call_1",
+			toolName: "bash",
+			startedAt: new Date().toISOString(),
+		});
+		await previous.flush();
+		const file = previous.getSessionFile();
+		await previous.close();
+		if (!file) throw new Error("previous session has no file");
+
+		const auth = createInMemoryAuthStorage();
+		auth.keys.setRuntime("mock", "test-key");
+		const modelRegistry = new ModelRegistry(auth);
+		registries.push(modelRegistry);
+		const mock = createMockModel({ responses: [{ content: [{ type: "text", text: "re-running the tests" }] }] });
+		const { session } = await createAgentSession({
+			cwd: dir.path(),
+			agentDir: dir.path(),
+			modelRegistry,
+			model: mock,
+			sessionManager: await SessionManager.open(file),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"retry.enabled": false,
+				"todo.enabled": false,
+				"todo.reminders": false,
+			}),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			toolNames: [],
+		});
+		sessions.push(session);
+		session.agent.streamFn = mock.stream;
+		// The eval snapshot is sent, but nothing is persisted between the call and its coming result.
+		expect(session.agent.state.messages.some(isEvalStateContext)).toBe(true);
+		const branchAfterTurn = () => {
+			const branch = session.sessionManager.getBranch();
+			const turn = branch.findLastIndex(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					entry.message.content.some(block => block.type === "toolCall" && block.id === "call_1"),
+			);
+			return branch.slice(turn + 1);
+		};
+		expect(branchAfterTurn().some(entry => entry.type === "custom_message")).toBe(false);
+
+		const result = await executeAcpBuiltinSlashCommand("/recover", {
+			session,
+			sessionManager: session.sessionManager,
+			settings: session.settings,
+			cwd: dir.path(),
+			output: () => {},
+			refreshCommands: () => {},
+			reloadPlugins: async () => {},
+		});
+		await session.waitForIdle();
+
+		expect(result).toEqual({ consumed: true, agentInvoked: true });
+		const [first] = branchAfterTurn().filter(entry => entry.type === "message" || entry.type === "custom_message");
+		expect(first?.type === "message" && first.message.role === "toolResult" && first.message.toolCallId).toBe(
+			"call_1",
+		);
+		expect(
+			first?.type === "message" && first.message.role === "toolResult" ? first.message.content : undefined,
+		).toEqual([{ type: "text", text: INTERRUPTED_TOOL_RESULT_TEXT }]);
+		expect(mock.calls).toHaveLength(1);
 	});
 });
