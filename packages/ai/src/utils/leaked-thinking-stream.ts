@@ -256,9 +256,10 @@ class LeakedThinkingProjector {
 	thinkingEnd(srcIndex: number, source: ThinkingContent | undefined): void {
 		const index = this.#thinkingBlocks.get(srcIndex);
 		if (index === undefined) {
-			if (source?.thinkingSignature) this.#projectSignedThinking(srcIndex, "", source);
+			if (source?.thinkingSignature) this.#projectSignedThinking(srcIndex, source);
 			return;
 		}
+		this.#appendThinkingTail(index, source);
 		adoptThinkingState(this.#partial.content[index] as ThinkingContent, source);
 		if (!this.#pendingThinkingEnds.delete(index)) return;
 		if (this.#thinking?.index === index) this.#thinking = undefined;
@@ -271,18 +272,29 @@ class LeakedThinkingProjector {
 	 * semantics as {@link toolStart}) so block order survives for replay —
 	 * the signature item must precede the function call it signs.
 	 */
-	#projectSignedThinking(srcIndex: number, thinking: string, source: ThinkingContent): void {
+	#projectSignedThinking(srcIndex: number, source: ThinkingContent): void {
 		this.#flushHealer();
 		this.#closeText();
 		this.#closeThinking();
-		const block: ThinkingContent = { type: "thinking", thinking };
+		const block: ThinkingContent = { type: "thinking", thinking: "" };
 		adoptThinkingState(block, source);
 		this.#partial.content.push(block);
 		const index = this.#partial.content.length - 1;
 		this.#anchor(index, srcIndex);
 		this.#thinkingBlocks.set(srcIndex, index);
 		this.#out.push({ type: "thinking_start", contentIndex: index, partial: this.#partial });
+		this.#appendThinkingTail(index, source);
 		this.#emitThinkingEnd(index);
+	}
+
+	/** Emit only finalized native thinking that did not arrive as deltas. */
+	#appendThinkingTail(index: number, source: ThinkingContent | undefined): void {
+		const block = this.#partial.content[index] as ThinkingContent;
+		if (!source || source.thinking.length <= block.thinking.length || !source.thinking.startsWith(block.thinking))
+			return;
+		const delta = source.thinking.slice(block.thinking.length);
+		block.thinking += delta;
+		this.#out.push({ type: "thinking_delta", contentIndex: index, delta, partial: this.#partial });
 	}
 
 	/** Forward a completed native image after releasing held text. */
@@ -380,7 +392,7 @@ class LeakedThinkingProjector {
 			const block = message.content[srcIndex];
 			if (block?.type !== "thinking" || !block.thinkingSignature) continue;
 			if (this.#thinkingBlocks.has(srcIndex)) continue;
-			this.#projectSignedThinking(srcIndex, block.thinking, block);
+			this.#projectSignedThinking(srcIndex, block);
 		}
 		for (let srcIndex = 0; srcIndex < message.content.length; srcIndex++) {
 			const block = message.content[srcIndex];
