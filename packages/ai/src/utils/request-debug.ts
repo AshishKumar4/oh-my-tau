@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import * as fs from "node:fs/promises";
+import { redactHeaders } from "./http-inspector";
 
 const REQUEST_DEBUG_ENV = "PI_REQ_DEBUG";
 const textEncoder = new TextEncoder();
@@ -61,7 +62,7 @@ export async function createRequestDebugSession(payload: RequestDebugPayload): P
 		method: payload.method,
 		url: payload.url,
 	};
-	const headers = headersToRecord(payload.headers);
+	const headers = redactHeaders(headersToRecord(payload.headers));
 	if (headers) requestDump.headers = headers;
 	if (payload.body !== undefined) requestDump.body = payload.body;
 	if (payload.bodyText !== undefined) requestDump.bodyText = payload.bodyText;
@@ -289,7 +290,7 @@ function looksLikeJson(text: string): boolean {
 
 function formatResponseHeaderBlock(statusLine: string, headers?: RequestDebugHeaders): string {
 	const lines = [statusLine];
-	const record = headersToRecord(headers);
+	const record = redactHeaders(headersToRecord(headers));
 	if (record) {
 		for (const name in record) {
 			const value = record[name];
