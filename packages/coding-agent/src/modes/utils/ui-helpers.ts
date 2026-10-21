@@ -245,7 +245,9 @@ export class UiHelpers {
 	 * Show a status message in the chat.
 	 *
 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
-	 * we update the previous status line instead of appending new ones to avoid log spam.
+	 * we update the previous status line instead of appending new ones to avoid log spam. A repeat of the
+	 * exact same text replaces the line with a fresh notice: an in-place update with identical props sends
+	 * nothing to a native terminal, so its expired toast would never show again.
 	 */
 	showStatus(message: string, options?: ShowStatusOptions): void {
 		const children = this.ctx.chatContainer.children;
@@ -257,9 +259,12 @@ export class UiHelpers {
 		const notice = { styleFn, toast: options?.toast };
 
 		if (last && last === this.ctx.lastStatus) {
-			this.ctx.lastStatus.setMessage(message, notice);
-			this.ctx.ui.requestRender();
-			return;
+			if (this.ctx.lastStatus.message !== message) {
+				this.ctx.lastStatus.setMessage(message, notice);
+				this.ctx.ui.requestRender();
+				return;
+			}
+			this.ctx.chatContainer.removeChild(last);
 		}
 
 		const status = new StatusNotice(message, notice);
