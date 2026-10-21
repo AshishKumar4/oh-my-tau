@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { MCPConnectionTimeoutError, connectToServer, listTools } from "@oh-my-pi/pi-coding-agent/mcp/client";
+import { MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
 import { isRetriableConnectionError } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import { LegacySseTransport } from "@oh-my-pi/pi-coding-agent/mcp/transports/sse";
 import type { JsonRpcMessage } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { withTimeout } from "@oh-my-pi/pi-utils";
 
@@ -159,7 +161,7 @@ describe("legacy MCP HTTP+SSE transport", () => {
 		).rejects.toThrow("Legacy SSE endpoint origin mismatch");
 	});
 
-	it("surfaces stream drops during requests as retriable transport failures", async () => {
+	it("does not replay accepted requests when the response stream closes", async () => {
 		let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
 
 		server = Bun.serve({
@@ -214,11 +216,119 @@ describe("legacy MCP HTTP+SSE transport", () => {
 			await listTools(connection);
 			throw new Error("Expected listTools to fail after legacy SSE stream close");
 		} catch (error) {
-			expect(error).toBeInstanceOf(Error);
-			if (error instanceof Error) {
-				expect(error.message).toBe("Transport closed: legacy SSE stream closed");
-				expect(isRetriableConnectionError(error)).toBe(true);
-			}
+			expect(error).toBeInstanceOf(MCPTransportError);
+			expect(error).toMatchObject({
+				transport: "http",
+				stage: "receive",
+				failure: "closed",
+				message: "Transport closed: legacy SSE stream closed",
+				retryable: false,
+			});
+			expect(isRetriableConnectionError(error)).toBe(false);
+		} finally {
+			await connection.transport.close();
+		}
+	});
+
+	it("does not replay a request whose POST connection closes after it was sent", async () => {
+		// Raw TCP: the GET stream announces the endpoint, then each POST connection closes after its request arrives.
+		const tcp = Bun.listen({
+			hostname: "127.0.0.1",
+			port: 0,
+			socket: {
+				data(socket, chunk) {
+					if (chunk.toString().startsWith("GET ")) {
+						socket.write(
+							"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\nevent: endpoint\ndata: /messages\n\n",
+						);
+					} else {
+						socket.end();
+					}
+				},
+			},
+		});
+		const transport = new LegacySseTransport({
+			type: "sse",
+			url: `http://127.0.0.1:${tcp.port}/sse`,
+			timeout: 1_000,
+		});
+		try {
+			await transport.connect();
+			const error = await transport.request("tools/call", { name: "write" }).then(
+				() => undefined,
+				reason => reason,
+			);
+			expect(error).toBeInstanceOf(MCPTransportError);
+			expect(error).toMatchObject({ transport: "http", stage: "send", retryable: false });
+			expect(["reset", "eof"]).toContain((error as MCPTransportError).failure);
+			expect(isRetriableConnectionError(error)).toBe(false);
+		} finally {
+			await transport.close();
+			tcp.stop(true);
+		}
+	});
+
+	it("does not mistake a JSON-RPC error containing fetch failed for a connection failure", async () => {
+		let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+		server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				if (req.method === "GET") {
+					return new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								streamController = controller;
+								controller.enqueue(encoder.encode("event: endpoint\ndata: /mcp/messages/\n\n"));
+							},
+						}),
+						{ headers: { "Content-Type": "text/event-stream" } },
+					);
+				}
+				const body = (await req.json()) as JsonRpcMessage;
+				if (!streamController) return new Response("SSE stream not open", { status: 500 });
+				if ("id" in body && "method" in body) {
+					const response =
+						body.method === "initialize"
+							? {
+									jsonrpc: "2.0",
+									id: body.id,
+									result: {
+										protocolVersion: "2024-11-05",
+										capabilities: { tools: {} },
+										serverInfo: { name: "legacy-sse", version: "1.0.0" },
+									},
+								}
+							: {
+									jsonrpc: "2.0",
+									id: body.id,
+									error: { code: -32603, message: "fetch failed inside the tool" },
+								};
+					streamController.enqueue(encoder.encode(`event: message\ndata: ${JSON.stringify(response)}\n\n`));
+				}
+				return new Response(null, { status: 202 });
+			},
+		});
+
+		const connection = await connectToServer("legacy-sse", {
+			type: "sse",
+			url: `http://127.0.0.1:${server.port}/mcp/sse`,
+			timeout: 300,
+		});
+		try {
+			const error = await listTools(connection).then(
+				() => undefined,
+				reason => reason,
+			);
+			expect(error).toBeInstanceOf(MCPTransportError);
+			expect(error).toMatchObject({
+				transport: "http",
+				stage: "protocol",
+				failure: "json_rpc",
+				retryable: false,
+				code: -32603,
+				message: "MCP error -32603: fetch failed inside the tool",
+			});
+			expect(isRetriableConnectionError(error)).toBe(false);
 		} finally {
 			await connection.transport.close();
 		}

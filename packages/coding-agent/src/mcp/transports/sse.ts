@@ -10,6 +10,12 @@ import type {
 	MCPTransport,
 } from "../../mcp/types";
 import { toJsonRpcError } from "../../mcp/types";
+import {
+	createMCPJsonRpcError,
+	MCPTransportError,
+	nonRetryableMCPTransportError,
+	normalizeMCPTransportError,
+} from "../errors";
 import { RequestIdAllocator } from "../request-id";
 import { createMCPTimeout, getNeverAbortSignal, resolveMCPTimeoutMs } from "../timeout";
 import { type MCPFetchInit, mcpFetch } from "./header-policy";
@@ -188,12 +194,24 @@ export class LegacySseTransport implements MCPTransport {
 			} else if (error instanceof Error && error.name !== "AbortError") {
 				logger.debug("Legacy SSE stream error", { url: this.#config.url, error: error.message });
 				this.onError?.(error);
-				this.#rejectPending(error);
+				this.#rejectPending(
+					nonRetryableMCPTransportError(
+						normalizeMCPTransportError(error, { transport: "http", stage: "receive" }),
+					),
+				);
 			}
 		} finally {
 			operation.clear();
 			if (endpointReceived) {
-				this.#rejectPending(new Error("Transport closed: legacy SSE stream closed"));
+				this.#rejectPending(
+					new MCPTransportError({
+						transport: "http",
+						stage: "receive",
+						failure: "closed",
+						message: "Transport closed: legacy SSE stream closed",
+						retryable: false,
+					}),
+				);
 			}
 		}
 	}
@@ -207,7 +225,7 @@ export class LegacySseTransport implements MCPTransport {
 				if (pending.abortHandler) pending.operation.signal?.removeEventListener("abort", pending.abortHandler);
 				const response = message as JsonRpcResponse;
 				if (response.error) {
-					pending.reject(new Error(`MCP error ${response.error.code}: ${response.error.message}`));
+					pending.reject(createMCPJsonRpcError("http", response.error));
 				} else {
 					pending.resolve(response.result);
 				}
@@ -271,8 +289,10 @@ export class LegacySseTransport implements MCPTransport {
 		}
 		this.#pending.set(id, pending);
 
+		let posted = false;
 		try {
 			const response = await this.#postJson(body, operation.signal);
+			posted = true;
 			if (!response.ok) {
 				const text = await response.text();
 				throw new Error(`HTTP ${response.status}: ${text}`);
@@ -285,6 +305,13 @@ export class LegacySseTransport implements MCPTransport {
 			if (pending.abortHandler) operation.signal?.removeEventListener("abort", pending.abortHandler);
 			if (operation.isTimeoutAbort(error)) {
 				throw new Error(`Request timeout after ${timeout}ms`);
+			}
+			if (!posted && error instanceof Error && error.name !== "AbortError") {
+				// A reset or EOF can follow the server reading the POST; only a refused connection proves it was not sent.
+				const normalized = normalizeMCPTransportError(error, { transport: "http", stage: "send" });
+				if (normalized.failure === "reset" || normalized.failure === "eof") {
+					throw nonRetryableMCPTransportError(normalized);
+				}
 			}
 			throw error;
 		}
