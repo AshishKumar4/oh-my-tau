@@ -2014,6 +2014,7 @@ export async function compact(
 	// to this request and is replayed after the returned signed block.
 	let nativeSummary: string | undefined;
 	let nativeSignature: string | undefined;
+	let nativeToolChanges: Record<string, unknown>[] | undefined;
 	let nativeFirstKeptEntryId = firstKeptEntryId;
 	let nativeUsedTokens: number | undefined;
 	let nativeRetainedFiles: AnthropicCompactionFiles[] | undefined;
@@ -2040,6 +2041,7 @@ export async function compact(
 										provider: previousNative.provider,
 										content: previousNative.content,
 										...(previousNative.signature ? { signature: previousNative.signature } : {}),
+										...(previousNative.toolChanges ? { toolChanges: previousNative.toolChanges } : {}),
 										...(previousNative.encryptedContent
 											? { encryptedContent: previousNative.encryptedContent }
 											: {}),
@@ -2141,6 +2143,7 @@ export async function compact(
 			);
 			nativeSummary = remote.content;
 			nativeSignature = remote.signature;
+			nativeToolChanges = remote.toolChanges;
 			nativeUsedTokens = calculatePromptTokens(remote.usage);
 			usedRemoteCompaction = true;
 		} catch (err) {
@@ -2238,6 +2241,7 @@ export async function compact(
 			provider: model.provider,
 			content: nativeSummary,
 			...(nativeSignature ? { signature: nativeSignature } : {}),
+			...(nativeToolChanges ? { toolChanges: nativeToolChanges } : {}),
 			...(filesText ? { filesText } : {}),
 			...(nativeRetainedFiles ? { retainedFiles: nativeRetainedFiles } : {}),
 			exactTail: true,

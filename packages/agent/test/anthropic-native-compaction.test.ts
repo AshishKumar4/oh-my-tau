@@ -327,6 +327,60 @@ describe("compact() Anthropic native lane", () => {
 		expect(calls[0]?.ctx.messages.map(message => message.content)).toEqual(["long history", "no safe boundary"]);
 	});
 
+	test("carries signed tool_changes from the response through persistence into replay and recompaction", async () => {
+		const model = makeAnthropicModel();
+		const toolChanges = [{ type: "tool_addition", tool: { type: "tool_reference", name: "search" } }];
+		const { completeImpl } = recordingCompleteImpl(() =>
+			assistantMessage(model, {
+				providerPayload: {
+					type: "anthropicCompaction",
+					provider: "anthropic",
+					content: NATIVE_SUMMARY,
+					signature: "sig_tools",
+					toolChanges,
+				},
+				stopDetails: { type: "compaction" },
+			}),
+		);
+
+		const result = await compact(makePreparation(), model, "sk-ant-test", undefined, undefined, { completeImpl });
+		// The session file stores preserve data as JSON; reading it back must keep the signed records.
+		const reloaded: Record<string, unknown> = JSON.parse(JSON.stringify(result.preserveData));
+		expect(getAnthropicCompactionPayload(reloaded)).toMatchObject({ signature: "sig_tools", toolChanges });
+
+		// A follow-up compaction re-sends the previous block with its tool changes.
+		const followUp = recordingCompleteImpl(() =>
+			assistantMessage(model, {
+				providerPayload: {
+					type: "anthropicCompaction",
+					provider: "anthropic",
+					content: "second",
+					signature: "sig_2",
+				},
+				stopDetails: { type: "compaction" },
+			}),
+		);
+		await compact(
+			makePreparation({
+				previousSummary: result.summary,
+				previousSummaryTimestamp: new Date(1_500).toISOString(),
+				previousPreserveData: reloaded,
+			}),
+			model,
+			"sk-ant-test",
+			undefined,
+			undefined,
+			{ completeImpl: followUp.completeImpl },
+		);
+		expect(followUp.calls[0]?.ctx.messages[0]).toMatchObject({
+			providerPayload: { type: "anthropicCompaction", signature: "sig_tools", toolChanges },
+		});
+
+		// Records mangled on disk cannot replay as signed: the summary falls back to its text.
+		const mangled = { anthropicCompaction: { ...(reloaded.anthropicCompaction as object), toolChanges: [null] } };
+		expect(getAnthropicCompactionPayload(mangled)).toBeUndefined();
+	});
+
 	test("leads a follow-up compaction with a legacy replay block and replaces it with a signature", async () => {
 		const model = makeAnthropicModel();
 		const { calls, completeImpl } = recordingCompleteImpl(() =>

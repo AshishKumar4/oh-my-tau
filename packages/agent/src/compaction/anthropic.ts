@@ -33,6 +33,8 @@ export interface AnthropicCompactionPreserveData {
 	content: string;
 	/** Signature attached to an on-demand block; replayed verbatim. */
 	signature?: string;
+	/** Opaque `tool_changes` records covered by the signature; replayed verbatim. */
+	toolChanges?: Record<string, unknown>[];
 	/** Legacy threshold block state; replay-only. */
 	encryptedContent?: string;
 	/** Harness file metadata (`<files>` section) replayed after the retained tail. */
@@ -70,12 +72,16 @@ export function getPreservedAnthropicCompactionData(
 	if (!isRecord(candidate)) return undefined;
 	if (typeof candidate.provider !== "string" || candidate.provider.length === 0) return undefined;
 	if (typeof candidate.content !== "string" || candidate.content.length === 0) return undefined;
+	const toolChanges = candidate.toolChanges;
+	// The signature covers `tool_changes`: a block missing or mangling them cannot replay.
+	if (toolChanges !== undefined && (!Array.isArray(toolChanges) || !toolChanges.every(isRecord))) return undefined;
 	return {
 		provider: candidate.provider,
 		content: candidate.content,
 		...(typeof candidate.signature === "string" && candidate.signature.length > 0
 			? { signature: candidate.signature }
 			: {}),
+		...(toolChanges !== undefined ? { toolChanges } : {}),
 		...(typeof candidate.encryptedContent === "string" && candidate.encryptedContent.length > 0
 			? { encryptedContent: candidate.encryptedContent }
 			: {}),
@@ -122,6 +128,7 @@ export function getAnthropicCompactionPayload(
 		provider: preserved.provider,
 		content: preserved.content,
 		...(preserved.signature ? { signature: preserved.signature } : {}),
+		...(preserved.toolChanges ? { toolChanges: preserved.toolChanges } : {}),
 		...(preserved.encryptedContent ? { encryptedContent: preserved.encryptedContent } : {}),
 		...(preserved.filesText ? { filesText: preserved.filesText } : {}),
 		...(preserved.retainedFiles?.length ? { retainedFiles: preserved.retainedFiles } : {}),
@@ -196,6 +203,8 @@ export interface AnthropicNativeCompactionRequest {
 export interface AnthropicNativeCompactionResponse {
 	content: string;
 	signature: string;
+	/** Opaque `tool_changes` records covered by the signature. */
+	toolChanges?: Record<string, unknown>[];
 	usage: Usage;
 	model: string;
 }
@@ -279,6 +288,7 @@ export async function requestAnthropicNativeCompaction(
 	return {
 		content: payload.content,
 		signature: payload.signature,
+		...(payload.toolChanges ? { toolChanges: payload.toolChanges } : {}),
 		usage: response.usage,
 		model: response.model,
 	};
