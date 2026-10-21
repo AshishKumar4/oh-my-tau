@@ -142,7 +142,7 @@ import { releaseCompletionHandles } from "../eval/completion-bridge";
 import { releaseJudgmentBatches } from "../eval/judgment-batch-bridge";
 import type { EvalPreludeDefinition } from "../eval/preludes";
 import type { PythonResult } from "../eval/py/executor";
-import { formatEvalStateContext } from "../eval/state";
+import { EVAL_STATE_CONTEXT_TYPE, formatEvalStateContext, isEvalStateContext } from "../eval/state";
 import { WorkPoolRegistry } from "../task/workpool";
 import { type BashPtyOptions, type BashResult, releaseShellSessions } from "../exec/bash-executor";
 import type { TtsrManager } from "../export/ttsr";
@@ -831,6 +831,16 @@ function ephemeralMaxTokensRejection(model: Model): string | undefined {
 	// policy says the output limit will be omitted or overwritten.
 	if (!supportsOutputTokenLimit(model)) return "does not support maxTokens for ephemeral turns";
 	return undefined;
+}
+
+/** True for transcript messages that create, use, or report on eval runtime state. */
+function isEvalActivity(message: AgentMessage): boolean {
+	if (message.role === "pythonExecution" || (message.role === "toolResult" && message.toolName === "eval")) {
+		return true;
+	}
+	return (
+		message.role === "assistant" && message.content.some(block => block.type === "toolCall" && block.name === "eval")
+	);
 }
 
 export class AgentSession implements SettingsScope {
@@ -1768,12 +1778,19 @@ export class AgentSession implements SettingsScope {
 		this.#evalToolSession = config.evalToolSession;
 		this.#eventBus = config.eventBus;
 		this.#subagentEventBus = config.subagentEventBus;
-		const initialEvalStateContext = this.#buildEvalStateContextMessage();
-		if (
-			initialEvalStateContext &&
-			this.#needsEvalStateContext(this.agent.state.messages, initialEvalStateContext.content)
-		) {
+		const initialEvalStateContext = this.#buildEvalStateContextMessage(this.agent.state.messages);
+		if (initialEvalStateContext) {
+			// Persist the startup snapshot at the slot this process sends it from, so
+			// the next resumed process rebuilds the same request prefix (#15736).
 			this.agent.appendMessage(initialEvalStateContext);
+			this.sessionManager.appendCustomMessageEntry(
+				initialEvalStateContext.customType,
+				initialEvalStateContext.content,
+				initialEvalStateContext.display,
+				undefined,
+				initialEvalStateContext.attribution,
+				initialEvalStateContext.timestamp,
+			);
 		}
 		const ircHost: IrcBridgeHost = {
 			agent: this.agent,
@@ -2449,7 +2466,8 @@ export class AgentSession implements SettingsScope {
 			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
 			persistEvalStateContext: () => {
-				const message = this.#buildEvalStateContextMessage();
+				// The rewritten history carries no snapshot yet, so always build one.
+				const message = this.#buildEvalStateContextMessage([]);
 				if (message) this.sessionManager.appendMessage(message);
 			},
 			convertToLlmForSideRequest: messages => this.#convertToLlmForSideRequest(messages),
@@ -6921,38 +6939,35 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#withEvalStateContext(context: SessionContext): SessionContext {
-		const evalStateContext = this.#buildEvalStateContextMessage();
+		const evalStateContext = this.#buildEvalStateContextMessage(context.messages);
 		if (!evalStateContext) return context;
-		if (!this.#needsEvalStateContext(context.messages, evalStateContext.content)) return context;
 		return { ...context, messages: [...context.messages, evalStateContext] };
 	}
 
-	#needsEvalStateContext(messages: AgentMessage[], content: CustomMessage["content"]): boolean {
-		const latest = messages.findLast(
-			message => message.role === "custom" && message.customType === "eval-state-context",
-		);
-		return latest?.role !== "custom" || latest.content !== content;
-	}
-
-	#buildEvalStateContextMessage(): CustomMessage | undefined {
+	/**
+	 * Eval runtime snapshot to append after `messages`, or `undefined` when there
+	 * is nothing to report or `messages` already ends its eval activity with this
+	 * exact snapshot (a persisted one from an earlier process stays at its slot).
+	 */
+	#buildEvalStateContextMessage(messages: AgentMessage[]): CustomMessage | undefined {
 		const session = this.#evalToolSession;
 		if (!session) return undefined;
-		const historyHasEval = this.sessionManager.getBranch().some(entry => {
-			if (entry.type !== "message") return false;
-			const message = entry.message;
-			if (message.role === "pythonExecution" || (message.role === "toolResult" && message.toolName === "eval")) {
-				return true;
-			}
-			return (
-				message.role === "assistant" &&
-				message.content.some(block => block.type === "toolCall" && block.name === "eval")
-			);
-		});
+		const historyHasEval = this.sessionManager
+			.getBranch()
+			.some(entry => entry.type === "message" && isEvalActivity(entry.message));
 		const content = formatEvalStateContext(session, { historyHasEval });
 		if (!content) return undefined;
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index];
+			if (isEvalStateContext(message)) {
+				if (message.content === content) return undefined;
+				break;
+			}
+			if (isEvalActivity(message)) break;
+		}
 		return {
 			role: "custom",
-			customType: "eval-state-context",
+			customType: EVAL_STATE_CONTEXT_TYPE,
 			content,
 			display: false,
 			attribution: "agent",

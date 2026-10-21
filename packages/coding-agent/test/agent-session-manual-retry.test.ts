@@ -9,8 +9,13 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import {
+	createInterruptedToolResults,
+	createInterruptedTurnAbortMessage,
+} from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 function lastAgentMessage(session: AgentSession): AssistantMessage {
@@ -444,6 +449,113 @@ describe("AgentSession manual retry", () => {
 			type: "text",
 			text: "recovered after session reopen",
 		});
+	});
+
+	it("retries a turn exit recovery closed when the eval state snapshot follows it (#16195)", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+		const toolSchema = type({ value: type("string") });
+		const executed: string[] = [];
+		const probeTool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "probe",
+			label: "Probe",
+			description: "Probe tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return { content: [{ type: "text", text: `ok:${params.value}` }], details: params };
+			},
+		};
+		const assistant = (fields: Pick<AssistantMessage, "content" | "stopReason">): AssistantMessage => ({
+			role: "assistant",
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+			...fields,
+		});
+		// The previous process died while `probe` ran, after an earlier eval call.
+		const sessionManager = SessionManager.inMemory();
+		for (const message of [
+			{ role: "user" as const, content: "eval something", timestamp: Date.now() },
+			assistant({
+				content: [{ type: "toolCall", id: "call_eval", name: "eval", arguments: { code: "1" } }],
+				stopReason: "toolUse",
+			}),
+			{
+				role: "toolResult" as const,
+				toolCallId: "call_eval",
+				toolName: "eval",
+				content: [{ type: "text" as const, text: "1" }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+			assistant({ content: [{ type: "text", text: "evaluated" }], stopReason: "stop" }),
+			{ role: "user" as const, content: "run the probe", timestamp: Date.now() },
+			assistant({
+				content: [{ type: "toolCall", id: "call_1", name: "probe", arguments: { value: "again" } }],
+				stopReason: "toolUse",
+			}),
+		]) {
+			sessionManager.appendMessage(message);
+		}
+		// Resume closes the cut-off turn the way sdk.ts exit recovery does.
+		const branch = sessionManager.getBranch();
+		const abort = createInterruptedTurnAbortMessage(branch, undefined, { assumeExit: true });
+		if (!abort) throw new Error("Expected an unfinished turn to close");
+		for (const message of [...createInterruptedToolResults(branch), abort]) sessionManager.appendMessage(message);
+
+		const mock = createMockModel({ responses: [{ content: ["done after retry"], stopReason: "stop" }] });
+		const evalToolSession: ToolSession = {
+			cwd: tempDir.path(),
+			hasUI: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => null,
+			getEvalSessionId: () => "retry-eval-state",
+		};
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [probeTool],
+				messages: sessionManager.buildSessionContext().messages,
+			},
+			streamFn: mock.stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": false }),
+			modelRegistry,
+			evalToolSession,
+		});
+		session.subscribe(() => {});
+
+		// Eval history makes the reopened session persist a snapshot right after the closed turn
+		// (bookkeeping entries such as `session_open` may follow it).
+		const tail = session.sessionManager.getBranch().findLast(entry => entry.type !== "custom");
+		expect(tail?.type === "custom_message" && tail.customType).toBe("eval-state-context");
+		// The idle "F5 to Retry" row sees the closed turn through the snapshot.
+		expect(session.hasAbortedToolCallTail).toBe(true);
+
+		await expect(session.retry()).resolves.toBe(true);
+		await session.waitForIdle();
+
+		expect(executed).toEqual(["again"]);
+		expect(mock.calls.length).toBe(1);
+		expect(lastAgentMessage(session).content).toContainEqual({ type: "text", text: "done after retry" });
 	});
 
 	it("lets an idle aside start a turn after the user resumes an interrupted run with retry", async () => {
