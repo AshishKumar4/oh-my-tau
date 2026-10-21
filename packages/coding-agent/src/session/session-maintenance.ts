@@ -3187,7 +3187,10 @@ export class SessionMaintenance {
 					});
 					return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
 				}
-				if (payloadRejection && !compactionResult.continuationScheduled) {
+				// No retry replaces the failed turn, so it stays the run's outcome for
+				// post-settle readers (print mode, task executor) instead of whatever
+				// assistant message preceded it.
+				if (!compactionResult.continuationScheduled) {
 					this.#host.retainTerminalFailure(assistantMessage);
 				}
 				return compactionResult;
@@ -3210,6 +3213,7 @@ export class SessionMaintenance {
 				});
 				return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
 			}
+			this.#host.retainTerminalFailure(assistantMessage);
 			return COMPACTION_CHECK_NONE;
 		}
 		// A context promotion can land while the failing call is already in

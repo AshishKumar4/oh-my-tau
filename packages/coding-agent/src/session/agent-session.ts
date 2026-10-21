@@ -1147,6 +1147,7 @@ export class AgentSession implements SettingsScope {
 	#userWaitCount = 0;
 	/** Whether the open dialogs ended a prompt's computer turn, which goes on once they settle. */
 	#userWaitEndedTurn = false;
+	#inFlightEpoch = 0;
 	#abortInProgress = false;
 	/** Submissions accepted by prompt()/promptCustomMessage()/sendCustomMessage() that have not
 	 *  yet dispatched a turn, queued, or bailed. Preprocessing (manual-compaction wait, slash
@@ -1245,17 +1246,21 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
-	#beginInFlight(): void {
+	#beginInFlight(): number {
 		this.#promptInFlightCount++;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
 			this.#beginComputerTurn();
 		}
+		return this.#inFlightEpoch;
 	}
 
-	#endInFlight(onSettled?: () => void | Promise<void>): void {
+	#endInFlight(epoch: number, onSettled?: () => void | Promise<void>): void {
 		if (onSettled) this.#inFlightSettledCallbacks.push(onSettled);
-		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
+		// Abort has already taken an earlier epoch's bracket out of the count, so its late finalizer leaves the
+		// count to a newer turn; with none in flight it still settles, since a turn begun while abort() was
+		// finishing has its bracket reset by it and ends here.
+		if (epoch === this.#inFlightEpoch) this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount !== 0) return;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
@@ -1466,7 +1471,7 @@ export class AgentSession implements SettingsScope {
 		// delaying the observation's finish and mis-attributing the successor's RPC
 		// progress to this now-dead wake monitor.
 		const generation = this.#promptGeneration;
-		this.#beginInFlight();
+		const inFlightEpoch = this.#beginInFlight();
 		let turnError: unknown;
 		// A pooled-turn yield transition (item-set mutation + prompt rebuild) may be
 		// in flight when the wake lands. Starting the turn on the stale prompt would
@@ -1527,7 +1532,7 @@ export class AgentSession implements SettingsScope {
 					);
 					this.#queuedMessageDrainBlocked ||= parkedQueueDrainBlocked;
 				}
-				this.#endInFlight();
+				this.#endInFlight(inFlightEpoch);
 				await this.#finishTurnObservation(observation, turnError);
 			});
 	}
@@ -1605,6 +1610,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#resetInFlight(): void {
+		this.#inFlightEpoch++;
 		this.#promptInFlightCount = 0;
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
@@ -2045,11 +2051,19 @@ export class AgentSession implements SettingsScope {
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
-				this.#beginInFlight();
+				// A user interrupt is still in effect: background completions (async job
+				// results, launch completions, MCP/LSP/advisor asides) must not restart
+				// the run the user stopped. Fold them into context so the next deliberate
+				// prompt sees them — same policy as #resumeStrandedIrcAsides.
+				if (this.#advisors.autoResumeSuppressed) {
+					this.#foldStrandedIrcAsidesIntoContext(messages);
+					return;
+				}
+				const inFlightEpoch = this.#beginInFlight();
 				try {
 					await this.agent.prompt(messages.length === 1 ? first : messages);
 				} finally {
-					this.#endInFlight();
+					this.#endInFlight(inFlightEpoch);
 				}
 			},
 			scheduleIdleFlush: run => {
@@ -4992,7 +5006,7 @@ export class AgentSession implements SettingsScope {
 					}
 				}
 
-				this.#beginInFlight();
+				const inFlightEpoch = this.#beginInFlight();
 				const coalescedSources = new Set([options.source]);
 				const promise = this.#runAgentContinue(signal, request, coalescedSources);
 				const attempt: ActiveAgentContinue = {
@@ -5014,7 +5028,7 @@ export class AgentSession implements SettingsScope {
 						this.#activeAgentContinue = undefined;
 					}
 					this.#usagePreflightReadyForNextModelCall = false;
-					this.#endInFlight();
+					this.#endInFlight(inFlightEpoch);
 				}
 			},
 			{
@@ -8187,7 +8201,7 @@ export class AgentSession implements SettingsScope {
 		// every pre-dispatch bail (generation bump from abort, disposal, usage
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
 		// the typed text back to the host instead of losing it.
-		this.#beginInFlight();
+		const inFlightEpoch = this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		this.#promptSequence++;
 		const setupAbort = new AbortController();
@@ -8407,7 +8421,7 @@ export class AgentSession implements SettingsScope {
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
 			this.#usagePreflightReadyForNextModelCall = false;
-			this.#endInFlight();
+			this.#endInFlight(inFlightEpoch);
 			if (this.#promptSetupAbortController === setupAbort) this.#promptSetupAbortController = undefined;
 		}
 	}
@@ -8968,7 +8982,7 @@ export class AgentSession implements SettingsScope {
 		message: CustomMessage,
 		options?: { acceptTerminalEmptyStop?: boolean },
 	): Promise<boolean> {
-		this.#beginInFlight();
+		const inFlightEpoch = this.#beginInFlight();
 		try {
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
 			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
@@ -8982,7 +8996,7 @@ export class AgentSession implements SettingsScope {
 		} finally {
 			this.#usagePreflightReadyForNextModelCall = false;
 			this.#recovery.setAcceptTerminalEmptyStop(false);
-			this.#endInFlight();
+			this.#endInFlight(inFlightEpoch);
 		}
 	}
 
@@ -9223,6 +9237,15 @@ export class AgentSession implements SettingsScope {
 			}
 			if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, false);
+				return false;
+			}
+			// The generation check suspends after the isStreaming check above, so a concurrent
+			// send (two asides in one tick) can start its turn in between. Re-check and queue
+			// behind that turn like the streaming branch, instead of losing the prompt race to
+			// AgentBusyError; no await sits between this check and #beginInFlight below.
+			if (this.isStreaming) {
+				outcome.sessionClaimed = this.agent.state.isStreaming;
+				this.#irc.queueAside([normalizedAppMessage]);
 				return false;
 			}
 			outcome.sessionClaimed = await this.#promptAgentInitiatedMessage(normalizedAppMessage, {
