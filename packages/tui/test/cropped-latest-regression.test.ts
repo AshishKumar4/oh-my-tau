@@ -71,7 +71,7 @@ for (const kind of ["list", "hud", "composer"] as const) {
 		const transcript = new TranscriptContainer();
 		const hud = new Hud();
 		const editor = new Container();
-		editor.addChild(new Text("EDITOR", 0, 0));
+		editor.addChild(kind === "composer" ? composer.editor : new Text("EDITOR", 0, 0));
 		composer.setRuntimeChildren([transcript, hud, editor], { transientChrome: [editor] });
 		composer.start({ playWelcomeIntro: false });
 		try {
@@ -92,7 +92,8 @@ for (const kind of ["list", "hud", "composer"] as const) {
 					: lines.slice(0, count).join("\n\n");
 			for (let count = 1; count <= lines.length; count++) {
 				if (count === 24 && kind === "hud") hud.rows = 6;
-				if (count === 24 && kind === "composer") editor.addChild(new Text("input\n".repeat(5), 0, 0));
+				if (count === 24 && kind === "composer")
+					composer.editor.setText(Array.from({ length: 7 }, () => "draft input").join("\n"));
 				message.updateContent(reply(text(count)), { transient: true });
 				composer.ui.requestRender();
 				await scheduler.settle(terminal);
@@ -105,8 +106,11 @@ for (const kind of ["list", "hud", "composer"] as const) {
 			await scheduler.advance(terminal, 300);
 			const ended = inspect(terminal);
 			hud.rows = 0;
-			editor.clear();
-			editor.addChild(new Text("EDITOR", 0, 0));
+			if (kind === "composer") composer.editor.setText("");
+			else {
+				editor.clear();
+				editor.addChild(new Text("EDITOR", 0, 0));
+			}
 			composer.ui.requestRender();
 			await scheduler.advance(terminal, 300);
 			const shrunk = inspect(terminal);

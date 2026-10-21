@@ -67,16 +67,30 @@ function source(kind: Kind, count: number, closed = false): string {
 		{ length: count },
 		(_, i) => `QZ${String(i + 1).padStart(3, "0")} alpha bravo charlie delta`,
 	);
-	if (kind === "list") return lines.map(line => `- ${line}`).join("\n");
-	if (kind === "loose list") return lines.map(line => `- ${line}`).join("\n\n");
-	if (kind === "fence") return ["```text", ...lines, ...(closed ? ["```", "", "End."] : [])].join("\n");
+	const following = closed ? "\n\nEnd.\n\nFollowing." : "";
+	if (kind === "list") return lines.map(line => `- ${line}`).join("\n") + following;
+	if (kind === "loose list") return lines.map(line => `- ${line}`).join("\n\n") + following;
+	if (kind === "fence")
+		return ["```text", ...lines, ...(closed ? ["```", "", "End.", "", "Following."] : [])].join("\n");
 	if (kind === "table")
-		return ["| Item |", "| --- |", ...lines.map(line => `| ${line} |`), ...(closed ? ["", "End."] : [])].join("\n");
-	return lines.join(kind === "paragraphs" ? "\n\n" : "\n");
+		return [
+			"| Item |",
+			"| --- |",
+			...lines.map(line => `| ${line} |`),
+			...(closed ? ["", "End.", "", "Following."] : []),
+		].join("\n");
+	return lines.join(kind === "paragraphs" ? "\n\n" : "\n") + following;
 }
 
 for (const kind of kinds) {
-	for (const variant of ["normal", "narrow", "resize", "growing chrome", "growing composer"] as const) {
+	for (const variant of [
+		"normal",
+		"narrow",
+		"resize",
+		"growing chrome",
+		"growing composer",
+		"real composer",
+	] as const) {
 		it(`diagnostic ${kind} / ${variant}`, async () => {
 			const terminal = new VirtualTerminal(variant === "narrow" ? 24 : 60, 18, 5000);
 			const scheduler = new VirtualRenderScheduler();
@@ -88,7 +102,7 @@ for (const kind of kinds) {
 			const transcript = new TranscriptContainer();
 			const chrome = new Chrome();
 			const editor = new Container();
-			editor.addChild(new Text("EDITOR", 0, 0));
+			editor.addChild(variant === "real composer" ? composer.editor : new Text("EDITOR", 0, 0));
 			composer.setRuntimeChildren([transcript, chrome, editor], { transientChrome: [editor] });
 			composer.start({ playWelcomeIntro: false });
 			const observations: unknown[] = [];
@@ -105,6 +119,8 @@ for (const kind of kinds) {
 					if (variant === "resize" && count === 40) terminal.resize(60, 18);
 					if (variant === "growing chrome" && count === 24) chrome.rows = 6;
 					if (variant === "growing composer" && count === 24) editor.addChild(new Text("input\n".repeat(5), 0, 0));
+					if (variant === "real composer" && count === 24)
+						composer.editor.setText(Array.from({ length: 7 }, () => "draft input").join("\n"));
 					message.updateContent(reply(source(kind, count)), { transient: true });
 					composer.ui.requestRender();
 					await scheduler.settle(terminal);
@@ -151,8 +167,11 @@ for (const kind of kinds) {
 				await scheduler.advance(terminal, 300);
 				observations.push({ phase: "turn end", ...snapshot(terminal, 48) });
 				chrome.rows = 0;
-				editor.clear();
-				editor.addChild(new Text("EDITOR", 0, 0));
+				if (variant === "real composer") composer.editor.setText("");
+				else {
+					editor.clear();
+					editor.addChild(new Text("EDITOR", 0, 0));
+				}
 				composer.ui.requestRender();
 				await scheduler.advance(terminal, 300);
 				const final = snapshot(terminal, 48);
