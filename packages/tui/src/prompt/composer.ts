@@ -37,7 +37,7 @@ export interface ComposerPreferences {
 	readonly showHardwareCursor: boolean;
 	readonly maxInlineImages: number;
 	readonly resizeScrollback: ResizeScrollbackMode;
-	/** Bill retirement at the chrome's current height instead of its floor, so displaced rows reach scrollback rather than being held live. */
+	/** Bill retirement at the chrome's current height instead of its floor while idle too (a run always does), so displaced rows reach scrollback rather than being held live. */
 	readonly completeScrollback: boolean;
 	readonly imeSafeCursor: boolean;
 	readonly autocompleteMaxVisible: number;
@@ -53,7 +53,7 @@ export const COMPOSER_DEFAULTS: ComposerPreferences = {
 	showHardwareCursor: true,
 	maxInlineImages: 8,
 	resizeScrollback: "rebuild",
-	completeScrollback: true,
+	completeScrollback: false,
 	imeSafeCursor: false,
 	autocompleteMaxVisible: 10,
 	spellingTypoDetection: true,
@@ -274,8 +274,11 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 	// displaced rows, so those rows refill the screen when it shrinks (#11007).
 	// Displaced rows reach history when newer output pushes them past the floor
 	// or persistent idle chrome settles and raises it.
-	// `completeScrollback` bills the current height instead, so displaced rows
-	// reach scrollback at once and the shrink leaves a blank band.
+	// While a run is active, and always with `completeScrollback`, retirement
+	// bills the current height instead: displaced rows reach scrollback at once
+	// and the shrink leaves a blank band, which a running turn's output fills.
+	// Held rows are unreachable until the chrome shrinks, and a streaming answer
+	// must never be (#11007 kept refill for idle reports and dialogs).
 	// The floor is terminal-height independent — chrome heights do not scale
 	// with rows — so it is retained across resizes rather than rediscovered
 	// from whatever chrome is expanded when the height changes.
@@ -434,7 +437,7 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		const promotedChromeContracted = this.#chromeFloorPromoted && eligibleChrome < (this.#chromeFloor ?? 0);
 		this.#chromeFloor = Math.min(this.#chromeFloor ?? eligibleChrome, eligibleChrome);
 		this.#rebaselineChromeFloor(this.#runActive || transcript.hasActiveBlock(), eligibleChrome);
-		const belowFloor = this.#preferences.completeScrollback ? after.length : this.#chromeFloor;
+		const belowFloor = this.#preferences.completeScrollback || this.#runActive ? after.length : this.#chromeFloor;
 		// Offer history under capacity pressure only: blocks stay live (and keep
 		// reflowing to the current width) while the screen has room. A batch
 		// leaves the mutable viewport in the same frame it is appended, so its
@@ -452,8 +455,9 @@ export class Composer implements TerminalFrameProvider, NativeSurfaceProvider {
 		// billed against, so its compaction allocator (one row per block, no
 		// inter-block blanks) engages only when a block genuinely cannot retire.
 		// Rows the chrome above its floor displaces are clipped from the top by
-		// the `drop` slice below; they stay live until the chrome shrinks. With
-		// `completeScrollback` the floor is the current height, so none are held.
+		// the `drop` slice below; they stay live until the chrome shrinks. While a
+		// run is active or with `completeScrollback` the floor is the current
+		// height, so none are held.
 		const active = transcript.renderViewport(width, Math.max(0, rows - before.length - belowFloor), frame);
 		const activeSpans: ViewportClickSpan[] = [];
 		for (const span of transcript.getLastViewportSpans()) {

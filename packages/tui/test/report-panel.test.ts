@@ -28,7 +28,7 @@ async function mountReport(bodyRows: number) {
 	const composer = new Composer({
 		terminal,
 		tuiOptions: { renderScheduler: scheduler },
-		preferences: { ...COMPOSER_DEFAULTS, quiet: true, completeScrollback: false },
+		preferences: { ...COMPOSER_DEFAULTS, quiet: true },
 	});
 	const transcript = new TranscriptContainer();
 	for (let i = 0; i < 60; i++) {
@@ -119,7 +119,7 @@ describe("ReportPanel in text mode", () => {
 		const composer = new Composer({
 			terminal,
 			tuiOptions: { renderScheduler: scheduler },
-			preferences: { ...COMPOSER_DEFAULTS, quiet: false, completeScrollback: false },
+			preferences: { ...COMPOSER_DEFAULTS, quiet: false },
 		});
 		const transcript = new TranscriptContainer();
 		let transcriptRows = 0;

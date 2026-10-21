@@ -391,13 +391,13 @@ export const cfgTuiResizeScrollback = register({
 export const cfgTuiCompleteScrollback = register({
 	id: "tui.completeScrollback",
 	type: "boolean",
-	default: true,
+	default: false,
 	ui: {
 		tab: "appearance",
 		group: "Display",
 		label: "Complete Scrollback",
 		description:
-			"Send transcript rows pushed off screen by a growing HUD, dialog or draft straight to scrollback, so they stay reachable; when it shrinks, blank rows sit between the transcript and the input until new output fills them. Off holds them out of view until it shrinks",
+			"While idle too, send transcript rows pushed off screen by a growing dialog, report or draft straight to scrollback; when it closes, blank rows sit above the input until new output fills them. During a turn they always go to scrollback",
 	},
 });
 

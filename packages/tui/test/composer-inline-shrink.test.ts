@@ -59,7 +59,6 @@ interface Harness {
 	editor: Container;
 }
 
-/** The floor that holds displaced rows back to refill the screen: `completeScrollback` off. */
 function makeHarness(
 	columns = COLUMNS,
 	rows = ROWS,
@@ -72,7 +71,7 @@ function makeHarness(
 	const composer = new Composer({
 		terminal,
 		tuiOptions: { renderScheduler: scheduler },
-		preferences: { ...COMPOSER_DEFAULTS, quiet: true, completeScrollback: false },
+		preferences: { ...COMPOSER_DEFAULTS, quiet: true },
 	});
 	const transcript = new TranscriptContainer();
 	for (let i = 0; i < transcriptRows; i++) {
@@ -240,7 +239,7 @@ describe("composer inline shrink (#11007)", () => {
 		const composer = new Composer({
 			terminal,
 			tuiOptions: { renderScheduler: scheduler },
-			preferences: { ...COMPOSER_DEFAULTS, quiet: true, completeScrollback: false },
+			preferences: { ...COMPOSER_DEFAULTS, quiet: true },
 		});
 		const transcript = new TranscriptContainer();
 		// The response straddles the top edge: only its rows above the screen
@@ -365,52 +364,55 @@ describe("composer inline shrink (#11007)", () => {
 		h.composer.stop();
 	});
 
-	it("with completeScrollback, retires displaced rows at once and never replays them when the chrome shrinks", async () => {
-		const STREAMED = 20;
-		const h = makeHarness();
-		h.composer.setPreferences({ completeScrollback: true });
-		const reachable = (): number[] =>
-			h.terminal
-				.getScrollBuffer()
-				.map(row => Bun.stripANSI(row).trimEnd())
-				.filter(row => row.startsWith(TRANSCRIPT_PREFIX))
-				.map(row => Number(row.slice(TRANSCRIPT_PREFIX.length)));
-		await h.scheduler.settle(h.terminal);
-		h.widget.rows = 24;
-		h.composer.ui.requestRender();
-		await h.scheduler.settle(h.terminal);
-		// Rows the grown chrome displaced are already in scrollback, not held live.
-		expect(reachable()).toEqual(Array.from({ length: TRANSCRIPT_ROWS }, (_, i) => i));
-
-		for (let i = TRANSCRIPT_ROWS; i < TRANSCRIPT_ROWS + STREAMED; i++) {
-			const row = i;
-			h.transcript.addChild({ render: () => [`${TRANSCRIPT_PREFIX}${row}`] });
+	for (const trigger of ["completeScrollback", "an active run"] as const) {
+		it(`with ${trigger}, retires displaced rows at once and never replays them when the chrome shrinks`, async () => {
+			const STREAMED = 20;
+			const h = makeHarness();
+			if (trigger === "completeScrollback") h.composer.setPreferences({ completeScrollback: true });
+			else h.composer.setRunActive(true);
+			const reachable = (): number[] =>
+				h.terminal
+					.getScrollBuffer()
+					.map(row => Bun.stripANSI(row).trimEnd())
+					.filter(row => row.startsWith(TRANSCRIPT_PREFIX))
+					.map(row => Number(row.slice(TRANSCRIPT_PREFIX.length)));
+			await h.scheduler.settle(h.terminal);
+			h.widget.rows = 24;
 			h.composer.ui.requestRender();
 			await h.scheduler.settle(h.terminal);
-		}
-		h.widget.rows = 0;
-		h.composer.ui.requestRender();
-		await h.scheduler.settle(h.terminal);
+			// Rows the grown chrome displaced are already in scrollback, not held live.
+			expect(reachable()).toEqual(Array.from({ length: TRANSCRIPT_ROWS }, (_, i) => i));
 
-		// The shrink re-offers nothing: each row is reachable exactly once, in order.
-		expect(reachable()).toEqual(Array.from({ length: TRANSCRIPT_ROWS + STREAMED }, (_, i) => i));
-		// The input keeps the bottom row; the slack the retired rows left is the
-		// band between the newest row and the input, which new output fills.
-		const view = (): string[] => h.terminal.getViewport().map(row => Bun.stripANSI(row).trimEnd());
-		const newest = `${TRANSCRIPT_PREFIX}${TRANSCRIPT_ROWS + STREAMED - 1}`;
-		const shrunk = view();
-		expect(shrunk[ROWS - 1]).toBe("EDITOR");
-		expect(shrunk.slice(shrunk.indexOf(newest) + 1, ROWS - 1).every(row => row === "")).toBe(true);
-		h.transcript.addChild({ render: () => [`${TRANSCRIPT_PREFIX}${TRANSCRIPT_ROWS + STREAMED}`] });
-		h.composer.ui.requestRender();
-		await h.scheduler.settle(h.terminal);
-		const filled = view();
-		expect(filled[ROWS - 1]).toBe("EDITOR");
-		expect(filled.indexOf(`${TRANSCRIPT_PREFIX}${TRANSCRIPT_ROWS + STREAMED}`)).toBe(filled.indexOf(newest) + 2);
-		expect(reachable()).toEqual(Array.from({ length: TRANSCRIPT_ROWS + STREAMED + 1 }, (_, i) => i));
+			for (let i = TRANSCRIPT_ROWS; i < TRANSCRIPT_ROWS + STREAMED; i++) {
+				const row = i;
+				h.transcript.addChild({ render: () => [`${TRANSCRIPT_PREFIX}${row}`] });
+				h.composer.ui.requestRender();
+				await h.scheduler.settle(h.terminal);
+			}
+			h.widget.rows = 0;
+			h.composer.ui.requestRender();
+			await h.scheduler.settle(h.terminal);
 
-		h.composer.stop();
-	});
+			// The shrink re-offers nothing: each row is reachable exactly once, in order.
+			expect(reachable()).toEqual(Array.from({ length: TRANSCRIPT_ROWS + STREAMED }, (_, i) => i));
+			// The input keeps the bottom row; the slack the retired rows left is the
+			// band between the newest row and the input, which new output fills.
+			const view = (): string[] => h.terminal.getViewport().map(row => Bun.stripANSI(row).trimEnd());
+			const newest = `${TRANSCRIPT_PREFIX}${TRANSCRIPT_ROWS + STREAMED - 1}`;
+			const shrunk = view();
+			expect(shrunk[ROWS - 1]).toBe("EDITOR");
+			expect(shrunk.slice(shrunk.indexOf(newest) + 1, ROWS - 1).every(row => row === "")).toBe(true);
+			h.transcript.addChild({ render: () => [`${TRANSCRIPT_PREFIX}${TRANSCRIPT_ROWS + STREAMED}`] });
+			h.composer.ui.requestRender();
+			await h.scheduler.settle(h.terminal);
+			const filled = view();
+			expect(filled[ROWS - 1]).toBe("EDITOR");
+			expect(filled.indexOf(`${TRANSCRIPT_PREFIX}${TRANSCRIPT_ROWS + STREAMED}`)).toBe(filled.indexOf(newest) + 2);
+			expect(reachable()).toEqual(Array.from({ length: TRANSCRIPT_ROWS + STREAMED + 1 }, (_, i) => i));
+
+			h.composer.stop();
+		});
+	}
 
 	it("keeps the below-chrome baseline across a height resize while inline chrome is expanded", async () => {
 		const shorter = ROWS - 10;
@@ -541,7 +543,7 @@ describe("composer inline shrink (#11007)", () => {
 		h.composer.stop();
 	});
 
-	it("keeps turn-scoped chrome out of the floor across a mid-run gap with no streaming block", async () => {
+	it("sends rows turn-scoped chrome displaces mid-run to scrollback, each reachable once", async () => {
 		const rows = 30;
 		const h = makeHarness(COLUMNS, rows, 0);
 		await h.scheduler.settle(h.terminal);
@@ -553,8 +555,15 @@ describe("composer inline shrink (#11007)", () => {
 		h.hud.rows = 0;
 		h.composer.setRunActive(false);
 		await h.scheduler.advance(h.terminal, 300);
+		// A run bills the chrome's current height, so nothing the HUD covered was held
+		// out of scrollback; its close leaves at most its own height blank.
+		const reachable = h.terminal
+			.getScrollBuffer()
+			.map(row => Bun.stripANSI(row).trim())
+			.filter(row => /^line\d+$/.test(row));
+		expect(reachable).toEqual(Array.from({ length: 110 }, (_, i) => `line${i}`));
 		expect(h.terminal.getViewport().findIndex(row => row.includes("EDITOR"))).toBe(rows - 1);
-		expect(blankBand(h.terminal)).toBeLessThanOrEqual(1);
+		expect(blankBand(h.terminal)).toBeLessThanOrEqual(23);
 		h.composer.stop();
 	});
 
@@ -742,13 +751,12 @@ describe("composer inline shrink (#11007)", () => {
 			expect(widgetRows()).toBe(15);
 
 			// Output finalized now must retire against the contracted floor, not the
-			// stale 7-row one.
+			// stale 7-row one. It arrives idle: a run bills the current height whatever
+			// the floor.
 			const next = Array.from({ length: 40 }, (_, i) => `next${i}`);
-			h.composer.setRunActive(true);
 			for (const row of next) h.transcript.addChild({ render: () => [row] });
 			h.composer.ui.requestRender();
 			await h.scheduler.settle(h.terminal);
-			h.composer.setRunActive(false);
 			await h.scheduler.advance(h.terminal, 300);
 			expect(widgetRows()).toBe(15);
 
@@ -780,7 +788,7 @@ describe("composer inline shrink (#11007)", () => {
 		const composer = new Composer({
 			terminal,
 			tuiOptions: { renderScheduler: scheduler },
-			preferences: { ...COMPOSER_DEFAULTS, quiet: true, completeScrollback: false },
+			preferences: { ...COMPOSER_DEFAULTS, quiet: true },
 		});
 		const transcript = new TranscriptContainer();
 		const todos = new InlineWidget();
@@ -796,12 +804,11 @@ describe("composer inline shrink (#11007)", () => {
 		const h = { terminal, scheduler, composer, transcript, editor };
 		try {
 			await h.scheduler.settle(h.terminal);
-			composer.setRunActive(true);
+			// Idle output: a run bills the current height whatever the floor.
 			const answer = Array.from({ length: 110 }, (_, i) => `line${i}`);
 			for (const row of answer) transcript.addChild({ render: () => [row] });
 			composer.ui.requestRender();
 			await h.scheduler.settle(h.terminal);
-			composer.setRunActive(false);
 			await h.scheduler.advance(h.terminal, 300);
 
 			// The todo HUD auto-clears: rows it covered must come back, not leave a band.
@@ -829,7 +836,7 @@ describe("composer inline shrink (#11007)", () => {
 		const composer = new Composer({
 			terminal,
 			tuiOptions: { renderScheduler: scheduler },
-			preferences: { ...COMPOSER_DEFAULTS, quiet: true, completeScrollback: false },
+			preferences: { ...COMPOSER_DEFAULTS, quiet: true },
 		});
 		const transcript = new TranscriptContainer();
 		const editorRoot = new Container();
@@ -853,12 +860,11 @@ describe("composer inline shrink (#11007)", () => {
 			composer.setRuntimeChildren([transcript, editorRoot], { transientChrome: [editorRoot] });
 			await scheduler.settle(terminal);
 
-			composer.setRunActive(true);
+			// Idle output: a run bills the current height whatever the floor.
 			const answer = Array.from({ length: 110 }, (_, i) => `line${i}`);
 			for (const row of answer) transcript.addChild({ render: () => [row] });
 			composer.ui.requestRender();
 			await scheduler.settle(terminal);
-			composer.setRunActive(false);
 			await scheduler.advance(terminal, 300);
 
 			// Clearing (not submitting) the draft must hand its rows back, not leave a band.
