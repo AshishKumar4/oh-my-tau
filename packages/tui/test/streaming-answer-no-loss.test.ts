@@ -91,7 +91,7 @@ for (const kind of kinds) {
 		"growing composer",
 		"real composer",
 	] as const) {
-		it(`diagnostic ${kind} / ${variant}`, async () => {
+		it(`keeps every row of a streamed ${kind} once the turn settles: ${variant}`, async () => {
 			const terminal = new VirtualTerminal(variant === "narrow" ? 24 : 60, 18, 5000);
 			const scheduler = new VirtualRenderScheduler();
 			const composer = new Composer({
@@ -105,15 +105,12 @@ for (const kind of kinds) {
 			editor.addChild(variant === "real composer" ? composer.editor : new Text("EDITOR", 0, 0));
 			composer.setRuntimeChildren([transcript, chrome, editor], { transientChrome: [editor] });
 			composer.start({ playWelcomeIntro: false });
-			const observations: unknown[] = [];
 			let tool: ToolExecutionComponent | undefined;
 			try {
 				await scheduler.settle(terminal);
 				composer.setRunActive(true);
 				const message = new AssistantMessageComponent();
 				transcript.addChild(message);
-				let firstLoss: unknown;
-				let lossFrames = 0;
 				for (let count = 1; count <= 48; count++) {
 					if (variant === "resize" && count === 24) terminal.resize(24, 18);
 					if (variant === "resize" && count === 40) terminal.resize(60, 18);
@@ -124,32 +121,15 @@ for (const kind of kinds) {
 					message.updateContent(reply(source(kind, count)), { transient: true });
 					composer.ui.requestRender();
 					await scheduler.settle(terminal);
-					if (variant === "resize" && [24, 40].includes(count)) {
-						observations.push({ phase: `resize ${count} before 120ms settle`, ...snapshot(terminal, count) });
-						await scheduler.advance(terminal, 200);
-					}
-					const state = snapshot(terminal, count);
-					if (state.missing.length > 0) {
-						lossFrames++;
-						firstLoss ??= { count, ...state };
-					}
-					if ([24, 48].includes(count))
-						observations.push({
-							phase: `stream ${count}`,
-							stable: message.getTranscriptStableRows().length,
-							...state,
-						});
+					if (variant === "resize" && [24, 40].includes(count)) await scheduler.advance(terminal, 200);
 				}
-				observations.push({ firstLoss, lossFrames });
 				message.updateContent(reply(source(kind, 48, true)), { transient: true });
 				composer.ui.requestRender();
 				await scheduler.settle(terminal);
-				observations.push({ phase: "closed while transient", ...snapshot(terminal, 48) });
 				message.updateContent(reply(source(kind, 48, true)));
 				message.markTranscriptBlockFinalized();
 				composer.ui.requestRender();
 				await scheduler.advance(terminal, 300);
-				observations.push({ phase: "message end, run active", ...snapshot(terminal, 48) });
 				tool = new ToolExecutionComponent("bash", { command: "echo tool" }, {}, undefined, {
 					requestRender: () => composer.ui.requestRender(),
 					requestComponentRender: () => composer.ui.requestRender(),
@@ -161,11 +141,9 @@ for (const kind of kinds) {
 				tool.updateResult({ content: [{ type: "text", text: "tool" }], details: {}, isError: false }, false);
 				composer.ui.requestRender();
 				await scheduler.advance(terminal, 300);
-				observations.push({ phase: "tool after text", ...snapshot(terminal, 48) });
 				composer.setRunActive(false);
 				composer.ui.requestRender();
 				await scheduler.advance(terminal, 300);
-				observations.push({ phase: "turn end", ...snapshot(terminal, 48) });
 				chrome.rows = 0;
 				if (variant === "real composer") composer.editor.setText("");
 				else {
@@ -175,8 +153,6 @@ for (const kind of kinds) {
 				composer.ui.requestRender();
 				await scheduler.advance(terminal, 300);
 				const final = snapshot(terminal, 48);
-				observations.push({ phase: "chrome shrunk", ...final });
-				console.log(JSON.stringify({ kind, variant, observations }));
 				expect({ missing: final.missing, duplicated: final.duplicated }).toEqual({ missing: [], duplicated: [] });
 			} finally {
 				tool?.stopAnimation();

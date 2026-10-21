@@ -102,7 +102,6 @@ for (const kind of ["list", "hud", "composer", "batched paragraphs", "paragraph 
 				await scheduler.settle(terminal);
 			}
 			const live = inspect(terminal);
-			const stableSnapshots = message.getTranscriptStableRows().length;
 			message.updateContent(reply(text(48)));
 			message.markTranscriptBlockFinalized();
 			composer.setRunActive(false);
@@ -118,7 +117,6 @@ for (const kind of ["list", "hud", "composer", "batched paragraphs", "paragraph 
 			composer.ui.requestRender();
 			await scheduler.advance(terminal, 300);
 			const shrunk = inspect(terminal);
-			console.log(JSON.stringify({ kind, stableSnapshots, live, ended, shrunk }));
 			// Check the end state too: this is temporary unreachability, not data deletion.
 			expect({ missing: shrunk.missing, duplicated: shrunk.duplicated }).toEqual({ missing: [], duplicated: [] });
 			expect(live.screen).toContain("QZ048");
