@@ -59,7 +59,7 @@ beforeAll(async () => {
 	await initTheme();
 });
 
-for (const kind of ["list", "hud", "composer"] as const) {
+for (const kind of ["list", "hud", "composer", "batched paragraphs", "paragraph control"] as const) {
 	it(`keeps the latest answer reachable in screen plus native scrollback: ${kind}`, async () => {
 		const terminal = new VirtualTerminal(60, 18);
 		const scheduler = new VirtualRenderScheduler();
@@ -91,6 +91,9 @@ for (const kind of ["list", "hud", "composer"] as const) {
 							.join("\n")
 					: lines.slice(0, count).join("\n\n");
 			for (let count = 1; count <= lines.length; count++) {
+				// Two deliveries of the same answer, with many stable boundaries
+				// between paints, must not make those boundaries indivisible.
+				if (kind === "batched paragraphs" && count > 1 && count < lines.length) continue;
 				if (count === 24 && kind === "hud") hud.rows = 6;
 				if (count === 24 && kind === "composer")
 					composer.editor.setText(Array.from({ length: 7 }, () => "draft input").join("\n"));
@@ -99,6 +102,7 @@ for (const kind of ["list", "hud", "composer"] as const) {
 				await scheduler.settle(terminal);
 			}
 			const live = inspect(terminal);
+			const stableSnapshots = message.getTranscriptStableRows().length;
 			message.updateContent(reply(text(48)));
 			message.markTranscriptBlockFinalized();
 			composer.setRunActive(false);
@@ -114,7 +118,7 @@ for (const kind of ["list", "hud", "composer"] as const) {
 			composer.ui.requestRender();
 			await scheduler.advance(terminal, 300);
 			const shrunk = inspect(terminal);
-			console.log(JSON.stringify({ kind, live, ended, shrunk }));
+			console.log(JSON.stringify({ kind, stableSnapshots, live, ended, shrunk }));
 			// Check the end state too: this is temporary unreachability, not data deletion.
 			expect({ missing: shrunk.missing, duplicated: shrunk.duplicated }).toEqual({ missing: [], duplicated: [] });
 			expect(live.screen).toContain("QZ048");
