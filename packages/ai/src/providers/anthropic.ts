@@ -1859,11 +1859,12 @@ function replaysAnthropicCompactionBlock(
 
 /** The wire block for a replayed compaction payload, opaque state included. */
 function compactionBlockParam(payload: AnthropicCompactionPayload): CompactionBlockParam {
-	const { content, signature, encryptedContent } = payload;
+	const { content, signature, toolChanges, encryptedContent } = payload;
 	return {
 		type: "compaction",
 		content,
 		...(signature !== undefined ? { signature } : {}),
+		...(toolChanges !== undefined ? { tool_changes: toolChanges } : {}),
 		...(encryptedContent !== undefined ? { encrypted_content: encryptedContent } : {}),
 	};
 }
@@ -3289,13 +3290,21 @@ const streamAnthropicOnce = (
 									partial: output,
 								});
 							} else if (event.content_block.type === "compaction") {
-								const { content, signature, encrypted_content } = event.content_block;
-								if (content) {
+								const { content, signature, encrypted_content, tool_changes } = event.content_block;
+								// The signature covers tool_changes: a block whose records cannot replay
+								// unchanged is not published.
+								const toolChanges =
+									tool_changes === undefined ||
+									(Array.isArray(tool_changes) && tool_changes.every(isRecord))
+										? tool_changes
+										: null;
+								if (content && toolChanges !== null) {
 									compactionPayload = {
 										type: "anthropicCompaction",
 										provider: model.provider,
 										content,
 										...(signature !== undefined ? { signature } : {}),
+										...(toolChanges !== undefined ? { toolChanges } : {}),
 										...(encrypted_content ? { encryptedContent: encrypted_content } : {}),
 									};
 								}
@@ -5853,7 +5862,8 @@ function toWellFormedDeep(value: unknown): unknown {
 		let changed = false;
 		const next: Record<string, unknown> = {};
 		for (const [key, entry] of Object.entries(value)) {
-			const sanitized = toWellFormedDeep(entry);
+			// The compaction signature covers this opaque list; its bytes must replay unchanged.
+			const sanitized = value.type === "compaction" && key === "tool_changes" ? entry : toWellFormedDeep(entry);
 			if (sanitized !== entry) changed = true;
 			next[key] = sanitized;
 		}

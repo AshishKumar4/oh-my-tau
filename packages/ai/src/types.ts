@@ -1183,6 +1183,8 @@ export interface AnthropicCompactionPayload {
 	content: string;
 	/** Signature of an on-demand block; replayed verbatim. */
 	signature?: string;
+	/** Opaque `tool_changes` records covered by the signature; replayed verbatim. */
+	toolChanges?: Record<string, unknown>[];
 	/** Legacy threshold block state (`compact-2026-01-12`); replay-only. */
 	encryptedContent?: string;
 	/**
