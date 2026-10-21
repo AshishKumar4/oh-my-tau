@@ -399,6 +399,20 @@ Average Latency: 1,240 ms
 			}
 		});
 
+		it("keeps a streaming table's height while its last row's open cell grows", () => {
+			const table = "| # | Name | Score |\n| --- | --- | --- |\n| 1 | black | 1.1 |\n| 2 | bright";
+			const markdown = new Markdown(table, 0, 0, defaultMarkdownTheme);
+			markdown.transientRenderCache = true;
+			const heights = [" gr", " green", " green with a long label that wraps"].map(tail => {
+				clearRenderCache();
+				markdown.setText(table + tail);
+				return markdown.render(40).length;
+			});
+			clearRenderCache();
+			// Rows below the table would move by the difference between any two frames.
+			expect(heights).toEqual([heights[0], heights[0], heights[0]]);
+		});
+
 		it("measures a streaming table's finished last row even without its trailing newline", () => {
 			// Assistant text reaches Markdown trimmed, so a finished row is told apart by its closing `|`.
 			const text =

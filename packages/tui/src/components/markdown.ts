@@ -4627,7 +4627,17 @@ export class Markdown implements Component {
 				const text = this.#renderInlineTokens(cell.tokens || [], styleContext);
 				return this.#wrapCellText(text, columnWidths[i]);
 			});
-			const rowLineCount = Math.max(...rowCellLines.map(c => c.length));
+			let rowLineCount = Math.max(...rowCellLines.map(c => c.length));
+			// The open cell is laid out in widths measured without it, so it can
+			// wrap past the lines its row's finished cells need. Those extra lines
+			// come and go as the cell grows and the column widens, moving every row
+			// below the table each frame; hold the row at its finished cells' height
+			// until the cell closes and counts toward the widths.
+			if (rowIndex === lastRow && rowCellLines[openCell]) {
+				const settledLineCount = Math.max(1, ...rowCellLines.filter((_, i) => i !== openCell).map(c => c.length));
+				rowCellLines[openCell] = rowCellLines[openCell].slice(0, settledLineCount);
+				rowLineCount = settledLineCount;
+			}
 
 			for (let lineIdx = 0; lineIdx < rowLineCount; lineIdx++) {
 				const rowParts = rowCellLines.map((cellLines, colIdx) => {
