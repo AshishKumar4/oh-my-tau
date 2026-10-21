@@ -478,8 +478,10 @@ async fn run_shell_session(
 	let _ = process_cancel_bridge.await;
 	abort_state.clear().await;
 
-	let keepalive = res.as_ref().is_ok_and(|(exec, ..)| session_keepalive(exec));
-	if !keepalive {
+	// `exit`, errexit, or a stray top-level `return`/`break` ends this command,
+	// not the session: the next run keeps the variables, functions, and options
+	// built so far. Only a failed run leaves the shell in an unknown state.
+	if res.is_err() {
 		*session.lock().await = None;
 	}
 	let (exec, minimized, working_dir) = res?;
@@ -1299,7 +1301,7 @@ async fn run_shell_command_segmented_chain(
 			aggregate = None;
 		}
 
-		let keep_running = session_keepalive(&command_run.result) && !cancel_token.is_cancelled();
+		let keep_running = continues_command(&command_run.result) && !cancel_token.is_cancelled();
 		last_result = Some(command_run.result);
 		if !keep_running {
 			break;
@@ -1945,7 +1947,9 @@ fn ensure_trailing_newline_for_heredoc(command: &mut String) {
 	command.push('\n');
 }
 
-const fn session_keepalive(result: &ExecutionResult) -> bool {
+/// Whether the command goes on to its next segment; `exit`, errexit, and other
+/// non-normal control flow stop it (the session itself stays usable).
+const fn continues_command(result: &ExecutionResult) -> bool {
 	match result.next_control_flow {
 		ExecutionControlFlow::Normal => true,
 		ExecutionControlFlow::BreakLoop { .. } => false,
@@ -6471,6 +6475,33 @@ replace = [{ pattern = "hello", replacement = "HI" }]
 
 		// Dropping the shell at scope end reaps the child via kill-on-drop.
 		shell.abort().await;
+	}
+
+	/// `exit` and errexit end the command, not the session: later runs keep
+	/// the variables, functions, and options set before them.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn exit_and_errexit_keep_session_state() {
+		let _guard = shell_test_lock().lock().await;
+		let shell = Shell::new(None);
+		let exit_code = async |command: &str| {
+			shell
+				.run(
+					ShellRunOptions { command: command.into(), ..Default::default() },
+					None,
+					CancelToken::default(),
+				)
+				.await
+				.expect("run")
+				.exit_code
+		};
+		let state_intact = "test \"$PI_KEPT\" = kept && pi_kept_fn";
+
+		assert_eq!(exit_code("set -e; PI_KEPT=kept; pi_kept_fn() { true; }").await, Some(0));
+		assert_eq!(exit_code("false; true").await, Some(1), "errexit stops the command");
+		assert_eq!(exit_code(state_intact).await, Some(0), "state lost after errexit");
+		assert_eq!(exit_code("exit 3").await, Some(3));
+		assert_eq!(exit_code(state_intact).await, Some(0), "state lost after exit");
+		assert_eq!(exit_code("false; exit 0").await, Some(1), "errexit option lost");
 	}
 
 	/// `Shell::pids` reports the in-flight run's live external children without
