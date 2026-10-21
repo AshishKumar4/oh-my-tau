@@ -2764,7 +2764,8 @@ interface FinalizeRunArgs {
 	/**
 	 * This finalize is a revival/wake or explicit follow-up turn, not the initial
 	 * run. Structured turns only republish a real `yield`; message-result turns
-	 * republish successful, non-empty reports only when requested by the parent.
+	 * republish successful, non-empty reports only when the parent or the user
+	 * requested the turn.
 	 */
 	followUpTurn?: boolean;
 	publishMessageResult?: boolean;
@@ -2838,8 +2839,8 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	//
 	// Structured follow-ups need a real yield so conversational wakes cannot
 	// replace the accepted artifact with a missing-yield warning (issue #9518).
-	// Message-result agents publish successful parent-requested reports, not
-	// conversational replies to peers or cancelled follow-ups.
+	// Message-result agents publish successful reports the parent or the user
+	// asked for, not conversational replies to peers or cancelled follow-ups.
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
 	let outputPath: string | undefined;
 	const hasMessageResult =
@@ -3368,7 +3369,14 @@ async function runLane(session: AgentSession, options: LaneRunOptions, start: La
 		const exitCode = thrown === undefined ? outcome.exitCode : 1;
 		const parentId = AgentRegistry.global().get(id)?.parentId;
 		const asked = start.asked === true || wakeSources(records, id).some(source => source.from === parentId);
-		const yielded = resultDelivered({ ...outcome, exitCode }, monitor, structured) && (structured || asked);
+		// A focused-session user prompt is the operator driving this agent (#14428): like an owner
+		// follow-up, its message-result reply is the agent's new result. A failed or empty one stays
+		// quiet, since the owner did not ask for it.
+		const userPrompted = records.some(record =>
+			record.role === "user" ? record.attribution === "user" : record.role === "developer" && record.userInitiated,
+		);
+		const yielded =
+			resultDelivered({ ...outcome, exitCode }, monitor, structured) && (structured || asked || userPrompted);
 		if (yielded) {
 			// Acceptance boundary (#11079): the run's final result is settled,
 			// so terminalize the ref here even when the run-state mirror never
@@ -3419,7 +3427,7 @@ async function runLane(session: AgentSession, options: LaneRunOptions, start: La
 				parentToolCallId: options.parentToolCallId,
 				detached: true,
 				followUpTurn: true,
-				publishMessageResult: asked,
+				publishMessageResult: asked || userPrompted,
 				sessionFile: start.sessionFile,
 				startTime,
 			});
