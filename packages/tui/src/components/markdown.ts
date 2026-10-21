@@ -1440,7 +1440,8 @@ function stableBlockBoundary(
 		startIndex = 0,
 		endIndex = tokens.length,
 		settle = false,
-	}: { startIndex?: number; endIndex?: number; settle?: boolean } = {},
+		cuts,
+	}: { startIndex?: number; endIndex?: number; settle?: boolean; cuts?: number[] } = {},
 ): BlockBoundary {
 	let pos = base;
 	let end = 0;
@@ -1455,16 +1456,22 @@ function stableBlockBoundary(
 			if (prev === undefined || prev.type !== "list" || !listMayContinueAt(text, tokenEnd, prev.raw)) {
 				end = tokenEnd;
 				count = i + 1;
+				if (cuts && isSettledCut(text, end)) cuts.push(end);
 			}
 		}
 		pos = tokenEnd;
 	}
-	if (count === 0 || end >= text.length) return { end: 0, count: 0 };
-	const next = text.charCodeAt(end);
-	if (next === 0x20 /* space */ || next === 0x0a /* \n */) return { end: 0, count: 0 };
-	WHITESPACE_LINE_RE.lastIndex = end;
-	if (WHITESPACE_LINE_RE.test(text)) return { end: 0, count: 0 };
+	if (count === 0 || !isSettledCut(text, end)) return { end: 0, count: 0 };
 	return { end, count };
+}
+
+/** Whether a block boundary at `end` is final: more text follows it, opening neither an indented nor a blank line. */
+function isSettledCut(text: string, end: number): boolean {
+	if (end >= text.length) return false;
+	const next = text.charCodeAt(end);
+	if (next === 0x20 /* space */ || next === 0x0a /* \n */) return false;
+	WHITESPACE_LINE_RE.lastIndex = end;
+	return !WHITESPACE_LINE_RE.test(text);
 }
 
 /**
@@ -1477,19 +1484,20 @@ export function lexDocument(text: string): TokensList {
 }
 
 /**
- * Every offset in `(after, text.length]` where `text`, cut there, ends at a
- * settled block boundary ({@link stableBlockBoundary} with `settle`), in
- * ascending order: the prefixes a streaming render would have frozen had it
- * painted once per finished block.
+ * Offsets after `start`, ascending, where `text` cut there ends at a settled
+ * block boundary ({@link stableBlockBoundary} with `settle`): the prefixes a
+ * streaming render would have frozen had it painted once per finished block.
+ * `start` must open a block after a settled boundary, so only the text from
+ * it is lexed. Empty for text holding a CR (the lexer normalizes it, so token
+ * lengths no longer address `text`) or a reference definition (which can
+ * restyle earlier blocks), the cases the streaming freeze excludes too.
  */
-export function settledBlockEnds(text: string, after: number): number[] {
-	const tokens = lexDocument(text);
-	const ends: number[] = [];
-	for (let endIndex = 1; endIndex <= tokens.length; endIndex++) {
-		const { end, count } = stableBlockBoundary(text, 0, tokens, { endIndex, settle: true });
-		if (count > 0 && end > after && end > (ends.at(-1) ?? 0)) ends.push(end);
-	}
-	return ends;
+export function settledBlockEnds(text: string, start: number): number[] {
+	const tail = text.slice(start);
+	if (tail.includes("\r") || HAS_REF_DEF.test(text)) return [];
+	const cuts: number[] = [];
+	stableBlockBoundary(text, start, lexDocument(tail), { settle: true, cuts });
+	return cuts;
 }
 
 /**

@@ -1239,29 +1239,30 @@ export class AssistantMessageComponent extends Container {
 		// frame). As one snapshot they retire only together, and a unit taller than the
 		// rows that left the screen never retires while the block streams, so publish
 		// each block boundary the paint passed, as one paint per block would have.
-		const published: { snapshot: StableSnapshot; rows: readonly string[] }[] = [];
+		this.#stableParts = parts;
 		let publishedRows = previousRows;
 		for (const boundary of this.#passedBoundaries(previous, parts)) {
 			const rows = this.#renderStableParts(parts, boundary.partCount, boundary.lastTextLength, width, "head");
 			if (rows.length <= publishedRows.length) continue;
 			if (!isRowPrefix(publishedRows, rows) || !isRowPrefix(rows, currentRows)) continue;
-			published.push({ snapshot: boundary, rows });
+			this.#pushStableSnapshot(boundary, width, rows);
 			publishedRows = rows;
 		}
-		published.push({ snapshot, rows: currentRows });
-		this.#stableParts = parts;
-		for (const { snapshot: next, rows } of published) {
-			this.#stableSnapshots.push(next);
-			this.#transcriptStableRows.push({ key: `thinking:${this.#nextStableRowId++}` });
-			this.#recordStableRows(this.#stableSnapshots.length, width, rows);
-		}
+		this.#pushStableSnapshot(snapshot, width, currentRows);
+	}
+
+	#pushStableSnapshot(snapshot: StableSnapshot, width: number, rows: readonly string[]): void {
+		this.#stableSnapshots.push(snapshot);
+		this.#transcriptStableRows.push({ key: `thinking:${this.#nextStableRowId++}` });
+		this.#recordStableRows(this.#stableSnapshots.length, width, rows);
 	}
 
 	/**
 	 * Snapshots strictly between `previous` and the end of `parts`, in order: each
 	 * settled block boundary in text added since `previous`, and the end of each part
 	 * the paint closed. A part whose added text holds no blank line after its first
-	 * new block passed no boundary, so the common one-block paint lexes nothing.
+	 * new block passed no boundary, so the common one-block paint lexes nothing, and
+	 * only text added since `previous` is ever lexed.
 	 */
 	#passedBoundaries(previous: StableSnapshot | undefined, parts: readonly StablePart[]): StableSnapshot[] {
 		const boundaries: StableSnapshot[] = [];

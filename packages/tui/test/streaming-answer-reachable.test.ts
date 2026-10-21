@@ -11,10 +11,10 @@ import { VirtualTerminal } from "./virtual-terminal";
 
 withoutTerminalMultiplexer();
 
-function reply(text: string): AssistantMessage {
+function reply(text: string | readonly string[]): AssistantMessage {
 	return {
 		role: "assistant",
-		content: [{ type: "text", text }],
+		content: (typeof text === "string" ? [text] : text).map(block => ({ type: "text" as const, text: block })),
 		api: "openai-codex-responses",
 		provider: "openai-codex",
 		model: "test",
@@ -36,6 +36,41 @@ class Hud implements Component {
 	render(): readonly string[] {
 		return Array.from({ length: this.rows }, (_, i) => `HUD ${i}`);
 	}
+}
+
+/** A running composer with a streaming assistant answer above `chrome` and an editor. */
+async function mount({ realEditor = false, columns = 60 }: { realEditor?: boolean; columns?: number } = {}) {
+	const terminal = new VirtualTerminal(columns, 18);
+	const scheduler = new VirtualRenderScheduler();
+	const composer = new Composer({
+		terminal,
+		tuiOptions: { renderScheduler: scheduler },
+		preferences: { ...COMPOSER_DEFAULTS, quiet: true },
+	});
+	const transcript = new TranscriptContainer();
+	const hud = new Hud();
+	const editor = new Container();
+	editor.addChild(realEditor ? composer.editor : new Text("EDITOR", 0, 0));
+	composer.setRuntimeChildren([transcript, hud, editor], { transientChrome: [editor] });
+	composer.start({ playWelcomeIntro: false });
+	await scheduler.settle(terminal);
+	composer.setRunActive(true);
+	const message = new AssistantMessageComponent();
+	transcript.addChild(message);
+	const paint = async (text: string | readonly string[]): Promise<void> => {
+		message.updateContent(reply(text), { transient: true });
+		composer.ui.requestRender();
+		await scheduler.settle(terminal);
+	};
+	/** Finalizes the answer and ends the run. */
+	const finish = async (text: string | readonly string[]): Promise<void> => {
+		message.updateContent(reply(text));
+		message.markTranscriptBlockFinalized();
+		composer.setRunActive(false);
+		composer.ui.requestRender();
+		await scheduler.advance(terminal, 300);
+	};
+	return { terminal, scheduler, composer, hud, editor, message, paint, finish };
 }
 
 /** The engine exposes history followed by the active grid, not just the screen. */
@@ -61,24 +96,10 @@ beforeAll(async () => {
 
 for (const kind of ["list", "hud", "composer", "batched paragraphs", "paragraph control"] as const) {
 	it(`keeps the latest answer reachable in screen plus native scrollback: ${kind}`, async () => {
-		const terminal = new VirtualTerminal(60, 18);
-		const scheduler = new VirtualRenderScheduler();
-		const composer = new Composer({
-			terminal,
-			tuiOptions: { renderScheduler: scheduler },
-			preferences: { ...COMPOSER_DEFAULTS, quiet: true },
+		const { terminal, scheduler, composer, hud, editor, paint, finish } = await mount({
+			realEditor: kind === "composer",
 		});
-		const transcript = new TranscriptContainer();
-		const hud = new Hud();
-		const editor = new Container();
-		editor.addChild(kind === "composer" ? composer.editor : new Text("EDITOR", 0, 0));
-		composer.setRuntimeChildren([transcript, hud, editor], { transientChrome: [editor] });
-		composer.start({ playWelcomeIntro: false });
 		try {
-			await scheduler.settle(terminal);
-			composer.setRunActive(true);
-			const message = new AssistantMessageComponent();
-			transcript.addChild(message);
 			const lines = Array.from(
 				{ length: 48 },
 				(_, i) => `QZ${String(i + 1).padStart(3, "0")} alpha bravo charlie delta`,
@@ -97,16 +118,10 @@ for (const kind of ["list", "hud", "composer", "batched paragraphs", "paragraph 
 				if (count === 24 && kind === "hud") hud.rows = 6;
 				if (count === 24 && kind === "composer")
 					composer.editor.setText(Array.from({ length: 7 }, () => "draft input").join("\n"));
-				message.updateContent(reply(text(count)), { transient: true });
-				composer.ui.requestRender();
-				await scheduler.settle(terminal);
+				await paint(text(count));
 			}
 			const live = inspect(terminal);
-			message.updateContent(reply(text(48)));
-			message.markTranscriptBlockFinalized();
-			composer.setRunActive(false);
-			composer.ui.requestRender();
-			await scheduler.advance(terminal, 300);
+			await finish(text(48));
 			const ended = inspect(terminal);
 			hud.rows = 0;
 			if (kind === "composer") composer.editor.setText("");
@@ -124,6 +139,33 @@ for (const kind of ["list", "hud", "composer", "batched paragraphs", "paragraph 
 			if (kind === "composer") expect(ended.missing).toEqual([]);
 			expect(live.missing).toEqual([]);
 			expect(ended.missing).toEqual([]);
+		} finally {
+			composer.stop();
+		}
+	});
+}
+
+const marker = (index: number): string => `QZ${String(index + 1).padStart(3, "0")}`;
+
+// Content 10 cells wide: `alpha beta xy` wraps after `beta`. A cut that lost the
+// CRs' offsets lands right there, which reads as a row prefix at this width and
+// is not one at the next. A live block of a few paragraphs retires that cut while
+// `xy` is still on screen when the terminal widens.
+for (const live of [5, 6, 7, 8]) {
+	it(`keeps CRLF paragraphs whole across a resize when one paint closes them (${live} live paragraphs)`, async () => {
+		const { terminal, scheduler, composer, paint, finish } = await mount({ columns: 12 });
+		try {
+			const closed = "P\r\n\r\nQ\r\n\r\nalpha beta xy\n\nTail";
+			const streaming = Array.from({ length: live }, (_, i) => marker(i)).join("\n\n");
+			await paint("P");
+			// One paint closes the CRLF block while a second block streams below it.
+			await paint([closed, `${streaming}\n\nstill writing`]);
+			terminal.resize(22, 18);
+			composer.ui.requestRender();
+			await scheduler.advance(terminal, 200);
+			await finish([closed, streaming]);
+			const reachable = terminal.getScrollBuffer().map(row => Bun.stripANSI(row));
+			expect(reachable.filter(row => /\bxy\b/.test(row))).toHaveLength(1);
 		} finally {
 			composer.stop();
 		}
