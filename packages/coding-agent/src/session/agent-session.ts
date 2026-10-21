@@ -908,6 +908,8 @@ export class AgentSession implements SettingsScope {
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
 	#unsubscribeQueueChange?: () => void;
+	/** Agent message count when {@link #disconnectFromAgent} unsubscribed; messages past it reached no persisting handler. */
+	#disconnectedMessageCount?: number;
 	#cancelExitRecorder?: () => void;
 	#cancelFatalRecoveryHint?: () => void;
 	#exitRecorded = false;
@@ -3803,6 +3805,38 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
+	 * Session transitions (`/compact`, `/new`, session switch) disconnect before
+	 * `await abort()`, so the result the abort gives a running tool reaches no
+	 * persisting handler. Record it before the transition rewrites or leaves the
+	 * session; otherwise its call is left without a result and replay fills in a
+	 * synthetic one. Only results of calls the last assistant turn before the
+	 * disconnect made qualify: that turn was persisted at its `message_end`. A turn
+	 * the abort cut short mid-stream was never persisted, so its synthetic results
+	 * would be orphans. A successful `rewind` result is the exception too: the
+	 * aborted turn never applies it, so recording "rewind requested" would claim
+	 * a branch cut that never happened.
+	 */
+	#persistToolResultsEndedWhileDisconnected(): void {
+		const start = this.#disconnectedMessageCount;
+		if (start === undefined) return;
+		// Once per disconnect: the transition may replace the agent's messages next (compaction, reset).
+		this.#disconnectedMessageCount = undefined;
+		const messages = this.agent.state.messages;
+		let lastAssistant: AgentMessage | undefined;
+		for (let index = Math.min(start, messages.length) - 1; index >= 0 && !lastAssistant; index--) {
+			if (messages[index].role === "assistant") lastAssistant = messages[index];
+		}
+		if (lastAssistant?.role !== "assistant") return;
+		const knownCalls = new Set(lastAssistant.content.flatMap(block => (block.type === "toolCall" ? [block.id] : [])));
+		for (let index = start; index < messages.length; index++) {
+			const message = messages[index];
+			if (message.role !== "toolResult" || !knownCalls.has(message.toolCallId)) continue;
+			if (!message.isError && semanticToolResult(message.toolName, message)?.toolName === "rewind") continue;
+			this.#persistSessionMessageIfMissing(message);
+		}
+	}
+
+	/**
 	 * Builds the transient checkpoint-active reminder for a successful
 	 * checkpoint tool result, or undefined otherwise. The reminder is queued as
 	 * steering synchronously in the message_end handler (before any await), so
@@ -5545,6 +5579,7 @@ export class AgentSession implements SettingsScope {
 		if (this.#unsubscribeAgent) {
 			this.#unsubscribeAgent();
 			this.#unsubscribeAgent = undefined;
+			this.#disconnectedMessageCount = this.agent.state.messages.length;
 		}
 		if (this.#unsubscribeQueueChange) {
 			this.#unsubscribeQueueChange();
@@ -5558,6 +5593,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	#reconnectToAgent(): void {
 		if (this.#unsubscribeAgent) return; // Already connected
+		this.#disconnectedMessageCount = undefined;
 		this.#unsubscribeAgent = this.agent.subscribe(this.#handleAgentEvent);
 		this.#unsubscribeQueueChange = this.agent.onQueueChange(() => this.#emitQueueUpdateIfChanged());
 	}
@@ -10054,6 +10090,7 @@ export class AgentSession implements SettingsScope {
 			this.agent.abort(options?.reason);
 			await Promise.all([postPromptDrain, computerControlRevocation]);
 			await this.agent.waitForIdle();
+			this.#persistToolResultsEndedWhileDisconnected();
 			// agent_end maintenance can enqueue a retry after the first cancellation.
 			// Keep the abort barrier up until those handlers settle, then cancel
 			// anything they scheduled before making the session revivable. Only
