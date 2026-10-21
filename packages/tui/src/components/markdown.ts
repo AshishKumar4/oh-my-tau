@@ -4451,7 +4451,14 @@ export class Markdown implements Component {
 		// (e.g. mdCode) would bleed into the "│" and the following cells.
 		// Terminate each line at default fg, clearing bold/italic but keeping
 		// any ambient background (message-bg rendering) intact.
-		return wrapped.map(line => `${line}\x1b[22m\x1b[23m\x1b[39m`);
+		// A wide glyph can exceed a one-cell column without wrapping (a 2-cell
+		// emoji in a column squeezed to 1), so clamp here before the row is
+		// spliced between borders; otherwise the overwide row is re-wrapped and
+		// the trailing border lands on its own line.
+		return wrapped.map(line => {
+			const fitted = visibleWidth(line) > cellWidth ? truncateToWidth(line, cellWidth) : line;
+			return `${fitted}\x1b[22m\x1b[23m\x1b[39m`;
+		});
 	}
 
 	/**
