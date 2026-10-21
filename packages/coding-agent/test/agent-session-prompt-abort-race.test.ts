@@ -37,7 +37,11 @@ describe("AgentSession prompt admission racing abort", () => {
 		authStorage?.close();
 	});
 
-	async function createSession(responses: Array<() => MockResponse | Promise<MockResponse>>, textOnly = false) {
+	async function createSession(
+		responses: Array<() => MockResponse | Promise<MockResponse>>,
+		textOnly = false,
+		settings: Record<string, unknown> = {},
+	) {
 		authStorage = await AuthStorage.create(":memory:");
 		authStorage.keys.setRuntime("anthropic", "test-key");
 		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -53,7 +57,7 @@ describe("AgentSession prompt admission racing abort", () => {
 		session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false }),
+			settings: Settings.isolated({ "compaction.enabled": false, "todo.enabled": false, ...settings }),
 			modelRegistry,
 		});
 		const dropped: string[] = [];
@@ -148,18 +152,23 @@ describe("AgentSession prompt admission racing abort", () => {
 	});
 
 	it("keeps the next prompt busy when an interrupted setup unwinds late", async () => {
-		const { session, modelRegistry } = await createSession([() => ({ content: ["done"] })]);
+		// Setup's usage-aware preflight is its first await that reads provider state;
+		// holding it there lets the interrupted prompt unwind after the next one began.
+		const { session, modelRegistry } = await createSession([() => ({ content: ["done"] })], false, {
+			"retry.usageAwareFallback": true,
+		});
 		const entered = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
 		const release = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
-		const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		const health = modelRegistry.authStorage.health;
+		const modelHealth = health.model.bind(health);
 		let calls = 0;
-		const spy = spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId, options) => {
+		const spy = spyOn(health, "model").mockImplementation(async (provider, options) => {
 			const index = calls++;
 			if (index < 2) {
 				entered[index].resolve();
 				await release[index].promise;
 			}
-			return getApiKey(model, sessionId, options);
+			return modelHealth(provider, options);
 		});
 		restores.push(() => spy.mockRestore());
 
