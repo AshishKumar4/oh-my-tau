@@ -1021,7 +1021,8 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 				const cell = cells[i];
 				const backend = cell.resolved.backend;
 				// The per-cell `timeout` is a budget on the cell runtime's *own*
-				// work. Host-side waits on `agent()`/`completion()` handles suspend
+				// work. Host-side waits on `agent()`/`completion()` handles,
+				// `tool.task()`/`tool.wait()`, and browser/computer preludes suspend
 				// that budget entirely and restart a fresh timeout window when control
 				// returns to the active backend runtime. Compute, stdout, `log()`/`phase()`, and
 				// ordinary tool calls all count against the budget. The watchdog drives
