@@ -1355,7 +1355,12 @@ describe("cold revival replays the system prompt the last request sent", () => {
 	): Promise<RecordingSession> {
 		let spawned: RecordingSession | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
-			spawned = createRecordingSession(options!.sessionManager!, names => buildPrompt(names, options), responses, hooks);
+			spawned = createRecordingSession(
+				options!.sessionManager!,
+				names => buildPrompt(names, options),
+				responses,
+				hooks,
+			);
 			// The SDK registers a spawned child, which keeps it live after it yields.
 			AgentRegistry.global().register({
 				id: "prompt-blocks",

@@ -3306,8 +3306,7 @@ const streamAnthropicOnce = (
 								// The signature covers tool_changes: a block whose records cannot replay
 								// unchanged is not published.
 								const toolChanges =
-									tool_changes === undefined ||
-									(Array.isArray(tool_changes) && tool_changes.every(isRecord))
+									tool_changes === undefined || (Array.isArray(tool_changes) && tool_changes.every(isRecord))
 										? tool_changes
 										: null;
 								if (content && toolChanges !== null) {
