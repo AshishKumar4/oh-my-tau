@@ -53,7 +53,7 @@ export const COMPOSER_DEFAULTS: ComposerPreferences = {
 	showHardwareCursor: true,
 	maxInlineImages: 8,
 	resizeScrollback: "rebuild",
-	completeScrollback: false,
+	completeScrollback: true,
 	imeSafeCursor: false,
 	autocompleteMaxVisible: 10,
 	spellingTypoDetection: true,

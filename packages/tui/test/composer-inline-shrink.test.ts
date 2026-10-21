@@ -59,6 +59,7 @@ interface Harness {
 	editor: Container;
 }
 
+/** The floor that holds displaced rows back to refill the screen: `completeScrollback` off. */
 function makeHarness(
 	columns = COLUMNS,
 	rows = ROWS,
@@ -71,7 +72,7 @@ function makeHarness(
 	const composer = new Composer({
 		terminal,
 		tuiOptions: { renderScheduler: scheduler },
-		preferences: { ...COMPOSER_DEFAULTS, quiet: true },
+		preferences: { ...COMPOSER_DEFAULTS, quiet: true, completeScrollback: false },
 	});
 	const transcript = new TranscriptContainer();
 	for (let i = 0; i < transcriptRows; i++) {
@@ -239,7 +240,7 @@ describe("composer inline shrink (#11007)", () => {
 		const composer = new Composer({
 			terminal,
 			tuiOptions: { renderScheduler: scheduler },
-			preferences: { ...COMPOSER_DEFAULTS, quiet: true },
+			preferences: { ...COMPOSER_DEFAULTS, quiet: true, completeScrollback: false },
 		});
 		const transcript = new TranscriptContainer();
 		// The response straddles the top edge: only its rows above the screen
@@ -779,7 +780,7 @@ describe("composer inline shrink (#11007)", () => {
 		const composer = new Composer({
 			terminal,
 			tuiOptions: { renderScheduler: scheduler },
-			preferences: { ...COMPOSER_DEFAULTS, quiet: true },
+			preferences: { ...COMPOSER_DEFAULTS, quiet: true, completeScrollback: false },
 		});
 		const transcript = new TranscriptContainer();
 		const todos = new InlineWidget();
@@ -828,7 +829,7 @@ describe("composer inline shrink (#11007)", () => {
 		const composer = new Composer({
 			terminal,
 			tuiOptions: { renderScheduler: scheduler },
-			preferences: { ...COMPOSER_DEFAULTS, quiet: true },
+			preferences: { ...COMPOSER_DEFAULTS, quiet: true, completeScrollback: false },
 		});
 		const transcript = new TranscriptContainer();
 		const editorRoot = new Container();

@@ -138,7 +138,7 @@ function parseUiState(
 			showHardwareCursor,
 			maxInlineImages,
 			resizeScrollback: resizeScrollback ?? "rebuild",
-			completeScrollback: completeScrollback ?? false,
+			completeScrollback: completeScrollback ?? true,
 			imeSafeCursor,
 			autocompleteMaxVisible,
 			spellingTypoDetection,
