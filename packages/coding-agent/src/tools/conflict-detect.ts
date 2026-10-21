@@ -610,7 +610,7 @@ export function formatConflictWarning(
 	if (partial) {
 		const hintPath = options.displayPath ?? "<file>";
 		out.push(
-			`⚠ ${entries.length} of ${total} unresolved ${word} visible in this window (read \`${hintPath}:conflicts\` for the full list).`,
+			`⚠ ${entries.length} of ${total} unresolved ${word} visible in this window; this read registered only the blocks below, so don't infer ids for the others — read \`${hintPath}:conflicts\` to list and register the file's blocks.`,
 		);
 	} else {
 		out.push(`⚠ ${total} unresolved ${word} detected`);
