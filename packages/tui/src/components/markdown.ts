@@ -1477,6 +1477,22 @@ export function lexDocument(text: string): TokensList {
 }
 
 /**
+ * Every offset in `(after, text.length]` where `text`, cut there, ends at a
+ * settled block boundary ({@link stableBlockBoundary} with `settle`), in
+ * ascending order: the prefixes a streaming render would have frozen had it
+ * painted once per finished block.
+ */
+export function settledBlockEnds(text: string, after: number): number[] {
+	const tokens = lexDocument(text);
+	const ends: number[] = [];
+	for (let endIndex = 1; endIndex <= tokens.length; endIndex++) {
+		const { end, count } = stableBlockBoundary(text, 0, tokens, { endIndex, settle: true });
+		if (count > 0 && end > after && end > (ends.at(-1) ?? 0)) ends.push(end);
+	}
+	return ends;
+}
+
+/**
  * `source` as a fenced code block in `lang`: the fence is one backtick longer
  * than any backtick run in the source (at least three), so the block always
  * closes where intended. `open` leaves it unclosed, the source verbatim, for

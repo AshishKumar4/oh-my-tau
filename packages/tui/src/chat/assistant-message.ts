@@ -8,6 +8,7 @@ import {
 	Markdown,
 	type MarkdownTheme,
 	rewriteMarkdownLinkDestinations,
+	settledBlockEnds,
 	speculativeStreamingSource,
 	streamingMarkdownSource,
 } from "../components/markdown";
@@ -1234,10 +1235,52 @@ export class AssistantMessageComponent extends Container {
 		if (!isRowPrefix(previousRows, currentRows)) return;
 		// Each stable row must add at least one physical row at every width.
 		if (currentRows.length === previousRows.length) return;
+		// One paint can pass several finished blocks (a burst of deltas, a throttled
+		// frame). As one snapshot they retire only together, and a unit taller than the
+		// rows that left the screen never retires while the block streams, so publish
+		// each block boundary the paint passed, as one paint per block would have.
+		const published: { snapshot: StableSnapshot; rows: readonly string[] }[] = [];
+		let publishedRows = previousRows;
+		for (const boundary of this.#passedBoundaries(previous, parts)) {
+			const rows = this.#renderStableParts(parts, boundary.partCount, boundary.lastTextLength, width, "head");
+			if (rows.length <= publishedRows.length) continue;
+			if (!isRowPrefix(publishedRows, rows) || !isRowPrefix(rows, currentRows)) continue;
+			published.push({ snapshot: boundary, rows });
+			publishedRows = rows;
+		}
+		published.push({ snapshot, rows: currentRows });
 		this.#stableParts = parts;
-		this.#stableSnapshots.push(snapshot);
-		this.#transcriptStableRows.push({ key: `thinking:${this.#nextStableRowId++}` });
-		this.#recordStableRows(this.#stableSnapshots.length, width, currentRows);
+		for (const { snapshot: next, rows } of published) {
+			this.#stableSnapshots.push(next);
+			this.#transcriptStableRows.push({ key: `thinking:${this.#nextStableRowId++}` });
+			this.#recordStableRows(this.#stableSnapshots.length, width, rows);
+		}
+	}
+
+	/**
+	 * Snapshots strictly between `previous` and the end of `parts`, in order: each
+	 * settled block boundary in text added since `previous`, and the end of each part
+	 * the paint closed. A part whose added text holds no blank line after its first
+	 * new block passed no boundary, so the common one-block paint lexes nothing.
+	 */
+	#passedBoundaries(previous: StableSnapshot | undefined, parts: readonly StablePart[]): StableSnapshot[] {
+		const boundaries: StableSnapshot[] = [];
+		const lastIndex = parts.length - 1;
+		for (let index = previous ? previous.partCount - 1 : 0; index <= lastIndex; index++) {
+			const part = parts[index]!;
+			if (part.kind === "spacer") continue;
+			const from = previous && index === previous.partCount - 1 ? previous.lastTextLength : 0;
+			const firstNew = part.text.slice(from).search(/\S/);
+			if (firstNew >= 0 && part.text.includes("\n\n", from + firstNew)) {
+				for (const end of settledBlockEnds(part.text, from + firstNew)) {
+					boundaries.push({ partCount: index + 1, lastTextLength: end });
+				}
+			}
+			if (index < lastIndex && part.text.length > from) {
+				boundaries.push({ partCount: index + 1, lastTextLength: part.text.length });
+			}
+		}
+		return boundaries;
 	}
 
 	/**
