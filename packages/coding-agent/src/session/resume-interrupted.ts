@@ -829,6 +829,8 @@ export interface RecoverHost {
 	readonly subagentEventBus: EventBus | undefined;
 	readonly agent: { replaceMessages(messages: AgentMessage[]): void };
 	buildDisplaySessionContext(): { messages: AgentMessage[] };
+	/** Persists the eval snapshot startup deferred until the interrupted calls have results. */
+	persistEvalStateContext(): void;
 	getAgentId(): string | undefined;
 }
 
@@ -872,6 +874,7 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 
 	if (scan.toolCallsRepairable) {
 		appendInterruptedToolResults(sessionManager, scan.toolCalls);
+		host.persistEvalStateContext();
 		host.agent.replaceMessages(host.buildDisplaySessionContext().messages);
 	}
 	// Recorded before the first await: a second /recover while this one is still

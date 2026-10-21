@@ -161,6 +161,7 @@ describe("/recover", () => {
 			subagentEventBus: bus,
 			agent: { replaceMessages: messages => replaced.push(messages) },
 			buildDisplaySessionContext: () => manager.buildSessionContext(),
+			persistEvalStateContext: () => {},
 			getAgentId: () => "Main",
 			replaced,
 		};
@@ -1733,13 +1734,52 @@ describe("/recover after the SDK's resume repair", () => {
 		await session.waitForIdle();
 
 		expect(result).toEqual({ consumed: true, agentInvoked: true });
-		const [first] = branchAfterTurn().filter(entry => entry.type === "message" || entry.type === "custom_message");
-		expect(first?.type === "message" && first.message.role === "toolResult" && first.message.toolCallId).toBe(
-			"call_1",
+		// The interruption result directly follows the turn, and the snapshot the recovered turn
+		// was sent with is persisted right after it.
+		const [repaired, snapshot] = branchAfterTurn().filter(
+			entry => entry.type === "message" || entry.type === "custom_message",
 		);
-		expect(
-			first?.type === "message" && first.message.role === "toolResult" ? first.message.content : undefined,
-		).toEqual([{ type: "text", text: INTERRUPTED_TOOL_RESULT_TEXT }]);
+		expect(repaired?.type === "message" && repaired.message.role === "toolResult" && repaired.message).toMatchObject({
+			toolCallId: "call_1",
+			content: [{ type: "text", text: INTERRUPTED_TOOL_RESULT_TEXT }],
+		});
+		expect(snapshot?.type === "message" && isEvalStateContext(snapshot.message)).toBe(true);
 		expect(mock.calls).toHaveLength(1);
+
+		// The next process rebuilds the same request prefix: no second snapshot after the recovered turn.
+		await session.dispose();
+		const auth2 = createInMemoryAuthStorage();
+		auth2.keys.setRuntime("mock", "test-key");
+		const registry2 = new ModelRegistry(auth2);
+		registries.push(registry2);
+		const { session: reopened } = await createAgentSession({
+			cwd: dir.path(),
+			agentDir: dir.path(),
+			modelRegistry: registry2,
+			model: mock,
+			sessionManager: await SessionManager.open(file),
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"retry.enabled": false,
+				"todo.enabled": false,
+				"todo.reminders": false,
+			}),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			toolNames: [],
+		});
+		sessions.push(reopened);
+		const snapshots = reopened.agent.state.messages.filter(isEvalStateContext);
+		expect(snapshots).toHaveLength(1);
+		const resultIndex = reopened.agent.state.messages.findIndex(
+			message => message.role === "toolResult" && message.toolCallId === "call_1",
+		);
+		expect(isEvalStateContext(reopened.agent.state.messages[resultIndex + 1])).toBe(true);
 	});
 });

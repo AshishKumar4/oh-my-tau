@@ -364,6 +364,7 @@ import { isDateCwdReminderControl } from "./date-cwd-reminder";
 import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
 import {
 	collectPendingToolCalls,
+	createInterruptedToolResults,
 	createInterruptedTurnAbortMessage,
 	createSessionOpenData,
 	SESSION_EXIT_CUSTOM_TYPE,
@@ -1783,9 +1784,9 @@ export class AgentSession implements SettingsScope {
 			this.agent.appendMessage(initialEvalStateContext);
 			// Persist the startup snapshot at the slot this process sends it from, so
 			// the next resumed process rebuilds the same request prefix (#15736). Not
-			// after calls a crash left without results: /recover appends their results
-			// right after the turn that issued them, and nothing may sit in between.
-			if (collectPendingToolCalls(this.sessionManager.getBranch()).length === 0) {
+			// after a last turn whose calls a crash left without results: /recover
+			// appends those right after the turn, then persists the snapshot itself.
+			if (createInterruptedToolResults(this.sessionManager.getBranch()).length === 0) {
 				this.sessionManager.appendCustomMessageEntry(
 					initialEvalStateContext.customType,
 					initialEvalStateContext.content,
@@ -6941,6 +6942,18 @@ export class AgentSession implements SettingsScope {
 
 	buildDisplaySessionContext(model = this.model): SessionContext {
 		return this.#withEvalStateContext(this.#providerBoundary.buildDisplaySessionContext(model));
+	}
+
+	/**
+	 * Persists the eval snapshot the next display rebuild would append, so a resumed
+	 * process sends it from the same slot (#15736). Startup defers it while the last
+	 * turn's calls lack results; /recover calls this once it has appended them.
+	 */
+	persistEvalStateContext(): void {
+		const message = this.#buildEvalStateContextMessage(
+			this.#providerBoundary.buildDisplaySessionContext(this.model).messages,
+		);
+		if (message) this.sessionManager.appendMessage(message);
 	}
 
 	#withEvalStateContext(context: SessionContext): SessionContext {
