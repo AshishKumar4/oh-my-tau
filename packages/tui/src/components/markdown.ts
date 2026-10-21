@@ -1817,7 +1817,9 @@ function labelSource(tokens: readonly Token[]): string {
 		} else if ("tokens" in token && token.tokens) {
 			source += labelSource(token.tokens);
 		} else {
-			source += LABEL_FREE_TOKENS.has(token.type) ? " " : token.raw;
+			// Brackets inside these never form a label, but the token itself can be one's
+			// text (`[`code`]`), so it stays visible as an opaque non-blank character.
+			source += LABEL_FREE_TOKENS.has(token.type) ? "\uFFFC" : token.raw;
 		}
 	}
 	return source;

@@ -171,3 +171,25 @@ for (const live of [5, 6, 7, 8]) {
 		}
 	});
 }
+
+it("holds a list item labelled by code until a later definition can no longer restyle it", async () => {
+	const { terminal, composer, paint, finish } = await mount();
+	try {
+		const items = Array.from({ length: 40 }, (_, i) =>
+			i === 0 ? `- [\`foo\`] ${marker(i)}` : `- ${marker(i)} item`,
+		);
+		for (let count = 1; count <= items.length; count++) await paint(items.slice(0, count).join("\n"));
+		const final = `${items.join("\n")}\n\n[\`foo\`]: https://example.com/foo\n\n${marker(40)} after`;
+		await finish(final);
+		const rowOf = (rows: readonly string[]): string | undefined =>
+			rows.map(row => Bun.stripANSI(row).trimEnd()).find(row => row.includes(marker(0)));
+		const fresh = new AssistantMessageComponent();
+		fresh.updateContent(reply(final));
+		fresh.markTranscriptBlockFinalized();
+		// The first item's row in history is the row its final render has: the late
+		// definition turned the label into a link, so no stale `[foo]` was retired.
+		expect(rowOf(terminal.getScrollBuffer())).toBe(rowOf(fresh.render(terminal.columns)));
+	} finally {
+		composer.stop();
+	}
+});
