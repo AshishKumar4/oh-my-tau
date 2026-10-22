@@ -244,6 +244,7 @@ describe("UiHelpers.renderInitialMessages — transcript source", () => {
 		expect(llmContextSpy).not.toHaveBeenCalled();
 		expect(renderSessionContextSpy).toHaveBeenCalledWith(transcript, {
 			updateFooter: true,
+			earlierMessages: 0,
 		});
 	});
 });

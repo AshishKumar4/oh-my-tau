@@ -100,6 +100,8 @@ export interface RenderSessionContextOptions {
 	reuseSettledComponents?: boolean;
 	/** Tool calls whose existing live component remains the sole render owner across a rebuild. */
 	preservedLiveToolCallIds?: ReadonlySet<string>;
+	/** Messages of a long session left out of the rendered tail; a marker row above the tail counts them. */
+	earlierMessages?: number;
 }
 
 /** How {@link InteractiveModeContext.showStatus} shows a notice. */

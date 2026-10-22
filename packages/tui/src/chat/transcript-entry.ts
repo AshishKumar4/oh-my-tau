@@ -55,18 +55,23 @@ export function transcriptEntryMessage(entry: TranscriptEntryLike): AgentMessage
 	return entry.type === "message" ? entry.message : customMessageEntryMessage(entry);
 }
 
+/** Whether `message` is a user-authored request: a prompt, or a custom message that starts a user turn. */
+export function isUserRequestMessage(message: AgentMessage): boolean {
+	return message.role === "user" || (message.role === "custom" && isUserTurnInitiator(message));
+}
+
 /** Identify user-authored requests among transcript and metadata entries. */
 export function isUserRequestEntry(entry: TranscriptEntryLike | { type: string }): boolean {
-	if (entry.type === "message" && "message" in entry) {
-		if (entry.message.role === "user") return true;
-		return entry.message.role === "custom" && isUserTurnInitiator(entry.message);
-	}
+	if (entry.type === "message" && "message" in entry) return isUserRequestMessage(entry.message);
 	if (entry.type === "custom_message" && "content" in entry) {
 		const message = customMessageEntryMessage(entry);
-		return message !== undefined && isUserTurnInitiator(message);
+		return message !== undefined && isUserRequestMessage(message);
 	}
 	return false;
 }
+
+/** Messages a recent transcript tail holds: what pickers render first and a live chat replays. */
+export const RECENT_TRANSCRIPT_LIMIT = 600;
 
 /**
  * Recent transcript tail starting at a user-request boundary, so tool calls
@@ -76,7 +81,10 @@ export function isUserRequestEntry(entry: TranscriptEntryLike | { type: string }
  *
  * A whole user turn may exceed `limit`; paginate rendering if one turn grows too large.
  */
-export function recentTranscriptEntries(entries: TranscriptEntryLike[], limit = 600): TranscriptEntryLike[] {
+export function recentTranscriptEntries(
+	entries: TranscriptEntryLike[],
+	limit = RECENT_TRANSCRIPT_LIMIT,
+): TranscriptEntryLike[] {
 	if (entries.length <= limit) return entries;
 	for (let index = entries.length - limit; index > 0; index--) {
 		if (isUserRequestEntry(entries[index]!)) return entries.slice(index);

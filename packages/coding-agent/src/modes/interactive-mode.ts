@@ -3948,12 +3948,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 		}
 		this.chatContainer.clear();
-		// Live display collapses to the compacted transcript tail unless the
-		// user opted into the full inline history; export/resume callers choose
-		// their own mode.
-		const context = this.viewSession.buildTranscriptSessionContext({
-			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
-		});
+		const { context, omitted } = this.#uiHelpers.buildLiveTranscript();
 		const preservedLiveToolCallIds = new Set<string>();
 		// A preserved pending-tool component whose result has already landed in
 		// the replayed transcript is re-rendered by `renderSessionContext` itself
@@ -4022,6 +4017,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.renderSessionContext(context, {
 			reuseSettledComponents: options.reuseSettledComponents,
 			preservedLiveToolCallIds,
+			earlierMessages: omitted.length,
 		});
 		for (const child of liveComponents) {
 			this.chatContainer.addChild(child);

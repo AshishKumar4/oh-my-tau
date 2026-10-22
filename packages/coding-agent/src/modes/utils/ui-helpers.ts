@@ -6,7 +6,7 @@ import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { StatusNotice } from "@oh-my-pi/pi-tui/chrome/status-notice";
 import { QueuedMessagesBand } from "@oh-my-pi/pi-tui/prompt/queued-messages";
-import { logger } from "@oh-my-pi/pi-utils";
+import { formatNumber, logger } from "@oh-my-pi/pi-utils";
 import type { AdvisorMessageDetails } from "../../advisor";
 import { InternalUrlRouter } from "../../internal-urls";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
@@ -38,7 +38,13 @@ import {
 } from "@oh-my-pi/pi-tui/chat/read-tool-group";
 import { SkillMessageComponent } from "@oh-my-pi/pi-tui/chat/skill-message";
 import { StrippedToolCallsPlaceholder } from "@oh-my-pi/pi-tui/chat/stripped-tool-calls-placeholder";
-import { imageContent, textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import {
+	imageContent,
+	isUserRequestMessage,
+	RECENT_TRANSCRIPT_LIMIT,
+	textContent,
+} from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { MessageDividerComponent } from "@oh-my-pi/pi-tui/chrome/message-divider";
 import { ToolActivityContainer } from "@oh-my-pi/pi-tui/chrome/tool-activity";
 import {
 	isSettledJobFrame,
@@ -124,6 +130,47 @@ const TRANSCRIPT_RENDER_CHUNK_MS = 8;
  * durable in the session file and reach the display on the next rebuild.
  */
 const TRANSCRIPT_REPLAY_MAX_ATTEMPTS = 5;
+
+/**
+ * Where the recent tail of `messages` starts: at most {@link RECENT_TRANSCRIPT_LIMIT}
+ * messages, from its earliest user request or, when the latest turn alone is longer,
+ * its earliest assistant message, so every tool result renders with its call. A
+ * window holding only results (one parallel batch longer than the limit) starts at
+ * the call that issued them.
+ */
+function recentTailStart(messages: readonly AgentMessage[]): number {
+	const floor = messages.length - RECENT_TRANSCRIPT_LIMIT;
+	if (floor <= 0) return 0;
+	for (let index = floor; index < messages.length; index++) {
+		if (isUserRequestMessage(messages[index]!)) return index;
+	}
+	for (let index = floor; index < messages.length; index++) {
+		if (messages[index]!.role === "assistant") return index;
+	}
+	for (let index = floor - 1; index > 0; index--) {
+		if (messages[index]!.role === "assistant") return index;
+	}
+	return 0;
+}
+
+/** The assistant messages of `omitted` followed by `tail`: the whole transcript a replay resolves links for. */
+function assistantMessages(omitted: readonly AgentMessage[], tail: readonly AgentMessage[]): AssistantMessage[] {
+	return [...omitted, ...tail].filter((message): message is AssistantMessage => message.role === "assistant");
+}
+
+/** The row above a live transcript tail that stands for the `count` messages left out of it. */
+function earlierHistoryMarker(count: number): MessageDividerComponent {
+	const label = (): string => `${formatNumber(count)} earlier ${count === 1 ? "message" : "messages"} not shown`;
+	return new MessageDividerComponent({
+		label: () => `${label()} ${theme.sep.dot.trim()} /branch to browse them`,
+		labelColor: "muted",
+		ruleColor: "dim",
+		ruleWidth: 10,
+		role: "omp.marker.earlier-history",
+		native: { icon: "history", label },
+		truncateWhenNarrow: false,
+	});
+}
 
 function waitForImmediate(): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
@@ -504,6 +551,7 @@ export class UiHelpers {
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
 		}
+		if (options.earlierMessages) this.ctx.chatContainer.addChild(earlierHistoryMarker(options.earlierMessages));
 
 		let readGroup: ReadToolGroupComponent | null = null;
 		const readToolCallArgs = new Map<string, Record<string, unknown>>();
@@ -1041,6 +1089,70 @@ export class UiHelpers {
 	}
 
 	/**
+	 * The transcript the live chat shows: history before the latest compaction
+	 * collapsed unless the user keeps it inline, and of a long session only its
+	 * recent tail. A relaunch, `/tree` or rewind then rebuilds, and writes into
+	 * native scrollback, a bounded number of rows instead of the whole history.
+	 * Views without a history browser (a focused subagent, a collab guest) keep
+	 * the whole transcript: `/branch` cannot reach what the tail leaves out.
+	 */
+	buildLiveTranscript(options: { keepInFlightToolCalls?: boolean } = {}): {
+		context: SessionContext;
+		/** Messages before the tail; the replay still resolves their link targets, which pickers show. */
+		omitted: readonly AgentMessage[];
+	} {
+		const context = this.ctx.viewSession.buildTranscriptSessionContext({
+			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
+			keepInFlightToolCalls: options.keepInFlightToolCalls,
+		});
+		if (this.ctx.focusedAgentId !== undefined || this.ctx.collabGuest) return { context, omitted: [] };
+		const { messages } = context;
+		const start = this.#earliestLiveToolCall(messages, recentTailStart(messages));
+		if (start <= 0) return { context, omitted: [] };
+		return {
+			context: {
+				...context,
+				messages: messages.slice(start),
+				cacheMissExplainedAt: context.cacheMissExplainedAt?.slice(start),
+			},
+			omitted: messages.slice(0, start),
+		};
+	}
+
+	/**
+	 * `start`, or the earlier assistant message whose returned background call is
+	 * still live, as the replay judges it: an unsettled job frame or a running job.
+	 * A rebuild re-attaches live progress only to cards it renders, so their calls
+	 * stay in the tail however old.
+	 */
+	#earliestLiveToolCall(messages: readonly AgentMessage[], start: number): number {
+		const running = new Set(
+			this.ctx.viewSession
+				.activeToolExecutionUpdates?.()
+				.filter(event => !isSettledJobFrame(event.partialResult?.details))
+				.map(event => event.toolCallId),
+		);
+		const jobs = new Set(this.ctx.viewSession.getAsyncJobSnapshot?.()?.running.map(job => job.id));
+		if (running.size === 0 && jobs.size === 0) return start;
+		for (let index = 0; index < start; index++) {
+			const message = messages[index]!;
+			if (message.role !== "toolResult") continue;
+			const jobId = (message.details as { async?: { jobId?: string } } | undefined)?.async?.jobId;
+			if (!running.has(message.toolCallId) && (jobId === undefined || !jobs.has(jobId))) continue;
+			for (let call = index - 1; call >= 0; call--) {
+				const candidate = messages[call]!;
+				if (
+					candidate.role === "assistant" &&
+					candidate.content.some(block => block.type === "toolCall" && block.id === message.toolCallId)
+				) {
+					return call;
+				}
+			}
+		}
+		return start;
+	}
+
+	/**
 	 * Rebuild the transcript from the view session. Calls run one at a time; a call
 	 * superseded by a newer one before or during its replay rolls back without
 	 * committing or clearing terminal history, so only the latest request paints.
@@ -1064,8 +1176,7 @@ export class UiHelpers {
 	async #renderInitialMessages(options: RenderInitialMessagesOptions, generation: number): Promise<void> {
 		if (generation !== this.#replayGeneration) return;
 		// Collapsed replay keeps in-flight calls so pending tools remain routable during mid-turn rebuilds.
-		let context = this.ctx.viewSession.buildTranscriptSessionContext({
-			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
+		let { context, omitted } = this.buildLiveTranscript({
 			keepInFlightToolCalls: this.ctx.viewSession.isStreaming,
 		});
 		let replayEntryCount = this.ctx.viewSession.sessionManager.getEntries().length;
@@ -1083,17 +1194,11 @@ export class UiHelpers {
 		const previousPendingPythonComponents = this.ctx.pendingPythonComponents;
 		const previousLastAssistantUsage = this.ctx.lastAssistantUsage;
 		const previousServedModelTracker = this.ctx.servedModelTracker;
-		const renderOptions = {
-			updateFooter: true,
-		};
 		let committed = false;
 		let replayAttempts = 0;
 		try {
 			// Resolve before replacing live component maps: streaming events may arrive during filesystem I/O.
-			await refreshAssistantMessageLinkTargets(
-				this.ctx,
-				context.messages.filter((message): message is AssistantMessage => message.role === "assistant"),
-			);
+			await refreshAssistantMessageLinkTargets(this.ctx, assistantMessages(omitted, context.messages));
 			if (generation !== this.#replayGeneration) return;
 
 			this.ctx.chatContainer = stagedChatContainer;
@@ -1106,6 +1211,7 @@ export class UiHelpers {
 			this.ctx.pendingBashComponents = [];
 			this.ctx.pendingPythonComponents = [];
 			while (true) {
+				const renderOptions = { updateFooter: true, earlierMessages: omitted.length };
 				if (this.ctx.viewSession.isStreaming) {
 					// Live events mutate the same component maps; keep their replay atomic so
 					// a delta cannot land halfway through rebuilding its pending tool block.
@@ -1133,15 +1239,11 @@ export class UiHelpers {
 				// yielded. The display callback stayed gated by initialChatRendered;
 				// discard the stale partial tree and replay the current session once
 				// more instead of letting a reentrant synchronous rebuild interleave.
-				context = this.ctx.viewSession.buildTranscriptSessionContext({
-					collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
+				({ context, omitted } = this.buildLiveTranscript({
 					keepInFlightToolCalls: this.ctx.viewSession.isStreaming,
-				});
+				}));
 				replayEntryCount = this.ctx.viewSession.sessionManager.getEntries().length;
-				await refreshAssistantMessageLinkTargets(
-					this.ctx,
-					context.messages.filter((message): message is AssistantMessage => message.role === "assistant"),
-				);
+				await refreshAssistantMessageLinkTargets(this.ctx, assistantMessages(omitted, context.messages));
 				if (generation !== this.#replayGeneration) return;
 				stagedChatContainer.disposeChildren();
 				this.ctx.transcriptMessageComponents = new WeakMap<AgentMessage, Component>();
