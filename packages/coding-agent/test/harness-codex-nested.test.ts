@@ -76,14 +76,59 @@ afterEach(async () => {
 const call = (s: ToolSession, name: string, args: unknown) => callSessionTool(name, args, { session: s });
 
 describe("codex nested exec aliases", () => {
-	test("exec_command maps cmd/workdir/yield_time_ms onto bash and returns the vendor shape", async () => {
-		const bash = stubTool("bash", () => ({ text: "/tmp/harness-task\n", details: { exitCode: 0 } }));
-		const s = session(CODEX, [bash]);
+	/** A bash stub that starts `async` calls as real background jobs on `manager`. */
+	function backgroundBash(manager: AsyncJobManager, run: () => Promise<string>): StubTool {
+		return stubTool("bash", args => {
+			const jobId = manager.register("bash", String(args.command), run, { ownerId: MAIN_AGENT_ID });
+			return { text: `Backgrounded: ${jobId}`, details: { async: { state: "running", jobId } } };
+		});
+	}
+
+	test("exec_command waits up to yield_time_ms and returns a fast command's output", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		managers.push(manager);
+		const bash = backgroundBash(manager, async () => "/tmp/harness-task\n");
+		const read = stubTool("read", () => ({ text: "unused", details: {} }));
+		const s = session(CODEX, [bash, read], { manager });
 
 		const out = await call(s, "exec_command", { cmd: "pwd", workdir: "/tmp/harness-task", yield_time_ms: 12000 });
-		expect(bash.calls).toEqual([{ command: "pwd", cwd: "/tmp/harness-task", timeout: 12 }]);
+		// The yield is how long to wait, never the command's deadline.
+		expect(bash.calls).toEqual([{ command: "pwd", cwd: "/tmp/harness-task", async: true }]);
 		expect(out).toMatchObject({ output: "/tmp/harness-task\n", exit_code: 0 });
+		expect((out as Record<string, unknown>).session_id).toBeUndefined();
 		expect(typeof (out as Record<string, unknown>).wall_time_seconds).toBe("number");
+		expect(read.calls).toEqual([]);
+	});
+
+	test("exec_command leaves a command running past yield_time_ms and returns its session_id", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		managers.push(manager);
+		const gate = Promise.withResolvers<string>();
+		const bash = backgroundBash(manager, () => gate.promise);
+		const read = stubTool("read", args => ({ text: `${String(args.path)}: running`, details: {} }));
+		const write = stubTool("write", () => ({ text: "unused", details: {} }));
+		const s = session(CODEX, [bash, read, write], { manager });
+
+		const out = (await call(s, "exec_command", { cmd: "sleep 30", yield_time_ms: 1 })) as Record<string, unknown>;
+		const jobId = String(out.session_id);
+		expect(manager.getJob(jobId)?.status).toBe("running");
+		expect(out.exit_code).toBeUndefined();
+		expect(out.output).toBe(`proc://${jobId}: running`);
+
+		// write_stdin then collects it like any exec session.
+		gate.resolve("slept\n");
+		expect(await call(s, "write_stdin", { session_id: jobId, yield_time_ms: 5000 })).toMatchObject({
+			output: "slept\n",
+			exit_code: 0,
+		});
+	});
+
+	test("exec_command without yield_time_ms leaves backgrounding to bash", async () => {
+		const bash = stubTool("bash", () => ({ text: "/tmp\n", details: { exitCode: 0 } }));
+		const s = session(CODEX, [bash]);
+
+		expect(await call(s, "exec_command", { cmd: "pwd" })).toMatchObject({ output: "/tmp\n", exit_code: 0 });
+		expect(bash.calls).toEqual([{ command: "pwd" }]);
 	});
 
 	test("exec_command reports session_id when bash backgrounded the command", async () => {

@@ -11,6 +11,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { EVAL_WAIT_BRIDGE_NAME } from "../eval/handle-bridge";
 import type { ToolSession } from "../tools";
+import { cfgAsyncEnabled } from "../tools/settings";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { servedHarnessPrompt } from "./capture";
 
@@ -82,13 +83,6 @@ function numberArg(args: Record<string, unknown>, key: string): number | undefin
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-/** Vendor `yield_time_ms` (milliseconds) → omp `timeout` (seconds), floor of 1s. */
-function yieldTimeoutSeconds(args: Record<string, unknown>): number | undefined {
-	const yieldMs = numberArg(args, "yield_time_ms");
-	if (yieldMs === undefined || yieldMs <= 0) return undefined;
-	return Math.max(1, Math.round(yieldMs / 1000));
-}
-
 /**
  * exec_command shape: `{ output, exit_code?, session_id?, wall_time_seconds? }`.
  * `exit_code` rides in bash details only on non-zero exits; a clean result is
@@ -125,12 +119,74 @@ function settledExitCode(status: unknown): number {
 }
 
 /**
- * write_stdin: an empty `chars` polls — a background job is waited on for at
- * most `yield_time_ms` (the eval handle wait: scoped to this id, abortable, and
- * it consumes the settled result so it is not delivered twice); anything still
- * running, or a service, is read back from `proc://<id>`. Non-empty `chars`
- * reach a service's stdin through `write proc://<id>`; background jobs take no
- * input.
+ * Poll session `id` the way Codex's exec sessions report: a background job is
+ * waited on for at most `yieldMs` (the eval handle wait: scoped to this id,
+ * abortable, and it consumes the settled result so it is not delivered twice)
+ * and returns its output and exit code once settled; anything still running,
+ * or a service, is read back from `proc://<id>` with its `session_id`.
+ */
+async function pollExecSession(
+	id: string,
+	yieldMs: number,
+	ctx: CodexNestedCallContext,
+): Promise<Record<string, unknown>> {
+	const job = ctx.session.asyncJobManager?.getJob(id);
+	if (job) {
+		const waited = await ctx.invoke(EVAL_WAIT_BRIDGE_NAME, {
+			items: [{ kind: "agent", id }],
+			timeoutMs: Math.max(0, yieldMs),
+		});
+		const items = asRecord(waited)?.items;
+		const settled = Array.isArray(items) ? asRecord(items[0]) : undefined;
+		if (settled && settled.status !== "running") {
+			const text = typeof settled.text === "string" ? settled.text : undefined;
+			const error = typeof settled.error === "string" ? settled.error : undefined;
+			const exitCode = job.latestDetails?.exitCode;
+			return {
+				output: text ?? error ?? "",
+				wall_time_seconds: ctx.elapsedSeconds(),
+				exit_code: typeof exitCode === "number" ? exitCode : settledExitCode(settled.status),
+			};
+		}
+	}
+	const snapshot = await ctx.invoke("read", { path: `proc://${id}` });
+	return { output: resultText(snapshot), wall_time_seconds: ctx.elapsedSeconds(), session_id: id };
+}
+
+/**
+ * exec_command: Codex runs `cmd`, waits up to `yield_time_ms`, and returns the
+ * output, or a `session_id` to poll while the process still runs. With a yield
+ * the command starts as a background bash job polled like write_stdin, so the
+ * yield never becomes the process's deadline; without one (or with async jobs
+ * off) bash runs it and its own auto-background threshold decides.
+ */
+async function execCommandCall(
+	args: Record<string, unknown>,
+	ctx: CodexNestedCallContext,
+): Promise<Record<string, unknown>> {
+	const params = {
+		command: stringArg(args, "cmd") ?? "",
+		...(stringArg(args, "workdir") !== undefined ? { cwd: stringArg(args, "workdir") } : {}),
+	};
+	const yieldMs = numberArg(args, "yield_time_ms");
+	if (
+		yieldMs === undefined ||
+		yieldMs <= 0 ||
+		!ctx.session.asyncJobManager ||
+		!cfgAsyncEnabled.get(ctx.session.settings)
+	) {
+		return execCommandResult(await ctx.invoke("bash", params), ctx.elapsedSeconds());
+	}
+	const started = await ctx.invoke("bash", { ...params, async: true });
+	const jobId = asRecord(resultDetails(started)?.async)?.jobId;
+	if (typeof jobId !== "string") return execCommandResult(started, ctx.elapsedSeconds());
+	return pollExecSession(jobId, yieldMs, ctx);
+}
+
+/**
+ * write_stdin: an empty `chars` polls the session (see {@link pollExecSession})
+ * for at most `yield_time_ms`. Non-empty `chars` reach a service's stdin through
+ * `write proc://<id>`; background jobs take no input.
  */
 async function writeStdinCall(
 	args: Record<string, unknown>,
@@ -142,30 +198,8 @@ async function writeStdinCall(
 	}
 	const id = String(sessionId);
 	const chars = stringArg(args, "chars");
-	const job = ctx.session.asyncJobManager?.getJob(id);
-	if (chars === undefined || chars === "") {
-		if (job) {
-			const waited = await ctx.invoke(EVAL_WAIT_BRIDGE_NAME, {
-				items: [{ kind: "agent", id }],
-				timeoutMs: Math.max(0, numberArg(args, "yield_time_ms") ?? 0),
-			});
-			const items = asRecord(waited)?.items;
-			const settled = Array.isArray(items) ? asRecord(items[0]) : undefined;
-			if (settled && settled.status !== "running") {
-				const text = typeof settled.text === "string" ? settled.text : undefined;
-				const error = typeof settled.error === "string" ? settled.error : undefined;
-				const exitCode = job.latestDetails?.exitCode;
-				return {
-					output: text ?? error ?? "",
-					wall_time_seconds: ctx.elapsedSeconds(),
-					exit_code: typeof exitCode === "number" ? exitCode : settledExitCode(settled.status),
-				};
-			}
-		}
-		const snapshot = await ctx.invoke("read", { path: `proc://${id}` });
-		return { output: resultText(snapshot), wall_time_seconds: ctx.elapsedSeconds(), session_id: id };
-	}
-	if (job) {
+	if (chars === undefined || chars === "") return pollExecSession(id, numberArg(args, "yield_time_ms") ?? 0, ctx);
+	if (ctx.session.asyncJobManager?.getJob(id)) {
 		throw new ToolError(
 			"background jobs have no stdin; start interactive processes as services with tools.bash({command, name}) and write to them with tools.write({path: 'proc://<name>', content})",
 		);
@@ -213,12 +247,7 @@ const CODEX_NESTED_ALIASES: readonly CodexNestedAlias[] = [
 		name: "exec_command",
 		summary: "Run a shell command and return its output (bridges to omp's bash tool).",
 		target: "bash",
-		toParams: args => ({
-			command: stringArg(args, "cmd") ?? "",
-			...(stringArg(args, "workdir") !== undefined ? { cwd: stringArg(args, "workdir") } : {}),
-			...(yieldTimeoutSeconds(args) !== undefined ? { timeout: yieldTimeoutSeconds(args) } : {}),
-		}),
-		fromResult: execCommandResult,
+		call: execCommandCall,
 	},
 	{
 		name: "write_stdin",
