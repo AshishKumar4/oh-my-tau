@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- A harness profile forced onto a provider that does not speak it (`harness.mode`: claude-code on Responses, Chat Completions or Google; pi anywhere) now declares, replays and forces tools by the profile's vendor names, and hands the model's calls back under omp's names
+
 ### Removed
 
 - Removed the `toolNamespacesInfo` stream option and the Code Mode snapshot it carried: the session sent it only on codex-profile turns, which never carry it, and stock Codex sends it only behind an opt-in flag
