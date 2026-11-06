@@ -34,6 +34,7 @@ import type { GoogleOptions } from "./providers/google";
 import { getVertexAccessToken } from "./providers/google-auth";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
+import { applyHarnessNameCodec } from "./providers/harness-name-codec";
 import { streamKimi } from "./providers/kimi";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
@@ -1171,6 +1172,15 @@ export function streamSimple<TApi extends Api>(
 	const effortRequested =
 		sessionOptions.reasoning !== undefined && !sessionOptions.disableReasoning && !sessionOptions.forceReasoningOff;
 	if (!effortRequested) model = withoutUnverifiedThinking(model);
+	const harness = applyHarnessNameCodec(model, context, sessionOptions);
+	return harness.wrap(streamSimpleGlyphs(model, harness.context, harness.options));
+}
+
+function streamSimpleGlyphs<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	sessionOptions: SimpleStreamOptions,
+): AssistantMessageEventStream {
 	if (!model.requiresGlyphTokenization) {
 		return streamSimpleRequest(model, context, sessionOptions);
 	}
