@@ -250,9 +250,10 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{ name: "set_interrupt_mode", doc: "Set how steering interrupts tools.", params: { mode: "InterruptMode" } },
 	{
 		name: "compact",
-		doc: "Compact the conversation.",
+		doc: "Compact the conversation; null when an extension rewrote history in place and wrote no boundary.",
 		params: { "customInstructions?": "string" },
 		result: "CompactionResult",
+		nullable: true,
 	},
 	{ name: "set_auto_compaction", doc: "Enable or disable auto-compaction.", params: { enabled: "boolean" } },
 	{

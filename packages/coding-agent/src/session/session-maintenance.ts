@@ -1467,6 +1467,8 @@ export class SessionMaintenance {
 					// completes the request with no boundary, exactly as an automatic
 					// pass settles there; otherwise the requested method runs over the
 					// rewritten branch, again exactly as an automatic pass escalates.
+					// The rewrite is durable, so the pass has committed either way.
+					markCommitted();
 					if (this.#compactionCreatedHeadroom()) return undefined;
 					pathEntries = this.#host.sessionManager.getBranch();
 					preparation = prepareCompaction(pathEntries, effectiveSettings, activeModel, this.#tokenizer);
@@ -1740,6 +1742,7 @@ export class SessionMaintenance {
 						manualCompactionResult,
 						manualCompactionError,
 						compactionAbortController.signal.aborted,
+						compactionCommitted,
 					);
 				}
 				if (this.#compactionAbortController === compactionAbortController) {
@@ -1775,13 +1778,21 @@ export class SessionMaintenance {
 		}
 	}
 
-	/** Close the `manual_compaction_start` a manual pass emitted, with its outcome. */
+	/**
+	 * Close the `manual_compaction_start` a manual pass emitted, with its outcome.
+	 * A pass that committed without a result had a `session_before_compact` hook
+	 * rewrite history in place and needed no boundary.
+	 */
 	#emitManualCompactionEnd(
 		result: CompactionResult | undefined,
 		error: unknown,
 		signalAborted: boolean,
+		committed: boolean,
 	): Promise<void> {
 		if (result) return this.#emitLifecycleEvent({ type: "manual_compaction_end", result, aborted: false }, false);
+		if (committed && error === undefined) {
+			return this.#emitLifecycleEvent({ type: "manual_compaction_end", aborted: false, rewritten: true }, false);
+		}
 		const errorMessage =
 			error instanceof Error ? error.message : error === undefined ? "Compaction failed" : String(error);
 		if (error instanceof ManualCompactionNoOpError) {

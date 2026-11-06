@@ -486,10 +486,10 @@
 			},
 			{
 				"name": "compact",
-				"doc": "Compact the conversation.",
+				"doc": "Compact the conversation; null when an extension rewrote history in place and wrote no boundary.",
 				"params": "CompactParams",
 				"result": "CompactionResult",
-				"nullable": false,
+				"nullable": true,
 				"unwrap": null,
 				"timeoutMs": null,
 				"completion": null,
@@ -4044,6 +4044,10 @@
 				"skipped": {
 					"type": "boolean",
 					"description": "There was nothing to compact; `errorMessage` says why."
+				},
+				"rewritten": {
+					"type": "boolean",
+					"description": "A `session_before_compact` hook rewrote history in place and no boundary was needed."
 				},
 				"errorMessage": {
 					"type": "string"

@@ -1126,6 +1126,8 @@ class ManualCompactionEndEvent:
     """Present when the compaction committed."""
     skipped: bool | None = None
     """There was nothing to compact; `errorMessage` says why."""
+    rewritten: bool | None = None
+    """A `session_before_compact` hook rewrote history in place and no boundary was needed."""
     error_message: str | None = None
 
 
@@ -2560,6 +2562,7 @@ def parse_manual_compaction_end_event(value: object, path: str = "ManualCompacti
         aborted=required(payload, "aborted", decode_bool, path),
         result=optional(payload, "result", parse_compaction_result, path),
         skipped=optional(payload, "skipped", decode_bool, path),
+        rewritten=optional(payload, "rewritten", decode_bool, path),
         error_message=optional(payload, "errorMessage", decode_str, path),
     )
 
@@ -3590,12 +3593,13 @@ class WireClient:
         params["mode"] = mode
         self._command("set_interrupt_mode", params)
 
-    def compact(self, custom_instructions: str | None = None) -> CompactionResult:
-        """Compact the conversation."""
+    def compact(self, custom_instructions: str | None = None) -> CompactionResult | None:
+        """Compact the conversation; null when an extension rewrote history in place and wrote no boundary."""
         params: dict[str, object] = {}
         if custom_instructions is not None:
             params["customInstructions"] = custom_instructions
-        return parse_compaction_result(self._command("compact", params), "compact")
+        data = self._command("compact", params)
+        return None if data is None else parse_compaction_result(data, "compact")
 
     def set_auto_compaction(self, enabled: bool) -> None:
         """Enable or disable auto-compaction."""

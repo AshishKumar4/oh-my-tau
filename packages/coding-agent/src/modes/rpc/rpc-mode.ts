@@ -2594,7 +2594,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 			case "compact": {
 				const result = await session.compact(command.customInstructions);
-				return success(id, "compact", result);
+				return success(id, "compact", result ?? null);
 			}
 
 			case "set_auto_compaction": {

@@ -4053,7 +4053,9 @@ type ManualCompactionEndEvent struct {
 	// Present when the compaction committed.
 	Result *CompactionResult `json:"result,omitempty"`
 	// There was nothing to compact; `errorMessage` says why.
-	Skipped      *bool   `json:"skipped,omitempty"`
+	Skipped *bool `json:"skipped,omitempty"`
+	// A `session_before_compact` hook rewrote history in place and no boundary was needed.
+	Rewritten    *bool   `json:"rewritten,omitempty"`
 	ErrorMessage *string `json:"errorMessage,omitempty"`
 }
 
@@ -4068,6 +4070,7 @@ func (v *ManualCompactionEndEvent) decodeFrom(raw map[string]json.RawMessage) er
 	d.required("aborted", &out.Aborted)
 	d.optional("result", &out.Result)
 	d.optional("skipped", &out.Skipped)
+	d.optional("rewritten", &out.Rewritten)
 	d.optional("errorMessage", &out.ErrorMessage)
 	if d.err != nil {
 		return d.err
@@ -8209,9 +8212,9 @@ type CompactCommand struct {
 	CustomInstructions *string `json:"customInstructions,omitempty"`
 }
 
-// Compact sends "compact": Compact the conversation.
-func (c Commands) Compact(ctx context.Context, p CompactCommand) (CompactionResult, error) {
-	var out CompactionResult
+// Compact sends "compact": Compact the conversation; null when an extension rewrote history in place and wrote no boundary.
+func (c Commands) Compact(ctx context.Context, p CompactCommand) (*CompactionResult, error) {
+	var out *CompactionResult
 	err := c.call(ctx, "compact", p, 0, &out)
 	return out, err
 }

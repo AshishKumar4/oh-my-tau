@@ -3818,6 +3818,9 @@ pub struct ManualCompactionEndEvent {
 	/// There was nothing to compact; `errorMessage` says why.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub skipped: Option<bool>,
+	/// A `session_before_compact` hook rewrote history in place and no boundary was needed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rewritten: Option<bool>,
 	#[serde(rename = "errorMessage", default, skip_serializing_if = "Option::is_none")]
 	pub error_message: Option<String>,
 }
@@ -6859,7 +6862,7 @@ impl Command for SetInterruptModeCommand {
 	}
 }
 
-/// Compact the conversation.
+/// Compact the conversation; null when an extension rewrote history in place and wrote no boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CompactCommand {
 	#[serde(rename = "customInstructions", default, skip_serializing_if = "Option::is_none")]
@@ -6869,10 +6872,13 @@ pub struct CompactCommand {
 impl Command for CompactCommand {
 	const NAME: &'static str = "compact";
 	const TIMEOUT_MS: Option<u64> = None;
-	type Output = CompactionResult;
+	type Output = Option<CompactionResult>;
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
-		serde_json::from_value::<CompactionResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+		match data {
+			None | Some(Value::Null) => Ok(None),
+			Some(value) => serde_json::from_value::<CompactionResult>(value).map(Some),
+		}
 	}
 }
 

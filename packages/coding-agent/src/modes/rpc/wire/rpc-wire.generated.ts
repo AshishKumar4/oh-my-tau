@@ -934,6 +934,8 @@ export interface ManualCompactionEndEvent {
 	result?: CompactionResult;
 	/** There was nothing to compact; `errorMessage` says why. */
 	skipped?: boolean;
+	/** A `session_before_compact` hook rewrote history in place and no boundary was needed. */
+	rewritten?: boolean;
 	errorMessage?: string;
 }
 
@@ -1964,7 +1966,7 @@ export interface RpcWireCommands {
 	set_steering_mode: { params: SetSteeringModeParams; result: undefined };
 	set_follow_up_mode: { params: SetFollowUpModeParams; result: undefined };
 	set_interrupt_mode: { params: SetInterruptModeParams; result: undefined };
-	compact: { params: CompactParams; result: CompactionResult };
+	compact: { params: CompactParams; result: CompactionResult | null };
 	set_auto_compaction: { params: SetAutoCompactionParams; result: undefined };
 	set_cache_warming: { params: SetCacheWarmingParams; result: SetCacheWarmingResult };
 	set_auto_retry: { params: SetAutoRetryParams; result: undefined };

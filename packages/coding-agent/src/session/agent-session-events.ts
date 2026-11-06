@@ -60,6 +60,8 @@ export type AgentSessionEvent =
 			aborted: boolean;
 			/** True when there was nothing to compact; `errorMessage` says why. */
 			skipped?: boolean;
+			/** True when a `session_before_compact` hook rewrote history in place and no boundary was needed. */
+			rewritten?: boolean;
 			errorMessage?: string;
 	  }
 	| {
