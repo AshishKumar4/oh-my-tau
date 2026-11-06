@@ -1149,6 +1149,7 @@ export function normalizeCodexToolChoice(
 	choice: ToolChoice | undefined,
 	tools: Tool[] = [],
 	model?: Model<"openai-codex-responses">,
+	toolNames?: HarnessToolNames,
 ): string | Record<string, unknown> | undefined {
 	if (!choice) return undefined;
 	if (typeof choice === "string") return choice;
@@ -1163,9 +1164,11 @@ export function normalizeCodexToolChoice(
 		if (offeredTool.native?.type === "computer" && model?.supportsComputerUse === true) {
 			return { type: "computer" };
 		}
+		// The choice names the tool as its declaration does: a harness profile's
+		// presented name (`request_user_input` for `ask`), not the native one.
 		return customTool
 			? { type: "custom", name: customTool.customWireName ?? customTool.name }
-			: { type: "function", name: offeredTool.name };
+			: { type: "function", name: toolNames?.toWire.get(offeredTool.name) ?? offeredTool.name };
 	};
 	if (choice.type === "computer") {
 		const computer = tools.find(tool => tool.native?.type === "computer");
@@ -1696,7 +1699,12 @@ export async function buildTransformedCodexRequestBody(
 	if (context.tools && context.tools.length > 0) {
 		params.tools = codexHarness ? childNamespaceTools : convertOpenAICodexResponsesTools(context.tools, model);
 		if (options?.toolChoice) {
-			const toolChoice = normalizeCodexToolChoice(options.toolChoice, context.tools, model);
+			const toolChoice = normalizeCodexToolChoice(
+				options.toolChoice,
+				context.tools,
+				model,
+				buildHarnessToolNames(model, "codex", context.tools, options.harnessProfile),
+			);
 			if (toolChoice) {
 				params.tool_choice = toolChoice;
 			}

@@ -948,6 +948,24 @@ describe("codex harness wire surface", () => {
 		});
 	});
 
+	it("forces a renamed tool by the name its declaration carries under the profile", async () => {
+		const renamed: Tool[] = [
+			{
+				name: "ask",
+				customWireName: "request_user_input",
+				description: "Ask the user a question.",
+				parameters: type({ question: "string" }),
+			},
+		];
+
+		const { body } = await captureRequest("gpt-6-astra", { toolChoice: { type: "function", name: "ask" } }, renamed);
+
+		// The forced tool is isolated from the declared surface, under its presented name.
+		expect(body.tool_choice).toBe("required");
+		const surface = inputItems(body)[0] as { tools: Array<{ tools: Array<{ name: string }> }> };
+		expect(surface.tools.flatMap(group => group.tools.map(tool => tool.name))).toEqual(["request_user_input"]);
+	});
+
 	it("resolves a namespace-qualified tool call back to the declared tool", async () => {
 		const result = await runToolCall({
 			namespace: "collaboration",
