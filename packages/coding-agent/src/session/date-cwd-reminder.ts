@@ -13,6 +13,7 @@
  * revived subagent sends its earlier turns with the reminders they were sent
  * with instead of today's.
  */
+import { isPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import type { Context, Message, UserMessage } from "@oh-my-pi/pi-ai";
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import dateCwdReminderTemplate from "../prompts/system/date-cwd-reminder.md" with { type: "text" };
@@ -511,19 +512,28 @@ export class DateCwdReminderInjector {
 			// writing into it would rewrite the middle of the cached history.
 			let lastSent = -1;
 			for (let index = messages.length - 1; index >= 0; index--) {
-				if (state.seen.has(keys[index]!)) {
+				// A per-call message has the same bytes (and key) on every request,
+				// so it marks nothing as already sent.
+				if (!isPerCallContextMessage(messages[index]!) && state.seen.has(keys[index]!)) {
 					lastSent = index;
 					break;
 				}
 			}
+			// A context hook's per-call message is rebuilt for every request too, so a
+			// reminder riding on one, or following one, would be gone from the next.
 			let newUser: number | undefined;
-			for (let index = messages.length - 1; index > lastSent; index--) {
-				if (messages[index]!.role === "user") {
+			let lastHistory = -1;
+			for (let index = messages.length - 1; index >= 0; index--) {
+				const message = messages[index]!;
+				if (isPerCallContextMessage(message)) continue;
+				if (lastHistory < 0) lastHistory = index;
+				if (index <= lastSent) break;
+				if (message.role === "user") {
 					newUser = index;
 					break;
 				}
 			}
-			const turnIndex = newUser ?? messages.length - 1;
+			const turnIndex = newUser ?? (lastHistory < 0 ? messages.length - 1 : lastHistory);
 			if (newUser !== undefined) {
 				const message = messages[newUser] as UserMessage;
 				state.injections.set(keys[newUser]!, injectionOf(reminder, message));
