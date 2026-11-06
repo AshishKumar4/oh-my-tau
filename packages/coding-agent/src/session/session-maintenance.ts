@@ -628,12 +628,14 @@ export class SessionMaintenance {
 	readonly #replaysThinking = new WeakMap<CompactionSummaryMessage, boolean | readonly SessionEntry[]>();
 	/** Reader copies that read an archive as text in place of its frames. */
 	readonly #textCopies = new WeakSet<AgentMessage>();
-	/** Reader copies of archive summary messages keyed by the original message, then by {@link ArchiveReader.key},
-	 *  so repeated swaps keep one identity. */
+	/** Reader copies of archive summary messages keyed by the original message, then by
+	 *  {@link ArchiveReader.key} and frame budget, so repeated swaps keep one identity. */
 	readonly #readerSummaries = new WeakMap<
 		AgentMessage,
-		Map<ArchiveReader["key"], { view: snapcompact.ArchiveView; message: CompactionSummaryMessage }>
+		Map<string, { view: snapcompact.ArchiveView; message: CompactionSummaryMessage }>
 	>();
+	/** The reasoning-free view of a summary with no archive behind it, built once per message. */
+	readonly #scrubbedSummaries = new WeakMap<AgentMessage, snapcompact.ArchiveView>();
 	/** The original summary message behind each reader copy, restored for readers that read the original. */
 	readonly #originalSummaries = new WeakMap<AgentMessage, CompactionSummaryMessage>();
 	/** How far each live message list was scanned for summaries to swap, and for which kind of reader. */
@@ -4964,7 +4966,7 @@ export class SessionMaintenance {
 			if (reader.withoutFrames && mayHoldArchive(original)) {
 				const entry = this.#archiveEntry(original, entries);
 				const view = entry && this.#viewWithoutFrames(entry, reader, model);
-				wanted = view ? this.#readerMessage(original, view, reader) : original;
+				wanted = view ? this.#readerMessage(original, view, reader, model) : original;
 			} else if (!reader.withoutFrames && this.#textCopies.has(message)) {
 				wanted = original;
 			}
@@ -5004,29 +5006,45 @@ export class SessionMaintenance {
 				: await this.#viewWithoutThinking(entry, model);
 		} else if (reader.excludeThinking && snapcompact.summaryIncludesThinking(message.summary)) {
 			// No archive behind it (e.g. archive text a summarizer folded into a plain
-			// summary): scrub the summary text itself and keep no blocks.
-			view = {
-				summary: snapcompact.textWithoutThinking(message.summary),
-				archive: { frames: [], totalChars: 0, truncatedChars: 0 },
-			};
+			// summary): scrub the summary text itself and keep no blocks, once, so
+			// repeated reads keep one copy.
+			view = this.#scrubbedSummaries.get(message);
+			if (!view) {
+				view = {
+					summary: snapcompact.textWithoutThinking(message.summary),
+					archive: { frames: [], totalChars: 0, truncatedChars: 0 },
+				};
+				this.#scrubbedSummaries.set(message, view);
+			}
 		}
-		return view ? this.#readerMessage(message, view, reader) : message;
+		return view ? this.#readerMessage(message, view, reader, model) : message;
 	}
 
-	/** `message` rebuilt from `view`, one copy per original, reader and view. */
+	/**
+	 * Frame bytes `model` reads an archive's frames at, or `undefined` for a
+	 * reader without image input, whose copy carries no frames.
+	 */
+	#readerFrameBudget(reader: ArchiveReader, model: Model): number | undefined {
+		return reader.withoutFrames ? undefined : snapcompact.frameDataBytesBudget(model);
+	}
+
+	/** `message` rebuilt from `view`, one copy per original, reader, frame budget and view. */
 	#readerMessage(
 		message: CompactionSummaryMessage,
 		view: snapcompact.ArchiveView,
 		reader: ArchiveReader,
+		model: Model,
 	): CompactionSummaryMessage {
 		let cache = this.#readerSummaries.get(message);
 		if (!cache) {
 			cache = new Map();
 			this.#readerSummaries.set(message, cache);
 		}
-		const cached = cache.get(reader.key);
+		const frameBudget = this.#readerFrameBudget(reader, model);
+		const key = `${reader.key}|${frameBudget ?? "text"}`;
+		const cached = cache.get(key);
 		if (cached?.view === view) return cached.message;
-		const blocks = this.#host.sessionManager.snapcompactHistoryBlocks(view.archive);
+		const blocks = this.#host.sessionManager.snapcompactHistoryBlocks(view.archive, frameBudget);
 		const images = blocks.filter(block => block.type === "image");
 		const readerMessage: CompactionSummaryMessage = {
 			...message,
@@ -5034,7 +5052,7 @@ export class SessionMaintenance {
 			blocks: blocks.length > 0 ? blocks : undefined,
 			images: images.length > 0 ? images : undefined,
 		};
-		cache.set(reader.key, { view, message: readerMessage });
+		cache.set(key, { view, message: readerMessage });
 		this.#originalSummaries.set(readerMessage, message);
 		if (reader.withoutFrames) this.#textCopies.add(readerMessage);
 		return readerMessage;
