@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { Api, Context, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
@@ -392,6 +392,30 @@ describe("ProviderFileManager", () => {
 		};
 	}
 
+	test("uploads with the workspace of the credential that resolved", async () => {
+		using tempDir = TempDir.createSync("@omp-provider-file-workspace-");
+		const cache = new ProviderFileCache(tempDir.join("provider-files.json"), { saveDebounceMs: 60_000 });
+		const uploads: Headers[] = [];
+		const anthropicFiles = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			uploads.push(new Headers(init?.headers));
+			expect(String(input)).toBe("https://api.anthropic.com/v1/files");
+			return Response.json({ id: "file_workspace", mime_type: "image/png", size_bytes: 3, expires_at: null });
+		};
+		using _fetch = spyOn(globalThis, "fetch").mockImplementation(
+			Object.assign(anthropicFiles, { preconnect: globalThis.fetch.preconnect }),
+		);
+		const manager = new ProviderFileManager(cache, async () => ({
+			apiKey: "sk-ant-api03-POOLEDfilesKey0000000",
+			credentialScope: { workspaceId: "wrkspc_01FILESworkspace" },
+		}));
+
+		await manager.decorateContext(contextWithRepeatedImage(), anthropicModel);
+
+		expect(uploads.map(headers => [headers.get("x-api-key"), headers.get("anthropic-workspace-id")])).toEqual([
+			["sk-ant-api03-POOLEDfilesKey0000000", "wrkspc_01FILESworkspace"],
+		]);
+	});
+
 	test("deduplicates concurrent uploads, decorates every image-bearing input transiently, and reuses the cache", async () => {
 		using tempDir = TempDir.createSync("@omp-provider-file-manager-");
 		const cache = new ProviderFileCache(tempDir.join("provider-files.json"), { saveDebounceMs: 60_000 });
@@ -417,7 +441,7 @@ describe("ProviderFileManager", () => {
 			async delete(): Promise<void> {},
 		};
 		const factory: ProviderFileClientFactory = model => (model.provider === "openai" ? client : null);
-		const manager = new ProviderFileManager(cache, async () => "account-a", [factory]);
+		const manager = new ProviderFileManager(cache, async () => ({ apiKey: "account-a" }), [factory]);
 		const original = contextWithRepeatedImage();
 
 		const firstDecoration = manager.decorateContext(original, openAIModel);
@@ -514,7 +538,7 @@ describe("ProviderFileManager", () => {
 			},
 		};
 		const factory: ProviderFileClientFactory = model => (model.provider === "openai" ? client : null);
-		const manager = new ProviderFileManager(cache, async () => "account-a", [factory]);
+		const manager = new ProviderFileManager(cache, async () => ({ apiKey: "account-a" }), [factory]);
 		const context: Context = {
 			messages: [
 				{

@@ -93,6 +93,19 @@ describe("createAgentSession auto-learn tool activation", () => {
 		expect(session.getHindsightSessionState()).toBeDefined();
 	});
 
+	it("never mounts a tool named in tools.disabled, even one auto-learn force-includes", async () => {
+		const names = await activeToolNames(
+			Settings.isolated({
+				"autolearn.enabled": true,
+				"memory.backend": "local",
+				"tools.disabled": ["manage_skill", "read"],
+			}),
+		);
+		expect(names).not.toContain("manage_skill");
+		expect(names).not.toContain("read");
+		expect(names).toContain("learn");
+	});
+
 	it("omits manage_skill from a restricted session when auto-learn is off", async () => {
 		const names = await activeToolNames(Settings.isolated({}));
 		expect(names).toContain("read");

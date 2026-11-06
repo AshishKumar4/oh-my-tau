@@ -12,7 +12,8 @@ export const anonymizeHelp = {
 } satisfies CommandMetadata;
 
 export const authHelp = {
-	description: "Export or import stored provider credentials (API keys and OAuth logins) as JSON",
+	description:
+		"Manage provider credentials: pooled API keys (auth keys add|list|remove <provider>), and export or import stored credentials (API keys and OAuth logins) as JSON",
 } satisfies CommandMetadata;
 
 export const authBrokerHelp = {
@@ -191,7 +192,9 @@ export const ttsrHelp = {
 	description: "Inspect and test Time-Traveling Stream Rules (TTSR)",
 } satisfies CommandMetadata;
 
-export const updateHelp = { description: "Check for and install updates" } satisfies CommandMetadata;
+export const updateHelp = {
+	description: "Say how to update this oh-my-tau build (./scripts/install-harness.sh), or update installed plugins",
+} satisfies CommandMetadata;
 
 export const usageHelp = {
 	description: "Show provider usage limits for every authenticated account",

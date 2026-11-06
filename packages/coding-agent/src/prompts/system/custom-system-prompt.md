@@ -4,7 +4,7 @@
 {{customPrompt}}
 {{#if skills.length}}
 Skills are specialized knowledge. Scan descriptions for your task domain.
-If a skill applies, you MUST read `skill://<name>` before proceeding.
+{{#if toolRefs.Skill}}If a skill applies, you MUST load it with `{{toolRefs.Skill}}` before proceeding.{{else}}If a skill applies, you MUST read `skill://<name>` before proceeding.{{/if}}
 <skills>
 {{#list skills join="\n"}}
 <skill name="{{name}}">
@@ -13,11 +13,14 @@ If a skill applies, you MUST read `skill://<name>` before proceeding.
 {{/list}}
 </skills>
 {{/if}}
+{{> xdevDevices}}
+{{> fusionLead}}
 {{#if hasSkillUriAccess}}
 {{#unless skills.length}}
 Loaded skills remain addressable as `skill://<name>`.
 {{/unless}}
 {{/if}}
+
 {{#if alwaysApplyRules.length}}
 {{#each alwaysApplyRules}}
 {{content}}

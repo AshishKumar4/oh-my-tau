@@ -20,7 +20,7 @@ import {
 	setProjectDir,
 	VERSION,
 } from "@oh-my-pi/pi-utils/dirs";
-import { $env, isBunTestRuntime, isCompiledBinary, setInteractiveHost } from "@oh-my-pi/pi-utils/env";
+import { $env, isBunTestRuntime, setInteractiveHost } from "@oh-my-pi/pi-utils/env";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import { fuzzyFilter } from "@oh-my-pi/pi-tui/fuzzy";
@@ -41,10 +41,7 @@ import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
 import { formatKeyHint, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { SessionPickerOptions } from "@oh-my-pi/pi-tui/apps/session-picker";
-import { fetchBuild } from "./cli/build-service";
 import { applyStartupCwd } from "./cli/startup-cwd";
-import { runAutoUpdate } from "./cli/auto-update";
-import { getLatestRelease, isSourceCheckout, managedInstallName } from "./cli/update-cli";
 import { findConfigFile } from "./config";
 import { ModelRegistry } from "./config/model-registry";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
@@ -169,7 +166,6 @@ import {
 	cfgSpellingAutocorrect,
 	cfgSpellingTypoDetection,
 	cfgStartupChangelogMode,
-	cfgStartupCheckUpdate,
 	cfgStartupQuiet,
 	cfgStartupSetupWizard,
 	cfgStartupShowSplash,
@@ -183,8 +179,6 @@ import {
 	cfgTuiSpinnerInterval,
 	cfgTuiMaxFps,
 	cfgTuiMotion,
-	cfgUpdateAuto,
-	cfgUpdateChannel,
 } from "./modes/settings";
 import {
 	cfgDefaultThinkingLevel,
@@ -270,26 +264,6 @@ export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string)
 /** Print a non-fatal startup warning, for launches without a UI to show it in. */
 function writeStartupWarning(warning: string): void {
 	process.stderr.write(`${chalk.yellow(`Warning: ${warning}`)}\n`);
-}
-
-async function checkForNewVersion(currentVersion: string): Promise<string | undefined> {
-	if (!cfgStartupCheckUpdate.get(settings) && !cfgUpdateAuto.get(settings)) {
-		return;
-	}
-	try {
-		// Checkouts update through git and a manager (Tern) updates its omp itself:
-		// "run omp update" would be wrong advice for both.
-		if (isSourceCheckout() || (await managedInstallName(process.execPath))) return;
-		const channel = cfgUpdateChannel.get(settings);
-		// A compiled binary updates from the build service; naming the running
-		// version lets the service prepare the patch `omp update` will then use.
-		const { version } = isCompiledBinary()
-			? await fetchBuild({ channel }, { timeoutMs: 5_000, fromVersion: currentVersion })
-			: await getLatestRelease({ timeoutMs: 5_000, channel });
-		return Bun.semver.order(version, currentVersion) > 0 ? version : undefined;
-	} catch {
-		return undefined;
-	}
 }
 
 // Protocol hosts inherit OMP's neutral defaults for settings declaring `protocolDefault`
@@ -642,7 +616,6 @@ async function runInteractiveMode(
 	session: AgentSession,
 	version: string,
 	notifs: (InteractiveModeNotify | null)[],
-	versionCheckPromise: Promise<string | undefined>,
 	initialMessages: string[],
 	setExtensionUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	lspServers: LspStartupServerInfo[] | undefined,
@@ -704,9 +677,8 @@ async function runInteractiveMode(
 		setupScenes = setupWizard
 			? await setupWizard.selectSetupScenes(storedSetupVersion, setupWizard.ALL_SCENES, mode, setupOptions)
 			: [];
-		// Every newer scene declined to run here (the auto-update question in a
-		// source checkout or under Tern): record the version as seen, or every
-		// launch would load the wizard only to skip it again.
+		// Every newer scene declined to run here: record the version as seen, or
+		// every launch would load the wizard only to skip it again.
 		if (
 			setupWizard &&
 			setupScenes.length === 0 &&
@@ -734,9 +706,6 @@ async function runInteractiveMode(
 			await setupWizard.runSetupWizard(mode, setupScenes);
 		}
 
-		// Consume failures immediately, but defer any banner until the transcript is stable.
-		const checkedVersionPromise = versionCheckPromise.catch(() => undefined);
-
 		// `init` already cleared native history before painting the startup frame.
 		// Replaying resumed transcript rows and repainting the viewport is enough;
 		// another clear would only archive the startup frame. In-process session
@@ -744,21 +713,6 @@ async function runInteractiveMode(
 		await logger.time("InteractiveMode.renderInitialMessages", () =>
 			mode.renderInitialMessages({ preserveExistingChat: true }),
 		);
-		// A resolved version check must not insert its banner into a partial transcript.
-		const notifyNewVersion = (newVersion: string): void => {
-			if (cfgStartupCheckUpdate.get(settings)) mode.showNewVersionNotification(newVersion);
-		};
-		if (cfgUpdateAuto.get(settings)) {
-			void runAutoUpdate(checkedVersionPromise, {
-				show: update => mode.showVersionUpdate(update),
-				notify: notifyNewVersion,
-			});
-		} else {
-			checkedVersionPromise.then(newVersion => {
-				if (newVersion) notifyNewVersion(newVersion);
-			});
-		}
-
 		const advisorConfigWarnings = session.getAdvisorConfigWarnings();
 		if (advisorConfigWarnings.length > 0) {
 			// Pulled here, not pushed from SessionAdvisors: the constructor-time
@@ -2833,7 +2787,6 @@ export async function runRootCommand(
 					input: rpcInput,
 				});
 			} else if (isInteractive) {
-				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 
 				const modelScopeNotification = buildModelScopeNotification(
 					scopedModels,
@@ -2865,7 +2818,6 @@ export async function runRootCommand(
 						session,
 						VERSION,
 						notifs,
-						versionCheckPromise,
 						initialArgs.messages,
 						setToolUIContext,
 						lspServers,
@@ -2881,7 +2833,7 @@ export async function runRootCommand(
 						startDeferredStartupWork,
 						startupLease,
 						initialArgs.goal,
-						parsedArgs.restore ? () => restoreSession(session, { eventBus, subagentEventBus }) : undefined,
+						parsedArgs.restore ? () => restoreSession(session) : undefined,
 						refreshScopedModelsAfterLogin,
 					);
 				} finally {

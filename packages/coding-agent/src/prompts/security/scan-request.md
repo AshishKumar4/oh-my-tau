@@ -18,4 +18,4 @@ Requested base-to-head diff:
 ```
 {{/if}}
 
-First inventory the exact scope. Delegate disjoint review assignments to `security-reviewer` through `task`. Reconcile all worker output, inspect any evidence needed to resolve uncertainty, then call `security_publish` once with findings, honest coverage, and the final report.
+First inventory the exact scope. Delegate disjoint review assignments to `reviewer` through `task`. Reconcile all worker output, inspect any evidence needed to resolve uncertainty, then call `security_publish` once with findings, honest coverage, and the final report.

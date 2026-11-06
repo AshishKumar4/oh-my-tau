@@ -7,8 +7,10 @@ import { fingerprintStaticModels } from "@oh-my-pi/pi-catalog/model-manager";
 import * as catalogModels from "@oh-my-pi/pi-catalog/models";
 import { mergeDiscoveredModel } from "@oh-my-pi/pi-coding-agent/config/model-patch";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 function fixtureModel(id = "merge-fixture"): Model<"openai-completions"> {
 	return buildModel({
@@ -154,5 +156,71 @@ describe("model merge reuse", () => {
 		expect(registry.find("openai", "explicit")).toBe(cached?.models[1]);
 		expect(cached?.models[0].contextWindow).toBeNull();
 		expect(cached?.models[0].maxTokens).toBeNull();
+	});
+
+	test("cached catalog reuse preserves explicit limits and refreshed model generations", async () => {
+		using directory = TempDir.createSync("@model-merge-reuse-");
+		const auth = createInMemoryAuthStorage();
+		auth.keys.setRuntime("openai", "fixture-key");
+		const existing = ["fallback", "explicit"].map(id => ({
+			...fixtureModel(id),
+			omitMaxOutputTokens: true,
+			supportsTools: true,
+		}));
+		const bundled = spyOn(catalogModels, "getBundledModels").mockImplementation(provider =>
+			provider === "openai" ? existing : [],
+		);
+		try {
+			writeModelCache(
+				"openai",
+				Date.now(),
+				[
+					{ ...fixtureModel("fallback"), contextWindow: null, maxTokens: null },
+					{
+						...fixtureModel("explicit"),
+						contextWindow: 4096,
+						maxTokens: 512,
+						omitMaxOutputTokens: false,
+						supportsTools: false,
+					},
+				],
+				false,
+				fingerprintStaticModels(existing, false),
+				directory.join("models.db"),
+			);
+			const cached = readModelCache("openai", 60_000, Date.now, directory.join("models.db"));
+			const explicit = cached?.models.find(model => model.id === "explicit");
+			if (!explicit) throw new Error("Expected the cached explicit model");
+			expect(mergeDiscoveredModel(explicit, fixtureModel("explicit"))).toBe(explicit);
+			const registry = new ModelRegistry(auth, directory.join("models.yml"), { settings: Settings.isolated({}) });
+			const before = registry.getAll().filter(model => model.provider === "openai");
+			expect(registry.getAvailableForProviders(new Set(["openai"]))).toEqual(before);
+			expect(registry.find("openai", "fallback")).toMatchObject({
+				contextWindow: 8192,
+				maxTokens: 1024,
+				omitMaxOutputTokens: true,
+				supportsTools: true,
+			});
+			expect(registry.find("openai", "explicit")).toMatchObject({
+				contextWindow: 4096,
+				maxTokens: 512,
+				omitMaxOutputTokens: false,
+				supportsTools: false,
+			});
+			expect(cached?.models[0]?.contextWindow).toBeNull();
+			await Bun.write(
+				directory.join("models.yml"),
+				"providers:\n  openai:\n    modelOverrides:\n      explicit:\n        contextWindow: 2048\n",
+			);
+			await registry.refresh("offline");
+			expect(registry.find("openai", "explicit")?.contextWindow).toBe(2048);
+			expect(before.find(model => model.id === "explicit")?.contextWindow).toBe(4096);
+			expect(
+				registry.getAll().find(model => model.provider === "openai" && model.id === "explicit")?.contextWindow,
+			).toBe(2048);
+		} finally {
+			bundled.mockRestore();
+			auth.close();
+		}
 	});
 });

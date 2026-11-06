@@ -30,6 +30,10 @@ import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { anthropicHostRunsTool } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
+import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { loadHarnessPrompt, servedHarnessPrompt } from "./harness/capture";
+import { effectiveHarnessProfile } from "./harness/effective-profile";
+import { type HarnessSurface, harnessSurface } from "./harness/facades";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
@@ -214,6 +218,15 @@ import {
 import { createInterruptedToolResults, createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import { recoverInlineSloppyEdit } from "./session/inline-edit-recovery";
 import {
+	createForkJournalStateReader,
+	type ForkRequestSnapshot,
+	forkAnchorIsCurrent,
+	forkPrefixMessageCount,
+	fingerprintForkMessages,
+	recordForkRequestSnapshot,
+	resolveForkCredentialId,
+} from "./session/fork-context";
+import {
 	type CustomMessage,
 	convertToLlm,
 	LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE,
@@ -258,8 +271,10 @@ import {
 	buildSystemPrompt as buildSystemPromptInternal,
 	cfgSystemPromptInputs,
 	composeAppendPrompt,
+	discoverSystemPromptOverride,
 	loadProjectContextFiles as loadContextFilesInternal,
 	projectSystemPromptToolMetadata,
+	SYSTEM_PROMPT_PREP_TIMEOUT_MS,
 	withoutAgentsMd,
 } from "./system-prompt";
 import type { AgentDefinition } from "./task/types";
@@ -303,6 +318,7 @@ import {
 	renderXdevPromptDocs,
 	resolveBuiltinToolPlan,
 	resolveMountedXdevExecutable,
+	SESSION_MANAGED_BUILTIN_TOOL_NAMES,
 	SETTINGS_GATED_BUILTIN_TOOL_NAMES,
 	supportsExternalThinking,
 	type Tool,
@@ -585,6 +601,12 @@ export interface CreateAgentSessionOptions {
 	spawns?: string;
 	/** User-authorized model agents inherited from the parent session for nested delegation. */
 	inheritedSessionAgents?: readonly AgentDefinition[];
+	/**
+	 * Definitions this session's own spawns use ahead of discovery, matched by
+	 * name. A host pins a worker's contract (tools, prompt, output schema) so
+	 * project or user agent files cannot replace it. Not inherited by children.
+	 */
+	pinnedAgents?: readonly AgentDefinition[];
 
 	/** Auth storage for credentials. Default: discoverAuthStorage(agentDir) */
 	authStorage?: AuthStorage;
@@ -696,7 +718,13 @@ export interface CreateAgentSessionOptions {
 	planYolo?: PlanYolo;
 
 	/** Provider-facing system prompt override. Replaces the fully rendered default blocks. */
-	systemPrompt?: string | string[] | ((defaultPrompt: string[]) => string | string[]);
+	systemPrompt?:
+		| string
+		| string[]
+		| ((
+				defaultPrompt: string[],
+				context?: { model: Model | undefined; toolRefs?: Readonly<Record<string, string>> },
+		  ) => string | string[]);
 	/** Raw Handlebars template replacing the bundled default system prompt rendering. */
 	systemPromptTemplate?: string;
 	/** Already-loaded custom prompt text rendered through the bundled custom system prompt template. */
@@ -871,6 +899,8 @@ export interface CreateAgentSessionOptions {
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	/** Whether to include the yield tool by default */
 	requireYieldTool?: boolean;
+	/** Internal: a forked worker keeps independent planning tools (`todo`) despite the yield-tool session policy. */
+	conversationFork?: boolean;
 	/**
 	 * Whether this top-level session takes over, until disposed, the process-global state that
 	 * follows one settings instance: setting effects and capability provider toggles. Helper
@@ -890,9 +920,15 @@ export interface CreateAgentSessionOptions {
 	agentDisplayName?: string;
 	/**
 	 * Agent definition name used to evaluate rule `agents` scoping. Defaults to
-	 * "main" for a top-level session / "sub" for a subagent.
+	 * `agentDefinition.name`, else "main" for a top-level session / "sub" for a subagent.
 	 */
 	agentName?: string;
+	/**
+	 * The agent definition a subagent session runs under. Per-agent session
+	 * policy (e.g. Fusion's `sidekick: true`) reads from here; the top-level
+	 * session has none.
+	 */
+	agentDefinition?: AgentDefinition;
 	/** Optional shared agent registry for IRC routing. Default: AgentRegistry.global(). */
 	agentRegistry?: AgentRegistryApi;
 	/**
@@ -929,6 +965,13 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
+
+	/**
+	 * Provider-native request a forked child inherits for prompt-cache prefix
+	 * reuse. When absent, a `subagent_fork_request` journal marker seeded by the
+	 * executor supplies the same state for restarts and nested forks.
+	 */
+	forkRequest?: ForkRequestSnapshot;
 
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
@@ -1131,6 +1174,7 @@ export async function discoverAuthStorage(
 	return discoverAuthStorageFromConfig(agentDir, {
 		...discoveryOptions,
 		accountPolicies: discoveryOptions.accountPolicies ?? policy.accountPolicies,
+		poolOrders: discoveryOptions.poolOrders ?? policy.poolOrders,
 		authStorageOptions: {
 			...discoveryOptions.authStorageOptions,
 			defaultReservePct: discoveryOptions.authStorageOptions?.defaultReservePct ?? policy.defaultReservePct,
@@ -1417,6 +1461,9 @@ export interface BuildSystemPromptOptions {
 	/** Raw Handlebars template replacing the bundled default system prompt rendering. */
 	systemPromptTemplate?: string;
 	appendPrompt?: string;
+	model?: Model;
+	/** Session settings carrying `harness.mode`; omitted resolves the model's catalog profile. */
+	settings?: Settings;
 	inlineToolDescriptors?: boolean;
 	includeWorkspaceTree?: boolean;
 	/** Include the read-only security:// resource inventory entry. Default: false. */
@@ -1440,6 +1487,13 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 				options.inlineToolDescriptors ? { mode: "full" } : { mode: "compact", toolNames: toolNames ?? [] },
 			)
 		: undefined;
+	const promptModelOption = options.model;
+	const harnessProfile =
+		promptModelOption === undefined
+			? undefined
+			: options.settings === undefined
+				? resolveHarnessProfile(promptModelOption)
+				: effectiveHarnessProfile(options.settings, promptModelOption);
 	return await buildSystemPromptInternal({
 		cwd: options.cwd,
 		customPrompt: options.customPrompt,
@@ -1453,9 +1507,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		evalPreludes: options.evalPreludes,
 		toolNames,
 		tools: promptTools,
+		...(harnessProfile && { harnessProfile }),
 	});
 }
-
 // Internal Helpers
 
 function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
@@ -1483,9 +1537,6 @@ function isLegacyBuiltinToolDefinition(tool: CustomTool | ToolDefinition): boole
 const TOOL_DEFINITION_MARKER = Symbol("__isToolDefinition");
 /** Matches the truncation applied to per-server instructions inside `rebuildSystemPrompt`. */
 const MAX_MCP_INSTRUCTIONS_LENGTH = 4000;
-/** Built-ins `createTools` force-includes into explicit tool lists; the active set mirrors them. */
-const SESSION_MANAGED_BUILTIN_TOOL_NAMES = ["manage_skill", "learn", "context_notes", "new_context"];
-
 let sshCleanupRegistered = false;
 
 async function cleanupSshResources(): Promise<void> {
@@ -2135,6 +2186,38 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		await sessionManager.setAdditionalDirectories(merged);
 	}
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
+	// Two distinct concepts, kept strictly separate:
+	//
+	// 1. inherited origin — the journal-certified fork marker this session was
+	//    created on. `forkJournal` re-reads the active branch so a mid-session
+	//    reset_boundary kills the origin and a newer compaction/branch rewrite
+	//    withholds raw-prefix replay. `options.forkRequest` seeds the marker
+	//    exactly once at construction, only when the journal shows neither a
+	//    marker (even malformed — a marker occupies the origin slot) nor a
+	//    boundary — afterwards the journal is the only origin authority, so a
+	//    `/clear` or a stale caller option can never re-arm it.
+	// 2. produced request — this session's last completed provider request,
+	//    owner-bound at dispatch (agent object, agent.sessionId, journal session
+	//    id, branch-leaf anchor). Served ONLY to future `fork: "all"` spawns via
+	//    getForkRequestSnapshot; it never becomes this session's own codexFork,
+	//    so a root session can never self-fork.
+	const forkJournal = createForkJournalStateReader(sessionManager);
+	const initialForkState = forkJournal();
+	if (!initialForkState.hasMarker && !initialForkState.hasBoundary && options.forkRequest !== undefined) {
+		recordForkRequestSnapshot(sessionManager, options.forkRequest);
+	}
+	/** The origin this session was forked from — undefined for non-forked sessions, always. */
+	const inheritedForkOrigin: ForkRequestSnapshot | undefined = forkJournal().snapshot;
+	/** This session's latest completed provider request, for future children only. */
+	let producedForkRequest:
+		| {
+				snapshot: ForkRequestSnapshot;
+				agent: Agent;
+				agentSessionId: string | undefined;
+				journalSessionId: string;
+				anchorId: string | null;
+		  }
+		| undefined;
 	const taskPromptCacheKey = options.taskPromptCacheKey ?? sessionManager.getHeader()?.taskPromptCacheKey;
 	if (taskPromptCacheKey !== undefined) await sessionManager.setTaskPromptCacheKey(taskPromptCacheKey);
 	if (options.credentialSourceSessionId) {
@@ -2152,13 +2235,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	}
 	// From here on the session resolves every key through its pools; see
 	// SessionAccountPoolScope. A startup failure leaves no session to lift them.
+	// A nested agent without pools of its own still runs inside its parent's:
+	// it takes a scope of its own over the pools its inherited registry enforces.
 	const accountPoolScope = options.oauthAccountPools
 		? new SessionAccountPoolScope(modelRegistry.authStorage, options.oauthAccountPools, providerSessionId)
-		: undefined;
+		: SessionAccountPoolScope.inherited(modelRegistry, providerSessionId);
 	if (accountPoolScope) {
 		modelRegistry = accountPoolScope.registry(modelRegistry);
 		startupCleanup.defer(() => accountPoolScope.release());
 	}
+
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
 		options.modelPattern !== undefined ||
@@ -2402,7 +2488,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const agentKind: AgentKind = isSubagentSession ? SUB_AGENT_RULE_NAME : MAIN_AGENT_RULE_NAME;
 	// Visuals (Mermaid, SVG figures, table charts) are drawn only in the top-level TUI transcript.
 	const tuiTranscript = options.tuiTranscript === true && !isSubagentSession;
-	const resolvedAgentName = (options.agentName ?? agentKind).trim().toLowerCase();
+	const resolvedAgentName = (options.agentName ?? options.agentDefinition?.name ?? agentKind).trim().toLowerCase();
 
 	// Discover rules and bucket them in one pass to avoid repeated scans over large rule sets.
 	const discovered = await logger.time("discoverTtsrRules", async () => {
@@ -2636,10 +2722,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			outputSchema: options.outputSchema,
 			outputSchemaMode: options.outputSchemaMode,
 			requireYieldTool: options.requireYieldTool,
+			conversationFork: options.conversationFork,
 			get prewalkArmed() {
 				return prewalk !== undefined || deferredPrewalk !== undefined;
 			},
-			taskDepth: options.taskDepth ?? 0,
+			taskDepth,
+			agentDefinition: options.agentDefinition,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			sessionManager,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
@@ -2647,11 +2735,35 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
-			getSessionId: () => sessionManager.getSessionId?.() ?? null,
+			// Tools look credentials up under this id with the raw authStorage, so a
+			// pooled session restricts it as it hands it out (idempotent per id).
+			getSessionId: () => {
+				const id = sessionManager.getSessionId?.() ?? null;
+				if (id) accountPoolScope?.restrict(id);
+				return id;
+			},
 			isDisposed: () => session?.isDisposed ?? false,
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
+			// Newest request this session produced — the snapshot a future
+			// `fork: "all"` spawn inherits. Owner-verified per call: the agent
+			// object and both session ids must still match dispatch, and no
+			// reset_boundary may sit between the dispatch anchor and the branch
+			// leaf. Cloned so a queued spawn never observes later mutation.
+			getForkRequestSnapshot: () => {
+				const produced = producedForkRequest;
+				if (
+					produced === undefined ||
+					produced.agent !== agent ||
+					produced.agentSessionId !== agent.sessionId ||
+					produced.journalSessionId !== sessionManager.getSessionId() ||
+					!forkAnchorIsCurrent(sessionManager, produced.anchorId)
+				) {
+					return undefined;
+				}
+				return structuredClone(produced.snapshot);
+			},
 			getPromptCacheKey: () => {
 				if (!session) return undefined;
 				const model = session.agent.state.model;
@@ -2661,6 +2773,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getToolByName: name => session?.getToolByName(name),
 			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
 			getAdvertisedEvalToolNames: () => session?.getAdvertisedEvalToolNames() ?? [],
+			getCodeModeDirectToolNames: () => session?.getCodeModeDirectToolNames(),
 			agentRegistry,
 			// The global lifecycle releases through AgentRegistry.global(); wiring it
 			// onto a caller-supplied registry would report a cancel while releasing an
@@ -2668,6 +2781,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// dispose + unregister on the session's own registry.
 			agentLifecycle: options.agentRegistry ? undefined : () => AgentLifecycleManager.global(),
 			getSessionSpawns: () => options.spawns ?? "*",
+			pinnedAgents: options.pinnedAgents,
 			getSessionAgents: () => session?.getSessionAgents() ?? [],
 			advertisedSessionAgents: () => session?.getAdvertisedSessionAgents() ?? [],
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
@@ -2786,6 +2900,44 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// SessionTools owns the advertised snapshot; before it exists the base
 		// prompt is built from, and therefore advertises, the live set.
 		toolSession.getAdvertisedEvalPreludes = () => session?.getAdvertisedEvalPreludes() ?? getEvalPreludes();
+		// What the effective harness profile presents over a set of enabled
+		// tools: the computation SessionTools presents with, so the initial
+		// prompt, the tool predicates and `toolRefs` see the surface the wire
+		// carries before the session exists.
+		const harnessPromptSurface = (names: readonly string[]): HarnessSurface => {
+			const promptModel = toolSession.getActiveModel?.();
+			const profile = promptModel ? effectiveHarnessProfile(settings, promptModel) : undefined;
+			const host = {
+				settings,
+				session: toolSession,
+				vendorTool: (wireName: string) => servedHarnessPrompt(promptModel, profile ?? null)?.tools[wireName],
+			};
+			return harnessSurface(profile, names, host, name => toolRegistry.has(name));
+		};
+		/**
+		 * Loads the capture the prompt build will serve before the surface is read.
+		 * Whether TaskOutput mounts, and so the name `wait` is reached by, depends
+		 * on it: read before the build loads it, the first prompt would name `wait`
+		 * while the tools presented afterwards offer TaskOutput, and the next
+		 * rebuild would rewrite the cached prompt. Memoized per profile and
+		 * model; skipped exactly when the build serves no capture (a caller-owned or
+		 * discovered SYSTEM.md prompt) and bounded like the build's own load.
+		 */
+		const loadServedHarnessPrompt = async (cwd: string): Promise<void> => {
+			const promptModel = toolSession.getActiveModel?.();
+			const profile = promptModel ? effectiveHarnessProfile(settings, promptModel) : undefined;
+			if (!promptModel || profile === undefined || servedHarnessPrompt(promptModel, profile)) return;
+			if (options.customSystemPrompt !== undefined || options.systemPromptTemplate !== undefined) return;
+			if ((await discoverSystemPromptOverride(cwd)) !== undefined) return;
+			const deadline = Promise.withResolvers<null>();
+			const timer = setTimeout(() => deadline.resolve(null), SYSTEM_PROMPT_PREP_TIMEOUT_MS);
+			try {
+				await Promise.race([loadHarnessPrompt(profile, promptModel.id).catch(() => null), deadline.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
+		};
+		toolSession.getToolRefs = () => session?.getToolRefs() ?? harnessPromptSurface([...activeToolNames]).toolRefs;
 
 		// Wire process-wide internal URL singletons owned by their real classes.
 		// Top-level sessions install the active snapshots; subagents inherit them.
@@ -4112,8 +4264,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// unrestricted (`createTools`), so the advertised arm is what recovers
 			// an MCP alias when there is no state at all. That arm reads a set
 			// already execution-wrapped by `#applyActiveToolsByName`, so a
-			// deselected, `defaultInactive`, or hidden tool stays unreachable and
-			// no permission wrapper is bypassed. Only `mcp__`
+			// deselected, `defaultInactive`, hidden, or Code Mode-demoted tool
+			// stays unreachable and no permission wrapper is bypassed. Only `mcp__`
 			// names yield candidates, so no first-party tool is reachable this way.
 			return resolveMCPToolAlias(
 				bareName,
@@ -4222,8 +4374,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const rebuildSystemPrompt = async (
 			toolNames: string[],
 			tools: Map<string, AgentTool>,
+			rebuildOptions?: { directToolNames?: readonly string[] },
 		): Promise<BuildSystemPromptResult> => {
 			const promptCwd = sessionManager.getCwd();
+			// The prompt's `toolRefs` name what the wire carries — with the served
+			// capture loaded first, so this prompt is the one later rebuilds reproduce.
+			await loadServedHarnessPrompt(promptCwd);
+			const surface = harnessPromptSurface(toolNames);
 			let activeRepoContext = initialActiveRepoContext;
 			// Re-discover rules and context files from disk on every session-scoped
 			// rebuild. The rule buckets are otherwise frozen at
@@ -4371,7 +4528,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const appendPrompt = composeAppendPrompt(appendParts, options.appendSystemPrompt);
 			// Owned/in-band tool dialects (non-native) require the full functions-
 			// namespace catalog; native tool calling lets the compact name list suffice.
-			const nativeTools = resolveDialect(cfgToolsFormat.get(settings), agent?.state.model ?? model) === undefined;
+			const promptModel = agent?.state.model ?? model;
+			const nativeTools = resolveDialect(cfgToolsFormat.get(settings), promptModel) === undefined;
 			const includeWorkspaceTree = cfgIncludeWorkspaceTree.get(settings);
 			if (includeWorkspaceTree && !workspaceTreePromise) {
 				const scan = scanWorkspaceTree();
@@ -4407,6 +4565,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				contextFiles,
 				tools: promptTools,
 				toolNames,
+				directToolNames: rebuildOptions?.directToolNames,
 				rules: rulebookRules,
 				alwaysApplyRules,
 				resolvedAppendSystemPrompt: appendPrompt,
@@ -4444,12 +4603,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				autoGraph: tuiTranscript && cfgTuiAutoGraph.get(settings) !== "off",
 				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(settings),
 				activeRepoContext,
+				...(promptModel && { harnessProfile: effectiveHarnessProfile(settings, promptModel) }),
+				harnessToolRefs: surface.toolRefs,
 			});
-
+			// `systemPrompt` may now also be a literal string or template, which the
+			// builder already resolved — only a function needs applying here.
 			if (typeof options.systemPrompt !== "function") {
 				return defaultPrompt;
 			}
-			const customPrompt = options.systemPrompt(defaultPrompt.systemPrompt);
+			const customPrompt = options.systemPrompt(defaultPrompt.systemPrompt, {
+				model: promptModel,
+				toolRefs: surface.toolRefs,
+			});
 			return {
 				systemPrompt: typeof customPrompt === "string" ? [customPrompt] : customPrompt,
 			};
@@ -4603,6 +4768,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		}
 
+		// The initial predicates read the surface too: load its capture first.
+		await loadServedHarnessPrompt(sessionManager.getCwd());
 		setSessionActiveToolNames(initialToolNames);
 		const { systemPrompt } = await logger.time(
 			"buildSystemPrompt",
@@ -4662,7 +4829,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const blobBroker = new LiveImageUrlService(
 			settings,
 			() => sessionManager.getCwd(),
-			model => modelRegistry.getApiKey(model, providerSessionId),
+			model =>
+				modelRegistry.getApiKeyWithCredentialForProvider(model.provider, providerSessionId, {
+					baseUrl: model.baseUrl,
+					modelId: model.id,
+				}),
 		);
 		disposeCallbacks.add(() => blobBroker.dispose());
 		// Always installed; the getter-backed options are snapshotted per request,
@@ -4814,6 +4985,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						getMode: () => cfgProvidersCacheWarming.get(settings),
 						decide: event => extensionRunner.emitCacheWarmingDecision(event),
 					});
+		const codeModeState: { namespacesInfo?: unknown } = {};
 		const transformToolCallArguments = (args: Record<string, unknown>): Record<string, unknown> => {
 			let result = args;
 			const maxTimeout = cfgToolsMaxTimeout.get(settings);
@@ -4880,16 +5052,51 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						});
 					}
 				}
+				// Owner identity for the produced-snapshot contract: captured at
+				// dispatch (agent object, live agent.sessionId, journal id, branch
+				// leaf, context fingerprints) so a callback from a superseded session
+				// or a mutated context can never be relabeled as current.
+				const dispatchAgent = agent;
+				const dispatchAgentSessionId = agent.sessionId;
+				const dispatchJournalId = sessionManager.getSessionId();
+				const dispatchAnchorId = sessionManager.getLeafId();
+				// Fingerprinting is Codex-only bookkeeping: every other provider
+				// skips the stable-JSON hashing over the whole context.
+				const dispatchFingerprints =
+					streamModel.api === "openai-codex-responses" ? fingerprintForkMessages(context.messages ?? []) : [];
+				// The inherited origin comes ONLY from the journal marker: a plain
+				// session never sets codexFork, and a forked child keeps using the
+				// journal origin even after its own produced request exists — the
+				// produced snapshot is reserved for future children.
+				const forkState = forkJournal();
+				const origin = forkState.snapshot;
+				const prefixCount =
+					origin !== undefined && forkState.replayable && context.messages !== undefined
+						? forkPrefixMessageCount(origin, context.messages)
+						: undefined;
+				const codexFork =
+					origin !== undefined
+						? {
+								source: origin.request,
+								...(prefixCount !== undefined ? { messageCount: prefixCount } : {}),
+							}
+						: undefined;
 				const externalThinking =
 					cfgExternalThinking.get(settings) &&
 					agent.state.tools.some(tool => tool.name === "think") &&
 					supportsExternalThinking(streamModel);
+				// Codex Code Mode namespaces ride only on effective-codex turns;
+				// effective-native turns on a profiled model must not send them
+				// (the provider drops them there today via the profile check).
+				const namespacesInfo =
+					effectiveHarnessProfile(settings, streamModel) === "codex" ? codeModeState.namespacesInfo : undefined;
 				const fallbackCreditRedemption = session?.consumeActiveFallbackCreditRedemption(streamModel);
 				if (streamOptions?.promptCacheKey === undefined) session?.promoteTaskSiblingCandidate(streamModel);
 				const merged: SimpleStreamOptions = {
 					...streamOptions,
 					promptCacheKey: streamOptions?.promptCacheKey ?? session?.getPromptCacheKeyForModel(streamModel),
 					forceReasoningOff: externalThinking || streamOptions?.forceReasoningOff,
+					...(namespacesInfo === undefined ? {} : { toolNamespacesInfo: namespacesInfo }),
 				};
 				// The provider calls `onPayload` as it sends, past any wait for an in-flight
 				// slot: the prompt cache entry's lifetime starts there, not here.
@@ -4897,6 +5104,34 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const stream = primaryStreamFn(streamModel, context, {
 					...merged,
 					...(fallbackCreditRedemption !== undefined ? { fallbackCreditRedemption } : {}),
+					...(codexFork !== undefined ? { codexFork } : {}),
+					onCodexRequestSnapshot: snapshot => {
+						// A late response from a previous session/agent must not be
+						// relabeled as the current session's produced request.
+						if (
+							dispatchAgent !== agent ||
+							dispatchAgentSessionId !== agent.sessionId ||
+							dispatchJournalId !== sessionManager.getSessionId()
+						) {
+							return;
+						}
+						// Store our own clone BEFORE the caller's callback runs — a
+						// mutating observer must not corrupt the produced request.
+						const credentialId =
+							resolveForkCredentialId(authStorage, snapshot, dispatchAgentSessionId) ?? undefined;
+						producedForkRequest = {
+							snapshot: {
+								request: structuredClone(snapshot),
+								messageFingerprints: dispatchFingerprints,
+								...(credentialId !== undefined ? { credentialId } : {}),
+							},
+							agent: dispatchAgent,
+							agentSessionId: dispatchAgentSessionId,
+							journalSessionId: dispatchJournalId,
+							anchorId: dispatchAnchorId,
+						};
+						streamOptions?.onCodexRequestSnapshot?.(snapshot);
+					},
 					onPayload: (payload, payloadModel, signal) => {
 						session.markPromptCacheDispatched(context);
 						return onPayload?.(payload, payloadModel, signal);
@@ -5007,6 +5242,42 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		}
 
+		// Fresh-fork credential affinity: a child created via options.forkRequest
+		// may reuse the parent's account so the provider's source-account check
+		// passes on the first request. Construction-time only, and only while
+		// the child has no credential choice of its own — a journal pin or an
+		// already-active session-sticky account (e.g. a revived child that was
+		// re-pinned before) must never be clobbered by the parent's credential.
+		// The pin is the parent's automatic affinity as of now, not a user pin,
+		// so the provider's warm window still decides when the child re-ranks.
+		// A held or unidentifiable account just declines; the request falls back
+		// to whatever key the session resolves.
+		const forkPinProvider = inheritedForkOrigin?.request.provider;
+		if (
+			options.forkRequest !== undefined &&
+			inheritedForkOrigin !== undefined &&
+			forkPinProvider !== undefined &&
+			model !== undefined &&
+			model.provider === forkPinProvider &&
+			!sessionManager.getCredentialPins().has(forkPinProvider) &&
+			!authStorage.oauth.accounts(forkPinProvider, providerSessionId).some(account => account.active)
+		) {
+			try {
+				const credentialId =
+					inheritedForkOrigin.credentialId ??
+					resolveForkCredentialId(authStorage, inheritedForkOrigin.request, providerSessionId);
+				if (credentialId !== undefined) {
+					authStorage.sessions.pin(inheritedForkOrigin.request.provider, providerSessionId, credentialId, {
+						restoredAtMs: Date.now(),
+					});
+				}
+			} catch (err) {
+				logger.warn("fork credential pinning failed", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
+
 		// Advisors share this session's extension runner (for the approval gate
 		// below), so their tool calls must name the advisor as `ctx.agent`; the
 		// runner's own identity would report them as this session's agent.
@@ -5045,7 +5316,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			requireYieldTool: false,
 			getSessionId: () => {
 				const id = sessionManager.getSessionId?.();
-				return id ? `${id}-advisor` : null;
+				if (!id) return null;
+				const advisorId = `${id}-advisor`;
+				accountPoolScope?.restrict(advisorId);
+				return advisorId;
 			},
 			queueLaunchCompletion: notification =>
 				session?.queueLaunchCompletion(notification) ??
@@ -5089,6 +5363,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// block createAgentSession for tens of seconds while the whole file is
 		// streamed and parsed on the main thread.
 		session = new AgentSession({
+			codeModeState,
 			cacheWarmer,
 			costGate: options.costGate,
 			advisorWatchdogPrompt,
@@ -5129,6 +5404,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			extensionRunner,
 			getEvalPreludes,
 			evalToolSession: toolSession,
+			eventBus,
+			subagentEventBus,
 			customCommands: customCommandsResult.commands,
 			skills,
 			skillDescriptions,
@@ -5148,7 +5425,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				: undefined,
 			memoryEnabled: !restrictToolNames,
 			memoryAgentDir: agentDir,
-			memoryTaskDepth: taskDepth,
 			createMemoryTools: restrictToolNames
 				? undefined
 				: async () => {
@@ -5158,6 +5434,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						return tools.filter((tool): tool is AgentTool => tool !== null);
 					},
 			createThinkTool: async () => (await HIDDEN_TOOLS.think(toolSession)) ?? null,
+			createSidekickTool: restrictToolNames
+				? undefined
+				: async () => (await BUILTIN_TOOLS.sidekick(toolSession)) ?? null,
 			createVibeTools:
 				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix
 					? () => createVibeTools(toolSession)
@@ -5207,6 +5486,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			obfuscator,
 			agentId: resolvedAgentId,
 			agentKind,
+			taskDepth,
+			agentDefinition: options.agentDefinition,
 			agentRegistry,
 			providerSessionId: options.providerSessionId,
 			accountPoolScope,
@@ -5594,6 +5875,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// `.api` equality doesn't narrow the generic; the guard makes this cast sound.
 			const codexModel = prewarmModel as Model<"openai-codex-responses">;
 			if (isOpenAICodexWebSocketPreferred(codexModel, { preferWebsockets: session.preferWebsockets })) {
+				const prewarmOwner = session.sessionId;
+				const prewarmTranscript = sessionManager.getSessionId();
 				void (async () => {
 					try {
 						const codexPrewarmApiKey = options.getApiKey
@@ -5601,15 +5884,27 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 								// then resolve the result if it is itself an ApiKeyResolver.
 								await resolveApiKeyOnce(await options.getApiKey(codexModel))
 							: await modelRegistry.getApiKey(codexModel, providerSessionId);
-						if (!codexPrewarmApiKey) return;
+						if (
+							!codexPrewarmApiKey ||
+							session.isDisposed ||
+							session.isSessionTransitioning ||
+							session.sessionId !== prewarmOwner ||
+							sessionManager.getSessionId() !== prewarmTranscript
+						)
+							return;
 						// Load the transport only for an actual Codex prewarm, not unrelated session setup.
 						const { prewarmOpenAICodexResponses } =
 							await import("@oh-my-pi/pi-ai/providers/openai-codex-responses");
+						// A forked child must warm the socket under the shared root
+						// lineage — WS headers are fixed at handshake, so an unwarmed-
+						// fork connection can never be reused by the real request.
+						const prewarmForkSource = forkJournal().snapshot?.request;
 						await logger.time("prewarmOpenAICodexResponses", prewarmOpenAICodexResponses, codexModel, {
 							apiKey: codexPrewarmApiKey,
 							sessionId: providerSessionId,
 							preferWebsockets: session.preferWebsockets,
 							providerSessionState: session.providerSessionState,
+							...(prewarmForkSource !== undefined ? { codexFork: { source: prewarmForkSource } } : {}),
 							serviceTier: session.effectiveServiceTier(codexModel),
 						});
 					} catch (error) {
@@ -5939,6 +6234,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			});
 		}
 		startDeferredMCPDiscovery?.(session);
+
+		// Route the initial tool surface through the Code Mode-aware path when the
+		// session starts directly on a Codex Code Mode model (`codeMode` `on`, or
+		// `auto` matching the model's `code_mode_only` flag): the Agent above was
+		// handed the unrestricted `initialTools`, so without this the first and all
+		// subsequent turns would expose the full direct tool surface and omit
+		// `tool_namespaces_info` until an unrelated model/setting/tool-selection
+		// change reconciled.
+		try {
+			await session.initializeCodeMode();
+		} catch (error) {
+			logger.warn("Code Mode initialization at session startup failed", { error: String(error) });
+		}
 
 		startupCleanup.move();
 		return {

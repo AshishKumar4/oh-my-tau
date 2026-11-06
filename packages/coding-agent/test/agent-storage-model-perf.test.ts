@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -79,6 +80,113 @@ describe("AgentStorage model perf aggregates", () => {
 		expect(stats?.ttftMs).toBeCloseTo(750, 5);
 	});
 
+	it("keeps standard, Fast and Ultrafast samples separate across close and reopen", async () => {
+		const storage = await openStorage();
+		const dbPath = path.join(tempDir.path(), "agent.db");
+		void storage.recordModelPerf("openai-codex/gpt-6-astra", { outputTokens: 100, durationMs: 4000, ttftMs: 500 });
+		void storage.recordModelPerf(
+			"openai-codex/gpt-6-astra",
+			{ outputTokens: 100, durationMs: 1000, ttftMs: 100 },
+			"priority",
+		);
+		void storage.recordModelPerf(
+			"openai-codex/gpt-6-astra",
+			{ outputTokens: 100, durationMs: 250, ttftMs: 50 },
+			"ultrafast",
+		);
+		AgentStorage.close();
+		const reopened = await AgentStorage.open(dbPath);
+		const stats = reopened.getModelPerf();
+		expect(stats.get("openai-codex/gpt-6-astra")?.tps).toBe(25);
+		expect(stats.get("openai-codex/gpt-6-astra@priority")?.tps).toBe(100);
+		expect(stats.get("openai-codex/gpt-6-astra@ultrafast")?.tps).toBe(400);
+		const pending = reopened.recordModelPerf(
+			"openai-codex/gpt-6-astra",
+			{ outputTokens: 50, durationMs: 125 },
+			"ultrafast",
+		);
+		await flushPerf(pending);
+		expect(reopened.getModelPerf().get("openai-codex/gpt-6-astra@ultrafast")?.samples).toBe(2);
+		expect(reopened.getModelPerf().get("openai-codex/gpt-6-astra")?.samples).toBe(1);
+	});
+
+	it.each([5, 6])(
+		"preserves the correct backfill behavior when reopening schema v%s with a v1 marker",
+		async version => {
+			vi.useRealTimers();
+			tempDir = TempDir.createSync("@omp-perf-v1-preserve-");
+			const agentDir = tempDir.join("agent");
+			const env = {
+				...process.env,
+				PI_CODING_AGENT_DIR: agentDir,
+				PI_CONFIG_DIR: path.relative(os.homedir(), tempDir.path()),
+				XDG_CONFIG_HOME: tempDir.join("xdg"),
+				XDG_DATA_HOME: tempDir.join("data"),
+				XDG_STATE_HOME: tempDir.join("state"),
+			};
+			const initial = await runProbe(
+				[
+					'import { Database } from "bun:sqlite";',
+					'import * as fs from "node:fs";',
+					'import * as path from "node:path";',
+					'import { getStatsDbPath } from "@oh-my-pi/pi-utils";',
+					`import { AgentStorage } from ${JSON.stringify(AGENT_STORAGE_MODULE)};`,
+					"const storage = await AgentStorage.open();",
+					'void storage.recordModelPerf("openai/repro", { outputTokens: 30, durationMs: 3000 });',
+					"AgentStorage.close();",
+					`const db = new Database(${JSON.stringify(path.join(agentDir, "agent.db"))});`,
+					'db.run("INSERT OR REPLACE INTO meta VALUES (?, ?)", ["model_perf_backfill", "complete"]);',
+					'db.run("DELETE FROM schema_version");',
+					`db.run("INSERT INTO schema_version VALUES (?)", [${version}]);`,
+					"db.close();",
+					"const statsPath = getStatsDbPath(); fs.mkdirSync(path.dirname(statsPath), { recursive: true });",
+					"const stats = new Database(statsPath);",
+					'stats.run("CREATE TABLE messages (provider TEXT, model TEXT, output_tokens INTEGER, duration INTEGER, ttft INTEGER, stop_reason TEXT, timestamp INTEGER, service_tier TEXT)");',
+					'stats.run("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)", ["openai", "repro", 40, 1000, null, "stop", Date.now(), "ultrafast"]);',
+					"stats.close();",
+				].join("\n"),
+				env,
+			);
+			expect(initial.exitCode, initial.stderr).toBe(0);
+			const reopened = await runProbe(
+				[
+					`import { AgentStorage } from ${JSON.stringify(AGENT_STORAGE_MODULE)};`,
+					"const storage = await AgentStorage.open();",
+					"storage.getModelPerf();",
+					"await Promise.resolve();",
+					'void storage.recordModelPerf("openai/repro", { outputTokens: 20, durationMs: 1000 }, "priority");',
+					"AgentStorage.close();",
+				].join("\n"),
+				env,
+			);
+			expect(reopened.exitCode, reopened.stderr).toBe(0);
+			const db = new Database(path.join(agentDir, "agent.db"), { readonly: true });
+			try {
+				const rows = db
+					.query<{ model_key: string; samples: number; output_tokens: number }, []>(
+						"SELECT model_key, samples, output_tokens FROM model_perf ORDER BY model_key",
+					)
+					.all();
+				expect(rows).toEqual(
+					version === 6
+						? [
+								{ model_key: "openai/repro", samples: 1, output_tokens: 30 },
+								{ model_key: "openai/repro@priority", samples: 1, output_tokens: 20 },
+							]
+						: [
+								{ model_key: "openai/repro@priority", samples: 1, output_tokens: 20 },
+								{ model_key: "openai/repro@ultrafast", samples: 1, output_tokens: 40 },
+							],
+				);
+				expect(
+					db.query<{ value: string }, []>("SELECT value FROM meta WHERE key='model_perf_backfill_v2'").get()
+						?.value,
+				).toBe("complete");
+			} finally {
+				db.close();
+			}
+		},
+	);
 	it("keeps a non-default service tier's samples in their own row", async () => {
 		const storage = await openStorage();
 
@@ -116,8 +224,9 @@ describe("AgentStorage model perf aggregates", () => {
 		const settings = Settings.isolated({ "tier.openai": "ultrafast" }, { storage });
 		const auth = await AuthStorage.create(":memory:");
 		try {
+			// Sessions admit a turn only with configured credentials for its provider.
+			auth.keys.setRuntime("openai-codex", "test-key");
 			const registry = new ModelRegistry(auth, path.join(tempDir.path(), "models.yml"));
-			registry.getApiKey = async () => "test-key";
 			const model = buildModel({
 				provider: "openai-codex",
 				id: "gpt-6-astra",

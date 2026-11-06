@@ -14,7 +14,6 @@ import { __resetAutoQaConsentForTests, resolveAutoQaConsent } from "@oh-my-pi/pi
 import {
 	cfgMarketplaceAutoUpdate,
 	cfgStartupChangelogMode,
-	cfgStartupCheckUpdate,
 	cfgStartupSetupWizard,
 	cfgStartupShowSplash,
 } from "@oh-my-pi/pi-coding-agent/modes/settings";
@@ -74,7 +73,6 @@ describe("cfg:// approval prompt wiring", () => {
 		testSession = await createTestSession(
 			askTimeout === undefined ? {} : { settingsOverrides: { "ask.timeout": askTimeout } },
 		);
-		cfgStartupCheckUpdate.override(testSession.session.settings, false);
 		cfgStartupChangelogMode.override(testSession.session.settings, "hidden");
 		cfgStartupSetupWizard.override(testSession.session.settings, false);
 		cfgStartupShowSplash.override(testSession.session.settings, false);

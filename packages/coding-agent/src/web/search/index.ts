@@ -15,8 +15,10 @@ import { type RoleChainCandidate, resolveModelRoleValue, resolveRoleChain } from
 import { roleCandidatePool } from "../../config/model-roles";
 import { settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext } from "../../extensibility/custom-tools/types";
+import { type HarnessBridges, harnessParameters, harnessParams } from "../../harness/bridge";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
+import claudeCodeWebSearchDescription from "../../prompts/tools/harness/claude-code-web-search.md" with { type: "text" };
 import { resolveConfiguredModelTarget } from "../../session/role-models";
 import { discoverAuthStorage } from "../../sdk";
 import type { ToolSession } from "../../tools";
@@ -53,6 +55,30 @@ export const webSearchSchema = type({
 });
 
 export type SearchToolParams = typeof webSearchSchema.infer;
+
+const claudeCodeWebSearchSchema = type({
+	query: type("string >= 2").describe("search query"),
+	"allowed_domains?": type("string[]").describe("only include results from these domains"),
+	"blocked_domains?": type("string[]").describe("never include results from these domains"),
+});
+type WebSearchInputSchema = typeof webSearchSchema | typeof claudeCodeWebSearchSchema;
+
+export function withDomainOperators(query: string, allowed?: readonly string[], blocked?: readonly string[]): string {
+	const parts = [query.trim()];
+	if (allowed && allowed.length > 0) {
+		const sites = allowed.map(domain => `site:${domain}`);
+		parts.push(sites.length === 1 ? sites[0]! : `(${sites.join(" OR ")})`);
+	}
+	for (const domain of blocked ?? []) parts.push(`-site:${domain}`);
+	return parts.join(" ");
+}
+
+const WEB_SEARCH_BRIDGES: HarnessBridges<SearchToolParams, typeof claudeCodeWebSearchSchema> = {
+	"claude-code": {
+		parameters: claudeCodeWebSearchSchema,
+		toParams: args => ({ query: withDomainOperators(args.query, args.allowed_domains, args.blocked_domains) }),
+	},
+};
 
 export interface SearchQueryParams extends SearchToolParams {
 	model?: string;
@@ -416,11 +442,25 @@ let registryDescription: string | undefined;
  *
  * Supports the configured web model role chain with automatic fallback.
  */
-export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchResultDetails> {
+export class WebSearchTool implements AgentTool<WebSearchInputSchema, SearchResultDetails> {
 	readonly name = "web_search";
 	readonly approval = "read" as const;
 	readonly label = "Web Search";
-	readonly parameters = webSearchSchema;
+	/**
+	 * Claude Code's `WebSearch` describes its own fields when no vendor declaration is
+	 * served. The native description advertises X search operators when xAI credentials
+	 * existed at the process's first read.
+	 */
+	get description(): string {
+		if (this.parameters === claudeCodeWebSearchSchema) return prompt.render(claudeCodeWebSearchDescription);
+		const modelRegistry = this.#session.modelRegistry;
+		if (!modelRegistry) return plainDescription;
+		registryDescription ??= prompt.render(webSearchDescription, { xSearch: xSearchAvailable(modelRegistry) });
+		return registryDescription;
+	}
+	get parameters(): WebSearchInputSchema {
+		return harnessParameters(this.#session, WEB_SEARCH_BRIDGES, webSearchSchema);
+	}
 	readonly strict = true;
 	readonly loadMode = "discoverable";
 	readonly summary = "Search the web for up-to-date information";
@@ -431,21 +471,14 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 		this.#session = session;
 	}
 
-	/** Advertises X search operators when xAI credentials existed at the process's first read. */
-	get description(): string {
-		const modelRegistry = this.#session.modelRegistry;
-		if (!modelRegistry) return plainDescription;
-		registryDescription ??= prompt.render(webSearchDescription, { xSearch: xSearchAvailable(modelRegistry) });
-		return registryDescription;
-	}
-
 	async execute(
 		_toolCallId: string,
-		params: SearchToolParams,
+		input: SearchToolParams | typeof claudeCodeWebSearchSchema.infer,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<SearchResultDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<SearchResultDetails>> {
+		const params = harnessParams(this.#session, WEB_SEARCH_BRIDGES, input);
 		const authStorage = this.#session.authStorage ?? (await discoverAuthStorage());
 		const sessionId = this.#session.getSessionId?.() ?? undefined;
 		return executeSearch(_toolCallId, params, {

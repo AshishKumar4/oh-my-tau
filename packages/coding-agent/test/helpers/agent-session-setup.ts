@@ -1,7 +1,10 @@
 import { Database } from "bun:sqlite";
+import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
 
 /**
@@ -35,6 +38,17 @@ export function createAssistantMessage(text: string): AssistantMessage {
  */
 export function createInMemoryAuthStorage(): AuthStorage {
 	return new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+}
+
+/** Exercise real auth admission and requests without reading local config or persisting catalog data. */
+export function createInMemoryModelRegistry(provider: string): ModelRegistry {
+	const auth = createInMemoryAuthStorage();
+	auth.keys.setRuntime(provider, "test-key");
+	return new ModelRegistry(auth, path.join(import.meta.dir, "fixture-models.yml"), {
+		ignoreLocalModelConfig: true,
+		cacheDbPath: ":memory:",
+		settings: Settings.isolated({}),
+	});
 }
 
 /**

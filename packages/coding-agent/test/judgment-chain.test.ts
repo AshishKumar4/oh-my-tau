@@ -240,6 +240,28 @@ afterEach(() => {
 });
 
 describe("ChainJudge", () => {
+	it("routes the next judgment through an edited role during the existing chain cache window", async () => {
+		const settings = Settings.isolated({ modelRoles: { judge: `${ONLINE.provider}/${ONLINE.id}` } });
+		const registry = makeRegistry([ONLINE, ONLINE_BACKUP], {
+			[ONLINE.provider]: "fixture-key",
+			[ONLINE_BACKUP.provider]: "backup-key",
+		});
+		const attempted: string[] = [];
+		vi.spyOn(ai, "completeSimple").mockImplementation(async model => {
+			attempted.push(model.id);
+			return reply(model, "level: low");
+		});
+		await new ChainJudge({ settings, registry, purpose: "test" }).judge({
+			state: "before",
+			questions: { level: TIER_QUESTION },
+		});
+		cfgModelRoles.override(settings, { judge: `${ONLINE_BACKUP.provider}/${ONLINE_BACKUP.id}` });
+		await new ChainJudge({ settings, registry, purpose: "test" }).judge({
+			state: "after",
+			questions: { level: TIER_QUESTION },
+		});
+		expect(attempted).toEqual([ONLINE.id, ONLINE_BACKUP.id]);
+	});
 	it("falls from a coarse local question to a tiered online question", async () => {
 		const settings = Settings.isolated({
 			modelRoles: { judge: `${LOCAL.provider}/${LOCAL.id}` },

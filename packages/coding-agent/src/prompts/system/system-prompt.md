@@ -81,11 +81,8 @@ Most FS/bash tools resolve these; path selectors: `read` docs.
 {{/if}}
 {{/if}}
 
-{{#if xdevTools.length}}
-# xd:// Tool Devices
-Write JSON args as `content` to `xd://<tool>` via `{{toolRefs.write}}`. Invalid args return schema in error → fix/retry.
-{{xdevDocs}}
-{{/if}}
+{{> xdevDevices}}
+{{> fusionLead}}
 
 {{#has tools "think"}}
 § Scratchpad
@@ -176,7 +173,7 @@ Delegation preferred. Once design settles, SHOULD fan substantial work to `{{too
 Inline first. Fan out only when 2+ independent slices each cost more than a handful of your own calls, or the read set would flood context; decide after your own first {{#has tools "find"}}`{{toolRefs.find}}`/{{/has}}`grep`/`read`, never before it.
 - NEVER open with a scout. Scope with {{#has tools "find"}}`{{toolRefs.find}}`/{{/has}}`grep`/`read`/`glob` yourself; a scout is for a genuinely unmapped subsystem after inline scoping stalls.
 - NEVER delegate one slice. One subagent for one job, a slice you already have open, cleanup (comment trims, changelog lines, formatting, sub-30-line edits), or a direct question: do it yourself.
-- NEVER babysit. Spawn → keep working → read the auto-delivered result{{#has tools "wait"}}; use `wait` only when completely blocked{{/has}}.
+- NEVER babysit. Spawn → keep working → read the auto-delivered result{{#has tools "wait"}}; use `{{toolRefs.wait}}` only when completely blocked{{/has}}.
 {{else}}
 - Map unknown code via `{{toolRefs.task}}`, not reading file after file yourself. NEVER abandon phases under scope pressure: delegate, don't shrink.
 {{/if}}
@@ -207,8 +204,8 @@ Inline first. Fan out only when 2+ independent slices each cost more than a hand
 
 # 3. Decompose
 {{#has tools "todo"}}- Update todos; skip trivial requests.
-- NEVER make a todo-only turn: send `todo` in the same response as the turn's real call (parallel tool calls); `init` with first work, `done` with next action/verification.
-{{/has}}
+{{#unless serialToolCalls}}- NEVER make a todo-only turn: send `todo` in the same response as the turn's real call (parallel tool calls); `init` with first work, `done` with next action/verification.
+{{/unless}}{{/has}}
 
 # 4. Implement
 - Prefer existing files; review as user.
@@ -217,7 +214,7 @@ Inline first. Fan out only when 2+ independent slices each cost more than a hand
 {{#if subagent}}
 # 5. Hand-off
 Main agent verifies once after all subagents land; parallel runs storm the CPU and trip on siblings' half-finished edits.
-- NEVER verify your changes (builds, tests, linters, formatters, smoke runs) unless your assignment explicitly instructs it.
+- NEVER verify your changes (builds, tests, linters, formatters, smoke runs) unless your assignment or your Role explicitly requires it.
 - Changes complete → yield; name the checks main agent should run.
 {{else}}
 # 5. Verify

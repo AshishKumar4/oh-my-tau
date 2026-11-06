@@ -22,6 +22,13 @@ const AGENTIC_PROMPTS_DIR = `${import.meta.dir}/../src/commit/agentic/prompts/`;
 
 const PROMPT_DIRS = [PROMPTS_DIR, COMMIT_PROMPTS_DIR, AGENTIC_PROMPTS_DIR];
 
+/**
+ * Vendor texts the harness profiles serve byte-exact (Claude Code and Codex tool
+ * descriptions, codex-rs's `exec` template), relative to `PROMPTS_DIR`. Formatting
+ * would rewrite the vendor's bytes (`...` to `…`, compacted tables).
+ */
+const VERBATIM_PROMPTS = [new Glob("tools/harness/**"), new Glob("tools/eval-codex-exec.md")];
+
 const PROMPT_FORMAT_OPTIONS = {
 	renderPhase: "pre-render",
 	replaceAsciiSymbols: true,
@@ -36,6 +43,7 @@ async function main() {
 
 	for (const dir of PROMPT_DIRS) {
 		for await (const path of glob.scan(dir)) {
+			if (dir === PROMPTS_DIR && VERBATIM_PROMPTS.some(verbatim => verbatim.match(path))) continue;
 			files.push(`${dir}${path}`);
 		}
 	}

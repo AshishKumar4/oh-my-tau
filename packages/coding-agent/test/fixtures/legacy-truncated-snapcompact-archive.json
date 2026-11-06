@@ -1,0 +1,28 @@
+{
+	"summary": "Resume prior conversation. Earlier turns archived under HISTORY below, oldest→newest. Read HISTORY fully; continue the live conversation following it.\n\nArchived transcript scopes:\n- `¶user:`, `¶think:`, `¶ai:`, `¶call:`: user, assistant reasoning, assistant reply, tool call.\n- Unprefixed following lines: current scope. Consecutive same-kind blocks omit repeated prefix.\n- Tool call: `¶call:name(args)//intent`; trailing `//intent` optional. `<out>…</out>`: tool output.\n\nReading HISTORY:\n- Plain text: verbatim transcript; rely on it exactly.\n- Some middle sections: images, not text. Each image: one page of that transcript, in reading order between marked delimiters. Solid black cell: newline; runs of spaces collapse to one.\n  - Frame: one grid 40 characters wide, up to 14 rows tall; read left→right, top→bottom. No word wrap; words may break across rows.\n- About 11200 characters of older middle history dropped to fit archive budget.\n- If an exact earlier detail matters and a section is unclear, re-derive from workspace (re-read files, re-run commands), rather than guess.\n\nHISTORY\n===================",
+	"details": {
+		"readFiles": [],
+		"modifiedFiles": []
+	},
+	"preserveData": {
+		"snapcompact": {
+			"frames": [
+				{
+					"data": "iVBORw0KGgoAAAANSUhEUgAAAUAAAAAQAQMAAABdpzSqAAAABlBMVEX///8AAABVwtN+AAAAl0lEQVR42sXROwrDMAwGYGF6AI05QIYcIRQP4seYkCnkCDlFBuEhB69qt1txTIZC7EXDh55EZHTxXYSeTFWP7pVIU+c9FHUIMoCPnoUgPXLchAEfmP/GWx3GH7jyWofP0mOBu+oOj5nnOnRksvCQcsZFkkPkeA4nHkrpSeDOh3mwSfjCIGhMPY4mUAYnQkJjj8T/PuF98A2WJDTzwoF5GgAAAABJRU5ErkJggg==",
+					"mimeType": "image/png",
+					"cols": 40,
+					"rows": 20,
+					"chars": 19,
+					"font": "8x13",
+					"variant": "bw",
+					"lineRepeat": 1
+				}
+			],
+			"totalChars": 1139,
+			"truncatedChars": 11200,
+			"text": "¶user:Plan the migration. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the req9.█PRIVATE-REASONING step 380.█PRIVATE-REASONING step 381.█PRIVATE-REASONING step 382.█PRIVATE-REASONING step 383.█PRIVATE-REASONING step 384.█PRIVATE-REASONING step 385.█PRIVATE-REASONING step 386.█PRIVATE-REASONING step 387.█PRIVATE-REASONING step 388.█PRIVATE-REASONING step 389.█PRIVATE-REASONING step 390.█PRIVATE-REASONING step 391.█PRIVATE-REASONING step 392.█PRIVATE-REASONING step 393.█PRIVATE-REASONING step 394.█PRIVATE-REASONING step 395.█PRIVATE-REASONING step 396.█PRIVATE-REASONING step 397.█PRIVATE-REASONING step 398.█PRIVATE-REASONING step 399.█¶ai:SHORT_ANSWER",
+			"textHead": "¶user:Plan the migration. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the request. Context line for the req",
+			"textTail": "G step 380.█PRIVATE-REASONING step 381.█PRIVATE-REASONING step 382.█PRIVATE-REASONING step 383.█PRIVATE-REASONING step 384.█PRIVATE-REASONING step 385.█PRIVATE-REASONING step 386.█PRIVATE-REASONING step 387.█PRIVATE-REASONING step 388.█PRIVATE-REASONING step 389.█PRIVATE-REASONING step 390.█PRIVATE-REASONING step 391.█PRIVATE-REASONING step 392.█PRIVATE-REASONING step 393.█PRIVATE-REASONING step 394.█PRIVATE-REASONING step 395.█PRIVATE-REASONING step 396.█PRIVATE-REASONING step 397.█PRIVATE-REASONING step 398.█PRIVATE-REASONING step 399.█¶ai:SHORT_ANSWER"
+		}
+	}
+}
