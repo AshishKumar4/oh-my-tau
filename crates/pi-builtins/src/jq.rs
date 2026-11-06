@@ -2207,6 +2207,9 @@ mod tests {
 			.and_then(|file| file.set_len(0))
 			.expect("truncate input");
 		assert_eq!(&loaded[..], json.as_bytes());
+		let (code, out, err) = run_jq(&["length"], std::str::from_utf8(&loaded).expect("fixture JSON"));
+		assert_eq!(code, 0, "stderr: {err:?}");
+		assert_eq!(out, "8192\n");
 	}
 
 	#[test]

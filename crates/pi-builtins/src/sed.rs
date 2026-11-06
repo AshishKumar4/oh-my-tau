@@ -5064,10 +5064,7 @@ pub fn input_runtime_error<T>(
 pub mod fast_io {
 // Zero-copy line-based I/O
 //
-// Abstractions that allow file lines to be processed and output
-// straight from an owned in-memory copy of the input file.  By
-// coalescing output requests a single write can be issued for adjacent
-// input lines, bypassing per-line copies into owned strings.
+// Adjacent lines borrow an owned input snapshot and coalesce into one output write.
 // Search for "main" to see a usage example.
 //
 // SPDX-License-Identifier: MIT
@@ -5078,8 +5075,8 @@ pub mod fast_io {
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-#[cfg(not(unix))]
-use std::marker::PhantomData;
+#[cfg(unix)]
+use std::{ops::Range, rc::Rc};
 use std::{
 	cell::Cell,
 	io::{self, BufRead, BufReader, BufWriter, Read, Write},
@@ -5093,31 +5090,32 @@ use pi_vfs::BlockingFs;
 use crate::{host::Host, sed::error_handling::SedError};
 
 // Define two cursors for iterating over lines:
-// - SliceLineCursor over a file read whole into memory,
+// - SliceLineCursor over an owned file snapshot,
 // - ReadLineCursor based on BufReader.
 
-/// Cursor for zero-copy iteration over an in-memory file snapshot.
+/// Cursor for zero-copy iteration over an owned file snapshot.
 #[cfg(unix)]
-pub struct SliceLineCursor<'a> {
-	data: &'a [u8], // Snapshot data
-	pos:  usize,    // Position within the data
+pub struct SliceLineCursor {
+	data: Rc<Vec<u8>>,
+	pos:   usize,    // Position within the data
 }
 
 #[cfg(unix)]
 /// Represents the get_line return: one line plus whether it was the last.
-pub struct NextSliceLine<'a> {
-	pub content:   &'a [u8],
-	pub full_span: &'a [u8],
+pub struct NextSliceLine {
+	data: Rc<Vec<u8>>,
+	content: Range<usize>,
+	full_span: Range<usize>,
 }
 
 #[cfg(unix)]
-impl<'a> SliceLineCursor<'a> {
-	fn new(data: &'a [u8]) -> Self {
-		Self { data, pos: 0 }
+impl SliceLineCursor {
+	fn new(data: Vec<u8>) -> Self {
+		Self { data: Rc::new(data), pos: 0 }
 	}
 
 	/// Return the next line, if available, or None.
-	fn get_line(&mut self) -> io::Result<Option<NextSliceLine<'a>>> {
+	fn get_line(&mut self) -> io::Result<Option<NextSliceLine>> {
 		if self.pos >= self.data.len() {
 			return Ok(None);
 		}
@@ -5135,14 +5133,8 @@ impl<'a> SliceLineCursor<'a> {
 		}
 
 		self.pos = end;
-		let full_span = &self.data[start..end];
-		let content = if full_span.ends_with(b"\n") {
-			&full_span[..full_span.len() - 1]
-		} else {
-			full_span
-		};
-
-		Ok(Some(NextSliceLine { content, full_span }))
+		let content_end = if self.data[start..end].ends_with(b"\n") { end - 1 } else { end };
+		Ok(Some(NextSliceLine { data: Rc::clone(&self.data), content: start..content_end, full_span: start..end }))
 	}
 
 	/// Return true if the previously returned line was the last one.
@@ -5191,14 +5183,14 @@ impl ReadLineCursor {
 
 /// A chunk of data that is input and can be output, often very efficiently
 #[derive(Debug, PartialEq, Eq)]
-pub struct IOChunk<'a> {
+pub struct IOChunk {
 	utf8_verified: Cell<bool>, // True if the contents are valid UTF-8
-	content:       IOChunkContent<'a>,
+	content:       IOChunkContent,
 }
 
-impl<'a> IOChunk<'a> {
+impl IOChunk {
 	/// Construct an IOChunk from the given content
-	fn from_content(content: IOChunkContent<'a>) -> Self {
+	fn from_content(content: IOChunkContent) -> Self {
 		Self { utf8_verified: Cell::new(false), content }
 	}
 
@@ -5227,8 +5219,8 @@ impl<'a> IOChunk<'a> {
 		match &self.content {
 			IOChunkContent::Owned { has_newline, .. } => *has_newline,
 			#[cfg(unix)]
-			IOChunkContent::SliceInput { full_span, .. } => {
-				if let Some(&last) = full_span.last() {
+			IOChunkContent::SliceInput { data, full_span, .. } => {
+				if let Some(&last) = data[full_span.clone()].last() {
 					last == b'\n'
 				} else {
 					false
@@ -5266,13 +5258,13 @@ impl<'a> IOChunk<'a> {
 	pub fn as_str(&self) -> Result<&str, SedError> {
 		match &self.content {
 			#[cfg(unix)]
-			IOChunkContent::SliceInput { content, .. } => {
+			IOChunkContent::SliceInput { data, content, .. } => {
 				if self.utf8_verified.get() {
 					// Use cached result
 					Ok(unsafe { self.content.as_str_unchecked() })
 				} else {
-					let result = str::from_utf8(content);
-					self.utf8_verified.set(true);
+					let result = str::from_utf8(&data[content.clone()]);
+					self.utf8_verified.set(result.is_ok());
 					result.map_err(|e| SedError::new(2, e.to_string()))
 				}
 			},
@@ -5284,7 +5276,7 @@ impl<'a> IOChunk<'a> {
 	pub fn as_bytes(&self) -> &[u8] {
 		match &self.content {
 			#[cfg(unix)]
-			IOChunkContent::SliceInput { content, .. } => content,
+			IOChunkContent::SliceInput { data, content, .. } => &data[content.clone()],
 			IOChunkContent::Owned { content, .. } => content.as_bytes(),
 		}
 	}
@@ -5295,9 +5287,9 @@ impl<'a> IOChunk<'a> {
 		match &self.content {
 			IOChunkContent::Owned { .. } => Ok(()), // already owned
 			#[cfg(unix)]
-			IOChunkContent::SliceInput { content, full_span, .. } => match std::str::from_utf8(content) {
+			IOChunkContent::SliceInput { data, content, full_span } => match std::str::from_utf8(&data[content.clone()]) {
 				Ok(valid_str) => {
-					let has_newline = full_span.last().copied() == Some(b'\n');
+					let has_newline = data[full_span.clone()].last().copied() == Some(b'\n');
 					self.content = IOChunkContent::new_owned(valid_str.to_string(), has_newline);
 					self.utf8_verified.set(true);
 					Ok(())
@@ -5319,45 +5311,35 @@ impl<'a> IOChunk<'a> {
 	}
 }
 
-/// Data to be written to a file. It can come from an in-memory input
-/// snapshot, in which case it is tracked to allow coalescing
+/// Data to be written to a file. It can come from the input-snapshot
+/// memory space, in which case it is tracked to allow coalescing
 /// and bypassing BufWriter, or it can be other data from the process's
 /// memory space.
 #[derive(Debug, PartialEq, Eq)]
-enum IOChunkContent<'a> {
+enum IOChunkContent {
 	#[cfg(unix)]
 	SliceInput {
-		content:   &'a [u8], // Line without newline
-		full_span: &'a [u8], // Line including original newline, if any
+		data: Rc<Vec<u8>>,
+		content: Range<usize>,
+		full_span: Range<usize>,
 	},
 	Owned {
 		content:     String, // Line content without newline
 		has_newline: bool,   // True if \n-terminated
-		#[cfg(not(unix))]
-		_phantom:    PhantomData<&'a ()>, // Silence E0392 warning
 	},
 }
 
-impl IOChunkContent<'_> {
+impl IOChunkContent {
 	/// Construct a new Owned chunk.
 	pub fn new_owned(content: String, has_newline: bool) -> Self {
-		#[cfg(unix)]
-		return IOChunkContent::Owned { content, has_newline };
-
-		#[cfg(not(unix))]
-		return IOChunkContent::Owned {
-			content,
-			has_newline,
-			// Avoid E0063 missing _phantom initialization errors
-			_phantom: std::marker::PhantomData,
-		};
+		IOChunkContent::Owned { content, has_newline }
 	}
 
 	#[cfg(unix)]
 	unsafe fn as_str_unchecked(&self) -> &str {
 		match self {
-			IOChunkContent::SliceInput { content, .. } => unsafe {
-				std::str::from_utf8_unchecked(content)
+			IOChunkContent::SliceInput { data, content, .. } => unsafe {
+				std::str::from_utf8_unchecked(&data[content.clone()])
 			},
 			IOChunkContent::Owned { content, .. } => content,
 		}
@@ -5378,38 +5360,30 @@ impl IOChunkContent<'_> {
 // driving write(2)/copy_file_range(2) output fast paths) is removed, because
 // the output writer is a plain `Write` handle without a file descriptor.
 
-/// Unified reader: regular host files are read whole into memory and served
-/// zero-copy; everything else streams through a buffered reader.
-pub enum LineReader<'a> {
+/// Regular native files use owned snapshots; pipes and provider files stream.
+pub enum LineReader {
 	#[cfg(unix)]
 	SliceInput {
-		_data:  Vec<u8>, // Owns the bytes `cursor` borrows
-		cursor: SliceLineCursor<'a>,
+		cursor:      SliceLineCursor,
 	},
 	ReadInput(ReadLineCursor),
-	#[cfg(not(unix))]
-	_Phantom(std::marker::PhantomData<&'a ()>),
 }
 
 /// Return a LineReader that uses the ReadInput method fot the specified file.
-fn line_reader_read_input(file: impl Read + 'static) -> io::Result<LineReader<'static>> {
+fn line_reader_read_input(file: impl Read + 'static) -> io::Result<LineReader> {
 	let boxed: Box<dyn Read> = Box::new(file);
 	let reader = BufReader::new(boxed);
 	Ok(LineReader::ReadInput(ReadLineCursor::new(reader)))
 }
 
-/// Return a LineReader that serves all of `file`, read into memory up front.
 #[cfg(unix)]
-fn line_reader_slice_input(mut file: impl Read) -> io::Result<LineReader<'static>> {
+fn line_reader_slice_input(mut file: impl Read) -> io::Result<LineReader> {
 	let mut data = Vec::new();
 	file.read_to_end(&mut data)?;
-	// SAFETY: the heap buffer of `data` is never mutated or reallocated, and it
-	// lives in the same variant as the cursor borrowing it.
-	let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-	Ok(LineReader::SliceInput { _data: data, cursor: SliceLineCursor::new(slice) })
+	Ok(LineReader::SliceInput { cursor: SliceLineCursor::new(data) })
 }
 
-impl<'a> LineReader<'a> {
+impl LineReader {
 	/// Open the specified file for line input.
 	// Use "-" to read from the standard input.
 	pub fn open_with_host(path: &PathBuf, host: &mut Host) -> io::Result<Self> {
@@ -5424,12 +5398,10 @@ impl<'a> LineReader<'a> {
 		// against the shell working directory.
 		let file = host.fs().open(host.resolve(path))?;
 
-		// Regular host files are read whole, never memory-mapped: sed runs in
-		// the host process, where truncating a mapped file under it raises
-		// SIGBUS and kills the host. Provider files and non-regular host files
-		// (pipes, process substitution) stream.
+		// Snapshot regular host files so concurrent truncation cannot SIGBUS the host.
+		// Provider files and native pipes retain buffered streaming.
 		#[cfg(unix)]
-		if file.native().is_some() && file.metadata().is_ok_and(|meta| meta.is_file()) {
+		if file.native().is_some() && file.metadata().is_ok_and(|metadata| metadata.is_file()) {
 			return line_reader_slice_input(file);
 		}
 
@@ -5451,12 +5423,12 @@ impl<'a> LineReader<'a> {
 	}
 
 	/// Return the next line, if available.
-	pub fn get_line(&mut self) -> io::Result<Option<IOChunk<'a>>> {
+	pub fn get_line(&mut self) -> io::Result<Option<IOChunk>> {
 		match self {
 			#[cfg(unix)]
 			LineReader::SliceInput { cursor, .. } => {
-				if let Some(NextSliceLine { content, full_span }) = cursor.get_line()? {
-					let chunk = IOChunk::from_content(IOChunkContent::SliceInput { content, full_span });
+				if let Some(NextSliceLine { data, content, full_span }) = cursor.get_line()? {
+					let chunk = IOChunk::from_content(IOChunkContent::SliceInput { data, content, full_span });
 
 					Ok(Some(chunk))
 				} else {
@@ -5472,9 +5444,6 @@ impl<'a> LineReader<'a> {
 					Ok(None)
 				}
 			},
-
-			#[cfg(not(unix))]
-			LineReader::_Phantom(_) => unreachable!("_Phantom should never be constructed"),
 		}
 	}
 
@@ -5485,9 +5454,6 @@ impl<'a> LineReader<'a> {
 			LineReader::SliceInput { cursor, .. } => cursor.last_line(),
 
 			LineReader::ReadInput(cursor) => cursor.last_line(),
-
-			#[cfg(not(unix))]
-			LineReader::_Phantom(_) => unreachable!("_Phantom should never be constructed"),
 		}
 	}
 }
@@ -5502,14 +5468,11 @@ impl<T: Write> OutputWrite for T {}
 #[cfg(unix)]
 #[derive(Clone)]
 struct SliceOutput {
-	out_ptr: *const u8, // Start of the output data chunk
-	len:     usize,     // Output data chunk size
+	data: Rc<Vec<u8>>,
+	range: Range<usize>,
 }
 
-/// Abstraction for outputting data, potentially from an input snapshot.
-/// Adjacent snapshot lines are coalesced and written with a single
-/// write of the original bytes.
-/// All other output is buffered and writen via BufWriter.
+/// Coalesces adjacent snapshot lines into one write; buffers other output through BufWriter.
 pub struct OutputBuffer {
 	out:               BufWriter<Box<dyn OutputWrite + 'static>>, // Where to write
 	line_buffered:     bool, // Flush completed lines for non-file stdout
@@ -5517,7 +5480,7 @@ pub struct OutputBuffer {
 	max_pending_write: usize,                        /* Max bytes to keep before
 	                                                               * flushing */
 	#[cfg(unix)]
-	slice_chunk:       Option<SliceOutput>, // Chunk to write
+	slice_chunk:        Option<SliceOutput>, // Chunk to write
 	// True when the last write didn't end with \n; the \n is deferred so
 	// that commands like `p` don't emit a spurious newline under -n.
 	pending_newline:   bool,
@@ -5659,20 +5622,17 @@ impl OutputBuffer {
 		}
 
 		match &new_chunk.content {
-			IOChunkContent::SliceInput { full_span, .. } => {
-				let new_ptr = full_span.as_ptr();
-				let new_len = full_span.len();
-
+			IOChunkContent::SliceInput { data, full_span, .. } => {
 				// Set whether a flush is needed and whether the
 				// slice_chunk needs to be reset to the new input.
 				// This avoids calling slice_chunk (which borrows self)
 				// when old_chunk is already borrowed.
 				let (flush_action, reset) = if let Some(old_chunk) = self.slice_chunk.as_mut() {
 					// Coalesce if adjacent.
-					if unsafe { old_chunk.out_ptr.add(old_chunk.len) } == new_ptr {
+					if Rc::ptr_eq(&old_chunk.data, data) && old_chunk.range.end == full_span.start {
 						// Coalesce.
-						old_chunk.len += new_len;
-						if old_chunk.len > self.max_pending_write {
+						old_chunk.range.end = full_span.end;
+						if old_chunk.range.len() > self.max_pending_write {
 							// Too much data; flush some full blocks.
 							(WriteRange::Blocks, false)
 						} else {
@@ -5691,7 +5651,7 @@ impl OutputBuffer {
 					self.flush_slice(flush_action)?;
 				}
 				if reset {
-					self.slice_chunk = Some(SliceOutput { out_ptr: new_ptr, len: new_len });
+					self.slice_chunk = Some(SliceOutput { data: Rc::clone(data), range: full_span.clone() });
 				}
 				self.pending_newline = !new_chunk.is_newline_terminated();
 			},
@@ -5722,16 +5682,13 @@ impl OutputBuffer {
 	// irrelevant and every flush writes the complete pending span.
 	#[cfg(unix)]
 	fn flush_slice(&mut self, _cover: WriteRange) -> io::Result<()> {
-		if let Some(chunk) = self.slice_chunk.as_mut() {
+		if let Some(chunk) = self.slice_chunk.as_ref() {
 			#[cfg(test)]
-			if chunk.len >= MIN_DIRECT_WRITE {
+			if chunk.range.len() >= MIN_DIRECT_WRITE {
 				self.low_level_flushes += 1;
 			}
-			let slice = unsafe { std::slice::from_raw_parts(chunk.out_ptr, chunk.len) };
-			self.out.write_all(slice)?;
-			let written = slice.len();
-			chunk.len -= written;
-			unsafe { chunk.out_ptr = chunk.out_ptr.add(written) };
+			self.out.write_all(&chunk.data[chunk.range.clone()])?;
+			self.slice_chunk = None;
 		}
 		Ok(())
 	}
@@ -5822,9 +5779,54 @@ mod tests {
 		buf
 	}
 
+	/// Truncating an input file after sed opened it must not fault the host
+	/// process; the reader keeps serving the bytes captured at open (unix
+	/// snapshots regular files; other platforms stream them).
 	#[cfg(unix)]
-	pub fn new_content_slice_input<'a>(content: &'a [u8], full_span: &'a [u8]) -> IOChunkContent<'a> {
-		IOChunkContent::SliceInput { content, full_span }
+	#[test]
+	fn test_file_truncated_after_open() -> io::Result<()> {
+		let mut tmp = NamedTempFile::new()?;
+		for _ in 0..4 {
+			tmp.write_all(&[b'.'; 4095])?;
+			tmp.write_all(b"\n")?;
+		}
+		tmp.flush()?;
+		let mut reader = LineReader::open(&tmp.path().to_path_buf())?;
+		tmp.as_file().set_len(0)?;
+
+		let mut lines = 0;
+		while let Some(chunk) = reader.get_line()? {
+			assert_eq!(chunk.as_bytes(), [b'.'; 4095]);
+			lines += 1;
+		}
+		assert_eq!(lines, 4);
+		Ok(())
+	}
+
+	/// The snapshot also keeps an unterminated final line unterminated.
+	#[cfg(unix)]
+	#[test]
+	fn snapshot_reader_survives_truncation_and_preserves_final_newline_state() -> io::Result<()> {
+		let directory = tempfile::tempdir()?;
+		let path = directory.path().join("input.txt");
+		let original = format!("{}final", "line\n".repeat(8192));
+		std::fs::write(&path, &original)?;
+		let mut reader = LineReader::open(&path)?;
+		std::fs::File::options().write(true).open(&path)?.set_len(0)?;
+		let mut captured = Vec::new();
+		while let Some(chunk) = reader.get_line()? {
+			captured.extend_from_slice(chunk.as_bytes());
+			if chunk.is_newline_terminated() { captured.push(b'\n'); }
+		}
+		assert_eq!(captured, original.as_bytes());
+		assert_eq!(std::fs::read(&path)?, Vec::<u8>::new());
+		Ok(())
+	}
+
+	#[cfg(unix)]
+	pub fn new_content_slice_input(content: &[u8], full_span: &[u8]) -> IOChunkContent {
+		assert!(full_span.starts_with(content));
+		IOChunkContent::SliceInput { data: Rc::new(full_span.to_vec()), content: 0..content.len(), full_span: 0..full_span.len() }
 	}
 
 	#[test]
@@ -5851,12 +5853,12 @@ mod tests {
 
 		use tempfile::NamedTempFile;
 
-		// Prepare the input buffer: two lines in one contiguous snapshot
-		let slice_data = b"line one\nline two\n";
+		// Prepare the input buffer: two lines in one contiguous snapshot region
+		let snapshot_data = b"line one\nline two\n";
 
 		// Write that into a temp file
 		let mut input = NamedTempFile::new()?;
-		input.write_all(slice_data)?;
+		input.write_all(snapshot_data)?;
 		input.flush()?;
 		let input_path = input.path().to_path_buf();
 
@@ -5878,7 +5880,7 @@ mod tests {
 		assert_eq!(out.low_level_flushes, 0);
 
 		let written = fs::read(&output_path)?;
-		assert_eq!(written.as_slice(), slice_data);
+		assert_eq!(written.as_slice(), snapshot_data);
 
 		Ok(())
 	}
@@ -6144,14 +6146,14 @@ mod tests {
 
 		// Verify the reader's operation
 		if let Some(IOChunk {
-			content: IOChunkContent::SliceInput { content, full_span, .. },
+			content: IOChunkContent::SliceInput { data, content, full_span },
 			utf8_verified,
 			..
 		}) = reader.get_line()?
 		{
-			assert_eq!(content, b"first line");
+			assert_eq!(&data[content.clone()], b"first line");
 			assert_eq!(content.len(), 10);
-			assert_eq!(full_span, b"first line\n");
+			assert_eq!(&data[full_span], b"first line\n");
 			assert!(!utf8_verified.get());
 			assert!(!reader.last_line().unwrap());
 		} else {
@@ -6159,13 +6161,13 @@ mod tests {
 		}
 
 		if let Some(IOChunk {
-			content: IOChunkContent::SliceInput { content, full_span, .. },
+			content: IOChunkContent::SliceInput { data, content, full_span },
 			utf8_verified,
 			..
 		}) = reader.get_line()?
 		{
-			assert_eq!(content, b"second line");
-			assert_eq!(full_span, b"second line\n");
+			assert_eq!(&data[content], b"second line");
+			assert_eq!(&data[full_span], b"second line\n");
 			assert!(!utf8_verified.get());
 			assert!(!reader.last_line().unwrap());
 		} else {
@@ -6185,30 +6187,6 @@ mod tests {
 
 		assert_eq!(reader.get_line()?, None);
 
-		Ok(())
-	}
-
-	/// Truncating an input file after sed opened it must not fault the host
-	/// process; the reader keeps serving the bytes captured at open. Unix only:
-	/// the snapshot is the `SliceInput` path; Windows always streams.
-	#[test]
-	#[cfg(unix)]
-	fn test_file_truncated_after_open() -> io::Result<()> {
-		let mut tmp = NamedTempFile::new()?;
-		for _ in 0..4 {
-			tmp.write_all(&[b'.'; 4095])?;
-			tmp.write_all(b"\n")?;
-		}
-		tmp.flush()?;
-		let mut reader = LineReader::open(&tmp.path().to_path_buf())?;
-		tmp.as_file().set_len(0)?;
-
-		let mut lines = 0;
-		while let Some(chunk) = reader.get_line()? {
-			assert_eq!(chunk.as_bytes(), [b'.'; 4095]);
-			lines += 1;
-		}
-		assert_eq!(lines, 4);
 		Ok(())
 	}
 
@@ -6283,8 +6261,8 @@ mod tests {
 	#[cfg(unix)]
 	#[test]
 	fn test_ensure_owned_on_slice_valid_utf8() {
-		let content = b"slice string";
-		let full_span = b"slice string\n";
+		let content = b"snapshot string";
+		let full_span = b"snapshot string\n";
 
 		let mut chunk = IOChunk::from_content(new_content_slice_input(content, full_span));
 
@@ -6293,7 +6271,7 @@ mod tests {
 
 		match &chunk.content {
 			IOChunkContent::Owned { content, has_newline, .. } => {
-				assert_eq!(content, "slice string");
+				assert_eq!(content, "snapshot string");
 				assert!(*has_newline);
 			},
 			_ => panic!("Expected Owned variant after ensure_owned"),
@@ -6404,68 +6382,66 @@ mod tests {
 		(buf, file)
 	}
 
+	/// A chunk over `range` of `data`, newline included in the span as written.
 	#[cfg(unix)]
-	fn make_slice_chunk(bytes: &'static [u8]) -> IOChunk<'static> {
+	fn make_slice_chunk(data: &Rc<Vec<u8>>, range: Range<usize>) -> IOChunk {
 		IOChunk {
 			utf8_verified: Cell::new(true),
-			content:       IOChunkContent::SliceInput { content: bytes, full_span: bytes },
+			content:       IOChunkContent::SliceInput { data: Rc::clone(data), content: range.clone(), full_span: range },
 		}
 	}
 
-	fn make_owned_chunk(s: &str, has_nl: bool) -> IOChunk<'_> {
+	fn make_owned_chunk(s: &str, has_nl: bool) -> IOChunk {
 		IOChunk {
 			utf8_verified: Cell::new(true),
 			content:       IOChunkContent::Owned {
 				content:                    s.to_string(),
 				has_newline:                has_nl,
-				#[cfg(not(unix))]
-				_phantom:                   std::marker::PhantomData,
 			},
 		}
 	}
 
-	#[cfg(unix)]
 	#[test]
+	#[cfg(unix)]
 	fn slice_new_chunk_single() {
 		let (mut outbuf, _file) = new_for_test(); // OutputBuffer
 
-		let c1 = make_slice_chunk(b"abc");
+		let backing = Rc::new(b"abc".to_vec());
+		let c1 = make_slice_chunk(&backing, 0..3);
 
 		outbuf.write_chunk(&c1).unwrap();
 
-		assert_eq!(outbuf.slice_chunk.as_ref().unwrap().len, 3);
+		assert_eq!(outbuf.slice_chunk.as_ref().unwrap().range.len(), 3);
 	}
 
-	#[cfg(unix)]
 	#[test]
+	#[cfg(unix)]
 	fn slice_new_chunk_and_coalesce() {
 		let (mut outbuf, _file) = new_for_test(); // OutputBuffer
 
-		let backing = b"abc\nefg\n"; // contiguous buffer, newline-terminated lines
-		let c1 = make_slice_chunk(&backing[0..4]); // "abc\n"
-		let c2 = make_slice_chunk(&backing[4..8]); // "efg\n"
+		let backing = Rc::new(b"abc\nefg\n".to_vec()); // contiguous, newline-terminated lines
+		let c1 = make_slice_chunk(&backing, 0..4); // "abc\n"
+		let c2 = make_slice_chunk(&backing, 4..8); // "efg\n"
 
 		outbuf.write_chunk(&c1).unwrap();
 		outbuf.write_chunk(&c2).unwrap();
 
-		assert_eq!(outbuf.slice_chunk.as_ref().unwrap().len, 8);
+		assert_eq!(outbuf.slice_chunk.as_ref().unwrap().range.len(), 8);
 	}
 
 	#[test]
 	#[cfg(unix)]
 	fn slice_not_contiguous_triggers_flush() {
 		let (mut buf, _file) = new_for_test();
-		let backing = b"abcdefghi";
-		let c1 = make_slice_chunk(&backing[0..4]); // "abcd"
-		// Guaranteed non-coalescable.  Surprisingly, on macOS
-		// passing two strings resulted in coalescible data.
-		let c2 = make_slice_chunk(&backing[5..9]); // "fghi"
+		let backing = Rc::new(b"abcdefghi".to_vec());
+		let c1 = make_slice_chunk(&backing, 0..4); // "abcd"
+		let c2 = make_slice_chunk(&backing, 5..9); // "fghi"
 
 		buf.write_chunk(&c1).unwrap();
-		assert_eq!(buf.slice_chunk.as_ref().unwrap().len, 4);
+		assert_eq!(buf.slice_chunk.as_ref().unwrap().range.len(), 4);
 		buf.write_chunk(&c2).unwrap();
-		// No coalescing
-		assert_eq!(buf.slice_chunk.as_ref().unwrap().len, 4);
+		// No coalescing: the pending span is now c2's alone.
+		assert_eq!(buf.slice_chunk.as_ref().unwrap().range, 5..9);
 	}
 
 	#[test]
@@ -6473,14 +6449,94 @@ mod tests {
 	fn slice_coalesce_and_flush_blocks() {
 		let (mut buf, _file) = new_for_test();
 		buf.max_pending_write = 4;
-		let backing = b"abcde\nfgh\n"; // contiguous newline-terminated lines
-		let c1 = make_slice_chunk(&backing[0..6]); // "abcde\n"
-		let c2 = make_slice_chunk(&backing[6..10]); // "fgh\n"
+		let backing = Rc::new(b"abcde\nfgh\n".to_vec()); // contiguous newline-terminated lines
+		let c1 = make_slice_chunk(&backing, 0..6); // "abcde\n"
+		let c2 = make_slice_chunk(&backing, 6..10); // "fgh\n"
 
 		buf.write_chunk(&c1).unwrap();
 		buf.write_chunk(&c2).unwrap();
-		// After a flush triggered by exceeding max_pending_write
-		assert_eq!(buf.slice_chunk.as_ref().unwrap().len, 0);
+		// Exceeding max_pending_write flushed the coalesced span.
+		assert!(buf.slice_chunk.is_none());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn queued_snapshot_spans_own_their_bytes_after_readers_and_chunks_drop() -> io::Result<()> {
+		for cap in [4, usize::MAX] {
+			let directory = tempfile::tempdir()?;
+			let input = directory.path().join("input");
+			let output = directory.path().join("output");
+			let expected = format!("{}\n{}\n", "a".repeat(4096), "b".repeat(4096));
+			fs::write(&input, &expected)?;
+			let mut reader = LineReader::open(&input)?;
+			let first = reader.get_line()?.expect("first line");
+			let second = reader.get_line()?.expect("second line");
+			let weak = match &first.content { IOChunkContent::SliceInput { data, .. } => Rc::downgrade(data), _ => panic!("expected snapshot") };
+			drop(reader);
+			assert_eq!(first.as_str().expect("retained UTF-8"), "a".repeat(4096));
+			let file = fs::File::create(&output)?;
+			let mut writer = OutputBuffer::new(Box::new(file), false);
+			writer.max_pending_write = cap;
+			writer.write_chunk(&first)?;
+			writer.write_chunk(&second)?;
+			drop(first);
+			drop(second);
+			writer.flush()?;
+			assert_eq!(fs::read_to_string(&output)?, expected);
+			assert!(weak.upgrade().is_none(), "flushed output must release its snapshot");
+			assert_eq!(writer.low_level_flushes, 1);
+		}
+		Ok(())
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn noncontiguous_and_different_snapshot_spans_are_not_combined() -> io::Result<()> {
+		let directory = tempfile::tempdir()?;
+		let a = directory.path().join("a");
+		let b = directory.path().join("b");
+		fs::write(&a, "alpha\nskip\nomega\n")?;
+		fs::write(&b, "xxxxx\nnew\n")?;
+		for separate_owner in [false, true] {
+			let mut reader = LineReader::open(&a)?;
+			let first = reader.get_line()?.expect("first");
+			let second = if separate_owner {
+				let mut other = LineReader::open(&b)?;
+				other.get_line()?;
+				other.get_line()?.expect("other owner")
+			} else { reader.get_line()?; reader.get_line()?.expect("noncontiguous") };
+			drop(reader);
+			let path = directory.path().join("out");
+			let mut writer = OutputBuffer::new(Box::new(fs::File::create(&path)?), false);
+			writer.write_chunk(&first)?;
+			writer.write_chunk(&second)?;
+			drop(first); drop(second);
+			writer.flush()?;
+			assert_eq!(fs::read_to_string(&path)?, if separate_owner { "alpha\nnew\n" } else { "alpha\nomega\n" });
+		}
+		Ok(())
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn invalid_snapshot_text_never_becomes_verified_and_raw_output_stays_lossless() -> io::Result<()> {
+		let directory = tempfile::tempdir()?;
+		let input = directory.path().join("input");
+		let output = directory.path().join("output");
+		let bytes = b"bad\xff\n";
+		fs::write(&input, bytes)?;
+		let mut reader = LineReader::open(&input)?;
+		let mut chunk = reader.get_line()?.expect("input line");
+		drop(reader);
+		assert!(chunk.as_str().is_err());
+		assert!(chunk.as_str().is_err());
+		let mut writer = OutputBuffer::new(Box::new(fs::File::create(&output)?), false);
+		writer.write_chunk(&chunk)?;
+		chunk.set_to_string("valid".to_owned(), true);
+		assert_eq!(chunk.as_str().expect("replacement string"), "valid");
+		writer.flush()?;
+		assert_eq!(fs::read(output)?, bytes);
+		Ok(())
 	}
 
 	#[test]
