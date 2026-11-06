@@ -19,12 +19,8 @@ import {
 	SESSION_OPEN_CUSTOM_TYPE,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
-import {
-	findInterruptedWork,
-	RECOVER_CUSTOM_TYPE,
-	type RecoverHost,
-	resumeInterruptedWork,
-} from "@oh-my-pi/pi-coding-agent/session/resume-interrupted";
+import { findInterruptedWork, RECOVER_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/recovery-journal";
+import { type RecoverHost, resumeInterruptedWork } from "@oh-my-pi/pi-coding-agent/session/resume-interrupted";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";

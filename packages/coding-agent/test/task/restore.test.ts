@@ -13,7 +13,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { getAgentTombstonePath } from "@oh-my-pi/pi-coding-agent/registry/agent-tombstone";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { createSessionOpenData, SESSION_OPEN_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
-import { RECOVER_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/resume-interrupted";
+import { RECOVER_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/recovery-journal";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
