@@ -276,6 +276,26 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	const resolveParentSession = () =>
 		ref.parentId === spec.rootAgentId ? spec.root : registry.get(ref.parentId ?? "")?.session;
 	const parentSession = resolveParentSession();
+	// The spawn's agent definition, as it stands now: it carries what the transcript
+	// does not, such as a Fusion lead's sidekick opt-in. File definitions follow the
+	// live parent's discovery scope; a missing parent uses current root discovery,
+	// never unrelated root-local pseudonyms.
+	const discoverySession = parentSession ?? spec.root;
+	const configuredAgent = init.agent
+		? getAgent(
+				[
+					...(
+						await discoverAgents(
+							discoverySession.sessionManager.getCwd(),
+							undefined,
+							discoverySession.effectiveExtensionRoots,
+						)
+					).agents,
+					...(parentSession?.getSessionAgents() ?? []),
+				],
+				init.agent,
+			)
+		: undefined;
 	let perCallModel: Model | undefined;
 	let assertApprovedModel: ((model: Model) => void) | undefined;
 	if (init.perCallModel) {
@@ -292,24 +312,6 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 					`Cannot revive subagent "${ref.id}": its per-call model ${init.perCallModelIdentity} is no longer available. A per-call worker revives only on its exact saved model.`,
 				);
 			}
-			// File definitions follow the live parent's discovery scope; a missing parent
-			// can use current root file discovery, never unrelated root-local pseudonyms.
-			const discoverySession = parentSession ?? spec.root;
-			const configuredAgent = init.agent
-				? getAgent(
-						[
-							...(
-								await discoverAgents(
-									discoverySession.sessionManager.getCwd(),
-									undefined,
-									discoverySession.effectiveExtensionRoots,
-								)
-							).agents,
-							...(parentSession?.getSessionAgents() ?? []),
-						],
-						init.agent,
-					)
-				: undefined;
 			const matchPreferences = structuredClone(getModelMatchPreferences(spec.settings.grantAuthority()));
 			// One grants object per live parent model keeps approval decisions cached across requests.
 			const grantsByParentModel = new Map<string | undefined, PerCallModelGrants>();
@@ -450,6 +452,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			agentDisplayName: ref.displayName,
 			// `agents` rule scoping keys on the durable definition name (see `persistedAgentName`).
 			agentName: persistedAgentName(ref.displayName, init),
+			agentDefinition: configuredAgent,
 			parentTaskPrefix: ref.id,
 			asyncJobManager: spec.asyncJobManager,
 			parentAgentId: ref.parentId,
