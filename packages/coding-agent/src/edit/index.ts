@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
 	AgentToolArgStream,
@@ -11,6 +12,7 @@ import type {
 	ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
 import type { Model, ToolExample } from "@oh-my-pi/pi-ai";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import {
 	EditSession,
 	editDescription,
@@ -25,6 +27,8 @@ import {
 	type EditWriteResponse,
 } from "@oh-my-pi/pi-natives";
 import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
+import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
+import { codexExecNestedSummary } from "../harness/codex-nested";
 import { extractUriScheme, InternalUrlRouter, type ResolveContext, sessionResolveContext } from "../internal-urls";
 import { createLspWritethrough, flushLspWritethroughBatch, type WritethroughCallback, writethroughNoop } from "../lsp";
 import { type FileDiagnosticsResult } from "@oh-my-pi/pi-tui/tools/lsp";
@@ -48,6 +52,7 @@ import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { resolveEditMode } from "../utils/edit-mode";
 import { attemptEditAutoRepair, type EditAutoRepairOutcome } from "./auto-repair";
 import { type AppliedEditSnapshot, createEditBlackboxRecorder } from "./blackbox";
+import claudeCodeEditDescription from "../prompts/tools/harness/claude-code-edit.md" with { type: "text" };
 import hashlineCompactPrompt from "./hashline-compact.md" with { type: "text" };
 import { getLspBatchRequest } from "../lsp/batch";
 import { type EditToolDetails, type EditToolPerFileResult, type Operation } from "@oh-my-pi/pi-tui/tools/edit";
@@ -90,14 +95,95 @@ export * from "./schemas";
 export * from "./store";
 export { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 
+const claudeCodeEditSchema = type({
+	file_path: "string",
+	old_string: "string",
+	new_string: "string",
+	replace_all: "boolean = false",
+});
+type ClaudeCodeEditParams = typeof claudeCodeEditSchema.inferIn;
+
+const REPLACE_BRIDGES: HarnessBridges<ReplaceParams, typeof claudeCodeEditSchema> = {
+	"claude-code": {
+		parameters: claudeCodeEditSchema,
+		toParams: ({ file_path, ...rest }) => ({ path: file_path, ...rest }),
+	},
+};
+
 type TInput =
 	| typeof replaceEditSchema
+	| typeof claudeCodeEditSchema
 	| typeof patchEditSchema
 	| typeof hashlineEditParamsSchema
 	| typeof applyPatchSchema
 	| typeof sloppyEditSchema;
 
-type EditParams = ReplaceParams | ReplaceBatchParams | PatchParams | HashlineParams | ApplyPatchParams | SloppyParams;
+type EditParams =
+	| ReplaceParams
+	| ClaudeCodeEditParams
+	| ReplaceBatchParams
+	| PatchParams
+	| HashlineParams
+	| ApplyPatchParams
+	| SloppyParams;
+
+class StreamedKeyRename {
+	#depth = 0;
+	#inString = false;
+	#escaped = false;
+	#expectKey = false;
+	#key: string | undefined;
+
+	constructor(
+		private readonly from: string,
+		private readonly to: string,
+	) {}
+
+	push(delta: string): string {
+		let out = "";
+		for (const ch of delta) {
+			if (this.#key !== undefined) {
+				if (this.#escaped) {
+					this.#escaped = false;
+				} else if (ch === "\\") {
+					this.#escaped = true;
+				} else if (ch === '"') {
+					out += `"${this.#key === this.from ? this.to : this.#key}"`;
+					this.#key = undefined;
+					continue;
+				}
+				this.#key += ch;
+				continue;
+			}
+			if (this.#inString) {
+				if (this.#escaped) this.#escaped = false;
+				else if (ch === "\\") this.#escaped = true;
+				else if (ch === '"') this.#inString = false;
+				out += ch;
+				continue;
+			}
+			if (ch === '"') {
+				if (this.#depth === 1 && this.#expectKey) {
+					this.#key = "";
+					continue;
+				}
+				this.#inString = true;
+			} else if (ch === "{" || ch === "[") {
+				this.#depth++;
+				this.#expectKey = ch === "{";
+			} else if (ch === "}" || ch === "]") {
+				this.#depth--;
+				this.#expectKey = false;
+			} else if (ch === ",") {
+				this.#expectKey = this.#depth === 1;
+			} else if (ch === ":") {
+				this.#expectKey = false;
+			}
+			out += ch;
+		}
+		return out;
+	}
+}
 
 const PATCH_EXAMPLES = [
 	{
@@ -386,13 +472,30 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	get description(): string {
-		return resolveEditToolDescription(this.mode, this.session.getActiveModel?.());
+		// With no vendor declaration to serve, Claude Code's `Edit` still describes
+		// its own fields; omp's replace prompt also claims a read-before-edit gate
+		// replace mode does not have.
+		if (this.parameters === claudeCodeEditSchema) return prompt.render(claudeCodeEditDescription);
+		const mode = this.mode;
+		const model = this.session.getActiveModel?.();
+		const rendered = resolveEditToolDescription(mode, model);
+		// Codex trains on the freeform apply_patch shape; when the capture is
+		// served, lead with the vendor's own nested summary for that tool.
+		if (mode === "apply_patch" && model && effectiveHarnessProfile(this.session.settings, model) === "codex") {
+			const vendor = codexExecNestedSummary(
+				model,
+				"apply_patch",
+				effectiveHarnessProfile(this.session.settings, model),
+			);
+			if (vendor) return `${vendor}\n\n${rendered}`;
+		}
+		return rendered;
 	}
 
 	get parameters(): TInput {
 		switch (this.mode) {
 			case "replace":
-				return replaceEditSchema;
+				return harnessParameters(this.session, REPLACE_BRIDGES, replaceEditSchema);
 			case "patch":
 				return patchEditSchema;
 			case "apply_patch":
@@ -484,6 +587,8 @@ export class EditTool implements AgentTool<TInput> {
 		// A call that arrived through the custom-tool wire streams the payload
 		// verbatim; JSON function calls stream JSON text.
 		const rawInput = init.customWireName !== undefined;
+		const rename =
+			!rawInput && this.parameters === claudeCodeEditSchema ? new StreamedKeyRename("file_path", "path") : undefined;
 		const open = this.#openSession(rawInput, undefined, (error, batch) => {
 			if (error) {
 				logger.debug("Native edit preview failed", { error: error.message, toolCallId: init.toolCallId });
@@ -502,11 +607,12 @@ export class EditTool implements AgentTool<TInput> {
 			this.#streamedArgs.delete(oldestId);
 		}
 		return {
-			push: delta => editSession.push(delta),
+			push: delta => editSession.push(rename ? rename.push(delta) : delta),
 			end: args => {
 				editSession.finish();
 				this.#streamedArgs.set(init.toolCallId, JSON.stringify(args));
 			},
+
 			cancel: () => {
 				editSession.close();
 				if (this.#sessions.get(init.toolCallId) === open) this.#sessions.delete(init.toolCallId);
@@ -517,11 +623,12 @@ export class EditTool implements AgentTool<TInput> {
 
 	async execute(
 		toolCallId: string,
-		params: EditParams,
+		input: EditParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<EditToolDetails, TInput>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
+		const params = this.#params(input);
 		let open = this.#sessions.get(toolCallId);
 		const argsJson = JSON.stringify(params);
 		if (open && this.#streamedArgs.get(toolCallId) !== argsJson) {
@@ -627,12 +734,16 @@ export class EditTool implements AgentTool<TInput> {
 		if (cached?.mode === this.mode) return cached.inspection;
 		let inspection: EditInspection;
 		try {
-			inspection = editInspect(this.mode, JSON.stringify(args ?? {}));
+			inspection = editInspect(this.mode, JSON.stringify(this.#params(args) ?? {}));
 		} catch {
 			inspection = { paths: [], entries: [], fileOps: [] };
 		}
 		if (tagged) tagged[kInspection] = { mode: this.mode, inspection };
 		return inspection;
+	}
+
+	#params(args: unknown): unknown {
+		return this.mode === "replace" ? harnessParams(this.session, REPLACE_BRIDGES, args) : args;
 	}
 
 	/**

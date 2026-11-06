@@ -6,6 +6,7 @@
  */
 
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+export { ToolError };
 
 /**
  * Error thrown when a tool operation is aborted (e.g., via AbortSignal).

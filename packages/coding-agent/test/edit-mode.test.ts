@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { type Model } from "@oh-my-pi/pi-ai/types";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgEditFuzzyMatch, cfgEditMode, cfgEditModelVariants } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
@@ -22,6 +24,7 @@ function restoreEnv(): void {
 
 function createSession(args: {
 	activeModel?: string;
+	activeModelObject?: Model;
 	/** Configured `edit.modelVariants` entry keyed by the whole active model selector. */
 	modelVariant?: EditMode;
 	settingsMode?: EditMode;
@@ -32,7 +35,7 @@ function createSession(args: {
 	if (args.modelVariant && args.activeModel) {
 		cfgEditModelVariants.set(settings, { [args.activeModel]: args.modelVariant });
 	}
-	return { getActiveModelString: () => args.activeModel, settings };
+	return { getActiveModelString: () => args.activeModel, getActiveModel: () => args.activeModelObject, settings };
 }
 
 describe("resolveEditMode", () => {
@@ -170,6 +173,23 @@ describe("resolveEditMode", () => {
 		expect(resolveEditMode(createSession({ activeModel: "openrouter/moonshotai/Kimi-K2-Instruct" }))).toBe(
 			"hashline",
 		);
+	});
+
+	test("defaults to apply_patch under the codex harness profile", () => {
+		delete Bun.env.PI_EDIT_VARIANT;
+		const codex = getBundledModel("openai-codex", "gpt-6-astra");
+
+		expect(
+			resolveEditMode(createSession({ activeModel: "openai-codex/gpt-6-astra", activeModelObject: codex })),
+		).toBe("apply_patch");
+		// An explicit user setting still wins over the profile default.
+		expect(
+			resolveEditMode(
+				createSession({ activeModel: "openai-codex/gpt-6-astra", activeModelObject: codex, settingsMode: "patch" }),
+			),
+		).toBe("patch");
+		// Unprofiled codex models keep the hashline default.
+		expect(resolveEditMode(createSession({ activeModel: "openai-codex/gpt-5.1-codex" }))).toBe("hashline");
 	});
 });
 

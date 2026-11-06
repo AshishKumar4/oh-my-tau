@@ -1,5 +1,5 @@
 export interface ToolTimeoutConfig {
-	/** Default timeout in seconds when agent omits the field */
+	/** Foreground fallback in seconds; background-capable tools bypass it for jobs. */
 	default: number;
 	/** Minimum allowed timeout in seconds */
 	min: number;
@@ -28,7 +28,8 @@ export type ToolWithTimeout = keyof typeof TOOL_TIMEOUTS;
  * `maxTimeout` (the `tools.maxTimeout` global ceiling) caps the *resolved*
  * value — including the default-fallback path — before the per-tool `min`/`max`
  * floor and ceiling apply, so a configured global cap governs calls where the
- * agent omits `timeout`, not only explicitly-passed values. `maxTimeout <= 0`
+ * agent omits `timeout`, not only explicitly-passed values. Background-capable
+ * tools bypass this fallback when no deadline was requested. `maxTimeout <= 0`
  * means no global cap.
  */
 export function clampTimeout(tool: ToolWithTimeout, rawTimeout?: number, maxTimeout?: number): number {

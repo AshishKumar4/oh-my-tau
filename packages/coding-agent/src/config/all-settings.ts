@@ -7,6 +7,7 @@ import { all, type AnySetting, Setting } from "./registry";
 import * as modesSettings from "../modes/settings";
 import * as sessionSettings from "../session/settings";
 import * as advisorSettings from "../advisor/settings";
+import * as harnessSettings from "../harness/settings";
 import * as configModelSettings from "./model-settings";
 import * as sessionContextSettings from "../session/context-settings";
 import * as memoryBackendSettings from "../memory-backend/settings";
@@ -22,6 +23,7 @@ import * as lspSettings from "../lsp/settings";
 import * as execSettings from "../exec/settings";
 import * as evalSettings from "../eval/settings";
 import * as taskSettings from "../task/settings";
+import * as fusionSettings from "../fusion/settings";
 import * as planModeSettings from "../plan-mode/settings";
 import * as goalsSettings from "../goals/settings";
 import * as titleSettings from "../utils/title-settings";
@@ -47,6 +49,7 @@ const DOMAINS: readonly Readonly<Record<string, unknown>>[] = [
 	configModelSettings,
 	modesSettings,
 	sessionSettings,
+	harnessSettings,
 	telemetrySettings,
 	advisorSettings,
 	sessionContextSettings,
@@ -63,6 +66,7 @@ const DOMAINS: readonly Readonly<Record<string, unknown>>[] = [
 	execSettings,
 	evalSettings,
 	taskSettings,
+	fusionSettings,
 	planModeSettings,
 	goalsSettings,
 	titleSettings,

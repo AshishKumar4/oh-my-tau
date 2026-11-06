@@ -33,6 +33,7 @@ import {
 	writeArchive,
 } from "@oh-my-pi/pi-utils/ar";
 import { detectLineEnding, normalizeToLF, restoreLineEndings } from "../edit/normalize";
+import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
 
 import {
 	extractUriScheme,
@@ -48,6 +49,8 @@ import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getLspBatchRequest } from "../lsp/batch";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 
+import claudeCodeWriteDescription from "../prompts/tools/harness/claude-code-write.md" with { type: "text" };
+import claudeCodeWriteDeviceOnlyDescription from "../prompts/tools/harness/claude-code-write-device-only.md" with { type: "text" };
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import writeDeviceOnlyDescription from "../prompts/tools/write-device-only.md" with { type: "text" };
 import writeDeviceOnlyRefusal from "../prompts/tools/write-device-only-refusal.md" with { type: "text" };
@@ -218,6 +221,20 @@ const writeSchema = type({
 
 /** Write arguments; `content` may be omitted only where the target scheme's write policy allows it. */
 export type WriteToolInput = typeof writeSchema.infer;
+
+const claudeCodeWriteSchema = type({
+	file_path: type("string").describe("absolute file path"),
+	content: type("string").describe("file content"),
+});
+
+type WriteInputSchema = typeof writeSchema | typeof claudeCodeWriteSchema;
+
+const WRITE_BRIDGES: HarnessBridges<WriteToolInput, typeof claudeCodeWriteSchema> = {
+	"claude-code": {
+		parameters: claudeCodeWriteSchema,
+		toParams: args => ({ path: args.file_path, content: args.content }),
+	},
+};
 
 /**
  * A `read` notice that its projection is incomplete: a truncation notice, or the column-cap
@@ -582,10 +599,10 @@ function parseSqliteWriteTarget(subPath: string, queryString: string): { table: 
  *
  * Creates or overwrites files with optional LSP formatting and diagnostics.
  */
-export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails> {
+export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> {
 	readonly name = "write";
 	readonly approval = (args: unknown): ToolApprovalDecision => {
-		const { path: rawPath, content } = args as Partial<WriteParams>;
+		const { path: rawPath, content } = harnessParams(this.session, WRITE_BRIDGES, args);
 		if (typeof rawPath !== "string") return "write";
 		// Unwrap a hashline `[path#TAG]` wrapper first (parity with execute) so a
 		// wrapped `[scheme://h/x#ABCD]` gets the same tier as the bare URL.
@@ -596,7 +613,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		);
 	};
 	readonly formatApprovalDetails = (args: unknown): string[] => {
-		const params = args as Partial<WriteParams>;
+		const params = harnessParams(this.session, WRITE_BRIDGES, args);
 		const targetPath = typeof params.path === "string" ? params.path : "(missing)";
 		const content = typeof params.content === "string" ? params.content : "";
 		const unwrapped = unwrapHashlineHeaderPath(targetPath);
@@ -624,16 +641,23 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly label = "Write";
 	get description(): string {
 		const deviceOnly = this.session.deviceOnlyWrite === true && this.session.pendingFullWriteDescription !== true;
+		// With no vendor declaration to serve, Claude Code's `Write` still names its
+		// own `file_path` and `Read`, not omp's `path` and `read`.
+		if (this.parameters === claudeCodeWriteSchema) {
+			return prompt.render(deviceOnly ? claudeCodeWriteDeviceOnlyDescription : claudeCodeWriteDescription);
+		}
 		return prompt.render(deviceOnly ? writeDeviceOnlyDescription : writeDescription);
 	}
-	readonly parameters = writeSchema;
+	get parameters(): WriteInputSchema {
+		return harnessParameters(this.session, WRITE_BRIDGES, writeSchema);
+	}
 	readonly strict = true;
 	readonly concurrency = "exclusive";
 	readonly loadMode = "essential";
 
 	/** Stream matchers should see the real file content, not its JSON-escaped argument encoding. */
 	matcherDigest(args: unknown): string | undefined {
-		const content = (args as Partial<WriteParams>).content;
+		const content = harnessParams(this.session, WRITE_BRIDGES, args).content;
 		return typeof content === "string" ? content : undefined;
 	}
 
@@ -930,11 +954,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 	async execute(
 		_toolCallId: string,
-		{ path: rawPath, content: rawContent }: WriteParams,
+		input: WriteParams | typeof claudeCodeWriteSchema.infer,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<WriteToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<WriteToolDetails>> {
+		const { path: rawPath, content: rawContent } = harnessParams(this.session, WRITE_BRIDGES, input);
 		// Strip a hashline `[path#TAG]` wrapper up front so every downstream
 		// decision (scheme routing, internal-URL handler dispatch, plan-mode
 		// guard, plan path resolution, ACP bridge routing) sees the same

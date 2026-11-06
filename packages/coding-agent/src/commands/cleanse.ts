@@ -1,8 +1,11 @@
-import { postmortem } from "@oh-my-pi/pi-utils";
+import { getProjectDir, postmortem } from "@oh-my-pi/pi-utils";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { runCleanseCommand } from "../cleanse";
 import { cleanseHelp as commandHelp } from "../cli/command-help";
 import { CliUsageError } from "../cli/usage-error";
+import { Settings } from "../config/settings";
+import { setSharedLspEnabled } from "../lsp/client";
+import { cfgLspShared } from "../lsp/settings";
 
 export default class Cleanse extends Command {
 	static description = commandHelp.description;
@@ -48,6 +51,10 @@ export default class Cleanse extends Command {
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Cleanse);
 		if (flags.agents <= 0) throw new CliUsageError("--agents must be a positive integer");
+		// Standalone cleanse has only worker sessions; in-process /cleanse leaves
+		// shared-LSP policy with its existing parent session instead.
+		const settings = await Settings.init({ cwd: getProjectDir() });
+		setSharedLspEnabled(cfgLspShared.get(settings));
 		const result = await runCleanseCommand({
 			maxAgents: flags.agents,
 			model: flags.model,

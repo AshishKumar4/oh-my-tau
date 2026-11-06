@@ -1,10 +1,12 @@
-import { type ElidedRange, formatSingleLine } from "@oh-my-pi/pi-tui/tools/read";
+import { type ElidedRange, formatSingleLine, type LineNumbering, numberedLine } from "@oh-my-pi/pi-tui/tools/read";
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { countNewlines } from "@oh-my-pi/pi-utils";
 import { getEditStore } from "../edit/store";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import {
 	formatHashlineHeader,
+	formatNumberedLine,
 	formatNumberedLines,
 	splitAddressableFileLines,
 } from "@oh-my-pi/pi-tui/tools/hashline-format";
@@ -36,6 +38,12 @@ import type { TruncationMetaInput } from "./output-meta";
 import { toolResult } from "./tool-result";
 
 import { cfgReadRenderMarkdown } from "./settings";
+function prependLineNumbers(text: string, startNum: number, numbering: LineNumbering): string {
+	return text
+		.split("\n")
+		.map((line, i) => numberedLine(startNum + i, line, numbering))
+		.join("\n");
+}
 
 export function toReadTruncationStats(result: TruncationResult): ReadTruncationStats {
 	const { content: _content, ...stats } = result;
@@ -55,12 +63,6 @@ export function appendReadNotice(text: string, notice: string, details: ReadTool
 export function markRawSuffixResolution(resolution: ReadToolDetails["suffixResolution"], raw: boolean): void {
 	if (resolution && raw) resolution.raw = true;
 }
-
-function prependLineNumbers(text: string, startNum: number): string {
-	const textLines = text.split("\n");
-	return textLines.map((line, i) => `${startNum + i}|${line}`).join("\n");
-}
-
 export interface HashlineHeaderContext {
 	header: string;
 	tag: string;
@@ -143,25 +145,34 @@ export function formatTextWithMode(
 	startNum: number,
 	shouldAddHashLines: boolean,
 	shouldAddLineNumbers: boolean,
+	numbering: LineNumbering = "pipe",
 ): string {
 	if (shouldAddHashLines) return formatNumberedLines(text, startNum);
-	if (shouldAddLineNumbers) return prependLineNumbers(text, startNum);
+	if (shouldAddLineNumbers) return prependLineNumbers(text, startNum, numbering);
 	return text;
 }
 
 export const BRACKET_CONTEXT_ELLIPSIS = "…";
 
-function formatLineEntryWithMode(entry: LineEntry, shouldAddHashLines: boolean, shouldAddLineNumbers: boolean): string {
+function formatLineEntryWithMode(
+	entry: LineEntry,
+	shouldAddHashLines: boolean,
+	shouldAddLineNumbers: boolean,
+	numbering: LineNumbering,
+): string {
 	if (entry.kind === "ellipsis") return BRACKET_CONTEXT_ELLIPSIS;
-	return formatSingleLine(entry.lineNumber, entry.text, shouldAddHashLines, shouldAddLineNumbers);
+	return formatSingleLine(entry.lineNumber, entry.text, shouldAddHashLines, shouldAddLineNumbers, numbering);
 }
 
 export function formatLineEntriesWithMode(
 	entries: readonly LineEntry[],
 	shouldAddHashLines: boolean,
 	shouldAddLineNumbers: boolean,
+	numbering: LineNumbering = "pipe",
 ): string {
-	return entries.map(entry => formatLineEntryWithMode(entry, shouldAddHashLines, shouldAddLineNumbers)).join("\n");
+	return entries
+		.map(entry => formatLineEntryWithMode(entry, shouldAddHashLines, shouldAddLineNumbers, numbering))
+		.join("\n");
 }
 
 /** Line count of file content: 0 for empty text, otherwise N newlines ⇒ N+1 lines. */
@@ -244,6 +255,31 @@ function lineNumbersFromEntries(entries: readonly LineEntry[]): number[] {
 	return lines;
 }
 
+/**
+ * Whether the model reads through Claude Code's `Read` (`file_path`, `offset`,
+ * `limit`) rather than omp's `read` with inline `path:N` selectors. That schema
+ * has no selector syntax, so read hints must name its parameters instead of
+ * asking for something the model cannot send.
+ */
+export function usesClaudeCodeRead(session: ToolSession): boolean {
+	const model = session.getActiveModel?.();
+	return model !== undefined && effectiveHarnessProfile(session.settings, model) === "claude-code";
+}
+
+/** Continuation hint for the line after a window; `selectorBase` prefixes the native selector. */
+export function formatContinueHint(session: ToolSession, selectorBase: string, nextLine: number): string {
+	return usesClaudeCodeRead(session)
+		? `Use offset=${nextLine} to continue`
+		: `Use ${selectorBase}:${nextLine} to continue`;
+}
+
+/** Recovery hint for a start line past the last of `totalLines`. */
+export function formatBeyondEndHint(session: ToolSession, selectorBase: string, totalLines: number): string {
+	return usesClaudeCodeRead(session)
+		? `Use offset=1 to read from the start, or offset=${totalLines} to read the last line.`
+		: `Use ${selectorBase}:1 to read from the start, or ${selectorBase}:${totalLines} to read the last line.`;
+}
+
 /** Sample ranges shown in the footer to demonstrate the multi-range syntax. */
 const FOOTER_RANGE_SAMPLES = 2;
 
@@ -253,14 +289,22 @@ const FOOTER_RANGE_SAMPLES = 2;
  * markers or burn a turn guessing the right selector (see issue #1046). The
  * footer demonstrates the multi-range selector syntax with concrete sample
  * ranges drawn from the actual elision so the model re-reads only what it
- * needs instead of falling back to `:raw` or whole-file reads.
+ * needs instead of falling back to `:raw` or whole-file reads. `byOffset`
+ * phrases the sample as `offset`/`limit` arguments, one range per call.
  */
 export function formatSummaryElisionFooter(
 	readPath: string,
 	elidedRanges: ReadonlyArray<ElidedRange>,
 	elidedLines: number,
+	byOffset = false,
 ): string {
 	if (elidedRanges.length === 0) return "";
+	if (byOffset) {
+		const first = elidedRanges[0]!;
+		const example = `offset=${first.start} limit=${first.end - first.start + 1}`;
+		const tail = elidedRanges.length > 1 ? `, e.g. ${example}` : ` with ${example}`;
+		return `[…${elidedLines}ln elided; re-read needed ranges${tail}]`;
+	}
 	const sampleCount = Math.min(elidedRanges.length, FOOTER_RANGE_SAMPLES);
 	const selector = elidedRanges
 		.slice(0, sampleCount)
@@ -391,9 +435,7 @@ export async function buildInMemoryTextResult(
 
 	if (requestedStart >= totalLines) {
 		const suggestion =
-			totalLines === 0
-				? `The ${options.entityLabel} is empty.`
-				: `Use :1 to read from the start, or :${totalLines} to read the last line.`;
+			totalLines === 0 ? `The ${options.entityLabel} is empty.` : formatBeyondEndHint(session, "", totalLines);
 		const notice = `Line ${requestedStart + 1} is beyond end of ${options.entityLabel} (${totalLines} lines total). ${suggestion}`;
 		return resultBuilder.text(appendReadNotice("", notice, details)).done();
 	}
@@ -463,7 +505,7 @@ export async function buildInMemoryTextResult(
 			lineNumbers: Array.from({ length: lineCount }, (_, i) => startNum + i),
 		};
 		if (shouldAddHashLines) seenLines = contiguousLineNumbers(startNum, lineCount);
-		const formatted = formatTextWithMode(content, startNum, shouldAddHashLines, shouldAddLineNumbers);
+		const formatted = formatTextWithMode(content, startNum, shouldAddHashLines, shouldAddLineNumbers, displayMode.numbering);
 		if (!hashContext || emittedHashlineHeader) return formatted;
 		emittedHashlineHeader = true;
 		return prependHashlineHeader(formatted, hashContext);
@@ -551,7 +593,8 @@ export async function buildInMemoryTextResult(
 		} else {
 			outputText = formatLineEntries(buildLineEntries(allLines, endLine), startLineDisplay);
 		}
-		outputText += `\n\n[${remaining} more lines in ${options.entityLabel}. Use :${nextOffset} to continue]`;
+		const continueHint = formatContinueHint(session, "", nextOffset);
+		outputText += `\n\n[${remaining} more lines in ${options.entityLabel}. ${continueHint}]`;
 	} else {
 		if (!allLines) {
 			rawSeenLines = contiguousLineNumbers(startLineDisplay, endLine - startLine);

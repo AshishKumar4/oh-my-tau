@@ -4,7 +4,13 @@
  */
 import { combine, register, type SettingValueOf } from "../config/registry";
 
-/** One bash-interceptor rule: commands matching `pattern` are redirected to `tool`. */
+/**
+ * One bash-interceptor rule: commands matching `pattern` are redirected to
+ * `tool`. `message` may name tools through `{{toolRefs.<tool>}}` (the name the
+ * session presents it under) and gate fields on the served Bash schema:
+ * `{{#if nativeBash}}` for omp's own (service `name`, `proc://`), and
+ * `{{#if backgroundField}}` for a harness schema's `run_in_background`.
+ */
 export interface BashInterceptorRule {
 	pattern: string;
 	flags?: string;
@@ -25,7 +31,8 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 		pattern:
 			"^\\s*(?:(?:head|tail|less|more)\\s+|cat\\s+(?!\\s|(?:[02-9]>{1,2}\\|?\\s*[^\\s>|]\\S*\\s+)*(?:<<|1?>(?!&)|&>)))",
 		tool: "read",
-		message: "Use the `read` tool instead of cat/head/tail. It provides better context and handles binary files.",
+		message:
+			"Use the `{{toolRefs.read}}` tool instead of cat/head/tail. It provides better context and handles binary files.",
 	},
 	{
 		pattern: "^\\s*(grep|rg|ripgrep|ag|ack)\\s+",
@@ -40,17 +47,18 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 	{
 		pattern: "^\\s*sed\\s+(-i|--in-place)",
 		tool: "edit",
-		message: "Use the `edit` tool instead of sed -i. It provides diff preview and fuzzy matching.",
+		message: "Use the `{{toolRefs.edit}}` tool instead of sed -i. It provides diff preview and fuzzy matching.",
 	},
 	{
 		pattern: "^\\s*perl\\s+.*-[pn]?i",
 		tool: "edit",
-		message: "Use the `edit` tool instead of perl -i. It provides diff preview and fuzzy matching.",
+		message: "Use the `{{toolRefs.edit}}` tool instead of perl -i. It provides diff preview and fuzzy matching.",
 	},
 	{
 		pattern: "^\\s*awk\\s+.*-i\\s+inplace",
 		tool: "edit",
-		message: "Use the `edit` tool instead of awk -i inplace. It provides diff preview and fuzzy matching.",
+		message:
+			"Use the `{{toolRefs.edit}}` tool instead of awk -i inplace. It provides diff preview and fuzzy matching.",
 	},
 	{
 		// `>` must sit outside quoted regions (so `echo "a -> b"` passes) and be
@@ -75,25 +83,27 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 			"^\\s*(?:(?:echo|printf)\\s+|cat\\s*<<|cat(?=\\s+(?:\\d+|&)?>)\\s+)(?:(?:\\\\[\\s\\S]|\\$\\((?:[^()\"'`]|\"[^\"]*\"|'[^']*'|`[^`]*`|\\([^()]*\\))*\\)|\\$\\{[^{}]*\\}|`[^`]*`|\\$(?!\\((?:[^()\"'`]|\"[^\"]*\"|'[^']*'|`[^`]*`|\\([^()]*\\))*\\)|\\{[^{}]*\\})|`(?![^`]*`)|[^\"'>;&|\\n\\\\$`]|(?<=[<>])&|(?<![<>])&(?=>)|(?<=(?:^|\\s)[02-9])>{1,2}\\|?|\"[^\"]*\"|'[^']*')|(?<!\\||>|(?:^|\\s)[02-9])>{1,2}\\|?\\s*(?:\"/dev/(?:null|tty|stdout|stderr)\"|'/dev/(?:null|tty|stdout|stderr)'|/dev/(?:null|tty|stdout|stderr))(?=[\\s;&|]|$))*(?<!\\||>|(?:^|\\s)[02-9])>{1,2}\\|?\\s*(?!(?:\"/dev/(?:null|tty|stdout|stderr)\"|'/dev/(?:null|tty|stdout|stderr)'|/dev/(?:null|tty|stdout|stderr))(?:[\\s;&|]|$))[$\\w./~\"'-]",
 		tool: "write",
 		message:
-			"Use the `write` tool instead of echo/cat redirection. It handles encoding and provides confirmation. `write` replaces the whole file; to append to an existing file, use `edit` to insert after its last line.",
+			"Use the `{{toolRefs.write}}` tool instead of echo/cat redirection. It handles encoding and provides confirmation. `{{toolRefs.write}}` replaces the whole file; to append to an existing file, use `{{toolRefs.edit}}` to insert after its last line.",
 	},
 	{
 		pattern: "^\\s*nohup\\s+|(?<!&)\\&\\s*$",
 		tool: "bash",
 		message:
-			"Use `bash` with `name` instead of nohup or background shell syntax so the service stays observable and managed.",
+			"Use `{{toolRefs.bash}}`{{#if nativeBash}} with `name`{{else}}{{#if backgroundField}} with `run_in_background: true`{{/if}}{{/if}} instead of nohup or background shell syntax so the service stays observable and managed.",
 	},
 	{
 		pattern:
 			"^\\s*(?:(?:bun|npm|pnpm|yarn)\\s+(?:run\\s+)?(?:dev|start)(?:\\s|$)|(?:vite|next\\s+dev|nuxt\\s+dev|nodemon|lldb|gdb|tail\\s+-f)(?:\\s|$)|docker\\s+compose\\s+up(?!.*(?:\\s-d(?:\\s|$)|--detach))(?:\\s|$))",
 		tool: "bash",
-		message: "Use `bash` with `name` for services, watchers, and debuggers; inspect with `read proc://<name>`.",
+		message:
+			"Use `{{toolRefs.bash}}`{{#if nativeBash}} with `name`{{else}}{{#if backgroundField}} with `run_in_background: true`{{/if}}{{/if}} for services, watchers, and debuggers{{#if nativeBash}}; inspect with `{{toolRefs.read}} proc://<name>`{{/if}}.",
 	},
 	{
 		pattern:
 			"^\\s*(?:(?:bun|npm|pnpm|yarn)\\s+(?:run\\s+)?\\S+|cargo\\s+watch|watchexec|pytest|vitest|jest|tsc)(?:.|\\n)*(?:--watch|-w)(?:\\s|$)",
 		tool: "bash",
-		message: "Use `bash` with `name` for watch mode so its output, input, and lifecycle stay managed.",
+		message:
+			"Use `{{toolRefs.bash}}`{{#if nativeBash}} with `name`{{else}}{{#if backgroundField}} with `run_in_background: true`{{/if}}{{/if}} for watch mode so its output, input, and lifecycle stay managed.",
 	},
 ];
 

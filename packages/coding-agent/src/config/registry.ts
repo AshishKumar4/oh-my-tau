@@ -55,6 +55,12 @@ export interface UiString extends UiBase {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
 }
 
+/**
+ * A provider-keyed record whose values are one of `options` edits as a per-provider choice; one
+ * without options has no structured editor. `defaultOption` is what a provider without an entry gets.
+ */
+export type UiRecord = UiBase | (UiBase & { options: ReadonlyArray<SubmenuOption>; defaultOption: string });
+
 export interface UiArray extends UiBase {
 	/** Membership choices. Without options or a JSON editor, the array stays config-file only. */
 	options?: ReadonlyArray<SubmenuOption>;
@@ -165,7 +171,7 @@ export interface RecordDefinition<T = unknown> extends DefinitionBase {
 	type: "record";
 	default: Readonly<Record<string, T>>;
 	env?: SettingEnv<Readonly<Record<string, T>>>;
-	ui?: UiBase;
+	ui?: UiRecord;
 }
 
 /** Any setting definition accepted by {@link register}. */
@@ -829,6 +835,11 @@ export function register<const D extends SettingDefinition>(definition: D): Sett
 /** Handle for `id`, or `undefined` when no setting has that id. */
 export function lookup(id: string): AnySetting | undefined {
 	return byId.get(id);
+}
+
+/** Narrows a string-keyed handle to a record setting, whose `setEntry` writes one entry checked at runtime. */
+export function isRecordSetting(setting: AnySetting): setting is Setting<Readonly<Record<string, unknown>>> {
+	return setting.type === "record";
 }
 
 /** Every registered setting, in declaration order. */

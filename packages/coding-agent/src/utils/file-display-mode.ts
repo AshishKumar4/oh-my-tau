@@ -2,12 +2,21 @@
  * Resolve line-display mode for file-like outputs (read, grep, @file mentions).
  */
 
-import { type EditModeSessionLike, resolveEditMode } from "./edit-mode";
+import type { LineNumbering } from "@oh-my-pi/pi-tui/tools/read";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { cfgReadLineNumbers } from "../tools/settings";
+import { type EditModeSessionLike, resolveEditMode } from "./edit-mode";
 
 export interface FileDisplayMode {
 	lineNumbers: boolean;
 	hashLines: boolean;
+	/**
+	 * Shape of a plain line-number prefix: omp's `N|` or `cat -n`'s `%6d\t`.
+	 * Claude Code's `Read` returns the latter and its `Edit` tells the model to
+	 * strip "line number + tab", so under that profile the model gets the shape
+	 * it was trained against.
+	 */
+	numbering: LineNumbering;
 }
 
 /** Session-like object providing settings and tool availability for display mode resolution. */
@@ -35,8 +44,11 @@ export function resolveFileDisplayMode(
 	const raw = options?.raw === true;
 	const immutable = options?.immutable === true;
 	const hashLines = !raw && !immutable && hasEditTool && usesHashLineAnchors;
+	const model = session.getActiveModel?.();
+	const vendorNumbering = model !== undefined && effectiveHarnessProfile(session.settings, model) === "claude-code";
 	return {
 		hashLines,
-		lineNumbers: !raw && (hashLines || cfgReadLineNumbers.get(settings) === true),
+		numbering: vendorNumbering ? "cat" : "pipe",
+		lineNumbers: !raw && (hashLines || vendorNumbering || cfgReadLineNumbers.get(settings) === true),
 	};
 }

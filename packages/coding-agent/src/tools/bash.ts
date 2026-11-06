@@ -22,11 +22,14 @@ import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import type { Settings } from "../config/settings";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
+import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
+import { sessionToolRefs } from "../harness/effective-profile";
 import { InternalUrlRouter } from "../internal-urls";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlFilesystem, UrlFsError } from "../internal-urls/url-filesystem";
 import { PipeTextSources, TextTap } from "../job-widgets";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
+import claudeCodeBashDescription from "../prompts/tools/harness/claude-code-bash.md" with { type: "text" };
 import type {
 	ClientBridgeTerminalExitStatus,
 	ClientBridgeTerminalHandle,
@@ -379,11 +382,36 @@ const bashSchemaWithAsyncAndService = type({
 	}),
 });
 
-type BashToolSchema =
+type BashNativeSchema =
 	| typeof bashSchemaBase
 	| typeof bashSchemaWithAsync
 	| typeof bashSchemaWithService
 	| typeof bashSchemaWithAsyncAndService;
+
+// Claude Code's own `Bash` shape. A served capture presents the vendor's exact
+// declaration instead; this mirror is the schema while no capture is served, so
+// both agree on the field set and on `timeout` being milliseconds. Neither
+// carries the vendor's `dangerouslyDisableSandbox`: omp has no sandbox to lift.
+const claudeCodeBashSchema = type({
+	command: type("string").describe("The command to execute"),
+	"timeout?": type("number").describe(`Optional timeout in milliseconds (max ${TOOL_TIMEOUTS.bash.max * 1000})`),
+	"description?": type("string").describe("Clear, concise description of what this command does in 5-10 words"),
+	"run_in_background?": type("boolean").describe("Set to true to run this command in the background"),
+});
+
+type BashToolSchema = BashNativeSchema | typeof claudeCodeBashSchema;
+
+const BASH_BRIDGES: HarnessBridges<BashToolInput, typeof claudeCodeBashSchema> = {
+	"claude-code": {
+		parameters: claudeCodeBashSchema,
+		toParams: args => ({
+			command: args.command,
+			// Vendor milliseconds to omp seconds; the clamp floor keeps a sub-second value alive.
+			...(args.timeout !== undefined ? { timeout: Math.ceil(args.timeout / 1000) } : {}),
+			...(args.run_in_background !== undefined ? { async: args.run_in_background } : {}),
+		}),
+	},
+};
 
 export interface BashToolInput {
 	command: string;
@@ -524,29 +552,36 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 * The interceptor message for a call, checking the raw command and the one after a leading
 	 * `cd … &&` so the wrapper hides neither shell-navigation rules nor the dedicated-tool command.
 	 */
-	#interception(
-		rawCommand: string,
-		command: string,
-		name: string | undefined,
-		toolNames: string[],
-	): string | undefined {
+	/**
+	 * Why the interceptor refuses `rawCommand` (and its cwd-normalized `command`), or undefined.
+	 * A `managed` run (a named service, or under a harness Bash schema, which has no `name`, a
+	 * background run) is the form the `bash` rules steer toward, so they exempt it.
+	 */
+	#interception(rawCommand: string, command: string, managed: boolean, toolNames: string[]): string | undefined {
 		if (!cfgBashInterceptorEnabled.get(this.session.settings)) return undefined;
-		const rules = cfgBashInterceptorPatterns.get(this.session.settings).filter(rule => !name || rule.tool !== "bash");
+		const rules = cfgBashInterceptorPatterns.get(this.session.settings).filter(rule => !managed || rule.tool !== "bash");
+		const nativeBash = this.parameters !== claudeCodeBashSchema;
+		const messageData = {
+			toolRefs: sessionToolRefs(this.session),
+			nativeBash,
+			backgroundField: !nativeBash && cfgAsyncEnabled.get(this.session.settings),
+		};
 		for (const commandToCheck of rawCommand === command ? [command] : [rawCommand, command]) {
-			const interception = checkBashInterception(commandToCheck, toolNames, rules, rawCommand);
+			const interception = checkBashInterception(commandToCheck, toolNames, rules, rawCommand, messageData);
 			if (interception.block) return interception.message ?? "Command blocked";
 		}
 		return undefined;
 	}
 
 	readonly approval = (args: unknown, ctx?: AgentToolContext): ToolApprovalDecision => {
-		const input = (args ?? {}) as Partial<BashToolInput>;
+		const input: Partial<BashToolInput> = harnessParams(this.session, BASH_BRIDGES, args ?? {});
 		const rawCommand = input.command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
 		// An intercepted call is refused outright; asking first would only approve a doomed call.
 		const cwdCommand = input.cwd ? command : (extractLeadingCdTarget(command)?.rest ?? command);
 		const name = typeof input.name === "string" ? blankToUndefined(input.name) : undefined;
-		const interception = this.#interception(command, cwdCommand, name, ctx?.toolNames ?? []);
+		const managed = name !== undefined || (this.parameters === claudeCodeBashSchema && input.async === true);
+		const interception = this.#interception(command, cwdCommand, managed, ctx?.toolNames ?? []);
 		if (interception) {
 			return { tier: "exec", override: true, policy: "deny", reason: interception.replace(/^Blocked:\s*/u, "") };
 		}
@@ -640,12 +675,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly label = "Bash";
 	readonly loadMode = "essential";
 	get description(): string {
+		// With no vendor declaration to serve, Claude Code's `Bash` still describes
+		// its own fields: omp's text names `cwd`, `pty` and `async`, which that
+		// schema cannot carry.
+		if (this.parameters === claudeCodeBashSchema) {
+			return prompt.render(claudeCodeBashDescription, {
+				defaultTimeoutMs: TOOL_TIMEOUTS.bash.default * 1000,
+				maxTimeoutMs: TOOL_TIMEOUTS.bash.max * 1000,
+			});
+		}
 		const evalBackends = resolveEvalBackends(this.session);
 		const isToolActive = (name: string, fallback: boolean): boolean => this.session.isToolActive?.(name) ?? fallback;
 		return prompt.render(bashDescription, {
 			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
-			// The deadline an omitted `timeout` resolves to, after the `tools.maxTimeout` cap.
-			defaultTimeoutSec: clampTimeout("bash", undefined, cfgToolsMaxTimeout.get(this.session.settings)),
 			autoBackgroundEnabled: cfgBashAutoBackgroundEnabled.get(this.session.settings),
 			autoBackgroundSeconds: cfgBashAutoBackgroundThresholdMs.get(this.session.settings) / 1000,
 			hasAstGrep: isToolActive("ast_grep", cfgAstGrepEnabled.get(this.session.settings)),
@@ -666,12 +708,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			isWindows: process.platform === "win32",
 		});
 	}
-	/** Schema variant for the live `async.enabled` and `launch.enabled` settings. */
 	get parameters(): BashToolSchema {
+		return harnessParameters(this.session, BASH_BRIDGES, this.#nativeParameters);
+	}
+	/** Schema variant for the live `async.enabled` and `launch.enabled` settings. */
+	get #nativeParameters(): BashNativeSchema {
 		const asyncEnabled = cfgAsyncEnabled.get(this.session.settings);
 		if (this.#launchEnabled) return asyncEnabled ? bashSchemaWithAsyncAndService : bashSchemaWithService;
 		return asyncEnabled ? bashSchemaWithAsync : bashSchemaBase;
 	}
+	readonly intent = (args: Partial<BashToolInput | typeof claudeCodeBashSchema.infer>): string | undefined =>
+		"description" in args && typeof args.description === "string" ? args.description : undefined;
 	// Non-pty calls run alongside each other (the executor isolates overlapping
 	// runs on the same shell session); pty takes over the terminal UI and must
 	// run alone.
@@ -1169,19 +1216,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 	async execute(
 		toolCallId: string,
-		{
-			command: rawCommand,
-			timeout: rawTimeout,
-			cwd,
-			name: rawName,
-			ready: rawReady,
-			async: rawAsync,
-			pty,
-		}: BashToolInput,
+		input: BashToolInput | typeof claudeCodeBashSchema.infer,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
+		const params = harnessParams(this.session, BASH_BRIDGES, input);
+		if (params.async && !cfgAsyncEnabled.get(this.session.settings) && "run_in_background" in input) {
+			throw new ToolError("Bash.run_in_background is not available: async.enabled is off in this session.");
+		}
+		const { command: rawCommand, timeout: rawTimeout, name: rawName, ready: rawReady, async: rawAsync, pty } = params;
+		let { cwd } = params;
 		let command = rawCommand;
 		// The session this call belongs to, captured before any await: a session
 		// change while the call waits must not move it into the new session's
@@ -1234,7 +1279,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
 		}
 
-		const interception = this.#interception(rawCommand, command, name, ctx?.toolNames ?? []);
+		const managed = name !== undefined || (this.parameters === claudeCodeBashSchema && asyncRequested);
+		const interception = this.#interception(rawCommand, command, managed, ctx?.toolNames ?? []);
 		if (interception) throw new ToolError(interception);
 
 		if (cfgWorktreeClone.get(this.session.settings)) {
@@ -1345,14 +1391,31 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			};
 		}
 
-		// A timeout of 0 is an explicit long-running-command contract: the user
-		// must still cancel the call or job, but OMP does not impose a deadline.
-		const requestedTimeoutSec = rawTimeout ?? 300;
-		const timeoutDisabled = requestedTimeoutSec === 0;
+		// The client-bridge terminal provides a live terminal card in the editor;
+		// when available it wins over auto-backgrounding.
+		const clientBridge = asyncRequested ? undefined : this.session.getClientBridge?.();
+		const bridgeTerminalAvailable = Boolean(
+			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && virtualCwd === undefined,
+		);
+		const autoBgManager = this.session.asyncJobManager;
+		const autoBackgroundEligible =
+			!asyncRequested &&
+			cfgBashAutoBackgroundEnabled.get(this.session.settings) &&
+			!pty &&
+			!bridgeTerminalAvailable &&
+			autoBgManager !== undefined &&
+			!autoBgManager.atCapacity;
+
+		// A managed run may background after starting; do not hand its executor
+		// a default deadline that would survive that promotion. Explicit 0 also
+		// disables the deadline, while caller-supplied nonzero limits still apply.
+		const requestedTimeoutSec =
+			rawTimeout ?? (asyncRequested || autoBackgroundEligible ? undefined : TOOL_TIMEOUTS.bash.default);
+		const timeoutDisabled = requestedTimeoutSec === undefined || requestedTimeoutSec === 0;
 		const maxTimeout = cfgToolsMaxTimeout.get(this.session.settings);
 		const timeoutSec = timeoutDisabled ? undefined : clampTimeout("bash", requestedTimeoutSec, maxTimeout);
 		const timeoutMs = timeoutSec === undefined ? undefined : timeoutSec * 1000;
-		if (timeoutSec !== undefined) {
+		if (requestedTimeoutSec !== undefined && timeoutSec !== undefined) {
 			const timeoutClampNotice = formatTimeoutClampNotice(requestedTimeoutSec, timeoutSec, maxTimeout);
 			if (timeoutClampNotice) pendingNotices.push(timeoutClampNotice);
 		}
@@ -1383,24 +1446,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			});
 		}
 
-		// The client-bridge terminal provides a live terminal card in the editor;
-		// when available it wins over auto-backgrounding (both are opt-in, and
-		// auto-background would otherwise silently disable the terminal route).
-		const clientBridge = this.session.getClientBridge?.();
-		const bridgeTerminalAvailable = Boolean(
-			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && virtualCwd === undefined,
-		);
-
-		const autoBgManager = this.session.asyncJobManager;
 		// At the running-job cap, fall through to direct foreground execution
 		// instead of failing every bash call until a slot frees up.
-		if (
-			cfgBashAutoBackgroundEnabled.get(this.session.settings) &&
-			!pty &&
-			!bridgeTerminalAvailable &&
-			autoBgManager &&
-			!autoBgManager.atCapacity
-		) {
+		if (autoBackgroundEligible && autoBgManager) {
 			const autoBackgroundWaitMs = resolveAutoBackgroundWaitMs(
 				Math.floor(cfgBashAutoBackgroundThresholdMs.get(this.session.settings)),
 				timeoutMs,

@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { OAuthRefreshUnavailableError } from "@oh-my-pi/pi-ai/error";
 import type { ApiKeyResolver, FetchImpl, ResolvedApiKey, UsageProvider } from "@oh-my-pi/pi-ai";
 import { type AuthApiKeyOptions, type AuthPeekOptions, oauthAccountKey } from "@oh-my-pi/pi-ai/auth-storage";
 import { registerCustomApi, unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
@@ -7,7 +8,6 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oaut
 import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-attestation";
 import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
 import { getEnvApiKey } from "@oh-my-pi/pi-ai/env-api-key";
-import { OAuthRefreshUnavailableError } from "@oh-my-pi/pi-ai/error";
 import type {
 	Api,
 	Context,
@@ -2804,18 +2804,17 @@ export class ModelRegistry {
 				hasExplicitVllmConfig ||
 				canUseSharedCatalogWithoutAuth
 			) {
-				// Residency belongs to the token selected for discovery, not another
-				// stored account that happens to appear first in the pool.
-				const identity = getOAuthCredentialsForProvider(this.authStorage, descriptor.providerId).find(
-					credential => credential.access === apiKey,
-				);
+				// Residency and workspace belong to the credential selected for discovery,
+				// not another stored one that happens to appear first in the pool.
+				const scope = apiKey ? this.authStorage.keys.requestScope(descriptor.providerId, apiKey) : undefined;
 				const discoveryConfig = {
 					apiKey: isDiscoveryBearerApiKey(apiKey) ? apiKey : undefined,
 					baseUrl: this.#descriptorBaseUrl(descriptor.providerId),
 					fetch: this.#fetch,
-					region: identity?.region,
-					inferenceRegion: identity?.inferenceRegion,
-					orgId: identity?.orgId,
+					region: scope?.region,
+					inferenceRegion: scope?.inferenceRegion,
+					orgId: scope?.orgId,
+					workspaceId: scope?.workspaceId,
 				};
 				const preparedConfig =
 					getProviderDefinition(descriptor.providerId)?.prepareModelDiscovery?.(discoveryConfig) ??
@@ -3720,6 +3719,12 @@ export class ModelRegistry {
 		}
 	}
 
+	/** OAuth account ids entitled to `modelId` (discovered `accountAccess`); selection and rotation both prefer them. */
+	accountIdsForModel(provider: string, modelId: string | undefined): readonly string[] | undefined {
+		const accountAccess = modelId ? this.find(provider, modelId)?.accountAccess : undefined;
+		return accountAccess && Object.keys(accountAccess);
+	}
+
 	/**
 	 * Resolve a provider's request credential or the no-auth sentinel.
 	 *
@@ -3737,14 +3742,14 @@ export class ModelRegistry {
 		if (this.#isKeylessProvider(provider)) {
 			return { apiKey: kNoAuth };
 		}
-		const accountAccess = options?.modelId ? this.find(provider, options.modelId)?.accountAccess : undefined;
 		return this.authStorage.keys.getWithCredential(provider, sessionId, {
 			baseUrl: options?.baseUrl,
 			modelId: options?.modelId,
-			accountIds: accountAccess && Object.keys(accountAccess),
+			accountIds: this.accountIdsForModel(provider, options?.modelId),
 			forceRefresh: options?.forceRefresh,
 			refreshReason: options?.refreshReason,
 			rejectedAccessToken: options?.rejectedAccessToken,
+			recordAffinity: options?.recordAffinity,
 			signal: options?.signal,
 		});
 	}

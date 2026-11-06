@@ -70,6 +70,8 @@ export async function createCleanseAgentRuntime(options: {
 	hooks?: CleanseAgentHooks;
 }): Promise<CleanseAgentRuntime> {
 	const cwd = options.cwd ?? getProjectDir();
+	// Shared-LSP policy stays with the process owner: `omp cleanse` sets it at its
+	// CLI boundary, and an in-process /cleanse keeps its parent session's.
 	const settings = await Settings.init({ cwd });
 	const authStorage = await discoverAuthStorage(undefined, { settings });
 	const modelRegistry = new ModelRegistry(authStorage);
@@ -104,7 +106,7 @@ export async function createCleanseAgentRuntime(options: {
 		getArtifactsDir: () => sessionManager.getArtifactsDir(),
 		getArtifactManager: () => sessionManager.getArtifactManager(),
 		getAgentId: () => MAIN_AGENT_ID,
-		getSessionSpawns: () => "sonic,task",
+		getSessionSpawns: () => "task",
 		getModelString: () => modelSelector,
 		getActiveModelString: () => modelSelector,
 		getActiveModel: () => resolved.model,
@@ -163,7 +165,7 @@ export async function createCleanseAgentRuntime(options: {
 					session: toolSession,
 					invocationKind: "task",
 					assignment: renderAssignment(assignment, context.peers, context.worker, context.checkers),
-					agent: "sonic",
+					agent: "task",
 					model: modelSelector,
 					identity: { id: agentId, label: name },
 					index: assignment.index,

@@ -17,6 +17,7 @@ import type {
 	PreparedExtension,
 } from "../extensibility/extensions/types";
 import type { Skill, SkillRediscoveryHost } from "../extensibility/skills";
+import { isFusionLead } from "../fusion/config";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -33,6 +34,7 @@ import type { AgentRegistryApi } from "../registry/agent-registry";
 import type { ArtifactManagerApi } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CostGateApi } from "../session/cost-gate";
+import type { ForkRequestSnapshot } from "../session/fork-context";
 import type { CustomMessage } from "../session/messages";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
@@ -70,6 +72,7 @@ import { MemoryReflectTool } from "./memory-reflect";
 import { MemoryRetainTool } from "./memory-retain";
 import { wrapToolWithMetaNotice } from "./output-meta";
 import { ReadTool } from "./read";
+import { SidekickTool } from "./sidekick";
 import type { PlanProposalHandler } from "./resolve";
 import { SecurityScanTool } from "./security-scan";
 import { supportsExternalThinking, ThinkTool } from "./think";
@@ -93,6 +96,7 @@ import {
 	cfgLaunchEnabled,
 	cfgSecurityEnabled,
 	cfgTodoEnabled,
+	cfgToolsDisabled,
 	cfgToolsXdev,
 	cfgWebSearchEnabled,
 } from "./settings";
@@ -157,6 +161,7 @@ export type {
 	SubmitReviewDetails,
 } from "@oh-my-pi/pi-tui/tools/task";
 export * from "./security-scan";
+export * from "./sidekick";
 export * from "./think";
 export * from "./todo";
 export * from "./tts";
@@ -334,6 +339,9 @@ export interface ToolSession {
 	/** Session starts with a prewalk hand-off armed. Keeps `todo` in yield-gated
 	 *  (subagent) registries: the prewalk plan nudge + todo gate need it. */
 	prewalkArmed?: boolean;
+	/** Session is a forked conversation worker: keeps independent planning
+	 *  tools (`todo`) even though `requireYieldTool` sessions normally omit them. */
+	conversationFork?: boolean;
 	/**
 	 * Constrain the active set to the caller's explicit built-in names (plus a
 	 * required yield tool). Suppresses automatic tool-set expansion.
@@ -343,16 +351,22 @@ export interface ToolSession {
 	readonly seanceSourceArtifactsDir?: string;
 	/** Task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
+	/** The agent definition a subagent session runs under; undefined for the top-level session. */
+	agentDefinition?: AgentDefinition;
 	/** Get this agent's eval executor session ID; keys its retained JS/Python/Ruby/Julia state. */
 	getEvalSessionId?: () => string | null;
 	/** Get session file */
 	getSessionFile: () => string | null;
 	/**
-	 * Owning journal; full SDK managers also supply registered identity and the
-	 * cost ledger (`appendModelUsage`) without changing advisor-local IDs.
+	 * Owning journal; full SDK managers also supply registered identity, the
+	 * cost ledger (`appendModelUsage`) and the resolved LLM context
+	 * (`buildSessionContext`, absent on advisor-local journals) without
+	 * changing advisor-local IDs.
 	 */
 	sessionManager?: Pick<SessionManager, "appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"> &
-		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage" | "getArtifactContent">>;
+		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage" | "getArtifactContent" | "buildSessionContext">>;
+	/** Latest Codex request snapshot captured by this session's main loop; a cloned copy so a queued fork never observes later mutation. */
+	getForkRequestSnapshot?: () => ForkRequestSnapshot | undefined;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
 	getEvalKernelOwnerId?: () => string | null;
 	/** Current enabled eval prelude definitions. */
@@ -385,10 +399,18 @@ export interface ToolSession {
 	getToolContext?: () => AgentToolContext | undefined;
 	/** Tool names the eval description advertises as callable from cells; frozen with the cached prompt prefix. */
 	getAdvertisedEvalToolNames?: () => readonly string[];
+	/** Direct partition of the active Code Mode surface; undefined when Code Mode is inactive. */
+	getCodeModeDirectToolNames?: () => readonly string[] | undefined;
 	/** Return whether a built-in tool is active in this turn's tool set. */
 	isToolActive?: (name: string) => boolean;
 	/** Update the active built-in tool predicate when a session changes tools mid-run. */
 	setActiveToolNames?: (names: Iterable<string>) => void;
+	/**
+	 * Tool names for omp's own prompt templates (`toolRefs`): the tools the
+	 * session presents, keyed by native name. Literal names natively; under a
+	 * harness profile only what the wire carries (see `harnessSurface`).
+	 */
+	getToolRefs?: () => Readonly<Record<string, string>>;
 	/** Canonical map containing every registered tool exactly once. */
 	toolRegistry?: Map<string, Tool>;
 	/** `xd://` presentation state backed by {@link toolRegistry}. */
@@ -420,6 +442,8 @@ export interface ToolSession {
 	allocateOutputArtifact?: (toolType: string) => Promise<{ id?: string; path?: string }>;
 	/** Get session spawns */
 	getSessionSpawns: () => string | null;
+	/** Definitions this session's own spawns use ahead of discovery, matched by name. */
+	pinnedAgents?: readonly AgentDefinition[];
 	/** Session-scoped agent definitions (user-tagged model pseudonyms) merged after discovered agents. */
 	getSessionAgents?: () => readonly AgentDefinition[];
 	/**
@@ -618,6 +642,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	reflect: MemoryReflectTool.createIf,
 	learn: LearnTool.createIf,
 	manage_skill: ManageSkillTool.createIf,
+	sidekick: SidekickTool.createIf,
 };
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {
@@ -636,6 +661,19 @@ export type ToolName = BuiltinToolName;
 export const SETTINGS_GATED_BUILTIN_TOOL_NAMES: readonly BuiltinToolName[] = (
 	Object.keys(BUILTIN_TOOLS) as BuiltinToolName[]
 ).filter(name => name === "learn" || !(MEMORY_BACKEND_TOOL_NAMES as readonly string[]).includes(name));
+
+/**
+ * Builtins `createTools` force-includes from settings rather than the caller's
+ * list. A session that names its tools explicitly still gets these activated,
+ * else the registry carries a tool the prompt tells the model to use and the
+ * active set never offers.
+ */
+export const SESSION_MANAGED_BUILTIN_TOOL_NAMES: readonly string[] = [
+	"manage_skill",
+	"context_notes",
+	"new_context",
+	...MEMORY_BACKEND_TOOL_NAMES,
+];
 
 /** Built-in tool selection {@link createTools} constructs for a session under its current settings. */
 export interface BuiltinToolPlan {
@@ -754,6 +792,12 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		// active still exposes the tools the nudge points at. Gated to top-level
 		// (taskDepth 0): the controller only runs there, so a subagent's explicit
 		// tool whitelist must never be silently widened with write-capable tools.
+		// A Fusion lead's `sidekick` tool rides the same rule: gated on
+		// `isFusionLead` (top-level, or an agent definition with `sidekick: true`),
+		// force-included into an explicit list.
+		if (!restrictToolNames && isFusionLead(session) && !requestedTools.includes("sidekick")) {
+			requestedTools.push("sidekick");
+		}
 		if (cfgAutolearnEnabled.get(session.settings) && (session.taskDepth ?? 0) === 0) {
 			if (!requestedTools.includes("manage_skill")) requestedTools.push("manage_skill");
 			if (
@@ -764,8 +808,10 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			}
 		}
 	}
+	const disabledTools = new Set(cfgToolsDisabled.get(session.settings));
 	const editDisabled = cfgEditMode.get(session.settings) === "none";
 	const isToolAllowed = (name: string) => {
+		if (disabledTools.has(name)) return false;
 		// Never in the default set. Explicitly activatable while goal.enabled and
 		// no goal record exists yet — /guided-goal enables it so the agent can
 		// finish the interview with `goal create`, which turns goal mode on. Once
@@ -784,7 +830,13 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (name === "debug") return cfgDebugEnabled.get(session.settings);
 		if (name === "ida") return cfgIdaAvailable.get(session.settings);
 		if (name === "todo")
-			return (!includeYield || session.prewalkArmed === true) && cfgTodoEnabled.get(session.settings);
+			return (
+				cfgTodoEnabled.get(session.settings) &&
+				(!includeYield ||
+					session.prewalkArmed === true ||
+					session.conversationFork === true ||
+					requestedTools?.includes("todo") === true)
+			);
 		if (name === "glob") return cfgGlobEnabled.get(session.settings);
 		if (name === "grep") return cfgGrepEnabled.get(session.settings);
 		if (name === "find") return isFindEnabled(session);
@@ -828,6 +880,7 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (name === "task") {
 			return canSpawnAtDepth(cfgTaskMaxRecursionDepth.get(session.settings), session.taskDepth ?? 0);
 		}
+		if (name === "sidekick") return !restrictToolNames && isFusionLead(session);
 		return true;
 	};
 	if (includeYield && requestedTools && !requestedTools.includes("yield")) {

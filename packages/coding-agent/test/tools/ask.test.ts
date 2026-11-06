@@ -2,6 +2,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } fro
 import { stripVTControlCharacters } from "node:util";
 import { type } from "@oh-my-pi/omptype";
 import { agentLoop, type AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { toolWireSchema } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentLoopConfig } from "@oh-my-pi/pi-agent-core/types";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -12,7 +14,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { getThemeByName, initTheme, theme, type Theme } from "@oh-my-pi/pi-tui/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { AskTool } from "@oh-my-pi/pi-coding-agent/tools/ask";
+import { AskTool, recoverAskQuestions } from "@oh-my-pi/pi-coding-agent/tools/ask";
 import { askToolRenderer } from "@oh-my-pi/pi-tui/tools/ask";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
@@ -2242,6 +2244,84 @@ describe("AskTool rich ask dialog", () => {
 			questions: [{ id: "q1", question: "Q?", options: [{ label: "Next →" }] }],
 		});
 		expect(reservedNext instanceof type.errors).toBe(true);
+	});
+});
+
+describe("AskTool under the claude-code harness", () => {
+	const CLAUDE_CODE = getBundledModel("anthropic", "claude-opus-5");
+	const VENDOR_CALL = {
+		questions: [
+			{
+				question: "Which backend?",
+				header: "Storage",
+				options: [
+					{ label: "SQLite", description: "Single file." },
+					{ label: "PostgreSQL", description: "Server." },
+				],
+				multiSelect: true,
+			},
+		],
+	};
+
+	it("declares Claude Code's AskUserQuestion shape and ships no omp-shaped examples", () => {
+		const tool = new AskTool(createSession({ getActiveModel: () => CLAUDE_CODE }));
+		const schema = toolWireSchema({ name: "ask", description: "", parameters: tool.parameters }) as {
+			properties: { questions: { items: { properties: Record<string, unknown>; required: string[] } } };
+			required: string[];
+		};
+		// `answers`/`annotations`/`metadata` are host-filled in Claude Code; no omp host fills them.
+		expect(Object.keys(schema.properties)).toEqual(["questions"]);
+		expect(schema.required).toEqual(["questions"]);
+		expect(schema.properties.questions.items.required).toEqual(["question", "header", "options"]);
+		expect(schema.properties.questions.items.properties.id).toBeUndefined();
+		expect(tool.examples).toEqual([]);
+		expect(new AskTool(createSession()).examples.length).toBeGreaterThan(0);
+	});
+
+	it("runs a vendor payload through the picker with synthesized ids and multiSelect as multi", async () => {
+		const askDialog = vi.fn().mockResolvedValue({
+			kind: "submit",
+			results: [
+				{
+					id: "q1",
+					question: "Which backend?",
+					options: ["SQLite", "PostgreSQL"],
+					multi: true,
+					selectedOptions: ["SQLite", "PostgreSQL"],
+				},
+			],
+		});
+		const tool = new AskTool(createSession({ getActiveModel: () => CLAUDE_CODE }));
+		const result = await tool.execute("call-vendor", VENDOR_CALL, undefined, undefined, createContext({ askDialog }));
+		expect(askDialog.mock.calls[0][0]).toEqual([
+			{
+				id: "q1",
+				question: "Which backend?",
+				header: "Storage",
+				options: [
+					{ label: "SQLite", description: "Single file." },
+					{ label: "PostgreSQL", description: "Server." },
+				],
+				multi: true,
+			},
+		]);
+		expect(result.details).toMatchObject({ multi: true, selectedOptions: ["SQLite", "PostgreSQL"] });
+	});
+
+	it("recovers questions from a persisted vendor-shaped call for /tree re-answer", () => {
+		expect(recoverAskQuestions(VENDOR_CALL)).toEqual([
+			{
+				id: "q1",
+				question: "Which backend?",
+				header: "Storage",
+				options: [
+					{ label: "SQLite", description: "Single file." },
+					{ label: "PostgreSQL", description: "Server." },
+				],
+				multi: true,
+			},
+		]);
+		expect(recoverAskQuestions({ questions: [{ question: "no header" }] })).toBeUndefined();
 	});
 });
 

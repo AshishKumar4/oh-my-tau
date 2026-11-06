@@ -42,6 +42,7 @@ import { normalizeToLF } from "../edit/normalize";
 import { getEditStore, recordFullySeenRows } from "../edit/store";
 import { extractUriScheme, InternalUrlRouter, type SchemeSpec, sessionResolveContext } from "../internal-urls";
 import { isMarkdownPath } from "@oh-my-pi/pi-tui/lang-from-path";
+import claudeCodeReadDescription from "../prompts/tools/harness/claude-code-read.md" with { type: "text" };
 import readDescription from "../prompts/tools/read.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { McpResourceNotFoundError } from "../internal-urls/mcp-protocol";
@@ -61,7 +62,7 @@ import {
 	warmBlockContext,
 } from "../utils/block-context";
 import { isCpuProfilePath, renderCpuProfile } from "../utils/cpuprofile";
-import { resolveFileDisplayMode } from "../utils/file-display-mode";
+import { type FileDisplayMode, resolveFileDisplayMode } from "../utils/file-display-mode";
 import { loadHeifImageInput, loadImageInput, loadSvgImageInput } from "../utils/image-loading";
 import {
 	ImageInputTooLargeError,
@@ -113,6 +114,8 @@ import {
 	buildInMemoryTextResult,
 	contiguousLineNumbers,
 	countTextLines,
+	formatBeyondEndHint,
+	formatContinueHint,
 	formatLineEntriesWithMode,
 	formatReadHashlineHeader,
 	formatSummaryElisionFooter,
@@ -130,6 +133,7 @@ import {
 	READ_CHUNK_SIZE,
 	readHashlineHeaderContext,
 	toReadTruncationStats,
+	usesClaudeCodeRead,
 } from "./read-format";
 import {
 	findSuffixMatchCached,
@@ -188,6 +192,7 @@ import { formatBytes, shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolAbortError, throwIfAborted } from "./tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
+import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
 
 import {
 	cfgFetchEnabled,
@@ -326,11 +331,15 @@ function omittedRequestedLine(
 function formatOmittedRequestedLineNotice(
 	line: NonNullable<ReadLineWindow["byteLimitLine"]>,
 	maxBytes: number,
-	rawTarget: string,
+	selectorBase: string,
+	byOffset: boolean,
 ): string {
-	return `[Line ${line.index + 1} is ${formatBytes(
+	const lineNumber = line.index + 1;
+	// Claude Code's `Read` has no raw selector; a one-line window reads the line without context.
+	const target = byOffset ? `offset=${lineNumber} limit=1` : `${selectorBase}:raw:${lineNumber}-${lineNumber}`;
+	return `[Line ${lineNumber} is ${formatBytes(
 		line.byteLength,
-	)} and could not fit after preceding context in the ${formatBytes(maxBytes)} read budget. Use ${rawTarget} to read that line without context (byte-capped if it exceeds the budget), or widen the requested range to increase the budget.]`;
+	)} and could not fit after preceding context in the ${formatBytes(maxBytes)} read budget. Use ${target} to read that line without context (byte-capped if it exceeds the budget), or widen the requested range to increase the budget.]`;
 }
 
 /**
@@ -849,8 +858,17 @@ interface FilesystemReadOptions {
  * Workflow hint for a large located file: page it through its URL, search/copy its backing
  * file. `rawBlocked` explains a refused whole-file `:raw` read.
  */
-function formatLocatedFileNotice(url: string, backingPath: string, size: number, rawBlocked: boolean): string {
-	const workflows = `Use ${url}:raw:1-3000 for bounded verbatim chunks, ${url}:1-3000 for numbered exploration, and the backing file path for search/copy workflows`;
+function formatLocatedFileNotice(
+	url: string,
+	backingPath: string,
+	size: number,
+	rawBlocked: boolean,
+	byOffset: boolean,
+): string {
+	// Claude Code's `Read` pages by `offset`/`limit`; it has no inline selectors to name.
+	const workflows = byOffset
+		? "Use offset/limit windows (e.g. offset=1 limit=3000) for numbered exploration, and the backing file path for search/copy workflows"
+		: `Use ${url}:raw:1-3000 for bounded verbatim chunks, ${url}:1-3000 for numbered exploration, and the backing file path for search/copy workflows`;
 	return rawBlocked
 		? `Unbounded raw read blocked for ${url} (${formatBytes(size)}). Reading the whole file verbatim can exhaust memory. ${workflows}: ${shortenPath(backingPath)}`
 		: `Backing file: ${shortenPath(backingPath)} (${formatBytes(size)}). ${workflows}.`;
@@ -892,6 +910,27 @@ const readSchema = type({
 });
 
 export type ReadToolInput = typeof readSchema.infer;
+
+const claudeCodeReadSchema = type({
+	file_path: type("string").describe("absolute path to the file to read"),
+	"offset?": type("number").describe("line number to start reading from"),
+	"limit?": type("number").describe("number of lines to read"),
+});
+
+type ReadInputSchema = typeof readSchema | typeof claudeCodeReadSchema;
+
+function claudeCodeReadSelector(offset: number | undefined, limit: number | undefined): string {
+	if (offset === undefined && limit === undefined) return "";
+	const start = Math.max(1, Math.trunc(offset ?? 1));
+	return limit === undefined ? `:${start}-` : `:${start}+${Math.max(1, Math.trunc(limit))}`;
+}
+
+const READ_BRIDGES: HarnessBridges<ReadToolInput, typeof claudeCodeReadSchema> = {
+	"claude-code": {
+		parameters: claudeCodeReadSchema,
+		toParams: args => ({ path: `${args.file_path}${claudeCodeReadSelector(args.offset, args.limit)}` }),
+	},
+};
 
 type ReadParams = ReadToolInput;
 
@@ -937,6 +976,19 @@ interface SessionWithRepeatReadTracker extends ToolSession {
 }
 
 /**
+ * Put an internal resource's warnings ahead of its content, each in its own
+ * text block, so the content block stays exactly what the resource resolved to.
+ */
+function withResourceWarnings(
+	result: AgentToolResult<ReadToolDetails>,
+	warnings: readonly string[] | undefined,
+): AgentToolResult<ReadToolDetails> {
+	if (!warnings?.length) return result;
+	const blocks: TextContent[] = warnings.map(text => ({ type: "text", text }));
+	return { ...result, content: [...blocks, ...result.content] };
+}
+
+/**
  * Append a loop-breaking hint when the same read selector returns
  * byte-identical output repeatedly. Weak models re-issue an unchanged read
  * dozens of times (observed: 29 bare re-reads of one file, ~645k tokens);
@@ -969,8 +1021,15 @@ function appendRepeatReadHint(session: ToolSession, path: string, result: AgentT
 	}
 	entry.count++;
 	if (entry.count < REPEAT_READ_HINT_THRESHOLD) return;
-	const next = acceptsLineSelector(path) ? "use a narrower selector (path:A-B), or proceed" : "proceed";
-	const notice = `[You have received this identical output ${entry.count} times. Re-reading '${path}' will not change it — ${next} with the edit.]`;
+	// Under Claude Code's `Read` the tracked path carries the bridged selector,
+	// syntax that schema cannot express, so the hint names the parameters instead.
+	const next = usesClaudeCodeRead(session)
+		? "use a narrower `offset`/`limit` range, or proceed"
+		: acceptsLineSelector(path)
+			? "use a narrower selector (path:A-B), or proceed"
+			: "proceed";
+	const target = usesClaudeCodeRead(session) ? "it" : `'${path}'`;
+	const notice = `[You have received this identical output ${entry.count} times. Re-reading ${target} will not change it — ${next} with the edit.]`;
 	block.text = appendReadNotice(block.text, notice, (result.details ??= {}), "\n\n");
 }
 
@@ -1099,12 +1158,12 @@ async function assessLocalReadSpeculation(
  * Reads files with support for images, converted documents (via markit), and text.
  * Directories return a formatted listing with modification times.
  */
-export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
+export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 	readonly name = "read";
 	readonly readsSkillUris = true;
 	readonly approval = (args: unknown): ToolTier => {
-		let readPath = "";
-		if (args && typeof args === "object" && "path" in args) readPath = String(args.path ?? "");
+		const rawPath = harnessParams(this.session, READ_BRIDGES, args).path;
+		let readPath = typeof rawPath === "string" ? rawPath : "";
 		const urlTier = InternalUrlRouter.instance().readTier(readPath);
 		if (urlTier !== "read") return urlTier;
 		readPath = splitImageQuestionTarget(readPath).path;
@@ -1150,12 +1209,17 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	readonly loadMode = "essential";
 	/** Rendered per access so the hashline guidance follows a live `edit.mode` change. */
 	get description(): string {
+		// With no vendor declaration to serve, Claude Code's `Read` still describes
+		// its own fields rather than omp's inline selectors.
+		if (this.parameters === claudeCodeReadSchema) return prompt.render(claudeCodeReadDescription);
 		return prompt.render(readDescription, {
 			IS_HL_MODE: resolveFileDisplayMode(this.session).hashLines,
 			BINARY_VIEWS: cfgIdaAvailable.get(this.session.settings),
 		});
 	}
-	readonly parameters = readSchema;
+	get parameters(): ReadInputSchema {
+		return harnessParameters(this.session, READ_BRIDGES, readSchema);
+	}
 	readonly strict = true;
 
 	readonly speculation = {
@@ -1355,7 +1419,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		for (const part of parts) {
 			try {
-				const result = await this.execute("read-delimited-part", { path: part }, signal, undefined, toolContext);
+				const result = await this.#executeNative(
+					"read-delimited-part",
+					{ path: part },
+					signal,
+					undefined,
+					toolContext,
+				);
 				const nestedTargets = result.details?.displayReadTargets;
 				if (nestedTargets?.length) {
 					const nestedLinks = result.details?.displayReadTargetLinks;
@@ -1367,6 +1437,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					displayReadTargets.push(result.details?.suffixResolution?.to ?? part);
 					displayReadTargetLinks.push(readDetailsLinkPath(result.details));
 				}
+
 				for (const block of result.content) {
 					if (block.type === "text") {
 						appendText(block.text);
@@ -1574,7 +1645,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						? "- Alpha: no"
 						: "- Alpha: unknown",
 				"",
-				`To analyze the image, read \`${imageQuestionPath}?q=<question>\` — the question is answered by a vision model and returned as text.`,
+				usesClaudeCodeRead(this.session)
+					? `To analyze the image, call Read with \`file_path\` set to \`${imageQuestionPath}?q=<question>\` — the question is answered by a vision model and returned as text.`
+					: `To analyze the image, read \`${imageQuestionPath}?q=<question>\` — the question is answered by a vision model and returned as text.`,
 			];
 			return { content: [{ type: "text", text: metadataLines.join("\n") }], details: {}, sourcePath: absolutePath };
 		}
@@ -1652,7 +1725,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		fileSize: number,
 		buffered: BufferedFileText | undefined,
 		parsed: ParsedSelector,
-		displayMode: { hashLines: boolean; lineNumbers: boolean },
+		displayMode: FileDisplayMode,
 		suffixResolution: { from: string; to: string } | undefined,
 		/** Target the in-body continuation hints name (a located read's URL, else empty). */
 		selectorBase: string,
@@ -1786,7 +1859,15 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				}
 				if (!fullLines || rawSelector) {
 					const blockText = displayLines.join("\n") + (rawSelector && endsAtTerminalNewline ? "\n" : "");
-					blocks.push(formatTextWithMode(blockText, range.startLine, shouldAddHashLines, shouldAddLineNumbers));
+					blocks.push(
+						formatTextWithMode(
+							blockText,
+							range.startLine,
+							shouldAddHashLines,
+							shouldAddLineNumbers,
+							displayMode.numbering,
+						),
+					);
 				}
 			}
 		}
@@ -1825,7 +1906,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				startLine: firstLine?.kind === "line" ? firstLine.lineNumber : (visibleSpans[0]?.startLine ?? 1),
 				lineNumbers: entries.map(entry => (entry.kind === "line" ? entry.lineNumber : null)),
 			};
-			outputText = formatLineEntriesWithMode(entries, shouldAddHashLines, shouldAddLineNumbers);
+			outputText = formatLineEntriesWithMode(
+				entries,
+				shouldAddHashLines,
+				shouldAddLineNumbers,
+				displayMode.numbering,
+			);
 		} else {
 			outputText = blocks.join(rawSelector ? "\n" : "\n\n…\n\n");
 		}
@@ -1857,6 +1943,22 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	}
 
 	async execute(
+		toolCallId: string,
+		input: ReadParams | typeof claudeCodeReadSchema.infer,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<ReadToolDetails>,
+		toolContext?: AgentToolContext,
+	): Promise<AgentToolResult<ReadToolDetails>> {
+		return this.#executeNative(
+			toolCallId,
+			harnessParams(this.session, READ_BRIDGES, input),
+			signal,
+			onUpdate,
+			toolContext,
+		);
+	}
+
+	async #executeNative(
 		toolCallId: string,
 		params: ReadParams,
 		signal?: AbortSignal,
@@ -1890,6 +1992,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		);
 		const displayTarget = InternalUrlRouter.instance().locateSync(params.path);
 		if (displayTarget && result.details) result.details.displayTarget = displayTarget;
+		// The truncation notice renders from this meta once execute returns; Claude
+		// Code's `Read` continues by its `offset` parameter, not an inline selector.
+		const truncation = result.details?.meta?.truncation;
+		if (truncation?.nextOffset !== undefined && usesClaudeCodeRead(this.session)) {
+			truncation.nextOffsetParam = "offset";
+		}
 		appendRepeatReadHint(this.session, params.path, result);
 		return result;
 	}
@@ -2312,7 +2420,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		// `:raw` read inlines one only below the budget; bigger ones page with ranges.
 		if (located && !located.spec.unbounded && parsed.kind === "raw" && fileSize > MAX_URL_RAW_INLINE_BYTES) {
 			return toolResult<ReadToolDetails>({ resolvedPath: absolutePath })
-				.text(formatLocatedFileNotice(located.url, absolutePath, fileSize, true))
+				.text(formatLocatedFileNotice(located.url, absolutePath, fileSize, true, usesClaudeCodeRead(this.session)))
 				.done();
 		}
 
@@ -2494,7 +2602,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				return toolResult<ReadToolDetails>({ resolvedPath: renderAbsolutePath, suffixResolution })
 					.text(
 						prependSuffixResolutionNotice(
-							`[Cannot read binary file '${resolvedDisplayPath}' (${formatBytes(fileSize)}); not valid UTF-8 text. Use ':raw' to read bytes verbatim.]`,
+							usesClaudeCodeRead(this.session)
+								? `[Cannot read binary file '${resolvedDisplayPath}' (${formatBytes(fileSize)}); not valid UTF-8 text.]`
+								: `[Cannot read binary file '${resolvedDisplayPath}' (${formatBytes(fileSize)}); not valid UTF-8 text. Use ':raw' to read bytes verbatim.]`,
 							suffixResolution,
 						),
 					)
@@ -2537,6 +2647,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						resolvedDisplayPath,
 						renderedSummary.elidedRanges,
 						renderedSummary.elidedLines,
+						usesClaudeCodeRead(this.session),
 					);
 					const summaryDisplayPath = formatPathRelativeToCwd(renderAbsolutePath, this.session.cwd);
 					const summaryHashContext = displayMode.hashLines
@@ -2631,8 +2742,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					// return line 31 and nothing else.
 					const rawSelector = isRawSelector(sel);
 					const requestedStart = offset ? Math.max(0, offset - 1) : 0;
-					const expandStart = !rawSelector && offset !== undefined && offset > 1;
-					const expandEnd = !rawSelector && limit !== undefined;
+					// Context padding is omp's convention; a vendor-numbered read
+					// returns exactly the window the vendor's `Read` would.
+					const padRange = !rawSelector && displayMode.numbering === "pipe";
+					const expandStart = padRange && offset !== undefined && offset > 1;
+					const expandEnd = padRange && limit !== undefined;
 					let leadingContext = expandStart ? Math.min(requestedStart, RANGE_LEADING_CONTEXT_LINES) : 0;
 					const trailingContext = expandEnd ? RANGE_TRAILING_CONTEXT_LINES : 0;
 					let startLine = requestedStart - leadingContext;
@@ -2752,7 +2866,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						const suggestion =
 							totalFileLines === 0
 								? "The file is empty."
-								: `Use ${selectorBase}:1 to read from the start, or ${selectorBase}:${totalFileLines} to read the last line.`;
+								: formatBeyondEndHint(this.session, selectorBase, totalFileLines);
 						const boundsDetails: ReadToolDetails = {
 							resolvedPath: renderAbsolutePath,
 							suffixResolution,
@@ -2900,7 +3014,13 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							startLine: startNum,
 							lineNumbers: Array.from({ length: lineCount }, (_, i) => startNum + i),
 						};
-						const formatted = formatTextWithMode(text, startNum, shouldAddHashLines, shouldAddLineNumbers);
+						const formatted = formatTextWithMode(
+							text,
+							startNum,
+							shouldAddHashLines,
+							shouldAddLineNumbers,
+							displayMode.numbering,
+						);
 						if (!hashContext || emittedHashlineHeader) return formatted;
 						emittedHashlineHeader = true;
 						return prependHashlineHeader(formatted, hashContext);
@@ -2936,7 +3056,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							startLine: firstLine?.kind === "line" ? firstLine.lineNumber : startLineDisplay,
 							lineNumbers: entries.map(entry => (entry.kind === "line" ? entry.lineNumber : null)),
 						};
-						const formatted = formatLineEntriesWithMode(entries, shouldAddHashLines, shouldAddLineNumbers);
+						const formatted = formatLineEntriesWithMode(
+							entries,
+							shouldAddHashLines,
+							shouldAddLineNumbers,
+							displayMode.numbering,
+						);
 						if (!hashContext || emittedHashlineHeader) return formatted;
 						emittedHashlineHeader = true;
 						return prependHashlineHeader(formatted, hashContext);
@@ -2984,27 +3109,27 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						const nextOffset = startLine + userLimitedLines + 1;
 						outputText = formatBracketAwareText() ?? formatText(selectedContent, startLineDisplay);
 						if (omittedSelectedLine) {
-							const lineNumber = omittedSelectedLine.index + 1;
 							outputText += `\n\n${formatOmittedRequestedLineNotice(
 								omittedSelectedLine,
 								maxBytesForRead,
-								`${selectorBase}:raw:${lineNumber}-${lineNumber}`,
+								selectorBase,
+								usesClaudeCodeRead(this.session),
 							)}`;
 						} else if (!rawSelector || limit === undefined || userLimitedLines < limit) {
 							outputText += `\n\n[More lines in file (${formatBytes(
 								fileSize,
-							)} total; not scanned to EOF). Use ${selectorBase}:${nextOffset} to continue]`;
+							)} total; not scanned to EOF). ${formatContinueHint(this.session, selectorBase, nextOffset)}]`;
 						}
 						details = {};
 						sourcePath = renderAbsolutePath;
 					} else if (truncation?.truncated) {
 						outputText = formatBracketAwareText() ?? formatText(truncation.content, startLineDisplay);
 						if (omittedSelectedLine) {
-							const lineNumber = omittedSelectedLine.index + 1;
 							outputText += `\n\n${formatOmittedRequestedLineNotice(
 								omittedSelectedLine,
 								maxBytesForRead,
-								`${selectorBase}:raw:${lineNumber}-${lineNumber}`,
+								selectorBase,
+								usesClaudeCodeRead(this.session),
 							)}`;
 						}
 						details = { truncation: toReadTruncationStats(truncation) };
@@ -3025,7 +3150,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						outputText = formatBracketAwareText() ?? formatText(selectedContent, startLineDisplay);
 						outputText += `\n\n[${
 							totalFileLines - (startLine + userLimitedLines)
-						} more lines in file. Use ${selectorBase}:${nextOffset} to continue]`;
+						} more lines in file. ${formatContinueHint(this.session, selectorBase, nextOffset)}]`;
 						details = {};
 						sourcePath = renderAbsolutePath;
 					} else {
@@ -3144,7 +3269,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (located && immutable && !isRawSelector(parsed) && fileSize > MAX_URL_RAW_INLINE_BYTES) {
 				const firstText = content.find((c): c is TextContent => c.type === "text");
 				if (firstText) {
-					firstText.text += `\n\n[${formatLocatedFileNotice(located.url, absolutePath, fileSize, false)}]`;
+					const notice = formatLocatedFileNotice(
+						located.url,
+						absolutePath,
+						fileSize,
+						false,
+						usesClaudeCodeRead(this.session),
+					);
+					firstText.text += `\n\n[${notice}]`;
 				}
 			}
 		}
@@ -3264,18 +3396,24 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				throw new ToolError("Cannot combine query extraction with line selectors");
 			}
 			if (parsedSel.kind === "raw") details.raw = true;
-			return toolResult(details).text(resource.content).sourceInternal(url).done();
+			return withResourceWarnings(
+				toolResult(details).text(resource.content).sourceInternal(url).done(),
+				resource.warnings,
+			);
 		}
 
-		return buildInMemorySelectorResult(this.session, resource.content, parsedSel, {
-			details,
-			sourcePath: resource.sourcePath,
-			sourceStartLine: resource.sourceStartLine,
-			sourceInternal: url,
-			entityLabel: "resource",
-			ignoreResultLimits: resource.unbounded ?? spec.unbounded === true,
-			immutable: resource.immutable,
-		});
+		return withResourceWarnings(
+			await buildInMemorySelectorResult(this.session, resource.content, parsedSel, {
+				details,
+				sourcePath: resource.sourcePath,
+				sourceStartLine: resource.sourceStartLine,
+				sourceInternal: url,
+				entityLabel: "resource",
+				ignoreResultLimits: resource.unbounded ?? spec.unbounded === true,
+				immutable: resource.immutable,
+			}),
+			resource.warnings,
+		);
 	}
 
 	/**
@@ -3328,9 +3466,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const start = offset ? Math.max(0, offset - 1) : 0;
 			if (start >= allLines.length) {
 				const suggestion =
-					allLines.length === 0
-						? "The listing is empty."
-						: `Use :1 to read from the start, or :${allLines.length} to read the last line.`;
+					allLines.length === 0 ? "The listing is empty." : formatBeyondEndHint(this.session, "", allLines.length);
 				return toolResult(details)
 					.text(`Line ${start + 1} is beyond end of listing (${allLines.length} lines total). ${suggestion}`)
 					.sourcePath(tree.rootPath)
@@ -3342,7 +3478,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			let text = sliced;
 			if (end < allLines.length) {
 				const remaining = allLines.length - end;
-				text += `\n\n[${remaining} more lines in listing. Use :${end + 1} to continue]`;
+				text += `\n\n[${remaining} more lines in listing. ${formatContinueHint(this.session, "", end + 1)}]`;
 			}
 			return resultBuilder.text(text).done();
 		}

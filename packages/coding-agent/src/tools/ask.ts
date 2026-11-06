@@ -23,11 +23,13 @@ import { replaceTabs, TERMINAL, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { isRecord, logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 
 import type { ExtensionUISelectItem } from "../extensibility/extensions";
+import { type HarnessBridges, type HarnessSchemaBridge, harnessParameters, harnessParams } from "../harness/bridge";
 import { formatKeyHint, formatKeyHints } from "@oh-my-pi/pi-tui/app-keybindings";
 import { editorKey, editorKeys } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import askHeadlessForkMessage from "../prompts/tools/ask-headless-fork.md" with { type: "text" };
+import claudeCodeAskDescription from "../prompts/tools/harness/claude-code-ask.md" with { type: "text" };
 import { vocalizer } from "../tts/vocalizer";
 
 import type { ToolSession } from ".";
@@ -91,6 +93,43 @@ const askRecoveryTool = { name: "ask", description: "", parameters: askSchema };
 
 export type AskToolInput = typeof askSchema.infer;
 
+const claudeCodeAskSchema = arkType({
+	questions: arkType({
+		question: arkType("string").describe("question text"),
+		header: arkType("string").describe("short display chip (max 12 chars)"),
+		options: arkType({
+			label: arkType("string").describe("display label"),
+			description: arkType("string").describe("explanatory text displayed below the label"),
+			"preview?": arkType("string").describe("optional rich preview content"),
+		})
+			.array()
+			.atLeastLength(2)
+			.atMostLength(4)
+			.describe("available options"),
+		multiSelect: arkType("boolean").describe("allow multiple selections").default(false),
+	})
+		.array()
+		.atLeastLength(1)
+		.atMostLength(4)
+		.describe("questions to ask (1-4)"),
+});
+type ClaudeCodeAskParams = typeof claudeCodeAskSchema.inferIn;
+type AskInputSchema = typeof askSchema | typeof claudeCodeAskSchema;
+
+const CLAUDE_CODE_ASK: HarnessSchemaBridge<AskToolInput, typeof claudeCodeAskSchema> = {
+	parameters: claudeCodeAskSchema,
+	toParams: args => ({
+		questions: args.questions.map((question, index) => ({
+			id: `q${index + 1}`,
+			question: question.question,
+			header: question.header,
+			options: question.options,
+			multi: question.multiSelect,
+		})),
+	}),
+};
+const ASK_BRIDGES: HarnessBridges<AskToolInput, typeof claudeCodeAskSchema> = { "claude-code": CLAUDE_CODE_ASK };
+
 /**
  * Recover valid questions from a persisted `ask` tool call for `/tree` re-answer.
  * Apply live tool-call normalization first so optional null placeholders in saved
@@ -98,7 +137,7 @@ export type AskToolInput = typeof askSchema.infer;
  */
 export function recoverAskQuestions(toolCallArguments: unknown): AskToolInput["questions"] | undefined {
 	if (!isRecord(toolCallArguments)) return undefined;
-	let normalized: Record<string, unknown>;
+	let normalized: Record<string, unknown> | undefined;
 	try {
 		normalized = validateToolArguments(askRecoveryTool, {
 			type: "toolCall",
@@ -107,11 +146,14 @@ export function recoverAskQuestions(toolCallArguments: unknown): AskToolInput["q
 			arguments: toolCallArguments,
 		});
 	} catch {
-		return undefined;
+		normalized = undefined;
 	}
-	const parsed = askSchema(normalized);
-	if (parsed instanceof arkType.errors) return undefined;
-	return parsed.questions;
+	const parsed = normalized === undefined ? undefined : askSchema(normalized);
+	if (parsed !== undefined && !(parsed instanceof arkType.errors)) return parsed.questions;
+	// A call recorded under the claude-code profile carries the vendor's shape.
+	const vendor = claudeCodeAskSchema(toolCallArguments);
+	if (vendor instanceof arkType.errors) return undefined;
+	return CLAUDE_CODE_ASK.toParams(vendor).questions;
 }
 
 interface AskOption {
@@ -543,36 +585,49 @@ function formatSingleQuestionResponse(result: {
 
 type AskParams = AskToolInput;
 
+const NO_EXAMPLES: readonly ToolExample<AskToolInput>[] = [];
+const ASK_EXAMPLES: readonly ToolExample<AskToolInput>[] = [
+	{
+		caption: "Choice",
+		call: {
+			questions: [
+				{
+					id: "storage",
+					question: "Database?",
+					options: [{ label: "SQLite" }, { label: "Postgres" }],
+					recommended: 0,
+				},
+			],
+		},
+	},
+];
+
 /**
  * Ask tool for interactive user prompting during execution.
  *
  * Allows gathering user preferences, clarifying instructions, and getting decisions
  * on implementation choices as the agent works.
  */
-export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+export class AskTool implements AgentTool<AskInputSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly approval = "read" as const;
 	readonly label = "Ask";
 	readonly summary = "Ask the user a clarifying question";
-	readonly description: string;
-	readonly parameters = askSchema;
+	readonly #nativeDescription: string;
+	/** Claude Code's `AskUserQuestion` describes its own fields when no vendor declaration is served. */
+	get description(): string {
+		return this.parameters === claudeCodeAskSchema
+			? prompt.render(claudeCodeAskDescription)
+			: this.#nativeDescription;
+	}
+	get parameters(): AskInputSchema {
+		return harnessParameters(this.session, ASK_BRIDGES, askSchema);
+	}
 	readonly strict = true;
 
-	readonly examples: readonly ToolExample<typeof askSchema.infer>[] = [
-		{
-			caption: "Choice",
-			call: {
-				questions: [
-					{
-						id: "storage",
-						question: "Database?",
-						options: [{ label: "SQLite" }, { label: "Postgres" }],
-						recommended: 0,
-					},
-				],
-			},
-		},
-	];
+	get examples(): readonly ToolExample<AskToolInput>[] {
+		return this.parameters === askSchema ? ASK_EXAMPLES : NO_EXAMPLES;
+	}
 	// Run alone in its tool batch. The interactive selector/editor is a single
 	// shared UI surface (`ExtensionUiController.showHookSelector` has no queue and
 	// overwrites `ctx.hookSelector` on each call), so two concurrent `ask` calls
@@ -582,7 +637,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	readonly loadMode = "discoverable";
 
 	constructor(private readonly session: ToolSession) {
-		this.description = prompt.render(askDescription);
+		this.#nativeDescription = prompt.render(askDescription);
 	}
 
 	static createIf(session: ToolSession): AskTool | null {
@@ -651,11 +706,12 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 
 	async execute(
 		_toolCallId: string,
-		params: AskParams,
+		input: AskParams | ClaudeCodeAskParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
+		const bridged = harnessParams(this.session, ASK_BRIDGES, input);
 		// Headless fallback
 		if (!context?.hasUI || !context.ui) {
 			// A headless fork (`/tan`) keeps `ask` advertised only to share the parent's
@@ -668,7 +724,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 		// Models occasionally inject `\r` runs into string values (observed with
 		// GLM via OpenRouter); sanitize before the dialog renders or the answer
 		// echoes back into session history.
-		params = sanitizeAskParams(params);
+		const params = sanitizeAskParams(bridged);
 		// Sanitizing `\r` runs can collapse a crafted label into a reserved
 		// runtime label (`Other\r(type your own)` → `Other (type your own)`),
 		// which would hijack the custom-input branch and duplicate the rich
