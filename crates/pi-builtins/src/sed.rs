@@ -5477,9 +5477,6 @@ pub struct OutputBuffer {
 	out:               BufWriter<Box<dyn OutputWrite + 'static>>, // Where to write
 	line_buffered:     bool, // Flush completed lines for non-file stdout
 	#[cfg(unix)]
-	max_pending_write: usize,                        /* Max bytes to keep before
-	                                                               * flushing */
-	#[cfg(unix)]
 	slice_chunk:        Option<SliceOutput>, // Chunk to write
 	// True when the last write didn't end with \n; the \n is deferred so
 	// that commands like `p` don't emit a spurious newline under -n.
@@ -5492,13 +5489,6 @@ pub struct OutputBuffer {
 /// in tests (formerly the direct-write threshold of the removed fd path).
 #[cfg(all(unix, test))]
 const MIN_DIRECT_WRITE: usize = 4 * 1024;
-
-/// Maximum size of a pending write buffer for non-files (likely pipes)
-// Once more than the specified bytes accumulate, issue a write.
-// This is set to the common size of Linux pipe buffer to maximize
-// throughput and liveness across the pipeline.
-#[cfg(unix)]
-const MAX_PENDING_WRITE_NON_FILE: usize = 64 * 1024;
 
 impl OutputBuffer {
 	#[cfg(not(unix))]
@@ -5517,11 +5507,6 @@ impl OutputBuffer {
 		Self {
 			out: BufWriter::new(w),
 			line_buffered,
-			max_pending_write: if line_buffered {
-				MAX_PENDING_WRITE_NON_FILE
-			} else {
-				usize::MAX
-			},
 			slice_chunk: None,
 			pending_newline: false,
 			#[cfg(test)]
@@ -5544,7 +5529,7 @@ impl OutputBuffer {
 		// Flush snapshot writes, if any.
 		#[cfg(unix)]
 		{
-			self.flush_slice(WriteRange::Complete)?;
+			self.flush_slice()?;
 		}
 
 		let Ok(file) = fs.open(path) else {
@@ -5599,14 +5584,6 @@ impl Write for OutputBuffer {
 }
 
 #[cfg(unix)]
-#[derive(Debug, PartialEq)]
-enum WriteRange {
-	Complete, // Write all specified data.
-	Blocks,   // Finish write on a block boundary (to help alignment).
-	None,     // No writing is needed.
-}
-
-#[cfg(unix)]
 impl OutputBuffer {
 	/// Schedule the specified output chunk for eventual output
 	pub fn write_chunk(&mut self, new_chunk: &IOChunk) -> io::Result<()> {
@@ -5615,7 +5592,7 @@ impl OutputBuffer {
 		}
 
 		if self.pending_newline {
-			self.flush_slice(WriteRange::Complete)?;
+			self.flush_slice()?;
 			self.out.write_all(b"\n")?;
 			self.pending_newline = false;
 			self.flush_completed_line()?;
@@ -5623,41 +5600,22 @@ impl OutputBuffer {
 
 		match &new_chunk.content {
 			IOChunkContent::SliceInput { data, full_span, .. } => {
-				// Set whether a flush is needed and whether the
-				// slice_chunk needs to be reset to the new input.
-				// This avoids calling slice_chunk (which borrows self)
-				// when old_chunk is already borrowed.
-				let (flush_action, reset) = if let Some(old_chunk) = self.slice_chunk.as_mut() {
-					// Coalesce if adjacent.
-					if Rc::ptr_eq(&old_chunk.data, data) && old_chunk.range.end == full_span.start {
-						// Coalesce.
-						old_chunk.range.end = full_span.end;
-						if old_chunk.range.len() > self.max_pending_write {
-							// Too much data; flush some full blocks.
-							(WriteRange::Blocks, false)
-						} else {
-							(WriteRange::None, false)
-						}
-					} else {
-						// Not contiguous
-						(WriteRange::Complete, true)
-					}
-				} else {
-					// No chunk yet; start a new one.
-					(WriteRange::None, true)
-				};
-
-				if flush_action != WriteRange::None {
-					self.flush_slice(flush_action)?;
-				}
-				if reset {
-					self.slice_chunk = Some(SliceOutput { data: Rc::clone(data), range: full_span.clone() });
+				// A span that continues the pending one in the same snapshot extends it;
+				// any other is written out first and replaced.
+				match self.slice_chunk.as_mut() {
+					Some(pending) if Rc::ptr_eq(&pending.data, data) && pending.range.end == full_span.start => {
+						pending.range.end = full_span.end;
+					},
+					_ => {
+						self.flush_slice()?;
+						self.slice_chunk = Some(SliceOutput { data: Rc::clone(data), range: full_span.clone() });
+					},
 				}
 				self.pending_newline = !new_chunk.is_newline_terminated();
 			},
 
 			IOChunkContent::Owned { content, has_newline, .. } => {
-				self.flush_slice(WriteRange::Complete)?;
+				self.flush_slice()?;
 				self.out.write_all(content.as_bytes())?;
 				if *has_newline {
 					self.out.write_all(b"\n")?;
@@ -5669,19 +5627,15 @@ impl OutputBuffer {
 		if self.line_buffered && new_chunk.is_newline_terminated() {
 			// Snapshot output reaches the BufWriter only here; file-backed
 			// output is block-buffered, so this cannot affect its fast path.
-			self.flush_slice(WriteRange::Complete)?;
+			self.flush_slice()?;
 			self.flush_completed_line()?;
 		}
 		Ok(())
 	}
 
-	/// Flush any pending snapshot data.
-	// the raw-fd write(2) and
-	// copy_file_range(2) fast paths are removed; the coalesced snapshot span is
-	// written through the buffered writer. `cover` block alignment is thus
-	// irrelevant and every flush writes the complete pending span.
+	/// Write the pending snapshot span through the buffered writer.
 	#[cfg(unix)]
-	fn flush_slice(&mut self, _cover: WriteRange) -> io::Result<()> {
+	fn flush_slice(&mut self) -> io::Result<()> {
 		if let Some(chunk) = self.slice_chunk.as_ref() {
 			#[cfg(test)]
 			if chunk.range.len() >= MIN_DIRECT_WRITE {
@@ -5696,7 +5650,7 @@ impl OutputBuffer {
 	/// Write a deferred newline if the last output didn't end with one.
 	pub fn flush_pending_newline(&mut self) -> io::Result<()> {
 		if self.pending_newline {
-			self.flush_slice(WriteRange::Complete)?;
+			self.flush_slice()?;
 			self.out.write_all(b"\n")?;
 			self.pending_newline = false;
 			self.flush_completed_line()?;
@@ -5706,7 +5660,7 @@ impl OutputBuffer {
 
 	/// Flush everything: pending snapshot and buffered data.
 	pub fn flush(&mut self) -> io::Result<()> {
-		self.flush_slice(WriteRange::Complete)?; // flush snapshot if any
+		self.flush_slice()?; // flush snapshot if any
 		self.out.flush() // then flush buffered data
 	}
 }
@@ -6373,8 +6327,6 @@ mod tests {
 			out: BufWriter::new(Box::new(file.try_clone().unwrap())),
 			line_buffered: false,
 			#[cfg(unix)]
-			max_pending_write: 8,
-			#[cfg(unix)]
 			slice_chunk: None,
 			pending_newline: false,
 			low_level_flushes: 0,
@@ -6444,25 +6396,10 @@ mod tests {
 		assert_eq!(buf.slice_chunk.as_ref().unwrap().range, 5..9);
 	}
 
-	#[test]
-	#[cfg(unix)]
-	fn slice_coalesce_and_flush_blocks() {
-		let (mut buf, _file) = new_for_test();
-		buf.max_pending_write = 4;
-		let backing = Rc::new(b"abcde\nfgh\n".to_vec()); // contiguous newline-terminated lines
-		let c1 = make_slice_chunk(&backing, 0..6); // "abcde\n"
-		let c2 = make_slice_chunk(&backing, 6..10); // "fgh\n"
-
-		buf.write_chunk(&c1).unwrap();
-		buf.write_chunk(&c2).unwrap();
-		// Exceeding max_pending_write flushed the coalesced span.
-		assert!(buf.slice_chunk.is_none());
-	}
-
 	#[cfg(unix)]
 	#[test]
 	fn queued_snapshot_spans_own_their_bytes_after_readers_and_chunks_drop() -> io::Result<()> {
-		for cap in [4, usize::MAX] {
+		{
 			let directory = tempfile::tempdir()?;
 			let input = directory.path().join("input");
 			let output = directory.path().join("output");
@@ -6476,7 +6413,6 @@ mod tests {
 			assert_eq!(first.as_str().expect("retained UTF-8"), "a".repeat(4096));
 			let file = fs::File::create(&output)?;
 			let mut writer = OutputBuffer::new(Box::new(file), false);
-			writer.max_pending_write = cap;
 			writer.write_chunk(&first)?;
 			writer.write_chunk(&second)?;
 			drop(first);
