@@ -16,7 +16,12 @@ import { isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import { SafeString } from "@oh-my-pi/pi-utils/template";
 import { escapeHarnessText, withRenderedEnvelope } from "../harness/content";
-import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, type AsyncJobManagerApi } from "../async";
+import {
+	ASYNC_JOB_MANAGER_SHUTDOWN_REASON,
+	AsyncJobError,
+	type AsyncJobManagerApi,
+	type AsyncJobRunResult,
+} from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { ModelRegistry } from "../config/model-registry";
@@ -3548,9 +3553,13 @@ async function runLane(session: AgentSession, options: LaneRunOptions, start: La
 		}
 		// Read before finalization: a schema-bearing agent that answered in
 		// prose gets a missing-yield warning prepended to `result.output`. The
-		// answer is the run's last report turn, not every turn's prose.
+		// answer is the run's last report turn; the session's last assistant text
+		// stands in only when no assistant message was seen, never for narration
+		// the monitor set aside.
 		const turnText =
-			monitor.lastReportTurnText() ?? (monitor.rawOutput() || (monitor.lastAssistantSalvageText() ?? ""));
+			monitor.lastReportTurnText() ??
+			(monitor.sawAssistantMessage() ? undefined : monitor.lastAssistantSalvageText()) ??
+			"";
 		let result: SingleResult | undefined;
 		let finalizeError: unknown;
 		try {
@@ -3648,6 +3657,35 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 }
 
 /**
+ * What the job carrying a lane run's end to its owner settles with: the run's
+ * result, or, when the owner asked and no result came, what a relay would have
+ * carried. Throws for a failed run, as a failed job.
+ */
+function laneJobOutcome(end: LaneRunEnd, carrier: string): string | AsyncJobRunResult {
+	if (!end.yielded) {
+		const body = buildWakeRelayBody({
+			...end,
+			alreadyMessaged: IrcBus.global().sentSince(end.id, carrier, end.startTime),
+		});
+		if (wakeTurnFailed(end)) throw withRenderedEnvelope(new AsyncJobError(body), new SafeString(body));
+		return withRenderedEnvelope({ text: body }, new SafeString(body));
+	}
+	if (!end.result) {
+		const message = end.finalizeError instanceof Error ? end.finalizeError.message : String(end.finalizeError);
+		throw new Error(`Wake turn of ${end.id} failed to finalize: ${message}`);
+	}
+	const text = formatTaskResultSummary(end.result, {
+		totalDurationMs: end.result.durationMs,
+		toolRefs: AgentRegistry.global().get(carrier)?.session?.getToolRefs(),
+	});
+	const structured = end.result.structuredOutput;
+	if (end.result.aborted || end.result.exitCode !== 0 || end.result.error !== undefined) {
+		throw withRenderedEnvelope(new AsyncJobError(text, structured), new SafeString(text));
+	}
+	return withRenderedEnvelope({ text, structured }, new SafeString(text));
+}
+
+/**
  * Open a wake run ({@link runLane}) for the turn `records` start; returns that
  * turn's settle callback, which returns at once so the session's settle drain
  * is never held up by the run.
@@ -3692,18 +3730,45 @@ function openWakeRun(
 	let jobOwnerId: string | undefined;
 	// The run's finished tool calls, which the job's widget reads like a first run's.
 	const tools = new TextTap(TOOLS_SOURCE_ID, TOOLS_SOURCE_LABEL);
+	// The job's progress record is what `wait` reads the run's stage and estimate from.
+	let reportJobProgress: ((progress: AgentProgress) => void) | undefined;
 	const ended = runLane(session, options, {
 		task,
 		records,
 		firstTurn: firstTurn.promise,
 		signal: cancel.signal,
+		onProgress: progress => reportJobProgress?.(progress),
 		onToolResult: result => appendToolResult(tools, result),
 		sessionFile: AgentRegistry.global().get(id)?.sessionFile ?? options.sessionFile ?? undefined,
 		// The owner's message is an assignment it waits on; a peer's gets a short answer, too short to probe.
 		completionProbe: ownerWoken && options.completionProbe === true,
 		yieldOptional: true,
-		// A parent manager with no room when the run opened may have room now.
-		carrier: ({ yielded, asked }) => (yielded || asked ? (jobOwnerId ??= routeToParent()) : undefined),
+		// A parent manager with no room when the run opened may have room now. A
+		// result with still no room for a job is delivered without one at the end.
+		carrier: ({ yielded, asked }) => {
+			if (!yielded && !asked) return undefined;
+			jobOwnerId ??= routeToParent();
+			if (jobOwnerId || !yielded || !ownerId || !manager) return jobOwnerId;
+			publishAtEnd = true;
+			return ownerId;
+		},
+	});
+	let publishAtEnd = false;
+	void ended.then(end => {
+		if (!publishAtEnd || !manager || !ownerId) return;
+		try {
+			const outcome = laneJobOutcome(end, ownerId);
+			manager.publishCompleted("task", id, typeof outcome === "string" ? { text: outcome } : outcome, {
+				id,
+				agentId: id,
+				ownerId,
+			});
+		} catch (error) {
+			logger.warn("Wake-run result delivery failed", {
+				id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	});
 	// A `send await:true` waiter holds its "stopped without replying" verdict
 	// until the run's relay has been delivered.
@@ -3722,8 +3787,12 @@ function openWakeRun(
 			manager.register(
 				"task",
 				id,
-				async ({ jobId, signal }) => {
+				async ({ jobId, signal, reportProgress }) => {
 					signal.addEventListener("abort", () => cancel.abort(signal.reason), { once: true });
+					reportJobProgress = progress => {
+						void reportProgress(`Running background task ${id}...`, { progress: [progress] });
+					};
+					if (lane) reportJobProgress(lane.progress);
 					const end = await ended;
 					if (end.carrier === undefined) {
 						// The relay already answered: settle without an async-result delivery.
@@ -3734,29 +3803,7 @@ function openWakeRun(
 						}
 						return `${id} answered by message and recorded no result.`;
 					}
-					if (!end.yielded) {
-						// The owner asked and no result came: the job carries what a relay would have.
-						const body = buildWakeRelayBody({
-							...end,
-							alreadyMessaged: IrcBus.global().sentSince(id, end.carrier, end.startTime),
-						});
-						if (wakeTurnFailed(end)) throw withRenderedEnvelope(new AsyncJobError(body), new SafeString(body));
-						return withRenderedEnvelope({ text: body }, new SafeString(body));
-					}
-					if (!end.result) {
-						const message =
-							end.finalizeError instanceof Error ? end.finalizeError.message : String(end.finalizeError);
-						throw new Error(`Wake turn of ${id} failed to finalize: ${message}`);
-					}
-					const text = formatTaskResultSummary(end.result, {
-						totalDurationMs: end.result.durationMs,
-						toolRefs: AgentRegistry.global().get(end.carrier)?.session?.getToolRefs(),
-					});
-					const structured = end.result.structuredOutput;
-					if (end.result.aborted || end.result.exitCode !== 0 || end.result.error !== undefined) {
-						throw withRenderedEnvelope(new AsyncJobError(text, structured), new SafeString(text));
-					}
-					return withRenderedEnvelope({ text, structured }, new SafeString(text));
+					return laneJobOutcome(end, end.carrier);
 				},
 				{
 					id,

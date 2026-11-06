@@ -4964,14 +4964,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					const retry = this.#todoCallArguments(toolCallId);
 					if (retry) this.#dropSupersededTodoReminders(retry, details && stringProperty(details, "op"));
 				}
-				// A queued failure reminder exists only to force a corrected retry. Once a
-				// later todo mutation lands it is stale: its embedded failure-time list would
-				// resurface finished work as open on the next prompt (#16001).
-				if (toolName === "todo" && !isError && details?.op !== "view") {
-					this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(
-						message => message.customType !== "todo-error-reminder",
-					);
-				}
 				if (toolName === "todo" && isError) {
 					const errorText = content.find(part => part.type === "text")?.text;
 					const attemptedArgs = this.#todoCallArguments(toolCallId);

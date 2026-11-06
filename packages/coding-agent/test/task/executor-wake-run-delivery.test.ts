@@ -898,7 +898,7 @@ describe("IRC wake run delivery", () => {
 		expect(relaysTo(REVIEWER)).toHaveLength(1);
 	});
 
-	it("hands the result to the parent as a message when its manager never has room for the job", async () => {
+	it("delivers the result to the parent without a job slot when its manager never has room for the job", async () => {
 		const lane = createLane([toolCall("yield", { data: { report: "answered directly" } })], {
 			maxRunningJobs: () => 1,
 		});
@@ -910,11 +910,13 @@ describe("IRC wake run delivery", () => {
 		await lane.runEnded;
 		await lane.session.waitForIrcReplies();
 
-		const toParent = relaysTo(MAIN_AGENT_ID);
-		expect(toParent).toHaveLength(1);
-		expect(toParent[0]).toContain("answered directly");
+		await lane.manager.drainDeliveries({ timeoutMs: 1000 });
+
+		// The result arrives as the parent's job result, as with room, not as a message.
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
+		expect(lane.delivered).toHaveLength(1);
+		expect(lane.delivered[0]).toContain("answered directly");
 		expect(relaysTo(REVIEWER)).toHaveLength(1);
-		expect(parentJobs(lane)).not.toContain(LANE);
 		filler.resolve("filler done");
 	});
 	it("does not relay a follow-up run's result to its job's owner when another agent spawned the lane", async () => {
@@ -980,10 +982,12 @@ describe("IRC wake run delivery", () => {
 		await lane.runEnded;
 		await lane.session.waitForIrcReplies();
 
-		const toParent = relaysTo(MAIN_AGENT_ID);
-		expect(toParent).toHaveLength(1);
-		expect(toParent[0]).toContain("answered without an artifact");
-		expect(toParent[0]).not.toContain("produced no output");
+		await lane.manager.drainDeliveries({ timeoutMs: 1000 });
+
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
+		expect(lane.delivered).toHaveLength(1);
+		expect(lane.delivered[0]).toContain("answered without an artifact");
+		expect(lane.delivered[0]).not.toContain("produced no output");
 		filler.resolve("filler done");
 	});
 });

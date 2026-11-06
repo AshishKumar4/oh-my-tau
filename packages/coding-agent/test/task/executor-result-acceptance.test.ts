@@ -552,7 +552,10 @@ describe("runSubprocess result acceptance", () => {
 				},
 			]);
 			harness.emitAssistantText("## Report\nroot cause found");
+			// The run settles after its turn's settle callback, which never waits on it.
+			const run = laneRuns.get(harness.session);
 			await finish?.(undefined);
+			await run?.released;
 			expect(manager.atCapacity).toBe(true);
 			await manager.drainDeliveries({ timeoutMs: 1000 });
 			AgentRegistry.global().setStatus(AGENT_ID, "idle");
