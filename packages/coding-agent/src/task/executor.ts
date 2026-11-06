@@ -1334,6 +1334,8 @@ interface RunMonitorArgs {
 	maxRuntimeMs: number;
 	/** Whether to periodically ask the agent for a completion estimate; see {@link isCompletionProbeEnabled}. */
 	completionProbe: boolean;
+	/** Fires each time a terminal `yield` is recorded for this run. */
+	onYieldAccepted?: () => void;
 }
 
 /**
@@ -1839,6 +1841,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				// Submitted: the remaining work is finalization (or waiting on owned
 				// async jobs), so stop showing the last stale self-estimate.
 				if (completionProbe) progress.completionPercent = 99;
+				args.onYieldAccepted?.();
 			}
 		}
 	};
@@ -3368,6 +3371,8 @@ interface LaneRunStart {
 	asked?: boolean;
 	/** Backs off from a prompt race lost to a wake; the monitor is detached meanwhile. See {@link DriveOptions.onPromptBusy}. */
 	onPromptBusy?: () => Promise<void>;
+	/** See {@link RunMonitorArgs.onYieldAccepted}. */
+	onYieldAccepted?: () => void;
 	/** The agent the run's end reaches through a job, given whether it is a result and whether the owner asked. */
 	carrier: (end: { yielded: boolean; asked: boolean }) => string | undefined;
 }
@@ -3414,6 +3419,7 @@ async function runLane(session: AgentSession, options: LaneRunOptions, start: La
 		softRequestBudgetNotice: options.softRequestBudgetNotice ?? (options.softRequestBudget ?? 0) > 0,
 		maxRuntimeMs: options.maxRuntimeMs ?? 0,
 		completionProbe: start.completionProbe ?? false,
+		onYieldAccepted: start.onYieldAccepted,
 	});
 	emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
 		id,
@@ -3743,6 +3749,10 @@ function openWakeRun(
 		// The owner's message is an assignment it waits on; a peer's gets a short answer, too short to probe.
 		completionProbe: ownerWoken && options.completionProbe === true,
 		yieldOptional: true,
+		// A yield is a result for the parent: its job opens now, so the parent waits on it.
+		onYieldAccepted: () => {
+			jobOwnerId ??= routeToParent();
+		},
 		// A parent manager with no room when the run opened may have room now. A
 		// result with still no room for a job is delivered without one at the end.
 		carrier: ({ yielded, asked }) => {
