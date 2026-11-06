@@ -530,7 +530,12 @@ export async function buildInMemoryTextResult(
 			lineNumbers: entries.map(entry => (entry.kind === "line" ? entry.lineNumber : null)),
 		};
 		if (shouldAddHashLines) seenLines = lineNumbersFromEntries(entries);
-		const formatted = formatLineEntriesWithMode(entries, shouldAddHashLines, shouldAddLineNumbers);
+		const formatted = formatLineEntriesWithMode(
+			entries,
+			shouldAddHashLines,
+			shouldAddLineNumbers,
+			displayMode.numbering,
+		);
 		if (!hashContext || emittedHashlineHeader) return formatted;
 		emittedHashlineHeader = true;
 		return prependHashlineHeader(formatted, hashContext);
@@ -718,7 +723,12 @@ export async function buildInMemoryMultiRangeResult(
 				lineNumbers: entries.map(entry => (entry.kind === "line" ? entry.lineNumber : null)),
 			};
 		}
-		const formatted = formatLineEntriesWithMode(entries, shouldAddHashLines, shouldAddLineNumbers);
+		const formatted = formatLineEntriesWithMode(
+			entries,
+			shouldAddHashLines,
+			shouldAddLineNumbers,
+			displayMode.numbering,
+		);
 		outputText = hashContext && !emittedHashlineHeader ? prependHashlineHeader(formatted, hashContext) : formatted;
 		if (hashContext) emittedHashlineHeader = true;
 	}
