@@ -209,9 +209,19 @@ export async function runEvalWait(
 ): Promise<{ items: EvalHandleSnapshot[] }> {
 	const { items, timeoutMs } = parseRefs(args);
 	const resolved = items.map(item => resolveHandle(item, options));
-	// A worker's job rows are snapshots taken when read: read a job's row again for its current state.
-	const current = (handle: ResolvedHandle): ResolvedHandle =>
-		"job" in handle ? { ...handle, job: handle.manager.getJob(handle.ref.id) ?? handle.job } : handle;
+	// A worker's job rows are snapshots taken when read, so a job's state is its row read
+	// last. Each job's row is read at its own settlement too: main may evict a settled row
+	// (its retention, or the consumed grace) while another handle keeps the wait open.
+	const rows = new Map<ResolvedHandle, AsyncJob>();
+	const current = (handle: ResolvedHandle): ResolvedHandle => {
+		if (!("job" in handle)) return handle;
+		const job = handle.manager.getJob(handle.ref.id) ?? rows.get(handle) ?? handle.job;
+		rows.set(handle, job);
+		return { ...handle, job };
+	};
+	for (const handle of resolved) {
+		if ("job" in handle) void handle.job.promise.then(() => current(handle));
+	}
 	const emittedProgress = new Map<string, unknown>();
 	const emitLatestProgress = (handle: ResolvedHandle): void => {
 		if (!("job" in handle)) return;

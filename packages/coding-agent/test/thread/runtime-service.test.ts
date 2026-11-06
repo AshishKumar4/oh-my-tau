@@ -48,8 +48,8 @@ afterEach(async () => {
 	fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-function newManager(): AsyncJobManager {
-	const manager = new AsyncJobManager({});
+function newManager(retentionMs?: number): AsyncJobManager {
+	const manager = new AsyncJobManager({ retentionMs });
 	managers.push(manager);
 	return manager;
 }
@@ -148,6 +148,29 @@ describe("runtime thread services: async jobs", () => {
 
 		expect(await waited).toEqual({ items: [{ kind: "agent", id, status: "completed", text: "all done" }] });
 		expect(manager.isJobResultConsumed(id)).toBe(true);
+	});
+
+	it("keeps a job's settled row for the wait when main evicts it before another handle settles", async () => {
+		const manager = newManager(30);
+		const probe = await startWorker();
+		const first = await jobId(probe, manager, "Worker");
+		const second = await jobId(probe, manager, "Worker");
+
+		const waited = probe("evalWait", manager, "Worker", first, second);
+		await Bun.sleep(20);
+		await probe("finish", first, "first done");
+		await manager.getJob(first)?.promise;
+		// Past its retention, main has dropped the first row while the second keeps the wait open.
+		await Bun.sleep(120);
+		expect(manager.getJob(first)).toBeUndefined();
+		await probe("finish", second, "second done");
+
+		expect(await waited).toEqual({
+			items: [
+				{ kind: "agent", id: first, status: "completed", text: "first done" },
+				{ kind: "agent", id: second, status: "completed", text: "second done" },
+			],
+		});
 	});
 
 	it("cancels the worker body from main and keeps the shutdown reason a symbol", async () => {

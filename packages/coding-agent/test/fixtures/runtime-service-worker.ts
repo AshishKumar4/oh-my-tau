@@ -130,7 +130,8 @@ const probe: RuntimeProbe = async (op, ...args) => {
 			// An eval `wait()` run in the worker, as a worker-homed session's cell runs it.
 			const jobs = manager(args[0]);
 			const session = { getAgentId: () => String(args[1]), asyncJobManager: jobs } as unknown as ToolSession;
-			return await runEvalWait({ items: [{ kind: "agent", id: String(args[2]) }], timeoutMs: 5_000 }, { session });
+			const items = args.slice(2).map(id => ({ kind: "agent", id: String(id) }));
+			return await runEvalWait({ items, timeoutMs: 5_000 }, { session });
 		}
 		case "localInputs": {
 			const job = manager(args[0]).getJob(String(args[1]));
