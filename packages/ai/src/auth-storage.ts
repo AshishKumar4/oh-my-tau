@@ -19,6 +19,10 @@
  * every namespace call to the main thread's, so pins, restrictions, refresh
  * single-flight, round-robin, and block/usage caches stay single-owner).
  *
+ * {@link AuthStorage.holdCredential} / {@link AuthStorage.releaseCredential}
+ * set a stored OAuth account aside and back; the hold lives with the persisted
+ * blocks and is honoured by every selection, pinning, and active-account path.
+ *
  * @example
  * const auth = await AuthStorage.create(getAgentDbPath());
  * await auth.credentials.reload();
@@ -43,6 +47,7 @@ import type {
 	AuthApiKeyOptions,
 	AuthCredential,
 	AuthStorageOptions,
+	CredentialPoolOrders,
 	BlocksApi,
 	CredentialsApi,
 	HealthApi,
@@ -114,6 +119,10 @@ export interface AuthStorageBackend {
 	readonly blocks: BlocksApi;
 	/** See {@link AuthStorage.setAccountPolicies}. */
 	setAccountPolicies(config: AuthAccountPolicyConfig): void;
+	/** See {@link AuthStorage.holdCredential}. */
+	holdCredential(provider: string, credentialId: number): void;
+	/** See {@link AuthStorage.releaseCredential}. */
+	releaseCredential(provider: string, credentialId: number): void;
 	/** See {@link AuthStorage.replaceStore}. */
 	replaceStore(store: AuthCredentialStore, options?: { sourceLabel?: string }): Promise<void>;
 	/** See {@link AuthStorage.close}. */
@@ -186,13 +195,30 @@ export class AuthStorage {
 
 	/**
 	 * Apply new account routing policy (live `auth.accountPolicies` /
-	 * `retry.usageReservePct` change). Throws a configuration error, leaving the
-	 * active policy untouched, when a policy is malformed, a selector matches
-	 * several stored OAuth accounts, or two policies claim the same account; a
-	 * policy naming an absent account stays inactive and logs a warning.
+	 * `retry.usageReservePct` / `auth.poolOrder` change). Throws a configuration
+	 * error, leaving the active policy untouched, when a policy is malformed, a
+	 * selector matches several stored OAuth accounts, or two policies claim the
+	 * same account; a policy naming an absent account stays inactive and logs a
+	 * warning.
 	 */
 	setAccountPolicies(config: AuthAccountPolicyConfig): void {
 		this.#backend.setAccountPolicies(config);
+	}
+
+	/**
+	 * Set a stored OAuth account aside: it stays saved and logged in, but no
+	 * session selects it — not even as the last resort when every other account
+	 * is blocked, nor by direct id — pins it, or reports it as its active account
+	 * until {@link AuthStorage.releaseCredential}. A hold never expires on its own
+	 * and survives block healing, usage reports, and saved-reset redemption.
+	 */
+	holdCredential(provider: string, credentialId: number): void {
+		this.#backend.holdCredential(provider, credentialId);
+	}
+
+	/** Lift a hold placed by {@link AuthStorage.holdCredential}. */
+	releaseCredential(provider: string, credentialId: number): void {
+		this.#backend.releaseCredential(provider, credentialId);
 	}
 
 	/**
@@ -251,7 +277,11 @@ class LocalAuthStorageBackend implements AuthStorageBackend {
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions) {
 		this.#options = options;
 		this.#overrides = new KeyOverrides(options.configValueResolver);
-		this.#policies = new AccountPolicies(options.accountPolicies ?? [], options.defaultReservePct);
+		this.#policies = new AccountPolicies(
+			options.accountPolicies ?? [],
+			options.defaultReservePct,
+			options.poolOrders,
+		);
 		this.#modules = this.#compose(store, options.sourceLabel);
 		if (options.onCredentialDisabled) this.#modules.pool.onDisabled(options.onCredentialDisabled);
 	}
@@ -288,7 +318,15 @@ class LocalAuthStorageBackend implements AuthStorageBackend {
 		const pool = this.#modules.pool;
 		const stored = new Map<string, AuthCredential[]>();
 		for (const provider of pool.providers()) stored.set(provider, pool.credentials(provider));
-		this.#policies.replace(config.accountPolicies, config.defaultReservePct, stored);
+		this.#policies.replace(config.accountPolicies, config.defaultReservePct, config.poolOrders, stored);
+	}
+
+	holdCredential(provider: string, credentialId: number): void {
+		this.#modules.blocks.hold(provider, credentialId);
+	}
+
+	releaseCredential(provider: string, credentialId: number): void {
+		this.#modules.blocks.release(provider, credentialId);
 	}
 
 	async replaceStore(store: AuthCredentialStore, options: { sourceLabel?: string } = {}): Promise<void> {
@@ -316,10 +354,10 @@ class LocalAuthStorageBackend implements AuthStorageBackend {
 		const pool = new CredentialPool(store, {
 			policies,
 			blockHealth,
-			onReset: provider => {
-				selector.resetRoundRobin(provider);
-				affinity.clearProvider(provider);
-			},
+			// Session pins survive: each resolves through its durable row id and drops
+			// itself once that row is gone, so only sessions on a changed account move.
+			onReset: provider => selector.resetRoundRobin(provider),
+			onApiKeyAdded: (provider, credentialId) => blocks.clearAll(provider, credentialId),
 		});
 		const refresher = new OAuthRefresher({
 			store,
@@ -332,7 +370,7 @@ class LocalAuthStorageBackend implements AuthStorageBackend {
 		// override's `cacheVersion` separates its rows from other processes sharing the store.
 		const usageCache = new UsageCache(store, pool, provider => usage.providerFor(provider));
 		const blocks = new CredentialBlocks({ store, pool, health: blockHealth, usageCache, strategies });
-		const affinity = new SessionAffinity(store, pool, overrides, this.#restrictions);
+		const affinity = new SessionAffinity(store, pool, overrides, blocks, this.#restrictions);
 		const usage = new UsageService({
 			store,
 			pool,
@@ -362,12 +400,14 @@ class LocalAuthStorageBackend implements AuthStorageBackend {
 			refresher,
 			strategies,
 		});
-		const limits = new RateLimits({ store, pool, overrides, blocks, affinity, usage, strategies });
+		const limits = new RateLimits({ store, pool, overrides, blocks, affinity, usage, strategies, policies });
 		const keys = new KeyCascade({
 			pool,
 			overrides,
 			selector,
 			affinity,
+			blocks,
+			policies,
 			rotate: (provider, sessionId, rotateOptions) => limits.rotate(provider, sessionId, rotateOptions),
 			sourceLabel,
 		});

@@ -235,6 +235,53 @@ describe("error-id classification", () => {
 		expect(AIError.retriable(id)).toBe(false);
 	});
 
+	it("classifies an Anthropic OAuth organization denial as account-scoped so rotation reaches another credential", () => {
+		const denial = message({
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-fable-5-1",
+			errorStatus: 403,
+			errorMessage:
+				'403 {"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_code":"oauth_not_allowed_for_organization"}},"request_id":"req_011Cex6VyetemYpe8MH4B3bz"}',
+		});
+		const denialId = AIError.classifyMessage(denial);
+		expect(AIError.is(denialId, AIError.Flag.AccountPolicy)).toBe(true);
+		expect(AIError.retriable(denialId)).toBe(false);
+		expect(AIError.isAccountPolicyError(denial)).toBe(true);
+
+		// Providers also surface the denial as a structured code rather than in
+		// the message body, and that path is classified separately.
+		expect(
+			AIError.isAccountPolicyError(new Error("denied", { cause: { code: "oauth_not_allowed_for_organization" } })),
+		).toBe(true);
+
+		// Upstream widened the classifier: `ANTHROPIC_ACCOUNT_POLICY_PATTERN` now
+		// matches a bare `permission_error`, so every Anthropic 403 of that shape
+		// is account-scoped and rotates the credential. This assertion pins the
+		// wider contract — it previously expected `false`, back when only the
+		// org-OAuth phrasing counted.
+		const bare = message({
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-fable-5-1",
+			errorStatus: 403,
+			errorMessage: '403 {"type":"error","error":{"type":"permission_error","message":"Forbidden."}}',
+		});
+		const bareId = AIError.classifyMessage(bare);
+		expect(AIError.is(bareId, AIError.Flag.AccountPolicy)).toBe(true);
+		expect(AIError.is(bareId, AIError.Flag.ContentBlocked)).toBe(false);
+
+		// A 403 from another provider still falls through to the generic auth path.
+		const otherProvider = message({
+			api: "openai-responses",
+			provider: "openai",
+			model: "gpt-6-astra",
+			errorStatus: 403,
+			errorMessage: '403 {"type":"error","error":{"type":"permission_error","message":"Forbidden."}}',
+		});
+		expect(AIError.is(AIError.classifyMessage(otherProvider), AIError.Flag.AccountPolicy)).toBe(false);
+	});
+
 	it("classifies only the matching Codex ChatGPT-account model entitlement denial as account policy", () => {
 		const errorMessage =
 			"The 'gpt-daybreak-blue-latest' model is not supported when using Codex with a ChatGPT account. (code=invalid_request_error)";
@@ -364,6 +411,17 @@ describe("error-id classification", () => {
 		const responsesId = AIError.classify(new Error(text), "openai-responses");
 		expect(AIError.is(anthropicId, AIError.Flag.StaleResponsesItem)).toBe(false);
 		expect(AIError.is(responsesId, AIError.Flag.StaleResponsesItem)).toBe(true);
+	});
+
+	it("classifies a Codex native-lane refusal as a stale Responses replay", () => {
+		const text =
+			"Codex error event: The experimental native turn lane cannot accept stateful WebSocket messages while a native turn is running. Start a new independent response.create turn instead. (code=unsupported_native_inflight_message)";
+		const codexId = AIError.classify(new Error(text), "openai-codex-responses");
+		expect(AIError.is(codexId, AIError.Flag.StaleResponsesItem)).toBe(true);
+		expect(AIError.retriable(codexId)).toBe(true);
+		expect(AIError.is(AIError.classify(new Error(text), "anthropic-messages"), AIError.Flag.StaleResponsesItem)).toBe(
+			false,
+		);
 	});
 
 	it("walks causes and preserves carried ids", () => {

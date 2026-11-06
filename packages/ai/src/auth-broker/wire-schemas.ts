@@ -59,7 +59,7 @@ export const oauthCredentialSchema: FluentType<OAuthCredential> = type({
 	refresh: type("string").narrow(
 		(value, ctx) =>
 			value !== REMOTE_REFRESH_SENTINEL ||
-			ctx.mustBe(`not equal to the remote sentinel (${REMOTE_REFRESH_SENTINEL})`),
+			ctx.mustBe(`a real refresh token, not the broker snapshot sentinel (${REMOTE_REFRESH_SENTINEL})`),
 	),
 	access: type("string").atLeastLength(1),
 	expires: "number",
@@ -99,6 +99,7 @@ export const apiKeyCredentialSchema: FluentType<ApiKeyCredential> = type({
 	type: "'api_key'",
 	key: type("string").atLeastLength(1),
 	"source?": "'login'",
+	"workspaceId?": type("string").atLeastLength(1),
 });
 
 /** Discriminated union accepted on POST /v1/credential (writes). */

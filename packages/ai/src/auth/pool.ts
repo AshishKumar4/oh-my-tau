@@ -1,7 +1,7 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import { resolveCredentialIdentityKey, serializeCredential } from "./sqlite-credential-store";
 import type { BlockStoreHealth } from "./blocks";
-import type { AccountPolicies } from "./policy";
+import { type AccountPolicies, isPoolCredential } from "./policy";
 import type { AuthCredentialStore } from "./store";
 import { REMOTE_REFRESH_SENTINEL } from "./types";
 import type {
@@ -52,7 +52,13 @@ export function credentialDisabledEvent(
 export function authCredentialEquals(left: AuthCredential, right: AuthCredential): boolean {
 	if (left.type !== right.type) return false;
 	if (left.type === "api_key") {
-		return right.type === "api_key" && left.key === right.key;
+		// `source` decides pool membership and `workspaceId` the request scope, so either changing is a change.
+		return (
+			right.type === "api_key" &&
+			left.key === right.key &&
+			left.source === right.source &&
+			left.workspaceId === right.workspaceId
+		);
 	}
 	if (right.type !== "oauth") return false;
 	return (
@@ -82,15 +88,17 @@ function storedCredentialArraysEqual(left: StoredCredential[], right: StoredCred
 export interface CredentialPoolOptions {
 	policies: AccountPolicies;
 	blockHealth: BlockStoreHealth;
-	/** Called whenever a provider's credential set changed locally. */
+	/** Called whenever a provider's credential set changed locally: resets round-robin state. */
 	onReset: (provider: string) => void;
+	/** Called after an API key is added or added again: it serves at once, whatever set it aside. */
+	onApiKeyAdded: (provider: string, credentialId: number) => void;
 }
 
 /** In-memory credential snapshot over an AuthCredentialStore: CRUD, change detection, events. */
 export class CredentialPool implements CredentialsApi {
 	/** Provider -> credentials cache, populated from store on reload(). */
 	#data: Map<string, StoredCredential[]> = new Map();
-	/** Recent bearer fingerprints resolved for each durable OAuth row; used only for delayed usage-limit attribution. */
+	/** Recent bearer fingerprints resolved for each durable OAuth row: delayed usage-limit attribution and {@link matchesStoredOAuthBearer}. */
 	#oauthBearerFingerprints: Map<string, Map<number, string[]>> = new Map();
 	#credentialDisabledListeners: Set<(event: CredentialDisabledEvent) => void | Promise<void>> = new Set();
 	/**
@@ -126,7 +134,7 @@ export class CredentialPool implements CredentialsApi {
 		return this.#data.keys();
 	}
 
-	/** Reset session affinity and round-robin state after a local credential change. */
+	/** Reset round-robin state after a local credential change. */
 	reset(provider: string): void {
 		this.#options.onReset(provider);
 	}
@@ -141,15 +149,36 @@ export class CredentialPool implements CredentialsApi {
 		return rows;
 	}
 
-	/** Persist a login-entered API key. */
-	async storeLoginApiKey(provider: string, key: string): Promise<void> {
-		const credential: ApiKeyCredential = { type: "api_key", key, source: "login" };
+	/**
+	 * Add one API key to the provider's key pool (`source: "login"`). Distinct keys
+	 * are appended; re-adding a stored key reuses its row and lifts its blocks.
+	 * Returns the stored row.
+	 */
+	async addApiKey(provider: string, key: string, options?: { workspaceId?: string }): Promise<StoredAuthCredential> {
+		const credential: ApiKeyCredential = {
+			type: "api_key",
+			key,
+			source: "login",
+			...(options?.workspaceId ? { workspaceId: options.workspaceId } : {}),
+		};
 		const stored = await this.#store.upsertAuthCredential(provider, credential);
 		this.replace(
 			provider,
 			stored.map(entry => ({ id: entry.id, credential: entry.credential })),
 		);
 		this.reset(provider);
+		const row = stored.find(entry => entry.credential.type === "api_key" && entry.credential.key === key);
+		if (!row) throw new Error(`API key for ${provider} was not stored`);
+		this.#options.onApiKeyAdded(provider, row.id);
+		return row;
+	}
+
+	pooledApiKeys(provider: string): Array<StoredAuthCredential & { credential: ApiKeyCredential }> {
+		return this.entries(provider).flatMap(entry =>
+			entry.credential.type === "api_key" && isPoolCredential(provider, entry.credential)
+				? [{ id: entry.id, provider, credential: entry.credential, disabledCause: null }]
+				: [],
+		);
 	}
 
 	/**
@@ -464,20 +493,26 @@ export class CredentialPool implements CredentialsApi {
 		return true;
 	}
 
-	/**
-	 * Persist a refreshed credential by id only while the row still matches this
-	 * process's snapshot. A peer rotation wins the CAS and is reloaded instead of
-	 * being overwritten after this process releases its refresh lease. An
-	 * unchanged credential still runs the CAS check (stores skip rewriting
-	 * identical bytes), so peer rotations are detected without churning the row.
-	 *
-	 * Returns the row's current index, or -1 when it was disabled or removed.
-	 */
-	replaceById(provider: string, id: number, credential: AuthCredential): number {
+	/** Re-list the durable row and derive its current slot after asynchronous work. */
+	syncById(provider: string, id: number): { credential: AuthCredential; index: number } | undefined {
+		this.reloadProvider(provider);
 		const entries = this.entries(provider);
 		const index = entries.findIndex(entry => entry.id === id);
-		if (index === -1) return -1;
-		const expected = serializeCredential(provider, entries[index]!.credential);
+		const entry = entries[index];
+		return entry ? { credential: entry.credential, index } : undefined;
+	}
+
+	/**
+	 * Persist a refreshed credential while its captured grant still matches.
+	 * A peer rotation wins the CAS and is reloaded instead of overwritten.
+	 * Returns the row's current index, or -1 when disabled or removed.
+	 */
+	replaceById(provider: string, id: number, credential: AuthCredential, expectedCredential?: AuthCredential): number {
+		const entries = this.entries(provider);
+		const index = entries.findIndex(entry => entry.id === id);
+		const current = entries[index];
+		if (!current) return -1;
+		const expected = serializeCredential(provider, expectedCredential ?? current.credential);
 		if (
 			expected &&
 			this.#store.tryUpdateAuthCredentialIfMatches &&
@@ -663,6 +698,15 @@ export class CredentialPool implements CredentialsApi {
 		return this.credentials(provider).some(credential => credential.type === "oauth");
 	}
 
+	/** Whether `bearer` is a stored OAuth account's current or recently served access token. */
+	matchesStoredOAuthBearer(provider: string, bearer: string): boolean {
+		return this.credentials(provider).some(
+			credential =>
+				credential.type === "oauth" &&
+				(credential.access === bearer || this.idForBearer(provider, bearer) !== undefined),
+		);
+	}
+
 	/**
 	 * Get OAuth credentials for a provider.
 	 */
@@ -795,6 +839,15 @@ export class CredentialPool implements CredentialsApi {
 	 */
 	findIdForUsageCredential(provider: string, previous: UsageCredential): number | undefined {
 		const entries = this.entries(provider);
+		// An API-key usage request belongs to its key row only. It carries no
+		// account identity, so the all-undefined identity match below would pin it
+		// on an identity-less OAuth row and let the key's report heal that row's block.
+		// A row holding a key reference (env name, `!command`) does not byte-match its
+		// resolved request, so its block heals only by expiry, never on another row.
+		if (previous.type === "api_key") {
+			return entries.find(entry => entry.credential.type === "api_key" && entry.credential.key === previous.apiKey)
+				?.id;
+		}
 		// Broker-backed rows all carry REMOTE_REFRESH_SENTINEL as their refresh
 		// token — it identifies nothing, and comparing it would match the FIRST
 		// OAuth row regardless of which account/org is being refreshed.

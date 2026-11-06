@@ -75,6 +75,7 @@ import { handleTranscriptions } from "./routes/transcriptions";
 import { handleVideoContent, handleVideoPoll, handleVideoSubmit } from "./routes/video";
 import { AuthGatewaySessionStateStore } from "./session-state";
 import type {
+	AuthGatewayHarnessWireFormat,
 	AuthGatewayServerHandle,
 	AuthGatewayFormatModule as FormatModule,
 	AuthGatewayParsedRequest as ParsedFormatRequest,
@@ -89,12 +90,18 @@ interface FormatRoute {
 	module: FormatModule;
 	label: string;
 	api: Api;
+	harness?: AuthGatewayHarnessWireFormat;
 }
 
 const FORMAT_ROUTES: Record<string, FormatRoute> = {
 	"/v1/chat/completions": { module: openaiChat, label: "openai-chat", api: "openai-completions" },
-	"/v1/messages": { module: anthropicMessages, label: "anthropic-messages", api: "anthropic-messages" },
-	"/v1/responses": { module: openaiResponses, label: "openai-responses", api: "openai-responses" },
+	"/v1/messages": {
+		module: anthropicMessages,
+		label: "anthropic-messages",
+		api: "anthropic-messages",
+		harness: "anthropic-messages",
+	},
+	"/v1/responses": { module: openaiResponses, label: "openai-responses", api: "openai-responses", harness: "openai-responses" },
 };
 
 // (passthrough fast-path removed — it bypassed pi-ai provider logic, in
@@ -326,6 +333,15 @@ async function handleFormatEndpoint(
 		return route.module.formatError(400, "invalid_request_error", `Invalid JSON body: ${String(error)}`);
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
+
+	if (route.harness !== undefined && bootOpts.harnessRecorder !== undefined) {
+		try {
+			await bootOpts.harnessRecorder({ format: route.harness, body, headers: req.headers });
+		} catch (error) {
+			logger.warn("auth-gateway harness recorder failed", { format: route.label, peer, error: String(error) });
+		}
+		if (controller.signal.aborted) return clientClosedResponse(route);
+	}
 
 	// All three supported wire formats put the model id on a top-level `model`
 	// field. Read it without running the full strict schema so the route can

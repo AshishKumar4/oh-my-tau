@@ -1,12 +1,11 @@
 import { logger } from "@oh-my-pi/pi-utils";
-import { USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
 import type { UsageReport } from "../usage";
 import { claudeResetClearedBlockScopes, consumeClaudeResetCredit, listClaudeResetCredits } from "../usage/claude-reset";
 import { consumeCodexResetCredit, listCodexResetCredits, pickSoonestExpiringCredit } from "../usage/openai-codex-reset";
 import type { CredentialBlocks } from "./blocks";
 import { providerTypeKey } from "./blocks";
 import { raceSignal } from "./abort";
-import { isUsageLimitReached } from "./usage-report";
+import { isLiveUsageReport, isUsageLimitReached } from "./usage-report";
 import type { OAuthAccounts } from "./oauth";
 import type { CredentialPool } from "./pool";
 import type { AuthCredentialStore } from "./store";
@@ -272,8 +271,7 @@ export class ResetCredits implements ResetsApi {
 					const cleared = result.cleared ?? [];
 					if (
 						report &&
-						Number.isFinite(report.fetchedAt) &&
-						Date.now() - report.fetchedAt <= USAGE_REPORT_TTL_MS &&
+						isLiveUsageReport(report, Date.now()) &&
 						cleared.length > 0 &&
 						this.#deps.pool.entries(provider).some(entry => entry.id === access.credentialId)
 					) {

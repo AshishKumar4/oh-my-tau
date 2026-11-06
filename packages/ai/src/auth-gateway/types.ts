@@ -146,6 +146,16 @@ export interface AuthGatewayFormatModule {
 	formatError(status: number, type: string, message: string): Response;
 }
 
+export type AuthGatewayHarnessWireFormat = "anthropic-messages" | "openai-responses";
+
+export interface AuthGatewayHarnessRequest {
+	readonly format: AuthGatewayHarnessWireFormat;
+	readonly body: unknown;
+	readonly headers: Headers;
+}
+
+export type AuthGatewayHarnessRecorder = (request: AuthGatewayHarnessRequest) => Promise<void>;
+
 export interface AuthGatewayServerOptions {
 	/** Listen address. Default `127.0.0.1:4000`. */
 	bind?: string;

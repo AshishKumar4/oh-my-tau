@@ -19,12 +19,13 @@ import {
 	openSqliteDatabase,
 } from "@oh-my-pi/pi-utils";
 import type { AuthCredentialStore, CredentialRefreshLeaseFence, CredentialRefreshLeaseHolder } from "./store";
-import type {
-	AuthCredential,
-	DisabledCredentialSummary,
-	OAuthCredential,
-	StoredAuthCredential,
-	StoredCredentialBlock,
+import {
+	type AuthCredential,
+	CREDENTIAL_HOLD_SCOPE,
+	type DisabledCredentialSummary,
+	type OAuthCredential,
+	type StoredAuthCredential,
+	type StoredCredentialBlock,
 } from "./types";
 import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
@@ -139,7 +140,11 @@ function normalizeStoredIdentityKey(identityKey: string | null | undefined): str
 
 export function serializeCredential(provider: string, credential: AuthCredential): SerializedCredentialRecord | null {
 	if (credential.type === "api_key") {
-		const data = credential.source === "login" ? { key: credential.key, source: "login" } : { key: credential.key };
+		const data = {
+			key: credential.key,
+			...(credential.source === "login" ? { source: "login" } : {}),
+			...(credential.workspaceId ? { workspaceId: credential.workspaceId } : {}),
+		};
 		return {
 			credentialType: "api_key",
 			data: JSON.stringify(data),
@@ -170,8 +175,12 @@ function deserializeCredential(row: AuthRow): AuthCredential | null {
 	if (row.credential_type === "api_key") {
 		const data = parsed as Record<string, unknown>;
 		if (typeof data.key === "string") {
-			const source = data.source === "login" ? "login" : undefined;
-			return source ? { type: "api_key", key: data.key, source } : { type: "api_key", key: data.key };
+			return {
+				type: "api_key",
+				key: data.key,
+				...(data.source === "login" ? { source: "login" } : {}),
+				...(typeof data.workspaceId === "string" && data.workspaceId ? { workspaceId: data.workspaceId } : {}),
+			};
 		}
 	}
 	if (row.credential_type === "oauth") {
@@ -533,7 +542,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				blocked_until_ms = MAX(blocked_until_ms, excluded.blocked_until_ms),
 				updated_at = excluded.updated_at`,
 		);
-		this.#deleteCredentialBlocksStmt = this.#db.prepare("DELETE FROM auth_credential_blocks WHERE credential_id = ?");
+		this.#deleteCredentialBlocksStmt = this.#db.prepare(
+			"DELETE FROM auth_credential_blocks WHERE credential_id = ? AND block_scope <> ?",
+		);
 		this.#deleteCredentialBlockStmt = this.#db.prepare(
 			"DELETE FROM auth_credential_blocks WHERE credential_id = ? AND provider_key = ? AND block_scope = ?",
 		);
@@ -1393,9 +1404,12 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				identityKey: resolveRowCredentialIdentityKey(providerName, row),
 			}));
 
+			// An OAuth login supersedes legacy and migrated static keys, which would
+			// otherwise shadow it. Pooled keys (`source: "login"`) are a deliberate
+			// second pool that serves alongside OAuth, so they survive.
 			if (item.type === "oauth") {
 				for (const row of existing) {
-					if (row.credential && row.credential.type === "api_key") {
+					if (row.credential?.type === "api_key" && row.credential.source !== "login") {
 						this.#deleteStmt.run("replaced by oauth login", row.id);
 					}
 				}
@@ -1720,7 +1734,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	deleteCredentialBlocks(credentialId: number): void {
-		this.#deleteCredentialBlocksStmt.run(credentialId);
+		// A manual hold is not a rate-limit block: lifting every backoff (e.g.
+		// after a saved reset) must leave the user's hold in place.
+		this.#deleteCredentialBlocksStmt.run(credentialId, CREDENTIAL_HOLD_SCOPE);
 		for (const key of this.#credentialBlockReconcileAfter.keys()) {
 			if (key.startsWith(`${credentialId}\0`)) this.#credentialBlockReconcileAfter.delete(key);
 		}

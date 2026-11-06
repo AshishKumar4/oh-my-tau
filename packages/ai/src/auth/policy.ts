@@ -1,3 +1,4 @@
+import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import type {
@@ -5,10 +6,11 @@ import type {
 	AuthAccountPolicy,
 	AuthAccountSelector,
 	AuthCredential,
+	CredentialPoolOrders,
 	OAuthAccountIdentity,
 	OAuthCredential,
 } from "./types";
-import { DEFAULT_USAGE_RESERVE_PCT } from "./types";
+import { DEFAULT_CREDENTIAL_POOL_ORDER, DEFAULT_USAGE_RESERVE_PCT, oauthAccountKey } from "./types";
 
 /** Whether every identity field set on `selector` matches `identity`. */
 export function matchesAuthAccountSelector(selector: AuthAccountSelector, identity: OAuthAccountIdentity): boolean {
@@ -20,14 +22,71 @@ export function matchesAuthAccountSelector(selector: AuthAccountSelector, identi
 	);
 }
 
-/** Validated per-account routing policies (priority/reserve) plus the global reserve fallback. */
+/**
+ * True when a stored credential is the provider's KDL `empty-fallback`
+ * keyless-mode marker — what an empty paste at an "Optional: paste API key"
+ * login prompt stores (e.g. `lm-studio-local` for lm-studio). The wire layer
+ * never sends these as a bearer (`isDiscoveryBearerApiKey` strips them), so
+ * auth-status surfaces must not count them either; otherwise the model hub
+ * and `/login` report the provider as authenticated while every request
+ * goes out bare (issue #12281). The credential itself stays stored: `/logout`
+ * can still remove it, and availability treats the provider as keyless.
+ */
+export function isKeylessFallback(provider: string, credential: AuthCredential): boolean {
+	if (credential.type !== "api_key") return false;
+	const login = authPolicyFor(provider)?.login;
+	if (login?.kind !== "api-key") return false;
+	const fallback = login.emptyFallback;
+	return fallback !== undefined && fallback !== "" && credential.key === fallback;
+}
+
+/**
+ * Whether a stored credential belongs to one of the provider's two rotating
+ * pools: an OAuth subscription account, or a pooled API key (`source: "login"`).
+ * Legacy and broker-migrated static keys and keyless-mode markers are outside both pools.
+ */
+export function isPoolCredential(provider: string, credential: AuthCredential): boolean {
+	if (credential.type === "oauth") return true;
+	return credential.source === "login" && !isKeylessFallback(provider, credential);
+}
+
+/**
+ * The model's OAuth account entitlement filter (`AuthApiKeyOptions.accountIds`).
+ * Applies only when at least one stored OAuth account is entitled; otherwise
+ * (no entitlements, or none stored) every account stays eligible. Strict
+ * selection and rotation both use it, so rotation counts exactly the accounts
+ * selection will accept.
+ */
+export function oauthEntitlementFilter(
+	credentials: readonly AuthCredential[],
+	accountIds: readonly string[] | undefined,
+): ((credential: OAuthCredential) => boolean) | undefined {
+	if (!accountIds?.length) return undefined;
+	const entitled = new Set(accountIds);
+	const isEntitled = (credential: OAuthCredential): boolean => {
+		const accountKey = oauthAccountKey(credential);
+		return accountKey !== undefined && entitled.has(accountKey);
+	};
+	const anyEntitled = credentials.some(credential => credential.type === "oauth" && isEntitled(credential));
+	return anyEntitled ? isEntitled : undefined;
+}
+
+/**
+ * Validated per-account routing policies (priority/reserve), the global reserve
+ * fallback, and each provider's stored-pool order.
+ */
 export class AccountPolicies {
 	#accountPolicies: AuthAccountPolicies;
 	#defaultReservePct: number;
+	#poolOrders: CredentialPoolOrders;
 	/** Indexes of policies already warned as unmatched; validation runs on every selection. */
 	#warnedUnmatched = new Set<number>();
 
-	constructor(policies: AuthAccountPolicies, defaultReservePct: number | undefined) {
+	constructor(
+		policies: AuthAccountPolicies,
+		defaultReservePct: number | undefined,
+		poolOrders: CredentialPoolOrders = {},
+	) {
 		const effectiveDefaultReservePct =
 			typeof defaultReservePct === "number" && Number.isFinite(defaultReservePct)
 				? Math.max(0, Math.min(100, defaultReservePct))
@@ -35,6 +94,7 @@ export class AccountPolicies {
 		AccountPolicies.#validateAccountPolicyConfiguration(policies, effectiveDefaultReservePct);
 		this.#accountPolicies = policies;
 		this.#defaultReservePct = effectiveDefaultReservePct;
+		this.#poolOrders = poolOrders;
 	}
 
 	/** Global usage reserve (0–100) for accounts without a per-account `reservePct`. */
@@ -42,20 +102,29 @@ export class AccountPolicies {
 		return this.#defaultReservePct;
 	}
 
+	/** The provider's stored pools in serving order; {@link DEFAULT_CREDENTIAL_POOL_ORDER} unless configured. */
+	poolOrder(provider: string): readonly AuthCredential["type"][] {
+		return (this.#poolOrders[provider] ?? DEFAULT_CREDENTIAL_POOL_ORDER) === "api-keys-first"
+			? ["api_key", "oauth"]
+			: ["oauth", "api_key"];
+	}
+
 	/**
-	 * Replace the policy set and global reserve in place (live settings change).
-	 * Validates the configuration and every provider in `storedCredentials` before
-	 * committing; on error the previous policies stay active.
+	 * Replace the policy set, global reserve, and pool orders in place (live
+	 * settings change). Validates the configuration and every provider in
+	 * `storedCredentials` before committing; on error the previous policies stay active.
 	 */
 	replace(
 		policies: AuthAccountPolicies,
 		defaultReservePct: number | undefined,
+		poolOrders: CredentialPoolOrders,
 		storedCredentials: ReadonlyMap<string, readonly AuthCredential[]> = new Map(),
 	): void {
-		const next = new AccountPolicies(policies, defaultReservePct);
+		const next = new AccountPolicies(policies, defaultReservePct, poolOrders);
 		for (const [provider, credentials] of storedCredentials) next.validateFor(provider, credentials);
 		this.#accountPolicies = next.#accountPolicies;
 		this.#defaultReservePct = next.#defaultReservePct;
+		this.#poolOrders = next.#poolOrders;
 		this.#warnedUnmatched = next.#warnedUnmatched;
 	}
 

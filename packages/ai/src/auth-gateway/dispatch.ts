@@ -15,9 +15,8 @@ import { classifyGatewayError, type GatewayErrorClassification } from "../error/
 import { isUsageLimitOutcome } from "../error/rate-limit";
 import type { Api, FetchImpl, Model, Usage } from "../types";
 import type { ClientUsageIdentity } from "../usage";
-import { extractProviderRetryHint } from "../utils/retry-after";
 import type { AuthGatewayClientScope } from "./clients";
-import type { AuthGatewayServerOptions } from "./types";
+import type { AuthGatewayHarnessRecorder, AuthGatewayServerOptions } from "./types";
 
 /** What a route knows about a request beyond the model id it names. */
 export interface ModelResolveOptions {
@@ -50,6 +49,8 @@ export interface AuthGatewayRouteOptions {
 	resolveModel: ModelResolver;
 	/** Optional supplier for `/v1/models` listing. Returns the full model array. */
 	listModels?: () => Iterable<Model<Api>>;
+	/** Capture each harness-shaped request so a profile's wire format can be replayed. */
+	harnessRecorder?: AuthGatewayHarnessRecorder;
 	/** Providers the host does not serve; `/v1/usage` and `/v1/credentials/check` leave their accounts out. */
 	excludeProviders?: ReadonlySet<string>;
 	/** Upstream transport for every provider call; defaults to global `fetch`. Test seam. */
@@ -145,25 +146,17 @@ export async function resolveGatewayApiKey(
 
 /**
  * Hook fired by a pi-ai client when the upstream request fails in a way
- * that's rotatable — today that's HTTP 401 (credential is bad) and
- * usage-limit phrasing matched by {@link isUsageLimitError} (Codex's
- * `usage_limit_reached`, Anthropic's `usage_limit_reached`, Google's
- * `resource_exhausted`, …). The two cases need different storage actions:
+ * that's rotatable. The storage's own rotation decides what the failure costs
+ * the credential, exactly as for an in-process request: a usage limit blocks
+ * it until its reset (honouring `retry-after` / `resets_at` hints), an
+ * account-policy denial sets it aside (for hours when it holds until someone
+ * changes a setting, like a key rejected for its workspace), and an auth
+ * failure suspects it.
  *
- * - **usage-limit** → {@link AuthStorage.limits.markReached}. Marks just
- *   the current session's credential as temporarily blocked (honouring
- *   `retry-after` / `resets_at` hints when present) and returns `true` only
- *   when a sibling credential is still available. Burning the credential
- *   with `invalidateCredentialMatching` here would orphan accounts whose
- *   reset window is several hours away — exactly the bug this helper exists
- *   to avoid.
- * - **auth-failure** → {@link AuthStorage.limits.invalidateMatching}.
- *   Suspect/delete the row so it doesn't get re-picked next request.
- *
- * In both branches we return the next `getWithCredential` result (sticky on the
- * same `sessionId`) so the client can transparently retry the pre-emit
- * failure with a fresh credential. Returning `undefined` aborts the retry
- * and surfaces the original error to the caller.
+ * Returns the next `getWithCredential` result (sticky on the same `sessionId`)
+ * so the client can transparently retry the pre-emit failure with a fresh
+ * credential. A usage limit with no sibling to switch to returns `undefined`,
+ * which aborts the retry and surfaces the original error to the caller.
  */
 async function refreshGatewayApiKeyAfterAuthError(
 	storage: AuthStorage,
@@ -177,40 +170,29 @@ async function refreshGatewayApiKeyAfterAuthError(
 	peer: string,
 ): Promise<ResolvedApiKey | undefined> {
 	const message = error instanceof Error ? error.message : String(error);
-	const status = extractHttpStatusFromError(error);
-	if (AIError.isUsageLimit(error) || isUsageLimitOutcome(status, message)) {
-		const retryAfterMs = extractProviderRetryHint(provider, message);
-		const { switched, retryAtMs } = await storage.limits.markReached(provider, sessionId, {
-			retryAfterMs,
-			providerTimed: retryAfterMs !== undefined,
-			baseUrl: model.baseUrl,
-			modelId: model.id,
-			apiKey: oldKey,
-			signal,
-		});
-		const outcome = switched
-			? "auth-gateway retrying provider request after usage-limit block"
-			: "auth-gateway usage-limit block, returning the error without retry";
-		logger.debug(outcome, {
-			format,
-			provider,
-			peer,
-			switched,
-			retryAfterMs,
-			retryAtMs,
-			error: message,
-		});
-		if (!switched) return undefined;
-		return storage.keys.getWithCredential(provider, sessionId, modelKeyOptions(model, signal));
-	}
-	await storage.limits.invalidateMatching(provider, oldKey, { sessionId, signal });
-	logger.debug("auth-gateway retrying provider request after credential invalidation", {
-		format,
-		provider,
-		peer,
-		error: message,
+	const keyOptions = modelKeyOptions(model, signal);
+	const rotation = await storage.limits.rotate(provider, sessionId, {
+		error,
+		modelId: model.id,
+		baseUrl: model.baseUrl,
+		accountIds: keyOptions.accountIds,
+		apiKey: oldKey,
+		signal,
 	});
-	return storage.keys.getWithCredential(provider, sessionId, modelKeyOptions(model, signal));
+	// A usage limit with no sibling to switch to goes back to the client as-is;
+	// any other failure retries on whatever credential rotation left in place.
+	const retry =
+		rotation.switched ||
+		!(AIError.isUsageLimit(error) || isUsageLimitOutcome(extractHttpStatusFromError(error), message));
+	logger.debug(
+		retry
+			? "auth-gateway retrying provider request after credential rotation"
+			: "auth-gateway usage-limit block, returning the error without retry",
+		{ format, provider, peer, switched: rotation.switched, error: message },
+	);
+	if (!retry) return undefined;
+	const resolved = await storage.keys.getWithCredential(provider, sessionId, keyOptions);
+	return rotation.afterSiblingWait && resolved ? { ...resolved, afterSiblingWait: true } : resolved;
 }
 
 /** Model-scoped key options: usage ranking by model id, routing to accounts discovery saw serve it. */

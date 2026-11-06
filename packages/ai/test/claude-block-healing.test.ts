@@ -236,7 +236,8 @@ describe("claude usage-block healing", () => {
 		expect(await storage.keys.get("anthropic", "global-heal", { modelId: "claude-fable-5-1" })).toBe("access-1");
 	});
 
-	for (const scope of ["auth", "account-policy"]) {
+	// A manual hold is no quota verdict either: no report may lift it, so none is fetched.
+	for (const scope of ["auth", "account-policy", "hold"]) {
 		it(`does not heal an independent ${scope} block`, async () => {
 			const { storage, probeCount, blocks } = makeHarness(
 				claudeReport([sharedLimit("5h", "5h", 0), sharedLimit("7d", "7d", 0), tierLimit("fable", 0)]),

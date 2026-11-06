@@ -24,12 +24,33 @@ import type {
 /** Default remaining quota protected for accounts without an explicit policy override. */
 export const DEFAULT_USAGE_RESERVE_PCT = 10;
 
-/** Stored API key used by credential selection. */
+/**
+ * Stored API key used by credential selection. `source: "login"` marks a key in
+ * the provider's key pool (entered through `/login` or `omp auth keys add`);
+ * keys without it are legacy or broker-migrated static copies.
+ */
 export type ApiKeyCredential = {
 	type: "api_key";
 	key: string;
 	source?: "login";
+	/** Anthropic: the workspace requests name when the key is not scoped to one (`anthropic-workspace-id`). */
+	workspaceId?: string;
 };
+
+/** Characters a masked key must keep hidden; shorter keys display as `…` alone. */
+const MASK_MIN_HIDDEN = 12;
+
+/**
+ * Display form of an API key: a short vendor prefix plus the last four
+ * characters (`sk-ant-…a1b2`). The prefix and tail show only when at least
+ * {@link MASK_MIN_HIDDEN} characters stay hidden between them, so no accepted
+ * key, however short or oddly shaped, is shown whole.
+ */
+export function maskApiKey(key: string): string {
+	const prefix = /^[A-Za-z]{2,8}-(?:[A-Za-z]{2,8}-)?/.exec(key)?.[0] ?? "";
+	if (key.length - prefix.length - 4 < MASK_MIN_HIDDEN) return "…";
+	return `${prefix}…${key.slice(-4)}`;
+}
 
 /** Stored OAuth token and provider account identity. */
 export type OAuthCredential = {
@@ -68,6 +89,19 @@ export interface AuthAccountPolicy {
 
 /** Read-only set of per-account routing policies. */
 export type AuthAccountPolicies = readonly AuthAccountPolicy[];
+
+/**
+ * Order in which a provider's stored credential pools serve requests.
+ * `subscription-first` (default) uses stored OAuth subscription accounts, then
+ * stored API keys once no subscription is usable; `api-keys-first` reverses it.
+ */
+export type CredentialPoolOrder = "subscription-first" | "api-keys-first";
+
+/** The pool order of a provider that `auth.poolOrder` does not list. */
+export const DEFAULT_CREDENTIAL_POOL_ORDER: CredentialPoolOrder = "subscription-first";
+
+/** Provider id → pool order; providers absent here use {@link DEFAULT_CREDENTIAL_POOL_ORDER}. */
+export type CredentialPoolOrders = Readonly<Record<string, CredentialPoolOrder>>;
 
 /**
  * Cascade leg that supplies a provider's active credential, highest precedence
@@ -110,6 +144,14 @@ export interface StoredCredentialBlock {
 	/** Last row update timestamp in epoch milliseconds, when provided by the backing store. */
 	updatedAtMs?: number;
 }
+
+/**
+ * Block scope of a manual hold: a stored OAuth account the user has set aside.
+ * Unlike a usage backoff, a hold is never tried as a last resort, never healed
+ * or cleared with rate-limit blocks, and never expires on its own; it ends only
+ * through `AuthStorage.releaseCredential`.
+ */
+export const CREDENTIAL_HOLD_SCOPE = "hold";
 
 /**
  * Identity slice of a disabled (soft-deleted) credential tombstone — cause and
@@ -231,6 +273,8 @@ export interface CompletionProbeInput {
 	provider: Provider;
 	credentialId: number;
 	credential: CompletionProbeCredential;
+	/** The stored credential's request scope, sent as a live request would send it. */
+	credentialScope: CredentialRequestScope | undefined;
 	signal: AbortSignal;
 }
 
@@ -344,6 +388,8 @@ export type AuthStorageOptions = {
 	accountPolicies?: AuthAccountPolicies;
 	/** Global reserve fallback for accounts without a matching reservePct policy. */
 	defaultReservePct?: number;
+	/** Per-provider order of the stored OAuth and API-key pools (`auth.poolOrder`). */
+	poolOrders?: CredentialPoolOrders;
 	usageFetch?: typeof fetch;
 	usageRequestTimeoutMs?: number;
 	usageLogger?: UsageLogger;
@@ -532,11 +578,24 @@ export function oauthAccountKey(identity: {
 	return identity.accountId ?? identity.email ?? identity.projectId;
 }
 
-/** Non-secret identity bound to the OAuth credential selected for one request attempt. */
-export interface OAuthRequestIdentity {
+/** Non-secret request scope bound to the stored credential selected for one request attempt. */
+export interface CredentialRequestScope {
+	/** OAuth: the account's organization. */
 	orgId?: string;
+	/** OAuth: the account's region. */
 	region?: string;
+	/** OAuth: where the account's inference runs. */
 	inferenceRegion?: "global" | "eu" | "us";
+	/** API key: the workspace an Anthropic key that is not scoped to one must name on every request. */
+	workspaceId?: string;
+}
+
+/** The request scope a stored credential's requests carry: an OAuth account's identity, or an API key's workspace. */
+export function credentialRequestScope(credential: AuthCredential): CredentialRequestScope | undefined {
+	if (credential.type === "api_key")
+		return credential.workspaceId ? { workspaceId: credential.workspaceId } : undefined;
+	const { orgId, region, inferenceRegion } = credential;
+	return { orgId, region, inferenceRegion };
 }
 
 /**
@@ -774,6 +833,14 @@ export type MarkUsageLimitOptions = {
 	providerTimed?: boolean;
 	baseUrl?: string;
 	modelId?: string;
+	/** The model's account entitlements; see {@link RotateCredentialOptions.accountIds}. */
+	accountIds?: readonly string[];
+	/**
+	 * The provider's failure text. A limit naming the account's billing
+	 * (exhausted credits, a spend cap) blocks the credential for every model
+	 * instead of only the request's quota scope.
+	 */
+	errorMessage?: string;
 	apiKey?: string;
 	credentialId?: number;
 	signal?: AbortSignal;
@@ -783,6 +850,14 @@ export type MarkUsageLimitOptions = {
 export type RotateCredentialOptions = {
 	error?: unknown;
 	modelId?: string;
+	/** The failed request's endpoint: a usage limit's quota report is read there. */
+	baseUrl?: string;
+	/**
+	 * The model's account entitlements (`AuthApiKeyOptions.accountIds`). When one
+	 * stored OAuth account is entitled, strict selection takes only entitled
+	 * accounts, so rotation counts only those as a switch; otherwise all count.
+	 */
+	accountIds?: readonly string[];
 	apiKey?: string;
 	credentialId?: number;
 	signal?: AbortSignal;
@@ -793,8 +868,9 @@ export type RotateCredentialOptions = {
 /**
  * Outcome of {@link LimitsApi.rotate}.
  *
- * `switched` is `true` when a usable same-type sibling credential is available,
- * so the caller's next resolve hands it out. `afterSiblingWait` is `true` when
+ * `switched` is `true` when a usable sibling credential is available (in the
+ * failed credential's pool, or the provider's other stored pool), so the
+ * caller's next resolve hands it out. `afterSiblingWait` is `true` when
  * no sibling was free at the failure but rotation slept out a sibling's short
  * block (e.g. a Cloud Code Assist capacity 429 that resets in under a second);
  * the freed credential may be one the caller already sent in this request, so
@@ -910,6 +986,20 @@ export interface CredentialsApi {
 	 */
 	upsert(provider: string, credential: AuthCredential): Promise<AuthCredentialSnapshotEntry[]>;
 	/**
+	 * Add one API key to the provider's key pool. Distinct keys are appended
+	 * alongside existing keys and OAuth accounts; re-adding a stored key reuses
+	 * its row and replaces its `workspaceId`. Pooled keys serve in
+	 * `auth.poolOrder` with the provider's OAuth accounts and rotate when a key
+	 * fails. Resolves with the stored row.
+	 */
+	addApiKey(provider: string, key: string, options?: { workspaceId?: string }): Promise<StoredAuthCredential>;
+	/**
+	 * The provider's pooled API keys (rows added through `addApiKey` or `/login`),
+	 * in storage order. Excludes legacy or broker-migrated static keys and
+	 * keyless-mode markers, which do not rotate with the pool.
+	 */
+	pooledApiKeys(provider: string): Array<StoredAuthCredential & { credential: ApiKeyCredential }>;
+	/**
 	 * Remove credential for a provider.
 	 */
 	remove(provider: string): Promise<void>;
@@ -948,10 +1038,11 @@ export interface KeysApi {
 	 * Priority (first match wins):
 	 * 1. Runtime override (CLI --api-key)
 	 * 2. Config override (models.yml `providers.<name>.apiKey`)
-	 * 3. OAuth token from storage (auto-refreshed)
-	 * 4. API key persisted by a successful `/login`
+	 * 3–4. The stored pools in `auth.poolOrder`: OAuth tokens (auto-refreshed) and
+	 *      pooled API keys, subscription-first by default; an exhausted pool falls
+	 *      through to the other
 	 * 5. Environment variable
-	 * 6. Stored API key (e.g. a broker-migrated copy) — last resort, so an explicit env var wins
+	 * 6. Stored static API key (e.g. a broker-migrated copy) — last resort, so an explicit env var wins
 	 *
 	 * Resolves `undefined` when no permitted credential can serve, including when
 	 * OAuth refresh failed transiently (network, timeout, 5xx), so availability
@@ -996,15 +1087,29 @@ export interface KeysApi {
 	 */
 	keyless(provider: string): boolean;
 	/**
+	 * Whether `bearer` is an official OAuth credential for `provider`: a stored
+	 * OAuth account's access token, or a value of the provider's declared
+	 * OAuth-token env var (`XAI_OAUTH_TOKEN`). Guards that must not send a
+	 * subscription token somewhere (a custom endpoint) check the bearer each
+	 * attempt actually received, since pooled API keys can fall back to OAuth.
+	 */
+	isOAuthBearer(provider: string, bearer: string): boolean;
+	/**
+	 * The request scope of the stored credential whose bearer is `bearer`, for
+	 * callers that hold only the bearer bytes (model discovery, an
+	 * environment override that names a stored key). Unknown bearers have none.
+	 */
+	requestScope(provider: string, bearer: string): CredentialRequestScope | undefined;
+	/**
 	 * Describe where the active credential for a provider came from.
 	 *
 	 * Mirrors {@link AuthStorage.keys.get} precedence, highest first:
 	 *   1. Runtime override (`--api-key`).
 	 *   2. Config override (`models.yml` `providers.<name>.apiKey`).
-	 *   3. Stored OAuth credential.
-	 *   4. API key persisted by a successful `/login`.
+	 *   3–4. The stored pools in `auth.poolOrder`: OAuth accounts (never one on
+	 *        hold) and pooled API keys; subscription-first by default.
 	 *   5. Env var — overrides a stored static api_key (e.g. a stale broker copy).
-	 *   6. Stored api_key credential.
+	 *   6. Stored static api_key credential.
 	 *
 	 * The string is purely informational; consumers must not parse it.
 	 */
@@ -1128,7 +1233,8 @@ export interface OAuthApi {
 	 * for operations whose provenance and policy boundary are tied to one workspace.
 	 *
 	 * Returns `undefined` when the row does not exist for `provider` or an
-	 * explicit runtime/config API-key override suppresses OAuth.
+	 * explicit runtime/config API-key override suppresses OAuth; an account on
+	 * hold resolves `ok: false`.
 	 */
 	accessById(
 		provider: string,
@@ -1143,13 +1249,14 @@ export interface OAuthApi {
 	 *
 	 * When `sessionId` is supplied, the session-sticky OAuth credential is marked
 	 * `active`. No account is active before that session has resolved or pinned a
-	 * credential.
+	 * credential, and an account on hold never is.
 	 */
 	accounts(provider: string, sessionId?: string): OAuthAccountSummary[];
 	/**
 	 * Get the OAuth account identity for a provider, preferring the credential that
-	 * is session-sticky for `sessionId`. This is a read-only lookup for display and
-	 * metadata paths; it does not refresh tokens, rank usage, or advance selection.
+	 * is session-sticky for `sessionId` (never an account on hold). This is a
+	 * read-only lookup for display and metadata paths; it does not refresh tokens,
+	 * rank usage, or advance selection.
 	 */
 	identity(provider: string, sessionId?: string): OAuthAccountIdentity | undefined;
 	/**
@@ -1196,7 +1303,8 @@ export interface SessionsApi {
 	 * `options.restoredAtMs` instead restores an automatic affinity recorded by a
 	 * persisted session, backdated to its last use, so it keeps the provider's
 	 * warm-window semantics: a resume inside the prompt-cache TTL reuses the
-	 * account, a stale resume re-ranks.
+	 * account, a stale resume re-ranks. An account on hold, or outside the
+	 * session's {@link restrict} list, is never pinned.
 	 */
 	pin(provider: string, sessionId: string, credentialId: number, options?: { restoredAtMs?: number }): boolean;
 	/**
@@ -1206,7 +1314,9 @@ export interface SessionsApi {
 	 * blocking, credential rotation, metadata, and persisted pins all continue
 	 * through the target session id without retaining a live dependency on the
 	 * source session. `include` limits the copy to the providers it accepts,
-	 * given whether the source's affinity is an explicit user pin.
+	 * given whether the source's affinity is an explicit user pin. The pin in
+	 * each of the source's pools is copied, except one outside the target's
+	 * restriction.
 	 */
 	inherit(
 		sourceSessionId: string,
@@ -1240,6 +1350,12 @@ export interface SessionsApi {
 	 * {@link restrict} list names.
 	 */
 	permits(provider: string, sessionId: string, credentialId: number): boolean;
+	/**
+	 * Whether {@link restrict} limits `sessionId` for `provider`. Such a session
+	 * serves only the OAuth accounts its list names, so a caller holding a key of
+	 * its own for the provider (a dedicated search key) must not use it either.
+	 */
+	isRestricted(provider: string, sessionId: string | undefined): boolean;
 	/**
 	 * Release a session's sticky credential so its next {@link getApiKey} call
 	 * re-runs native pool ranking. This never blocks or penalizes the released
@@ -1352,8 +1468,25 @@ export interface HealthApi {
 	check(options?: CheckCredentialsOptions): Promise<CredentialHealthResult[]>;
 }
 
+/** Size and current availability of one stored pool (OAuth subscriptions or pooled API keys). */
+export interface CredentialPoolSummary {
+	kind: AuthCredential["type"];
+	members: number;
+	/** Members with an active temporary block (usage, credits, or auth backoff). */
+	blocked: number;
+	/** Earliest block expiry among blocked members, when every member is blocked. */
+	retryAtMs?: number;
+}
+
 /** Usage-limit blocking and credential rotation operations. */
 export interface LimitsApi {
+	/**
+	 * The provider's stored pools in serving order (`auth.poolOrder`), each with
+	 * its member and blocked counts for `modelId`. Pools without members are
+	 * omitted; for a session restricted to an account pool, so are the accounts
+	 * outside it.
+	 */
+	pools(provider: string, modelId?: string, sessionId?: string): CredentialPoolSummary[];
 	/**
 	 * Marks the current session's credential as temporarily blocked due to usage limits.
 	 * Uses usage reports to determine accurate reset time when available.
@@ -1383,7 +1516,8 @@ export interface LimitsApi {
 	 * - exact model-entitlement denial (Codex ChatGPT account or Cursor plan) →
 	 *   temporarily block only that requested model, then rotate.
 	 * - other account-scoped policy denial → temporarily block that account
-	 *   without marking its credential suspect, then rotate through siblings.
+	 *   without marking its credential suspect, then rotate through siblings; an
+	 *   org-wide OAuth denial blocks it provider-wide for six hours.
 	 * - otherwise (hard 401 / auth failure) → mark the credential suspect (or
 	 *   reload when no broker hook is wired) and block it, then drop matching
 	 *   sticky state.
@@ -1430,6 +1564,6 @@ export interface BlocksApi {
 	 * Broker-server seam: clear one exact persisted block and notify snapshot waiters.
 	 */
 	delete(credentialId: number, providerKey: string, blockScope: string): void;
-	/** Delete all persisted blocks for a credential. */
+	/** Delete all persisted rate-limit blocks for a credential; a manual hold is not one and survives. */
 	deleteAll(credentialId: number): void;
 }

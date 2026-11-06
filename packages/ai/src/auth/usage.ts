@@ -175,29 +175,31 @@ export class UsageService implements UsageApi {
 	/** Preserve the persisted OAuth row's login anchor and subtype metadata on usage-path refresh. */
 	persistRefreshedCredential(
 		provider: Provider,
-		previous: UsageCredential,
+		previous: OAuthCredential,
 		next: UsageCredential,
-		credentialId = this.#deps.pool.findIdForUsageCredential(provider, previous),
+		credentialId: number,
 	): void {
-		if (credentialId === undefined) return;
-		const entry = this.#deps.pool.entries(provider).find(candidate => candidate.id === credentialId);
-		if (entry?.credential.type !== "oauth") return;
-		this.#deps.pool.replaceById(provider, credentialId, {
-			...entry.credential,
-			access: next.accessToken ?? entry.credential.access,
-			refresh: next.refreshToken ?? entry.credential.refresh,
-			expires: next.expiresAt ?? entry.credential.expires,
-			accountId: next.accountId ?? entry.credential.accountId,
-			projectId: next.projectId ?? entry.credential.projectId,
-			email: next.email ?? entry.credential.email,
-			enterpriseUrl: next.enterpriseUrl ?? entry.credential.enterpriseUrl,
-			apiEndpoint: next.apiEndpoint ?? entry.credential.apiEndpoint,
-			orgId: next.orgId,
-			orgName: next.orgName,
-			region: next.region,
-			inferenceRegion: next.inferenceRegion,
-			activeOrganizationId: next.activeOrganizationId,
-		});
+		this.#deps.pool.replaceById(
+			provider,
+			credentialId,
+			{
+				...previous,
+				access: next.accessToken ?? previous.access,
+				refresh: next.refreshToken ?? previous.refresh,
+				expires: next.expiresAt ?? previous.expires,
+				accountId: next.accountId ?? previous.accountId,
+				projectId: next.projectId ?? previous.projectId,
+				email: next.email ?? previous.email,
+				enterpriseUrl: next.enterpriseUrl ?? previous.enterpriseUrl,
+				apiEndpoint: next.apiEndpoint ?? previous.apiEndpoint,
+				orgId: next.orgId,
+				orgName: next.orgName,
+				region: next.region,
+				inferenceRegion: next.inferenceRegion,
+				activeOrganizationId: next.activeOrganizationId,
+			},
+			previous,
+		);
 	}
 
 	/** Probe a provider endpoint, refreshing near-expiry OAuth tokens when possible. */
@@ -227,6 +229,9 @@ export class UsageService implements UsageApi {
 						request.provider,
 						request.credential,
 					);
+					const previous = this.#deps.pool
+						.entries(request.provider)
+						.find(entry => entry.id === refreshableCredentialId)?.credential;
 					const refreshed = await this.#deps.refresher.refresh(
 						request.provider,
 						refreshableCredential,
@@ -235,12 +240,14 @@ export class UsageService implements UsageApi {
 						"usage-probe",
 					);
 					const refreshedCredential = mergeRefreshedUsageCredential(request.credential, refreshed);
-					this.persistRefreshedCredential(
-						request.provider,
-						request.credential,
-						refreshedCredential,
-						refreshableCredentialId,
-					);
+					if (previous?.type === "oauth" && refreshableCredentialId !== undefined) {
+						this.persistRefreshedCredential(
+							request.provider,
+							previous,
+							refreshedCredential,
+							refreshableCredentialId,
+						);
+					}
 					params = {
 						...request,
 						credential: refreshedCredential,
@@ -331,6 +338,11 @@ export class UsageService implements UsageApi {
 		const cached = this.#deps.cache.get<UsageReport | null>(cacheKey);
 		// Fresh cache hit: return whatever's there (success or null fallback).
 		if (cached && cached.expiresAt > now) {
+			// Reconcile here too, not only after a network fetch: the report that
+			// proves a scope recovered is usually already cached (an `omp usage`
+			// render or an earlier turn warms every credential), and healing keeps
+			// its own freshness guards against a block a just-returned 429 wrote.
+			if (cached.value !== null) this.#deps.blocks.reconcileRequest(request, cached.value);
 			return cached.value;
 		}
 
@@ -707,6 +719,7 @@ export class UsageService implements UsageApi {
 		const strategy = this.#deps.strategies(provider);
 		const providerReports = reports.filter(report => report.provider === provider);
 		if (providerReports.length === 0) return [];
+		const nowMs = Date.now();
 		const seen = new Set<string>();
 		const reporting: string[] = [];
 		for (const modelId of modelIds) {
@@ -715,7 +728,7 @@ export class UsageService implements UsageApi {
 			const context: CredentialRankingContext = { modelId };
 			const hasUsage = providerReports.some(report => {
 				const limits = strategy
-					? scopedUsageLimits(strategy, report, context)
+					? scopedUsageLimits(strategy, report, context, nowMs)
 					: report.limits.filter(limit => limit.scope.shared === true || limit.scope.modelId === modelId);
 				return limits.some(limit => isUsageLimitExhausted(limit) || resolveUsedFraction(limit) !== undefined);
 			});

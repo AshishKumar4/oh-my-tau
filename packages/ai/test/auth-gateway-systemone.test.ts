@@ -597,10 +597,11 @@ describe("auth-gateway POST /v1/systemone", () => {
 	it("invalidates the bearer each chunk sent, not the one a sibling rotated to", async () => {
 		harness = await boot(() => Response.json(UPSTREAM_ANSWER));
 		const storage = harness.storage;
-		const invalidated: string[] = [];
-		vi.spyOn(storage.limits, "invalidateMatching").mockImplementation(async (_provider, apiKey) => {
-			invalidated.push(apiKey);
-			return true;
+		// Rotation sets aside the credential matching the bearer it is handed.
+		const invalidated: Array<string | undefined> = [];
+		vi.spyOn(storage.limits, "rotate").mockImplementation(async (_provider, _sessionId, options) => {
+			invalidated.push(options?.apiKey);
+			return { switched: true };
 		});
 		vi.spyOn(storage.keys, "getWithCredential").mockImplementation(async () => ({ apiKey: "key-b" }));
 		const model = getBundledModel("typesafe", "jev-latest");

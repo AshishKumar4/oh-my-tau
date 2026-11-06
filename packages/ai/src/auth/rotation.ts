@@ -1,12 +1,15 @@
 import { scheduler } from "node:timers/promises";
+import { logger } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
-import { isUsageLimitOutcome } from "../error/rate-limit";
+import { calculateRateLimitBackoffMs, isAccountBillingExhaustion, isUsageLimitOutcome } from "../error/rate-limit";
 import { extractProviderRetryHint } from "../utils/retry-after";
+import { HOUR_MS } from "../usage/shared";
 import type { CredentialRankingContext, CredentialRankingStrategy } from "../usage";
 import type { RankingStrategyResolver } from "../usage/registry";
 import { raceSignal } from "./abort";
 import {
 	ACCOUNT_POLICY_BLOCK_SCOPE,
+	ACCOUNT_WIDE_BLOCK_SCOPE,
 	AUTH_BLOCK_SCOPE,
 	DEFAULT_BLOCK_MS,
 	credentialBlockScopesForRequest,
@@ -16,10 +19,12 @@ import {
 import type { CredentialBlocks } from "./blocks";
 import type { KeyOverrides } from "./cascade";
 import type { SessionAffinity } from "./affinity";
+import { type AccountPolicies, isPoolCredential, oauthEntitlementFilter } from "./policy";
 import type { CredentialPool } from "./pool";
 import type { AuthCredentialStore } from "./store";
 import type {
 	AuthCredential,
+	CredentialPoolSummary,
 	CredentialRotation,
 	InvalidateCredentialMatchingOptions,
 	LimitsApi,
@@ -29,6 +34,7 @@ import type {
 } from "./types";
 import type { UsageService } from "./usage";
 import {
+	isLiveUsageReport,
 	isUsageLimitExhausted,
 	isUsageLimitReached,
 	scopedUsageLimits,
@@ -36,6 +42,8 @@ import {
 	windowResetAt,
 } from "./usage-report";
 
+/** Standing denials need a setting change: bounded so fixing it self-heals, far past a rotate-and-retry. */
+const STANDING_DENIAL_BLOCK_MS = 6 * HOUR_MS;
 /**
  * Longest sibling block {@link RateLimits.rotate} sleeps out instead of giving
  * up. Covers Cloud Code Assist capacity 429s ("Resets in 0s", sub-second
@@ -53,6 +61,8 @@ export type CredentialBlockRouting = {
 	rankingContext: CredentialRankingContext;
 	blockScope: string | undefined;
 	siblingBlockScopes: readonly string[];
+	/** The request model's account entitlements, which cross-pool OAuth candidates must match. */
+	accountIds?: readonly string[];
 };
 
 /** Dependencies for rate-limit marking and credential rotation. */
@@ -64,6 +74,7 @@ export interface RateLimitsDeps {
 	affinity: SessionAffinity;
 	usage: UsageService;
 	strategies: RankingStrategyResolver;
+	policies: AccountPolicies;
 }
 
 /** Usage-limit marking, credential rotation after failures, and bearer-matched invalidation. */
@@ -72,6 +83,33 @@ export class RateLimits implements LimitsApi {
 
 	constructor(deps: RateLimitsDeps) {
 		this.#deps = deps;
+	}
+
+	pools(provider: string, modelId?: string, sessionId?: string): CredentialPoolSummary[] {
+		const entries = this.#deps.pool.credentials(provider).map((credential, index) => ({ credential, index }));
+		const summaries: CredentialPoolSummary[] = [];
+		for (const kind of this.#deps.policies.poolOrder(provider)) {
+			const routing = this.#credentialBlockRouting(provider, kind, modelId);
+			const members = entries.filter(
+				entry =>
+					entry.credential.type === kind &&
+					isPoolCredential(provider, entry.credential) &&
+					!this.#deps.blocks.isHeld(provider, entry.index) &&
+					this.#deps.affinity.allows(provider, sessionId, entry.credential),
+			);
+			if (members.length === 0) continue;
+			const deadlines = members.map(entry =>
+				this.#deps.blocks.blockedUntil(provider, routing.providerKey, entry.index, routing.siblingBlockScopes),
+			);
+			const blockedDeadlines = deadlines.filter((deadline): deadline is number => deadline !== undefined);
+			summaries.push({
+				kind,
+				members: members.length,
+				blocked: blockedDeadlines.length,
+				...(blockedDeadlines.length === members.length ? { retryAtMs: Math.min(...blockedDeadlines) } : {}),
+			});
+		}
+		return summaries;
 	}
 
 	async #resolveCredentialTarget(
@@ -115,16 +153,68 @@ export class RateLimits implements LimitsApi {
 		const sessionCredential = this.#deps.affinity.get(provider, sessionId);
 		return sessionCredential ? { ...sessionCredential, explicit: false } : undefined;
 	}
+
+	/**
+	 * Credentials a request can rotate to after `targetIndex` fails: its own pool's
+	 * siblings, then the provider's other stored pool (OAuth subscriptions or
+	 * pooled API keys). Static or migrated keys stay outside rotation: they serve
+	 * only after both pools, so they cannot mask an exhausted pool.
+	 *
+	 * A cross-pool OAuth candidate must pass the same account filter the strict
+	 * OAuth pass applies: when the model names entitled accounts and one is
+	 * stored, only those count. Otherwise rotation would report a switch the next
+	 * resolve refuses, and the request would retry the exhausted key. A session
+	 * restricted to an account pool rotates only inside it.
+	 */
+	#rotationCandidates(
+		provider: string,
+		sessionId: string | undefined,
+		credentialType: AuthCredential["type"],
+		targetIndex: number,
+		accountIds: readonly string[] | undefined,
+	): Array<{ credential: AuthCredential; index: number }> {
+		const credentials = this.#deps.pool.credentials(provider);
+		const failed = credentials[targetIndex];
+		// A pooled credential rotates only within the pools; a static key is never a
+		// sibling of one, since selection serves it only after both pools are spent.
+		const pooled = failed === undefined || isPoolCredential(provider, failed);
+		// Entitlement counts only the accounts this session may use, as selection counts them.
+		const entitled = oauthEntitlementFilter(
+			credentials.filter(credential => this.#deps.affinity.allows(provider, sessionId, credential)),
+			accountIds,
+		);
+		const eligible = (credential: AuthCredential): boolean =>
+			credential.type === "oauth"
+				? entitled === undefined || entitled(credential)
+				: !pooled || isPoolCredential(provider, credential);
+		const candidates = credentials
+			.map((credential, index) => ({ credential, index }))
+			.filter(
+				entry =>
+					entry.index !== targetIndex &&
+					!this.#deps.blocks.isHeld(provider, entry.index) &&
+					(entry.credential.type === credentialType || pooled) &&
+					eligible(entry.credential) &&
+					this.#deps.affinity.allows(provider, sessionId, entry.credential),
+			);
+		// Same-pool siblings first: rotation stays in the serving pool while it can.
+		return [
+			...candidates.filter(entry => entry.credential.type === credentialType),
+			...candidates.filter(entry => entry.credential.type !== credentialType),
+		];
+	}
 	#credentialBlockRouting(
 		provider: string,
 		credentialType: AuthCredential["type"],
 		modelId: string | undefined,
 		blockScopeOverride?: string,
+		accountIds?: readonly string[],
 	): CredentialBlockRouting {
 		const providerKey = providerTypeKey(provider, credentialType);
 		const strategy = this.#deps.strategies(provider);
 		const rankingContext: CredentialRankingContext = { modelId };
 		const defaultBlockScope = strategy?.blockScope?.(rankingContext);
+		// An empty override writes the unscoped key, which every request checks.
 		const blockScope = blockScopeOverride ?? defaultBlockScope;
 		const requestBlockScopes = credentialBlockScopesForRequest(provider, strategy, rankingContext, defaultBlockScope);
 		const siblingBlockScopes =
@@ -137,6 +227,7 @@ export class RateLimits implements LimitsApi {
 			rankingContext,
 			blockScope,
 			siblingBlockScopes,
+			accountIds,
 		};
 	}
 	#blockCredentialForRotation(
@@ -184,25 +275,25 @@ export class RateLimits implements LimitsApi {
 					blockedUntil)
 				: blockedUntil;
 
-		const remainingCredentials = this.#deps.pool
-			.credentials(provider)
-			.map((credential, index) => ({ credential, index }))
-			.filter(
-				(entry): entry is { credential: AuthCredential; index: number } =>
-					entry.credential.type === credentialType &&
-					entry.index !== targetIndex &&
-					this.#deps.affinity.allows(provider, sessionId, entry.credential),
-			);
-
 		let retryAtMs: number | undefined;
-		for (const candidate of remainingCredentials) {
+		for (const candidate of this.#rotationCandidates(
+			provider,
+			sessionId,
+			credentialType,
+			targetIndex,
+			routing.accountIds,
+		)) {
 			// Sibling availability must use the same scope set selection reads, or
 			// this reports a sibling as free that selection will then refuse.
+			const candidateRouting =
+				candidate.credential.type === credentialType
+					? routing
+					: this.#credentialBlockRouting(provider, candidate.credential.type, routing.rankingContext.modelId);
 			const candidateBlockedUntil = this.#deps.blocks.blockedUntil(
 				provider,
-				routing.providerKey,
+				candidateRouting.providerKey,
 				candidate.index,
-				routing.siblingBlockScopes,
+				candidateRouting.siblingBlockScopes,
 			);
 			if (candidateBlockedUntil === undefined)
 				return {
@@ -246,9 +337,22 @@ export class RateLimits implements LimitsApi {
 		const credentialType = sessionCredential.type;
 		const targetCredentialId = target.id;
 
-		const routing = this.#credentialBlockRouting(provider, credentialType, options?.modelId);
+		// Exhausted credits or a spend cap stop the account for every model and do
+		// not lift within a retry window. A model quota window (`tier:fable`,
+		// Cursor `pool:api`) keeps its own scope and the short default block.
+		const billingExhausted = options?.errorMessage !== undefined && isAccountBillingExhaustion(options.errorMessage);
+		const routing = this.#credentialBlockRouting(
+			provider,
+			credentialType,
+			options?.modelId,
+			billingExhausted ? ACCOUNT_WIDE_BLOCK_SCOPE : undefined,
+			options?.accountIds,
+		);
 		const now = Date.now();
-		const requestedBlockedUntilMs = now + (options?.retryAfterMs ?? DEFAULT_BLOCK_MS);
+		// Without a provider hint, billing exhaustion takes the quota-exhausted
+		// backoff turn recovery uses, so a spent key is not re-tried a minute later.
+		const fallbackBlockMs = billingExhausted ? calculateRateLimitBackoffMs("QUOTA_EXHAUSTED") : DEFAULT_BLOCK_MS;
+		const requestedBlockedUntilMs = now + (options?.retryAfterMs ?? fallbackBlockMs);
 		let blockedUntil = requestedBlockedUntilMs;
 		// Heuristic/default fallbacks are guesses; provider-stated hints and
 		// report-derived extensions are timed.
@@ -267,15 +371,20 @@ export class RateLimits implements LimitsApi {
 				options?.signal,
 				"usage fetch aborted",
 			);
-			if (report) {
-				const scopedLimits = scopedUsageLimits(routing.strategy, report, routing.rankingContext);
+			// A failed fetch serves the last good report, however old. Only a live
+			// one may stretch this block past the provider's own retry hint: a
+			// report from before a saved reset (or before the window rolled)
+			// still shows the account exhausted until its old reset, and would
+			// re-block a recovered account for days.
+			const nowMs = Date.now();
+			if (report && isLiveUsageReport(report, nowMs)) {
+				const scopedLimits = scopedUsageLimits(routing.strategy, report, routing.rankingContext, nowMs);
 				if (isUsageLimitReached(scopedLimits)) {
-					const resetAtMs = usageResetAtMs(scopedLimits, Date.now());
+					const resetAtMs = usageResetAtMs(scopedLimits, nowMs);
 					if (resetAtMs && resetAtMs > blockedUntil) {
 						blockedUntil = resetAtMs;
 						providerTimed = true;
 					}
-					const nowMs = Date.now();
 					const exhaustedLimits = scopedLimits.filter(limit => isUsageLimitExhausted(limit));
 					const futureResets = exhaustedLimits
 						.map(limit => windowResetAt(limit.window))
@@ -302,6 +411,7 @@ export class RateLimits implements LimitsApi {
 			routing,
 			providerTimed,
 		);
+		logSetAside(provider, targetCredentialId, "usage limit", rotation.blockedUntilMs, options?.errorMessage);
 		return {
 			...rotation,
 			requestedBlockedUntilMs,
@@ -387,7 +497,8 @@ export class RateLimits implements LimitsApi {
 	 * - exact model-entitlement denial (Codex ChatGPT account or Cursor plan) →
 	 *   temporarily block only that requested model, then rotate.
 	 * - other account-scoped policy denial → temporarily block that account
-	 *   without marking its credential suspect, then rotate through siblings.
+	 *   without marking its credential suspect, then rotate through siblings; an
+	 *   org-wide OAuth denial blocks it provider-wide for six hours.
 	 * - otherwise (hard 401 / auth failure) → mark the credential suspect (or
 	 *   reload when no broker hook is wired) and block it, then drop matching
 	 *   sticky state.
@@ -418,6 +529,9 @@ export class RateLimits implements LimitsApi {
 				retryAfterMs,
 				providerTimed: retryAfterMs !== undefined,
 				modelId: options?.modelId,
+				baseUrl: options?.baseUrl,
+				accountIds: options?.accountIds,
+				errorMessage: message,
 				apiKey: options?.apiKey,
 				credentialId: options?.credentialId,
 				signal: options?.signal,
@@ -449,6 +563,7 @@ export class RateLimits implements LimitsApi {
 				sessionCredential.type,
 				options?.modelId,
 				modelPolicyScope,
+				options?.accountIds,
 			);
 			// Account-wide denials must not inherit a quota scope that healthy usage can heal.
 			routing.blockScope = modelPolicyScope ?? ACCOUNT_POLICY_BLOCK_SCOPE;
@@ -459,14 +574,26 @@ export class RateLimits implements LimitsApi {
 			) {
 				this.#deps.affinity.clear(provider, sessionId);
 			}
+			// A standing denial (an org-wide OAuth prohibition, or a key rejected for
+			// its workspace) holds until someone changes a setting and denies every
+			// model, so re-selecting the credential each minute only spends a failed
+			// request per minute. A per-request content denial keeps the short window.
+			const blockMs = AIError.isStandingAccountDenial(error) ? STANDING_DENIAL_BLOCK_MS : DEFAULT_BLOCK_MS;
 			const mark = this.#blockCredentialForRotation(
 				provider,
 				sessionId,
 				sessionCredential.type,
 				sessionCredential.index,
-				Date.now() + DEFAULT_BLOCK_MS,
+				Date.now() + blockMs,
 				routing,
 				false,
+			);
+			logSetAside(
+				provider,
+				this.#deps.pool.entries(provider)[sessionCredential.index]?.id,
+				exactModelPolicy ? "model policy" : "account policy",
+				mark.blockedUntilMs,
+				message,
 			);
 			return awaitSiblingUnblock(mark, options?.signal, options?.waitForSibling);
 		}
@@ -474,15 +601,20 @@ export class RateLimits implements LimitsApi {
 		const providerKey = providerTypeKey(provider, sessionCredential.type);
 		// Snapshot sibling availability before mutating so a soft-deleting
 		// suspect hook can't reindex the answer out from under us.
-		const hasSibling = this.#deps.pool
-			.credentials(provider)
-			.some(
-				(credential, index) =>
-					credential.type === sessionCredential.type &&
-					index !== sessionCredential.index &&
-					!this.#deps.blocks.isBlocked(provider, providerKey, index) &&
-					this.#deps.affinity.allows(provider, sessionId, credential),
-			);
+		const hasSibling = this.#rotationCandidates(
+			provider,
+			sessionId,
+			sessionCredential.type,
+			sessionCredential.index,
+			options?.accountIds,
+		).some(
+			candidate =>
+				!this.#deps.blocks.isBlocked(
+					provider,
+					providerTypeKey(provider, candidate.credential.type),
+					candidate.index,
+				),
+		);
 		const target = this.#deps.pool.entries(provider)[sessionCredential.index];
 		const sticky = this.#deps.affinity.get(provider, sessionId);
 		if (
@@ -497,6 +629,14 @@ export class RateLimits implements LimitsApi {
 			sessionCredential.index,
 			Date.now() + DEFAULT_BLOCK_MS,
 			AUTH_BLOCK_SCOPE,
+		);
+		// The block map keeps the longest block, so report the one it now holds.
+		logSetAside(
+			provider,
+			target?.id,
+			"auth failure",
+			this.#deps.blocks.blockedUntil(provider, providerKey, sessionCredential.index, AUTH_BLOCK_SCOPE),
+			message,
 		);
 
 		if (target && AIError.isInvalidatedOAuthTokenError(error)) {
@@ -528,6 +668,26 @@ export class RateLimits implements LimitsApi {
 
 		return { switched: hasSibling };
 	}
+}
+
+/**
+ * Records why a provider error set a credential aside. The provider's own words
+ * reach no session journal, and the transport logs only the status.
+ */
+function logSetAside(
+	provider: string,
+	credentialId: number | undefined,
+	reason: string,
+	blockedUntilMs: number | undefined,
+	providerMessage: string | undefined,
+): void {
+	logger.warn("Credential set aside after a provider error", {
+		provider,
+		credentialId,
+		reason,
+		blockedUntil: blockedUntilMs === undefined ? undefined : new Date(blockedUntilMs).toISOString(),
+		providerMessage: providerMessage?.slice(0, 500),
+	});
 }
 
 /**

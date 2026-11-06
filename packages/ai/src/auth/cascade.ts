@@ -6,17 +6,21 @@ import * as AIError from "../error";
 import { isUsageLimitOutcome } from "../error/rate-limit";
 import { AUTHENTICATED_SENTINEL } from "../registry/types";
 import type { SessionAffinity } from "./affinity";
+import type { CredentialBlocks } from "./blocks";
+import { type AccountPolicies, isKeylessFallback, isPoolCredential } from "./policy";
 import type { CredentialPool } from "./pool";
 import type { CredentialSelector, OAuthResolutionResult } from "./select";
-import type {
-	AuthApiKeyOptions,
-	AuthPeekOptions,
-	AuthCredential,
-	AuthSource,
-	AuthSourceOptions,
-	KeysApi,
-	LimitsApi,
-	OAuthRequestIdentity,
+import {
+	type ApiKeyCredential,
+	type AuthApiKeyOptions,
+	type AuthCredential,
+	type AuthPeekOptions,
+	type AuthSource,
+	type AuthSourceOptions,
+	type CredentialRequestScope,
+	credentialRequestScope,
+	type KeysApi,
+	type LimitsApi,
 } from "./types";
 
 /**
@@ -140,12 +144,17 @@ export class KeyOverrides {
 	}
 }
 
+/** One of a provider's two stored credential pools. */
+type CredentialPoolKind = AuthCredential["type"];
+
 /** Dependencies of the provider key precedence cascade. */
 export interface KeyCascadeDeps {
 	pool: CredentialPool;
 	overrides: KeyOverrides;
 	selector: CredentialSelector;
 	affinity: SessionAffinity;
+	blocks: CredentialBlocks;
+	policies: AccountPolicies;
 	/** LimitsApi.rotate, injected to avoid a cascade↔rotation import cycle. */
 	rotate: LimitsApi["rotate"];
 	sourceLabel?: string;
@@ -159,27 +168,9 @@ export class KeyCascade implements KeysApi {
 		this.#deps = deps;
 	}
 
-	/**
-	 * True when a stored credential is the provider's KDL `empty-fallback`
-	 * keyless-mode marker — what an empty paste at an "Optional: paste API key"
-	 * login prompt stores (e.g. `lm-studio-local` for lm-studio). The wire layer
-	 * never sends these as a bearer (`isDiscoveryBearerApiKey` strips them), so
-	 * auth-status surfaces must not count them either; otherwise the model hub
-	 * and `/login` report the provider as authenticated while every request
-	 * goes out bare (issue #12281). The credential itself stays stored: `/logout`
-	 * can still remove it, and availability treats the provider as keyless.
-	 */
-	isKeylessFallback(provider: string, credential: AuthCredential): boolean {
-		if (credential.type !== "api_key") return false;
-		const login = authPolicyFor(provider)?.login;
-		if (login?.kind !== "api-key") return false;
-		const fallback = login.emptyFallback;
-		return fallback !== undefined && fallback !== "" && credential.key === fallback;
-	}
-
 	/** Stored credentials that carry real auth — keyless-fallback markers excluded. */
 	#getAuthBearingCredentials(provider: string): AuthCredential[] {
-		return this.#deps.pool.credentials(provider).filter(credential => !this.isKeylessFallback(provider, credential));
+		return this.#deps.pool.credentials(provider).filter(credential => !isKeylessFallback(provider, credential));
 	}
 
 	/**
@@ -191,7 +182,20 @@ export class KeyCascade implements KeysApi {
 	 */
 	keyless(provider: string): boolean {
 		const stored = this.#deps.pool.credentials(provider);
-		return stored.length > 0 && stored.every(credential => this.isKeylessFallback(provider, credential));
+		return stored.length > 0 && stored.every(credential => isKeylessFallback(provider, credential));
+	}
+
+	isOAuthBearer(provider: string, bearer: string): boolean {
+		if (this.#deps.pool.matchesStoredOAuthBearer(provider, bearer)) return true;
+		const oauthTokenEnv = authPolicyFor(provider)?.oauthTokenEnv ?? [];
+		return oauthTokenEnv.some(name => $env[name]?.trim() === bearer);
+	}
+
+	requestScope(provider: string, bearer: string): CredentialRequestScope | undefined {
+		const credential = this.#deps.pool
+			.credentials(provider)
+			.find(stored => (stored.type === "api_key" ? stored.key : stored.access) === bearer);
+		return credential && credentialRequestScope(credential);
 	}
 
 	/**
@@ -207,9 +211,9 @@ export class KeyCascade implements KeysApi {
 
 	/**
 	 * Classify where a provider's auth comes from, following the same precedence
-	 * as {@link KeyCascade.get}: runtime override → config override →
-	 * stored OAuth → login-stored api_key → config fallback → env var → stored api_key.
-	 * Returns undefined when no auth is configured.
+	 * as {@link KeyCascade.get}: runtime override → config override → stored
+	 * OAuth and pooled API keys (in the configured pool order) → config fallback →
+	 * env var → other stored api_key. Returns undefined when no auth is configured.
 	 *
 	 * Compact, structured counterpart to {@link KeyCascade.describe}; `env`
 	 * selects dedicated-only, alias-aware, or no environment fallback.
@@ -219,9 +223,12 @@ export class KeyCascade implements KeysApi {
 		if (this.#deps.overrides.configKey(provider) !== undefined) return { kind: "config", concrete: true };
 		const bearing = this.#getAuthBearingCredentials(provider);
 		const concrete = bearing.length > 0 || this.#envConcrete(provider);
-		if (bearing.some(credential => credential.type === "oauth")) return { kind: "oauth", concrete: true };
-		if (bearing.some(credential => credential.type === "api_key" && credential.source === "login")) {
-			return { kind: "api_key", concrete: true };
+		for (const pool of this.#deps.policies.poolOrder(provider)) {
+			const present =
+				pool === "oauth"
+					? bearing.some(credential => credential.type === "oauth")
+					: bearing.some(credential => this.isPooledApiKey(provider, credential));
+			if (present) return { kind: pool, concrete: true };
 		}
 		if (this.#deps.overrides.fallbackKey(provider) !== undefined) return { kind: "config", concrete: true };
 		if (
@@ -268,20 +275,28 @@ export class KeyCascade implements KeysApi {
 
 		await this.#deps.pool.adoptExternalChanges();
 
-		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
-		// then a stored static api_key (which may be a stale broker-migrated copy) as a last resort.
+		// Stored pools in the configured order, then an explicit env var, then a
+		// stored static api_key (which may be a stale broker-migrated copy) as a last resort.
 		// Peek never refreshes, so only an unexpired OAuth access token is usable
 		// unless the caller only needs the account it names.
 		const now = Date.now();
-		const oauthSelection =
-			this.#deps.selector.selectByType(
-				provider,
-				"oauth",
-				undefined,
-				credential =>
-					credential.type === "oauth" && Number.isFinite(credential.expires) && credential.expires > now,
-			) ?? (options?.includeExpired ? this.#deps.selector.selectByType(provider, "oauth") : undefined);
-		if (oauthSelection) {
+		for (const pool of this.#deps.policies.poolOrder(provider)) {
+			if (pool === "api_key") {
+				const pooledKey = this.#deps.selector.selectByType(provider, "api_key", undefined, credential =>
+					this.isPooledApiKey(provider, credential),
+				);
+				if (pooledKey) return this.#deps.overrides.resolve(pooledKey.credential.key);
+				continue;
+			}
+			const oauthSelection =
+				this.#deps.selector.selectByType(
+					provider,
+					"oauth",
+					undefined,
+					credential =>
+						credential.type === "oauth" && Number.isFinite(credential.expires) && credential.expires > now,
+				) ?? (options?.includeExpired ? this.#deps.selector.selectByType(provider, "oauth") : undefined);
+			if (!oauthSelection) continue;
 			if (provider === "github-copilot") {
 				return JSON.stringify({
 					token: oauthSelection.credential.access,
@@ -290,19 +305,6 @@ export class KeyCascade implements KeysApi {
 				});
 			}
 			return oauthSelection.credential.access;
-		}
-
-		const loginApiKeySelection = this.#deps.selector.selectByType(
-			provider,
-			"api_key",
-			undefined,
-			credential =>
-				credential.type === "api_key" &&
-				credential.source === "login" &&
-				!this.isKeylessFallback(provider, credential),
-		);
-		if (loginApiKeySelection) {
-			return this.#deps.overrides.resolve(loginApiKeySelection.credential.key);
 		}
 
 		const fallbackKey = this.#deps.overrides.fallbackKey(provider);
@@ -331,11 +333,11 @@ export class KeyCascade implements KeysApi {
 		options?: AuthApiKeyOptions,
 	): Promise<ResolvedApiKey | undefined> {
 		let credentialId: number | undefined;
-		let oauthIdentity: OAuthRequestIdentity | undefined;
+		let credentialScope: CredentialRequestScope | undefined;
 		let oauthAccess: string | undefined;
-		const apiKey = await this.#resolve(provider, sessionId, options, (id, identity, access) => {
+		const apiKey = await this.#resolve(provider, sessionId, options, (id, scope, access) => {
 			credentialId = id;
-			oauthIdentity = identity;
+			credentialScope = scope;
 			oauthAccess = access;
 		});
 		if (apiKey === undefined) return undefined;
@@ -343,7 +345,7 @@ export class KeyCascade implements KeysApi {
 			apiKey,
 			credentialId,
 			...(oauthAccess ? { oauthAccess } : {}),
-			...(oauthIdentity ? { oauthIdentity } : {}),
+			...(credentialScope ? { credentialScope } : {}),
 		};
 	}
 
@@ -380,7 +382,7 @@ export class KeyCascade implements KeysApi {
 		provider: string,
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
-		onCredentialId?: (id: number, identity?: OAuthRequestIdentity, oauthAccess?: string) => void,
+		onCredentialId?: (id: number, scope?: CredentialRequestScope, oauthAccess?: string) => void,
 	): Promise<string | undefined> {
 		const restricted = this.#deps.affinity.isRestricted(provider, sessionId);
 		// Runtime override takes highest priority
@@ -405,26 +407,9 @@ export class KeyCascade implements KeysApi {
 			return this.#deps.overrides.resolve(configKey);
 		}
 
-		// Precedence: a deliberate OAuth/login credential wins, then an explicit env var,
-		// then a stored static api_key (which may be a stale broker-migrated copy) as a last resort.
-		// A transient OAuth refresh failure still lets later sources serve the request; it is
-		// rethrown only when none can, so callers retry instead of reporting a missing key.
-		let oauthResolved: OAuthResolutionResult | undefined;
-		let oauthRefreshFailure: AIError.OAuthRefreshUnavailableError | undefined;
-		try {
-			oauthResolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options);
-		} catch (error) {
-			if (!(error instanceof AIError.OAuthRefreshUnavailableError)) throw error;
-			oauthRefreshFailure = error;
-		}
-		if (oauthResolved) {
-			if (onCredentialId && oauthResolved.credentialId !== undefined) {
-				const { orgId, region, inferenceRegion } = oauthResolved.credential;
-				const identity = { orgId, region, inferenceRegion };
-				onCredentialId(oauthResolved.credentialId, identity, oauthResolved.credential.access);
-			}
-			return oauthResolved.apiKey;
-		}
+		const stored = await this.#resolveStoredPools(provider, sessionId, options, onCredentialId);
+		if (stored.apiKey !== undefined) return stored.apiKey;
+		const oauthRefreshFailure = stored.oauthRefreshFailure;
 		if (restricted) {
 			if (oauthRefreshFailure) throw oauthRefreshFailure;
 			throw new AIError.MissingApiKeyError(
@@ -432,23 +417,7 @@ export class KeyCascade implements KeysApi {
 				`No API key for provider: ${provider} (session ${sessionId} is restricted to its OAuth account pool and none of those accounts is available)`,
 			);
 		}
-		const loginApiKeySelection = await this.#deps.selector.selectApiKey(
-			provider,
-			sessionId,
-			options,
-			credential => credential.source === "login" && !this.isKeylessFallback(provider, credential),
-		);
-		if (loginApiKeySelection) {
-			if (options?.recordAffinity !== false) {
-				this.#deps.affinity.record(provider, sessionId, "api_key", loginApiKeySelection.index);
-			}
-			const credentialId = onCredentialId
-				? this.#deps.pool.entries(provider)[loginApiKeySelection.index]?.id
-				: undefined;
-			const apiKey = await this.#deps.overrides.resolve(loginApiKeySelection.credential.key);
-			if (apiKey !== undefined && credentialId !== undefined) onCredentialId?.(credentialId);
-			return apiKey;
-		}
+		if (stored.admitted) return undefined;
 
 		// Past OAuth: the session sticky (if any) is stale — the request authenticates via
 		// env/api_key, not OAuth, so clear it now so getOAuthAccountId() correctly
@@ -460,23 +429,131 @@ export class KeyCascade implements KeysApi {
 
 		const envKey = getEnvApiKey(provider);
 		if (envKey) return envKey;
-		const apiKeySelection = await this.#deps.selector.selectApiKey(
+		const storedApiKey = await this.#resolveStoredApiKey(
 			provider,
 			sessionId,
 			options,
 			credential => credential.source !== "login",
 		);
-		if (apiKeySelection) {
-			if (options?.recordAffinity !== false) {
-				this.#deps.affinity.record(provider, sessionId, "api_key", apiKeySelection.index);
-			}
-			const credentialId = onCredentialId ? this.#deps.pool.entries(provider)[apiKeySelection.index]?.id : undefined;
-			const apiKey = await this.#deps.overrides.resolve(apiKeySelection.credential.key);
-			if (apiKey !== undefined && credentialId !== undefined) onCredentialId?.(credentialId);
-			return apiKey;
+		if (storedApiKey) {
+			if (storedApiKey.apiKey !== undefined) onCredentialId?.(storedApiKey.credentialId, storedApiKey.identity);
+			return storedApiKey.apiKey;
 		}
 		if (oauthRefreshFailure) throw oauthRefreshFailure;
 		return undefined;
+	}
+
+	/**
+	 * Resolve the provider's two stored pools: OAuth subscription accounts and
+	 * pooled API keys (`/login` or `omp auth keys add` keys). The configured
+	 * {@link CredentialPoolOrder} picks which serves first. A pool is skipped while
+	 * every member is blocked, so an exhausted pool falls through to the other one.
+	 * When both pools are unusable, the preferred pool's last resort still returns
+	 * a credential, so the caller sees the provider's real error instead of a
+	 * missing key.
+	 */
+	async #resolveStoredPools(
+		provider: string,
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+		onCredentialId: ((id: number, scope?: CredentialRequestScope, oauthAccess?: string) => void) | undefined,
+	): Promise<{
+		apiKey?: string;
+		admitted?: boolean;
+		oauthRefreshFailure?: AIError.OAuthRefreshUnavailableError;
+	}> {
+		// Another process may have added or removed credentials; the pool check
+		// must see them, or a provider whose only account arrived externally reads empty.
+		await this.#deps.pool.adoptExternalChanges();
+		// A session restricted to an account pool counts only the accounts it may use.
+		const stored = this.#deps.pool
+			.credentials(provider)
+			.filter(credential => this.#deps.affinity.allows(provider, sessionId, credential));
+		const hasOAuth = stored.some(credential => credential.type === "oauth");
+		const hasPooledKeys = stored.some(credential => this.isPooledApiKey(provider, credential));
+		const available = this.#deps.policies
+			.poolOrder(provider)
+			.filter(pool => (pool === "oauth" ? hasOAuth : hasPooledKeys));
+		let oauthRefreshFailure: AIError.OAuthRefreshUnavailableError | undefined;
+		const tryPool = async (
+			pool: CredentialPoolKind,
+			strict: boolean,
+		): Promise<
+			| { apiKey: string | undefined; credentialId?: number; identity?: CredentialRequestScope; oauthAccess?: string }
+			| undefined
+		> => {
+			if (pool === "api_key") {
+				return this.#resolveStoredApiKey(
+					provider,
+					sessionId,
+					options,
+					credential => this.isPooledApiKey(provider, credential),
+					strict,
+				);
+			}
+			let resolved: OAuthResolutionResult | undefined;
+			try {
+				resolved = await this.#deps.selector.resolveOAuth(provider, sessionId, options, strict);
+			} catch (error) {
+				if (!(error instanceof AIError.OAuthRefreshUnavailableError)) throw error;
+				oauthRefreshFailure = error;
+				return undefined;
+			}
+			if (!resolved) return undefined;
+			return {
+				apiKey: resolved.apiKey,
+				credentialId: resolved.credentialId,
+				identity: credentialRequestScope(resolved.credential),
+				oauthAccess: resolved.credential.access,
+			};
+		};
+		// One pool: its own selection ladder (strict, then last resort) is the whole story.
+		// Two pools: each strictly in order, then the preferred pool's last resort.
+		const [preferred, ...rest] = available;
+		const passes: Array<[CredentialPoolKind, boolean]> =
+			preferred === undefined
+				? []
+				: rest.length === 0
+					? [[preferred, false]]
+					: [
+							[preferred, true],
+							...rest.map((pool): [CredentialPoolKind, boolean] => [pool, true]),
+							[preferred, false],
+						];
+		for (const [pool, strict] of passes) {
+			const resolved = await tryPool(pool, strict);
+			if (!resolved) continue;
+			if (resolved.apiKey !== undefined && resolved.credentialId !== undefined) {
+				onCredentialId?.(resolved.credentialId, resolved.identity, resolved.oauthAccess);
+			}
+			// An admitted key whose reference failed to resolve must not enable a lower-precedence source.
+			return { apiKey: resolved.apiKey, admitted: true, oauthRefreshFailure };
+		}
+		return { oauthRefreshFailure };
+	}
+
+	/** A stored API key in the provider's key pool (not a migrated copy or a keyless-mode marker). */
+	isPooledApiKey(provider: string, credential: AuthCredential): credential is ApiKeyCredential {
+		return credential.type === "api_key" && isPoolCredential(provider, credential);
+	}
+
+	async #resolveStoredApiKey(
+		provider: string,
+		sessionId: string | undefined,
+		options: AuthApiKeyOptions | undefined,
+		filter: (credential: ApiKeyCredential) => boolean,
+		strict = false,
+	): Promise<{ apiKey: string | undefined; credentialId: number; identity?: CredentialRequestScope } | undefined> {
+		const selection = await this.#deps.selector.selectApiKey(provider, sessionId, options, filter, strict);
+		if (!selection) return undefined;
+		let apiKey = await this.#deps.overrides.resolve(selection.credential.key);
+		if (!this.#deps.selector.syncApiKeySelection(provider, selection, filter)) apiKey = undefined;
+		if (apiKey !== undefined && options?.recordAffinity !== false) {
+			const recorded = this.#deps.affinity.record(provider, sessionId, "api_key", selection.index);
+			if (sessionId && !recorded) apiKey = undefined;
+		}
+		// An admitted but unresolved source must not silently enable a lower-precedence key.
+		return { apiKey, credentialId: selection.credentialId, identity: credentialRequestScope(selection.credential) };
 	}
 
 	/**
@@ -509,6 +586,7 @@ export class KeyCascade implements KeysApi {
 				const rotation = await this.#deps.rotate(provider, sessionId, {
 					error,
 					modelId,
+					baseUrl,
 					signal,
 					apiKey: previousKey,
 				});
@@ -538,10 +616,10 @@ export class KeyCascade implements KeysApi {
 	 * Mirrors {@link KeyCascade.get} precedence, highest first:
 	 *   1. Runtime override (`--api-key`).
 	 *   2. Config override (`models.yml` `providers.<name>.apiKey`).
-	 *   3. Stored OAuth credential.
-	 *   4. API key persisted by a successful `/login`.
+	 *   3–4. The stored pools in `auth.poolOrder`: OAuth accounts (never one on
+	 *        hold) and pooled API keys; subscription-first by default.
 	 *   5. Env var — overrides a stored static api_key (e.g. a stale broker copy).
-	 *   6. Stored api_key credential.
+	 *   6. Stored static api_key credential.
 	 *
 	 * The string is purely informational; consumers must not parse it.
 	 */
@@ -560,9 +638,15 @@ export class KeyCascade implements KeysApi {
 			type: AuthCredential["type"],
 			filter?: (credential: AuthCredential) => boolean,
 		): string | undefined => {
+			// A held account is neither the session's credential nor its fallback.
 			const typed = stored
 				.map((entry, index) => ({ entry, index }))
-				.filter(({ entry }) => entry.credential.type === type && (filter?.(entry.credential) ?? true));
+				.filter(
+					({ entry, index }) =>
+						entry.credential.type === type &&
+						!this.#deps.blocks.isHeld(provider, index) &&
+						(filter?.(entry.credential) ?? true),
+				);
 			if (typed.length === 0) return undefined;
 			const sticky = session?.type === type ? typed.find(entry => entry.index === session.index) : undefined;
 			const chosen = sticky?.entry ?? typed[0].entry;
@@ -574,17 +658,14 @@ export class KeyCascade implements KeysApi {
 			return `${baseLabel} · ${type} #${chosen.id} (${identity})`;
 		};
 
-		// Deliberate login credentials win; then an explicit env var; then a stored static api_key.
-		const oauthSource = describeStored("oauth");
-		if (oauthSource) return oauthSource;
-		const loginApiKeySource = describeStored(
-			"api_key",
-			credential =>
-				credential.type === "api_key" &&
-				credential.source === "login" &&
-				!this.isKeylessFallback(provider, credential),
-		);
-		if (loginApiKeySource) return loginApiKeySource;
+		// Stored pools in the configured order; then an explicit env var; then a stored static api_key.
+		for (const pool of this.#deps.policies.poolOrder(provider)) {
+			const source =
+				pool === "oauth"
+					? describeStored("oauth")
+					: describeStored("api_key", credential => this.isPooledApiKey(provider, credential));
+			if (source) return source;
+		}
 		if (this.#deps.overrides.fallbackKey(provider) !== undefined) return "provider config (fallback)";
 		if (getEnvApiKey(provider)) return `env (over ${baseLabel})`;
 		const apiKeySource = describeStored(

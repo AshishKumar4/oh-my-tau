@@ -1221,10 +1221,12 @@ export class OAuthRefresher {
 			// refresh was in flight, so the pre-await positional index is unsafe. A
 			// -1 means the row was disabled/removed mid-refresh — surface that as a
 			// miss rather than implying a live row the snapshot won't contain.
-			if (this.#deps.pool.replaceById(provider, id, updated) === -1) {
+			const currentIndex = this.#deps.pool.replaceById(provider, id, updated, attempted);
+			const current = this.#deps.pool.entries(provider)[currentIndex];
+			if (!current || current.credential.type !== "oauth") {
 				throw new AIError.ValidationError(`No credential with id=${id}`);
 			}
-			return snapshotEntry(id, provider, updated);
+			return snapshotEntry(id, provider, current.credential);
 		}
 		throw new AIError.ValidationError(`No credential with id=${id}`);
 	}

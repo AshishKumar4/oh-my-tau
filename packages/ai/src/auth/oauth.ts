@@ -8,6 +8,7 @@ import type { SessionAffinity } from "./affinity";
 import type { KeyOverrides } from "./cascade";
 import type { AccountPolicies } from "./policy";
 import type { CredentialPool } from "./pool";
+import type { OAuthSelection } from "./rank";
 import type { OAuthRefresher } from "./refresh";
 import type { CredentialSelector } from "./select";
 import type {
@@ -27,11 +28,7 @@ import type {
 	StoredOAuthRefreshResult,
 } from "./types";
 
-type StoredOAuthSelection = {
-	credentialId: number;
-	credential: OAuthCredential;
-	index: number;
-};
+type StoredOAuthSelection = OAuthSelection;
 
 /** Dependencies used by the OAuth account operations. */
 export interface OAuthAccountsDeps {
@@ -93,7 +90,7 @@ export class OAuthAccounts implements OAuthApi {
 				return undefined;
 			}
 			// `store-as` routes API-key logins too, not only OAuth credentials.
-			await this.#deps.pool.storeLoginApiKey(def.storeCredentialsAs ?? provider, result);
+			await this.#deps.pool.addApiKey(def.storeCredentialsAs ?? provider, result);
 			return { type: "api_key" };
 		}
 		// Stamp the interactive-login instant: providers with an absolute grant
@@ -183,7 +180,7 @@ export class OAuthAccounts implements OAuthApi {
 			// tryOAuth refreshes only expired tokens; it resyncs this row from the store after a forced re-mint.
 			let index = selection.index;
 			if (options?.forceRefresh) {
-				await this.refresh(selection.credentialId, options.signal, {
+				await this.#deps.refresher.refreshById(selection.credentialId, options.signal, {
 					reuseRecentMint: options.refreshReason === "auth-recovery",
 					reason: options.refreshReason,
 					rejectedAccess: options.rejectedAccessToken,
@@ -194,7 +191,7 @@ export class OAuthAccounts implements OAuthApi {
 			}
 			const resolved = await this.#deps.selector.tryOAuth(
 				provider,
-				{ credential: selection.credential, index },
+				{ ...selection, index },
 				providerKey,
 				undefined,
 				options,
@@ -249,18 +246,15 @@ export class OAuthAccounts implements OAuthApi {
 	 *
 	 * When `sessionId` is supplied, the session-sticky OAuth credential is marked
 	 * `active`. No account is active before that session has resolved or pinned a
-	 * credential.
+	 * credential, and a held account never is.
 	 */
 	accounts(provider: string, sessionId?: string): OAuthAccountSummary[] {
 		if (this.#deps.overrides.suppressesOAuth(provider, this.#deps.affinity.isRestricted(provider, sessionId))) {
 			return [];
 		}
-		const sessionCredential = this.#deps.affinity.get(provider, sessionId);
-		const activeCredentialId =
-			sessionCredential?.type === "oauth"
-				? this.#deps.pool.entries(provider)[sessionCredential.index]?.id
-				: undefined;
-		const activeLastUsedAtMs = activeCredentialId !== undefined ? sessionCredential?.lastUsedAtMs : undefined;
+		const activeCredentialId = this.#deps.affinity.activeOAuthId(provider, sessionId);
+		const activeLastUsedAtMs =
+			activeCredentialId !== undefined ? this.#deps.affinity.get(provider, sessionId)?.lastUsedAtMs : undefined;
 		return this.#getStoredOAuthSelections(provider).map((selection, position) => {
 			const active = selection.credentialId === activeCredentialId;
 			return {

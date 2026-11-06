@@ -80,6 +80,8 @@ export interface OAuthProviderInfo {
 	 * entry back to the model provider it authenticates.
 	 */
 	storeCredentialsAs?: string;
+	/** The provider also accepts a plain API key, which `/login` can add to its key pool. */
+	acceptsApiKey?: boolean;
 }
 
 /** Sign-in URL and accepted cookies for an isolated, host-owned browser. */

@@ -92,4 +92,6 @@ export interface ProviderDefinition {
 	readonly callbackPort?: number;
 	/** OAuth flow needs a pasted code/redirect URL rather than a callback server. */
 	readonly pasteCodeFlow?: boolean;
+	/** The API also accepts a plain API key, so `/login` offers adding one to the key pool. */
+	readonly acceptsApiKey?: boolean;
 }

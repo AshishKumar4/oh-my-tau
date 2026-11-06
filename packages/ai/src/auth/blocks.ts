@@ -5,12 +5,20 @@ import type { RankingStrategyResolver } from "../usage/registry";
 import type { CredentialPool } from "./pool";
 import { isSqliteCorruptionError, USAGE_REPORT_TTL_MS } from "./sqlite-credential-store";
 import type { AuthCredentialStore } from "./store";
-import { isUsageLimitReached, usageReportMetadataValue, usageReportScopeAccountId } from "./usage-report";
+import {
+	isLiveUsageReport,
+	isUsageLimitReached,
+	usageReportMetadataValue,
+	usageReportScopeAccountId,
+} from "./usage-report";
 import type { UsageCache, UsageRequestDescriptor } from "./usage-cache";
-import type { AuthCredential, BlocksApi, StoredCredentialBlock } from "./types";
+import { type AuthCredential, type BlocksApi, CREDENTIAL_HOLD_SCOPE, type StoredCredentialBlock } from "./types";
 
 /** Default block when no provider reset time is known; used by selectors and rate limits. */
 export const DEFAULT_BLOCK_MS = 60_000;
+
+/** Deadline stored for a hold: far enough out that expiry pruning never removes it. */
+const CREDENTIAL_HOLD_UNTIL_MS = Date.UTC(2200, 0, 1);
 
 /** Composite key for round-robin tracking: "<provider>:oauth" or "<provider>:api_key". */
 export function providerTypeKey(provider: string, type: AuthCredential["type"]): string {
@@ -26,6 +34,12 @@ export function scopedBackoffKey(providerKey: string, blockScope: string | undef
 export const AUTH_BLOCK_SCOPE = "auth";
 /** Account-policy backoffs apply to every model and survive quota resets. */
 export const ACCOUNT_POLICY_BLOCK_SCOPE = "account-policy";
+/**
+ * The unscoped block every request checks, for a usage limit that stops the
+ * account for every model (exhausted credits, a spend cap), unlike a model
+ * quota window such as `tier:fable`.
+ */
+export const ACCOUNT_WIDE_BLOCK_SCOPE = "";
 const PROTECTED_BLOCK_SCOPES = [AUTH_BLOCK_SCOPE, ACCOUNT_POLICY_BLOCK_SCOPE] as const;
 
 const MODEL_ACCOUNT_POLICY_BLOCK_SCOPE_PREFIX = "model-policy:";
@@ -270,7 +284,14 @@ export class CredentialBlocks implements BlocksApi {
 		return memory === undefined ? persisted : persisted === undefined ? memory : Math.max(memory, persisted);
 	}
 
-	/** Returns block expiry timestamp for a credential, checking unscoped and scoped blocks. */
+	/**
+	 * Returns block expiry timestamp for a credential, checking unscoped and
+	 * scoped blocks plus a manual hold. A hold applies to every request scope and
+	 * outlasts any backoff, so every eligibility decision built on this (ranking,
+	 * rotation siblings, heal probes, model health) treats a held account as
+	 * unavailable; the paths that deliberately try blocked accounts anyway ask
+	 * {@link CredentialBlocks.isHeld} instead.
+	 */
 	blockedUntil(
 		provider: string,
 		providerKey: string,
@@ -279,14 +300,27 @@ export class CredentialBlocks implements BlocksApi {
 	): number | undefined {
 		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
 		if (credentialId === undefined) return undefined;
-		return this.#blockedUntilById(
-			credentialId,
-			providerKey,
-			blockScopeOrScopes,
-			this.#readPersistedCredentialBlockScopes(credentialId, providerKey),
-		);
+		const persistedScopes = this.#readPersistedCredentialBlockScopes(credentialId, providerKey);
+		const blockedUntil = this.#blockedUntilById(credentialId, providerKey, blockScopeOrScopes, persistedScopes);
+		const heldUntil = this.#heldUntil(provider, providerKey, credentialId, persistedScopes);
+		return heldUntil !== undefined && (blockedUntil === undefined || heldUntil > blockedUntil)
+			? heldUntil
+			: blockedUntil;
 	}
 
+	/** A manual hold's deadline on an OAuth row; `persistedScopes` is a bulk read for `providerKey`. */
+	#heldUntil(
+		provider: string,
+		providerKey: string,
+		credentialId: number,
+		persistedScopes: PersistedBlockScopes,
+	): number | undefined {
+		return providerKey === providerTypeKey(provider, "oauth")
+			? this.#readPersistedCredentialBlock(credentialId, providerKey, CREDENTIAL_HOLD_SCOPE, persistedScopes)
+			: undefined;
+	}
+
+	/** Backoff expiry for a credential (unscoped, requested and protected scopes, in memory and persisted), ignoring any hold. */
 	#blockedUntilById(
 		credentialId: number,
 		providerKey: string,
@@ -340,6 +374,42 @@ export class CredentialBlocks implements BlocksApi {
 			}
 		}
 		return blockedUntil;
+	}
+
+	/**
+	 * Whether the stored row at `credentialIndex` is an OAuth account the user
+	 * has set aside with {@link CredentialBlocks.hold}. Consulted by every path
+	 * that hands out, pins, or names an account, including the ones that try
+	 * blocked accounts anyway.
+	 */
+	isHeld(provider: string, credentialIndex: number): boolean {
+		const entry = this.#deps.pool.entries(provider)[credentialIndex];
+		return (
+			entry?.credential.type === "oauth" &&
+			this.#readPersistedCredentialBlock(entry.id, providerTypeKey(provider, "oauth"), CREDENTIAL_HOLD_SCOPE) !==
+				undefined
+		);
+	}
+
+	/**
+	 * Set a stored OAuth account aside: it stays saved and logged in, but no
+	 * session selects it, pins it, or reports it as active until
+	 * {@link CredentialBlocks.release}. Persisted as a
+	 * {@link CREDENTIAL_HOLD_SCOPE} block row, so every process sharing the store
+	 * honours it, and no expiry pruning, healing, or saved-reset clear removes it.
+	 */
+	hold(provider: string, credentialId: number): void {
+		this.upsert({
+			credentialId,
+			providerKey: providerTypeKey(provider, "oauth"),
+			blockScope: CREDENTIAL_HOLD_SCOPE,
+			blockedUntilMs: CREDENTIAL_HOLD_UNTIL_MS,
+		});
+	}
+
+	/** Lift a hold placed by {@link CredentialBlocks.hold}. */
+	release(provider: string, credentialId: number): void {
+		this.delete(credentialId, providerTypeKey(provider, "oauth"), CREDENTIAL_HOLD_SCOPE);
 	}
 
 	/** Checks if a credential is temporarily blocked due to usage limits. */
@@ -444,11 +514,12 @@ export class CredentialBlocks implements BlocksApi {
 	}
 
 	/**
-	 * Lift any temporary backoff blocks on one credential (across the bare
-	 * `provider:oauth` key and its scoped `\0`-suffixed derivatives). Called
-	 * after a saved reset is redeemed so the just-reset account is immediately
-	 * selectable again instead of being skipped/under-ranked by a stale block
-	 * that `markUsageLimitReached` set for the now-obsolete reset time.
+	 * Lift any temporary backoff blocks on one credential (across its bare
+	 * `provider:<type>` key and scoped `\0`-suffixed derivatives). Called after a
+	 * saved reset is redeemed, so the just-reset account is selectable again
+	 * instead of skipped by a block set for the now-obsolete reset time, and
+	 * when a pooled API key is added again, the user's fix for whatever set it
+	 * aside. A manual hold is not a backoff: the store's bulk delete leaves it in place.
 	 */
 	clearAll(provider: string, credentialId: number): void {
 		try {
@@ -461,10 +532,13 @@ export class CredentialBlocks implements BlocksApi {
 			});
 		}
 
-		const providerKey = providerTypeKey(provider, "oauth");
-		const scopedPrefix = `${providerKey}\0`;
-		for (const key of this.#credentialBackoff.keys()) {
-			if (key === providerKey || key.startsWith(scopedPrefix)) this.#deleteCredentialBackoff(key, credentialId);
+		// The row id is unique across credential types; clear both type namespaces for it.
+		for (const type of ["oauth", "api_key"] as const) {
+			const providerKey = providerTypeKey(provider, type);
+			const scopedPrefix = `${providerKey}\0`;
+			for (const key of this.#credentialBackoff.keys()) {
+				if (key === providerKey || key.startsWith(scopedPrefix)) this.#deleteCredentialBackoff(key, credentialId);
+			}
 		}
 	}
 
@@ -499,7 +573,8 @@ export class CredentialBlocks implements BlocksApi {
 	 * Whether a fresh report could lift what currently blocks this credential.
 	 *
 	 * Claude reports can heal legacy account-wide quota blocks too. Explicit
-	 * auth/account-policy blocks never justify a usage probe.
+	 * auth/account-policy blocks and manual holds never justify a usage probe:
+	 * no report can lift them, so the probe cannot change the outcome.
 	 */
 	canHeal(
 		provider: Provider,
@@ -510,8 +585,9 @@ export class CredentialBlocks implements BlocksApi {
 		if (!this.supportsHealing(provider)) return false;
 		const credentialId = this.#deps.pool.entries(provider)[credentialIndex]?.id;
 		if (credentialId === undefined) return false;
-		// One persisted read serves the protected-scope, global, and requested checks.
+		// One persisted read serves the hold, protected-scope, global, and requested checks.
 		const persistedScopes = this.#readPersistedCredentialBlockScopes(credentialId, providerKey);
+		if (this.#heldUntil(provider, providerKey, credentialId, persistedScopes) !== undefined) return false;
 		if (
 			PROTECTED_BLOCK_SCOPES.some(
 				scope => this.#exactBlockedUntil(credentialId, providerKey, scope, persistedScopes) !== undefined,
@@ -534,14 +610,15 @@ export class CredentialBlocks implements BlocksApi {
 	 * verdicts via {@link CredentialRankingStrategy.healableBlockScopes}.
 	 */
 	reconcile(provider: Provider, credentialId: number, report: UsageReport): void {
-		const providerKey = providerTypeKey(provider, "oauth");
-		const credentialIndex = this.#deps.pool.entries(provider).findIndex(entry => entry.id === credentialId);
-		if (credentialIndex < 0) return;
+		const entry = this.#deps.pool.entries(provider).find(candidate => candidate.id === credentialId);
+		if (!entry) return;
+		// A report heals only its own row's blocks, under that row's credential type.
+		const providerKey = providerTypeKey(provider, entry.credential.type);
 		const strategy = this.#deps.strategies(provider);
 		// Only a live report proves recovery. A broker can serve its retained
 		// last-good report for hours after `/usage` starts failing, and those
 		// healthy limits describe the account before the 429 that blocked it.
-		if (!Number.isFinite(report.fetchedAt) || Date.now() - report.fetchedAt > USAGE_REPORT_TTL_MS) return;
+		if (!isLiveUsageReport(report, Date.now())) return;
 		for (const { blockScope, limits, healthy } of strategy?.healableBlockScopes?.(report) ?? []) {
 			if (healthy === false || isUsageLimitReached(limits) || (healthy === undefined && limits.length === 0))
 				continue;
@@ -553,7 +630,8 @@ export class CredentialBlocks implements BlocksApi {
 	 * Drop one scope's block after a healthy report, unless the block is too
 	 * fresh: `/usage` can lag the request path that just returned 429, so local
 	 * and broker-sourced blocks get one usage-cache window before a healthy
-	 * report may clear them.
+	 * report may clear them. Only rate-limit blocks are judged here; a hold is
+	 * no usage verdict, so no report can clear it.
 	 */
 	#clearHealedBlockScope(
 		provider: Provider,

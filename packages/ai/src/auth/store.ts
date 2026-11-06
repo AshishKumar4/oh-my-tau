@@ -110,7 +110,7 @@ export interface CredentialBlockStore {
 	upsertCredentialBlock(block: StoredCredentialBlock): void;
 	/** Drop one block row for a credential/provider/scope key. */
 	deleteCredentialBlock(credentialId: number, providerKey: string, blockScope: string): void;
-	/** Drop every block row for a credential (all providerKeys/scopes). */
+	/** Drop every rate-limit block row for a credential (all providerKeys/scopes); a manual hold row survives. */
 	deleteCredentialBlocks(credentialId: number): void;
 	/** Prune rows with blocked_until_ms <= nowMs. */
 	cleanExpiredCredentialBlocks(nowMs: number): void;
