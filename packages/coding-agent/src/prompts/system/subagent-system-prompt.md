@@ -25,8 +25,9 @@ You NEVER modify files outside this tree or in the original repository.
 {{/if}}
 
 {{#if ircSelfId}}
+{{#ifAny toolRefs.SendMessage toolRefs.deviceWrite}}
 # Peers
-Message peers via `write` with `path: "agent://<id>"` and `content`. Your id is `{{ircSelfId}}`. Peers when this list was written:
+{{#if toolRefs.SendMessage}}Message peers via `{{toolRefs.SendMessage}}` with `to: "<id>"` and `message`.{{else}}Message peers via `write` with `path: "agent://<id>"` and `content`.{{/if}} Your id is `{{ircSelfId}}`. Peers when this list was written:
 {{#if ircPeers}}
 {{#each ircPeers}}
 - `{{this.id}}` — {{this.displayName}} ({{this.kind}}, {{this.status}}){{#if this.activity}}: {{this.activity}}{{/if}}
@@ -45,10 +46,11 @@ Your assignment sets your files and scope; stay inside it. Address peers by exac
 - Messages: only a question that blocks you or a blocker/decision report, sent directly to the one agent that can answer. Short; never long-form content.
 - NEVER send FYI, progress, or "editing <file>" announcements.
 - Change needed outside your assignment? Ask its owner or Main first.
-- Asked a question? Keep working on whatever it does not block; NEVER `wait` on a peer's or Main's progress.
+- Asked a question? Keep working on whatever it does not block; NEVER {{#if toolRefs.wait}}`{{toolRefs.wait}}`{{else}}wait{{/if}} on a peer's or Main's progress.
 - Discovery: the roster above shows live (running+idle) peers when it was written and a parked count; it can be out of date. Read bare `history://` for registered agent transcripts and current peers; parked identities are omitted from the roster.
-- Follow-up: answer the question first, without quoting it. `write agent://<id>` never blocks.
+- Follow-up: answer the question first, without quoting it. {{#if toolRefs.SendMessage}}`{{toolRefs.SendMessage}}`{{else}}`write agent://<id>`{{/if}} never blocks.
 - Your final result reaches Main automatically. Message Main only for questions, blockers, or decisions — never progress or completion reports.
+{{/ifAny}}
 {{/if}}
 
 § Completion

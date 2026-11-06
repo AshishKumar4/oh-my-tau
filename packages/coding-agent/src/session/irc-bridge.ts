@@ -1,11 +1,13 @@
 import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
+import { escapeExpression } from "@oh-my-pi/pi-utils/template";
+import { escapeHarnessText, getRenderedEnvelope, withRenderedEnvelope } from "../harness/content";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import { harnessToolRefs } from "../harness/manifest";
 import parentIrcSteerTemplate from "../prompts/steering/parent-irc.md" with { type: "text" };
 import ircIncomingTemplate from "../prompts/system/irc-incoming.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "./agent-session-events";
-import { escapeHarnessTags } from "./harness-tags";
 import type { CustomMessage } from "./messages";
 import type { SessionManager } from "./session-manager";
 
@@ -18,6 +20,8 @@ export interface IrcBridgeHost {
 	planModeEnabled(): boolean;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	wakeForIrc(records: AgentMessage[]): void;
+	/** Tool names under the session's harness profile, for the incoming-message text. */
+	toolRefs?(): Readonly<Record<string, string>>;
 }
 
 /** Owns incoming IRC queues and the session's non-interrupting aside queue. */
@@ -211,16 +215,21 @@ export class IrcBridge {
 					queue.remaining.push(record);
 					continue;
 				}
-				messages.push({
-					id,
-					from,
-					to: agentId,
-					body,
-					ts: record.timestamp,
-					...(typeof replyTo === "string" ? { replyTo } : {}),
-					...(broadcast ? { broadcast: true } : {}),
-					...(progress ? { progress: true } : {}),
-				});
+				messages.push(
+					withRenderedEnvelope(
+						{
+							id,
+							from,
+							to: agentId,
+							body,
+							ts: record.timestamp,
+							...(typeof replyTo === "string" ? { replyTo } : {}),
+							...(broadcast ? { broadcast: true } : {}),
+							...(progress ? { progress: true } : {}),
+						},
+						getRenderedEnvelope(details, body),
+					),
+				);
 			}
 		}
 		if (opts?.ifAny && !messages.some(opts.ifAny)) return [];
@@ -268,33 +277,38 @@ export class IrcBridge {
 		// A broadcast leg or progress note asks nothing of the recipient, so a
 		// busy one reads it at its next step boundary without being interrupted.
 		const quiet = msg.broadcast === true || msg.progress === true;
-		// The body is agent-authored (a peer's message, or a wake relay's
-		// `<task-result>` around a subagent's output), so it must not close the
+		// The body is agent-authored (a peer's message), so it must not close the
 		// harness envelope it is rendered into or open a forged one, e.g. a parent
-		// steer. `details.message` keeps the raw body for the transcript card and inbox.
-		const envelopeBody = escapeHarnessTags(msg.body);
+		// steer; only a harness-rendered envelope (a wake relay's `<task-result>`)
+		// passes through. `details.message` keeps the raw body for the transcript card and inbox.
+		const rendered = getRenderedEnvelope(msg, msg.body);
+		const body = rendered ?? escapeHarnessText(msg.body);
 		const record: CustomMessage = {
 			role: "custom",
 			customType: "irc:incoming",
 			content: prompt.render(ircIncomingTemplate, {
-				from: msg.from,
-				message: envelopeBody,
-				replyTo: msg.replyTo ?? "",
+				from: escapeExpression(msg.from),
+				message: body,
+				replyTo: escapeExpression(msg.replyTo ?? ""),
 				progress: msg.progress === true,
 				interrupting: streaming && !quiet,
 				relayOnStop,
+				toolRefs: this.#host.toolRefs?.() ?? harnessToolRefs(undefined),
 			}),
 			display: true,
-			details: {
-				id: msg.id,
-				from: msg.from,
-				message: msg.body,
-				...(msg.replyTo ? { replyTo: msg.replyTo } : {}),
-				...(msg.wakeRelay ? { wakeRelay: true } : {}),
-				...(msg.broadcast ? { broadcast: true } : {}),
-				...(msg.progress ? { progress: true } : {}),
-				...(fromParent ? { fromParent: true } : {}),
-			},
+			details: withRenderedEnvelope(
+				{
+					id: msg.id,
+					from: msg.from,
+					message: msg.body,
+					...(msg.replyTo ? { replyTo: msg.replyTo } : {}),
+					...(msg.wakeRelay ? { wakeRelay: true } : {}),
+					...(msg.broadcast ? { broadcast: true } : {}),
+					...(msg.progress ? { progress: true } : {}),
+					...(fromParent ? { fromParent: true } : {}),
+				},
+				rendered,
+			),
 			attribution: "agent",
 			timestamp: msg.ts,
 		};
@@ -304,7 +318,7 @@ export class IrcBridge {
 			if (fromParent && !peerMessage) {
 				const steer: AgentMessage = {
 					role: "user",
-					content: prompt.render(parentIrcSteerTemplate, { from: msg.from, message: envelopeBody }),
+					content: prompt.render(parentIrcSteerTemplate, { from: escapeExpression(msg.from), message: body }),
 					attribution: "agent",
 					timestamp: msg.ts,
 					steering: true,

@@ -13,6 +13,7 @@ import { USER_INTERRUPT_LABEL } from "../session/messages";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 
+import { sessionToolRefs } from "../harness/effective-profile";
 import type { ToolSession } from "../tools";
 
 import { formatDuration, formatNumber } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -110,36 +111,59 @@ export function runningAgentsOutsideJobs(session: ToolSession): AgentActivitySna
 }
 
 /**
+ * How the caller reaches an agent through the tools it presents (see
+ * `harnessToolRefs`): the stop and message facades by name, else omp's own
+ * `write` device URLs (`deviceWrite`, named natively), else nothing to name.
+ */
+function agentControls(toolRefs: Readonly<Record<string, string>>): {
+	stop?: (id: string) => string;
+	message?: string;
+} {
+	if (toolRefs.TaskStop || toolRefs.SendMessage) {
+		return {
+			...(toolRefs.TaskStop ? { stop: (id: string) => `\`${toolRefs.TaskStop}\` (\`task_id: "${id}"\`)` } : {}),
+			...(toolRefs.SendMessage ? { message: `\`${toolRefs.SendMessage}\` (\`to: "<id>"\`)` } : {}),
+		};
+	}
+	if (!toolRefs.deviceWrite) return {};
+	return { stop: id => `\`write proc://${id}/kill\``, message: "`write agent://<id>`" };
+}
+
+/**
  * Suffix flagging a claimed-running agent with no turn in flight; empty for a
  * live one. Shared by `jobs`, empty-wait results, and the `proc://` roster so
  * every surface tells a finished-but-unterminalized run (#11079) from real work.
+ * The clean-up it names goes through the tools the caller presents (`toolRefs`).
  */
-export function agentStaleNote(agent: AgentActivitySnapshot): string {
+export function agentStaleNote(agent: AgentActivitySnapshot, toolRefs: Readonly<Record<string, string>>): string {
 	if (agent.live) return "";
 	// An accepted final result with no turn in flight is the #11079 leak:
 	// the run is over but the ref never terminalized, so say so actionably
 	// instead of the generic stale-registration hint.
+	const { stop } = agentControls(toolRefs);
+	const clear = stop ? `; clear it with ${stop(agent.id)}` : "";
 	return agent.acceptedAt !== undefined
-		? ` — final result accepted ${formatDuration(Math.max(0, Date.now() - agent.acceptedAt))} ago but still running; clear it with \`write proc://${agent.id}/kill\``
+		? ` — final result accepted ${formatDuration(Math.max(0, Date.now() - agent.acceptedAt))} ago but still running${clear}`
 		: " — no turn in flight (stale registration?)";
 }
 
 /** Model-facing lines for the running-agents section shared by `jobs` and empty-wait results. */
-function describeAgents(agents: AgentActivitySnapshot[]): string[] {
+function describeAgents(agents: AgentActivitySnapshot[], toolRefs: Readonly<Record<string, string>>): string[] {
+	const { stop, message } = agentControls(toolRefs);
 	const lines = [`## Running Agents (${agents.length}) — not job-backed\n`];
 	for (const agent of agents) {
 		const parent = agent.parentId ? ` (spawned by \`${agent.parentId}\`)` : "";
 		const activity = agent.activity ? ` — ${agent.activity}` : "";
-		lines.push(`- \`${agent.id}\`${parent} — up ${formatDuration(agent.ageMs)}${activity}${agentStaleNote(agent)}`);
-	}
-	lines.push(
-		"",
-		"These agents have no job entry; message them via `write agent://<id>`, transcripts at `history://<id>`.",
-	);
-	if (agents.some(agent => !agent.live)) {
 		lines.push(
-			"An agent with no turn in flight cannot answer a message and never satisfies `wait`; clear it with `write proc://<id>/kill`.",
+			`- \`${agent.id}\`${parent} — up ${formatDuration(agent.ageMs)}${activity}${agentStaleNote(agent, toolRefs)}`,
 		);
+	}
+	const reach = message ? ` message them via ${message},` : "";
+	lines.push("", `These agents have no job entry;${reach} transcripts at \`history://<id>\`.`);
+	if (agents.some(agent => !agent.live)) {
+		const wait = toolRefs.wait ? ` and never satisfies \`${toolRefs.wait}\`` : "";
+		const clear = stop ? `; clear it with ${stop("<id>")}` : "";
+		lines.push(`An agent with no turn in flight cannot answer a message${wait}${clear}.`);
 	}
 	return lines;
 }
@@ -233,6 +257,7 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 			label: latest.label,
 			...(latest.intent ? { intent: latest.intent } : {}),
 			durationMs: Math.max(0, (latest.endTime ?? now) - latest.startTime),
+			startedAt: latest.startTime,
 			...(exitCode !== undefined ? { exitCode } : {}),
 			...(resolvedModel ? { resolvedModel } : {}),
 			...(resolvedModelIdentity ? { resolvedModelIdentity } : {}),
@@ -385,7 +410,7 @@ export function buildJobResult(
 
 	if (agents.length > 0) {
 		if (lines.length > 0) lines.push("");
-		lines.push(...describeAgents(agents));
+		lines.push(...describeAgents(agents, sessionToolRefs(session)));
 	}
 
 	// A tool result must never be empty text — the model cannot tell "no

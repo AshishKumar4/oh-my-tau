@@ -1,6 +1,7 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { PipeStreams } from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
+import { getRenderedEnvelope, withRenderedEnvelope } from "../harness/content";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { IrcBus } from "../irc/bus";
@@ -523,6 +524,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 				});
 				job.endTime = Date.now();
 				const text = typeof outcome === "string" ? outcome : outcome.text;
+				if (typeof outcome !== "string") withRenderedEnvelope(job, getRenderedEnvelope(outcome, text));
 				const structured = typeof outcome === "string" ? undefined : outcome.structured;
 				if (structured) job.structured = structured;
 				if (typeof outcome !== "string" && outcome.agentOutputPublished !== undefined) {
@@ -540,6 +542,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 				job.endTime = Date.now();
 				if (error instanceof AsyncJobError && error.structured) job.structured = error.structured;
 				const errorText = error instanceof Error ? error.message : String(error);
+				if (error instanceof Error) withRenderedEnvelope(job, getRenderedEnvelope(error, errorText));
 				job.errorText = errorText;
 				if (job.status !== "cancelled") {
 					job.status = "failed";
@@ -862,23 +865,27 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	/**
-	 * Cancel every job owned by `ownerId`, then wait only until `deadlineAt`.
-	 * The returned completion keeps waiting for actual process settlement when
-	 * the deadline expires, so callers can move that cleanup out of the
-	 * user-visible Task wait without losing ownership of the live work.
+	 * Cancel the given jobs, then wait only until `deadlineAt` for them to
+	 * settle. The returned completion keeps waiting for actual process
+	 * settlement when the deadline expires, so callers can move that cleanup
+	 * out of the user-visible wait without losing ownership of the live work.
+	 * Unknown ids are skipped.
 	 */
-	async cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
-		this.cancelAll({ ownerId });
-		const timeoutMs = Math.max(0, deadlineAt - Date.now());
-		const settled = await this.waitForOwnerJobs(ownerId, { timeoutMs });
-		if (settled) {
+	async cancelAndReapJobs(jobIds: readonly string[], deadlineAt: number): Promise<AsyncJobReapResult> {
+		const jobs = jobIds.flatMap(id => this.#jobs.get(id) ?? []);
+		for (const job of jobs) this.cancel(job.id);
+		const completion = Promise.all(jobs.map(job => job.promise)).then(() => {});
+		const unsettled = () => jobs.filter(job => job.endTime === undefined).map(job => job.id);
+		if (unsettled().length === 0 || (await this.#waitForDeliveryPromise(completion, deadlineAt))) {
 			return { settled: true, pendingJobIds: [], completion: Promise.resolve() };
 		}
-		const pendingJobIds = this.#filterJobs(this.#jobs.values(), { ownerId })
-			.filter(job => job.status === "running" || job.status === "cancelled")
-			.map(job => job.id);
-		const completion = this.waitForOwnerJobs(ownerId).then(() => {});
-		return { settled: false, pendingJobIds, completion };
+		return { settled: false, pendingJobIds: unsettled(), completion };
+	}
+
+	/** {@link cancelAndReapJobs} for every job `ownerId` registered. */
+	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
+		const jobIds = this.#filterJobs(this.#jobs.values(), { ownerId }).map(job => job.id);
+		return this.cancelAndReapJobs(jobIds, deadlineAt);
 	}
 
 	async #waitForAllUntil(deadline: number): Promise<boolean> {
@@ -1256,18 +1263,21 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 			nextAttemptAt: Date.now(),
 			ownerId: job?.ownerId,
 			jobSnapshot: job
-				? {
-						type: job.type,
-						status: job.status,
-						startTime: job.startTime,
-						endTime: job.endTime,
-						label: job.label,
-						intent: job.intent,
-						structured: job.structured,
-						agentId: job.agentId,
-						agentOutputPublished: job.agentOutputPublished,
-						latestDetails: job.latestDetails,
-					}
+				? withRenderedEnvelope(
+						{
+							type: job.type,
+							status: job.status,
+							startTime: job.startTime,
+							endTime: job.endTime,
+							label: job.label,
+							intent: job.intent,
+							structured: job.structured,
+							agentId: job.agentId,
+							agentOutputPublished: job.agentOutputPublished,
+							latestDetails: job.latestDetails,
+						},
+						getRenderedEnvelope(job, text),
+					)
 				: undefined,
 		});
 		this.#ensureDeliveryLoop();
@@ -1397,22 +1407,25 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	#reconstructEvictedJob(delivery: AsyncJobDelivery): AsyncJob | undefined {
 		const snapshot = delivery.jobSnapshot;
 		if (!snapshot) return undefined;
-		return {
-			id: delivery.jobId,
-			type: snapshot.type,
-			status: snapshot.status,
-			startTime: snapshot.startTime,
-			endTime: snapshot.endTime,
-			label: snapshot.label,
-			intent: snapshot.intent,
-			abortController: new AbortController(),
-			promise: Promise.resolve(),
-			resultText: delivery.text,
-			structured: snapshot.structured,
-			agentId: snapshot.agentId,
-			agentOutputPublished: snapshot.agentOutputPublished,
-			latestDetails: snapshot.latestDetails,
-		};
+		return withRenderedEnvelope(
+			{
+				id: delivery.jobId,
+				type: snapshot.type,
+				status: snapshot.status,
+				startTime: snapshot.startTime,
+				endTime: snapshot.endTime,
+				label: snapshot.label,
+				intent: snapshot.intent,
+				abortController: new AbortController(),
+				promise: Promise.resolve(),
+				resultText: delivery.text,
+				structured: snapshot.structured,
+				agentId: snapshot.agentId,
+				agentOutputPublished: snapshot.agentOutputPublished,
+				latestDetails: snapshot.latestDetails,
+			},
+			getRenderedEnvelope(snapshot, delivery.text),
+		);
 	}
 
 	#queueDelivery(delivery: AsyncJobDelivery): void {

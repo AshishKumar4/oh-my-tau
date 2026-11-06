@@ -762,12 +762,10 @@ describe("runSubprocess soft request budget", () => {
 describe("resolveSoftRequestBudget", () => {
 	it("lets a configured budget lower a bundled agent's ceiling", () => {
 		expect(resolveSoftRequestBudget("scout", 20)).toBe(20);
-		expect(resolveSoftRequestBudget("sonic", 20)).toBe(20);
 	});
 
 	it("keeps the bundled ceiling when the configured budget is higher", () => {
 		expect(resolveSoftRequestBudget("scout", 200)).toBe(100);
-		expect(resolveSoftRequestBudget("sonic", 200)).toBe(100);
 	});
 
 	it("uses the configured budget for agents without a bundled entry", () => {
@@ -790,7 +788,8 @@ describe("resolveSoftRequestBudget", () => {
 		const agentBudgets = { lead: 400 };
 		expect(resolveSoftRequestBudget("task", 200, agentBudgets)).toBe(200);
 		expect(resolveSoftRequestBudget("scout", 200, agentBudgets)).toBe(100);
-		expect(resolveSoftRequestBudget("sonic", 200, agentBudgets)).toBe(100);
+		// The fork retired `sonic`; the Fusion sidekick's bundled entry turns the guard off.
+		expect(resolveSoftRequestBudget("sidekick", 200, agentBudgets)).toBe(0);
 	});
 
 	it("disables only the named agent's guard with an entry of 0", () => {

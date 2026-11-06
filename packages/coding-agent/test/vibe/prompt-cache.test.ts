@@ -23,7 +23,7 @@ afterEach(() => {
 	AgentRegistry.resetGlobalForTests();
 });
 
-it("shares Vibe sibling cache routing by worker type while keeping conversations separate", async () => {
+it("shares Vibe sibling cache routing by worker agent while keeping conversations separate", async () => {
 	using directory = TempDir.createSync("@omp-vibe-cache-");
 	vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Network is disabled in this test"));
 	// Task workers classify each turn's difficulty through the judge role, whose native backends
@@ -104,10 +104,12 @@ it("shares Vibe sibling cache routing by worker type while keeping conversations
 			await job.promise;
 			expect(job.status, job.errorText ?? job.resultText).toBe("completed");
 		}
+		// Every vibe tier runs the bundled `task` agent (`fast` only swaps its model and
+		// thinking), so all three siblings share the `task` worker lineage.
 		expect(requests.map(request => request.key)).toEqual([
 			"parent-cache-lineage:task",
 			"parent-cache-lineage:task",
-			"parent-cache-lineage:sonic",
+			"parent-cache-lineage:task",
 		]);
 		expect(new Set(requests.map(request => request.sessionId)).size).toBe(3);
 	} finally {

@@ -1,1 +1,1 @@
-Tip: this call spawned {{count}} generic `{{agent}}` workers. Check the agent list for a closer specialist type{{#if scoutAvailable}} — e.g. read-only research belongs on `agent: "scout"`, which runs on a faster model{{/if}}.
+Tip: this call spawned {{count}} generic `{{agent}}` workers. Check the agent list for a closer specialist type{{#if scoutAvailable}} — e.g. read-only research belongs on {{#if toolRefs.Agent}}`subagent_type: "scout"`{{else}}`agent: "scout"`{{/if}}, which runs on a faster model{{/if}}.

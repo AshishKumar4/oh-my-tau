@@ -15,6 +15,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { parseAgentFields } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
@@ -125,6 +126,25 @@ function createModelRegistry(
 describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("persists the spawning owner's expanded advisor role for later cold revival", async () => {
+		const child = yieldEmittingSession();
+		const journal = SessionManager.inMemory("/tmp");
+		vi.spyOn(child.sessionManager, "appendSessionInit").mockImplementation(config =>
+			journal.appendSessionInit(config),
+		);
+		const opened = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(child));
+		const settings = Settings.isolated({ modelRoles: { advisor: "openai/gpt-5.6-sol:high" } });
+		const outcome = await runSubprocess({ ...baseOptions, agent: { ...baseAgent, advisor: "@advisor" }, settings });
+		expect(outcome.exitCode).toBe(0);
+		const childSettings = opened.mock.calls[0]?.[0]?.settings;
+		expect(childSettings?.getModelRole("advisor")).toBe("openai/gpt-5.6-sol:high");
+		const initialization = journal.getEntries().find(entry => entry.type === "session_init");
+		if (!initialization || initialization.type !== "session_init")
+			throw new Error("Expected persisted session initialization");
+		expect(initialization.advisor).toBe("openai/gpt-5.6-sol:high");
+		expect(settings.getModelRole("advisor")).toBe("openai/gpt-5.6-sol:high");
 	});
 
 	it("forwards rules, extension-root policy, prepared extensions, and preloaded source paths to createAgentSession", async () => {
@@ -334,6 +354,19 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(forwarded?.outputSchemaMode).toBe("strict");
 		expect(persistedInits).toHaveLength(1);
 		expect(persistedInits[0]).toMatchObject({ restrictToolNames: true, tools: ["read", "yield"] });
+	});
+
+	it("persists bridge-only tools in the enabled Code Mode set", async () => {
+		const session = yieldEmittingSession();
+		vi.spyOn(session, "getActiveToolNames").mockReturnValue(["eval", "yield"]);
+		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["eval", "read", "yield"]);
+		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({ ...baseOptions, id: "code-mode-child" });
+
+		expect(result.exitCode).toBe(0);
+		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["eval", "read", "yield"] }));
 	});
 
 	it("persists xd://-mounted tools from the enabled set", async () => {

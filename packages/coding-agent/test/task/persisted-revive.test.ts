@@ -3,6 +3,8 @@ import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
+import { SUBAGENT_CONTEXT_TAG } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
+import type { Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -127,6 +129,8 @@ function createRevivedSession(activeToolNames: string[][], extensionRunner?: unk
 	const session = {
 		...createSessionDefaults(),
 		getMountedXdevToolNames: () => [],
+		// The persisted contract's tools (createPersistedSession): a lane run reads its result mode from them.
+		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (names: string[]) => {
 			activeToolNames.push(names);
 		},
@@ -610,6 +614,31 @@ describe("persisted subagent revival", () => {
 		await reviver(ref);
 
 		expect(capturedBudget).toBe(100);
+	it("revives transcripts of removed bundled agents from their recorded contract", async () => {
+		const contracts = [
+			{ agent: "security-reviewer", tools: ["read", "find", "grep", "glob", "lsp", "ast_grep", "yield"] },
+			{ agent: "sonic", tools: ["read", "edit", "write", "bash", "yield"] },
+		];
+		const captured: CreateAgentSessionOptions[] = [];
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			if (!options) throw new Error("expected session options");
+			captured.push(options);
+			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
+		});
+
+		for (const contract of contracts) {
+			const cwd = makeTempDir(`@pi-revive-retired-${contract.agent}-`);
+			const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, contract);
+			const ref = createRef(sessionFile);
+			const reviver = await createFactory(cwd)(ref);
+			if (!reviver) throw new Error("Expected a persisted reviver");
+			await reviver(ref);
+		}
+
+		// No definition lookup: each keeps the tools it ran with and its rule scope.
+		expect(captured.map(options => [options.agentName, options.toolNames])).toEqual(
+			contracts.map(contract => [contract.agent, contract.tools]),
+		);
 	});
 
 	it("restores the live account pool for the persisted agent name, so a revived agent stays restricted", async () => {
@@ -1340,6 +1369,7 @@ describe("persisted subagent revival", () => {
 		const advisedFile = await createPersistedSession(cwd, undefined, undefined, "moonshot/k3");
 		const roleAdvisedFile = await createPersistedSession(cwd, undefined, undefined, "on");
 		const unadvisedFile = await createPersistedSession(cwd);
+		const resolvedFile = await createPersistedSession(cwd, undefined, undefined, "openai/gpt-5.6-sol:high");
 		const captured: Settings[] = [];
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
 			if (options?.settings) captured.push(options.settings);
@@ -1347,19 +1377,21 @@ describe("persisted subagent revival", () => {
 		});
 
 		const factory = createFactory(cwd);
-		for (const sessionFile of [advisedFile, roleAdvisedFile, unadvisedFile]) {
+		for (const sessionFile of [advisedFile, roleAdvisedFile, unadvisedFile, resolvedFile]) {
 			const ref = createRef(sessionFile);
 			const reviver = await factory(ref);
 			if (!reviver) throw new Error("Expected a persisted reviver");
 			await reviver(ref);
 		}
 
-		const [advised, roleAdvised, unadvised] = captured;
+		const [advised, roleAdvised, unadvised, resolved] = captured;
 		expect(cfgAdvisorEnabled.get(advised)).toBe(true);
 		expect(advised.getModelRole("advisor")).toBe("moonshot/k3");
 		expect(cfgAdvisorEnabled.get(roleAdvised)).toBe(true);
 		expect(roleAdvised.getModelRole("advisor")).toBeUndefined();
 		expect(cfgAdvisorEnabled.get(unadvised)).toBe(false);
+		expect(cfgAdvisorEnabled.get(resolved)).toBe(true);
+		expect(resolved.getModelRole("advisor")).toBe("openai/gpt-5.6-sol:high");
 	});
 
 	it("keeps a nested spawn's owner-resolved advisor when reviving under root settings with a different advisor", async () => {
@@ -1878,6 +1910,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.global().unregister("prompt-blocks");
 		AgentRegistry.global().unregister("Peer");
+		AgentRegistry.global().unregister("Peer");
 	});
 
 	function createTool(name: string): AgentTool {
@@ -2002,6 +2035,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		responses: MockResponseSource,
 		hooks?: ExtensionHooks,
 		toolNames?: string[],
+		settings = Settings.isolated(),
 	): Promise<RecordingSession> {
 		let spawned: RecordingSession | undefined;
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
@@ -2029,7 +2063,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 			task: "do work",
 			index: 0,
 			id: "prompt-blocks",
-			settings: Settings.isolated(),
+			settings,
 			modelRegistry: { refresh: async () => {} } as unknown as ModelRegistry,
 			enableLsp: false,
 			artifactsDir: cwd,
@@ -2228,6 +2262,22 @@ describe("cold revival replays the system prompt the last request sent", () => {
 
 		await spawned.session.setActiveToolsByName(["read"]);
 		expect(spawned.session.systemPrompt.join("\n")).toContain("`Peer` — Peer (sub, running): editing b.ts");
+
+	it("warm-revives a Claude Code subagent with the roster its wrapped per-spawn block held", async () => {
+		const cwd = makeTempDir("@pi-revive-wrapped-roster-");
+		const claudeCode = getBundledModel("anthropic", "claude-opus-5");
+		const spawned = await spawn(
+			cwd,
+			(names, options) => subagentPrompt(names, options, claudeCode),
+			spawnResponses(),
+			undefined,
+			Settings.isolated({ "harness.mode": "claude-code" }),
+		);
+		const sent = spawned.requests.at(-1)!;
+		expect(sent.at(-1)).toStartWith(`<${SUBAGENT_CONTEXT_TAG}>\n`);
+		expect(sent.join("\n")).toContain("(no other agents)");
+		const { warm } = await parkAndRevive(registerPeer, undefined, claudeCode);
+		expect(warm.requests[0]).toEqual(sent);
 	});
 
 	it("warm-revives with the roster its prompt held, not one a discarded rebuild rendered", async () => {

@@ -202,24 +202,27 @@ describe("task.batch schema gating", () => {
 		expect(getSchemaProperties(batch).schema).toBeUndefined();
 	});
 
-	it("hides outputSchema and schemaMode from the wire shape and description unless task.structured is on", async () => {
+	it("keeps outputSchema and schemaMode on the wire shape and description with task.structured off", async () => {
+		// A call that declares a schema gets a structured result whatever the
+		// setting, so the fields stay advertised (and the wire schema static).
 		mockDiscovery();
 
 		const flat = await TaskTool.create(createSession({ settings: { "task.batch": false } }));
-		expect(getSchemaProperties(flat).outputSchema).toBeUndefined();
-		expect(getSchemaProperties(flat).schemaMode).toBeUndefined();
-		expect(flat.description).not.toContain("outputSchema");
+		expect(getSchemaProperties(flat).outputSchema).toBeDefined();
+		expect(getSchemaProperties(flat).schemaMode).toBeDefined();
+		expect(flat.description).toContain("`outputSchema` overrides agent/session schemas");
 
 		const batch = await TaskTool.create(createSession({ settings: { "task.batch": true, "async.enabled": true } }));
-		expect(getBatchItemProperties(batch).outputSchema).toBeUndefined();
-		expect(getBatchItemProperties(batch).schemaMode).toBeUndefined();
-		expect(batch.description).not.toContain("outputSchema");
+		expect(getBatchItemProperties(batch).outputSchema).toBeDefined();
+		expect(getBatchItemProperties(batch).schemaMode).toBeDefined();
+		expect(batch.description).toContain("`outputSchema` overrides agent/session schemas");
 	});
 
-	it("explains structured result navigation with task.structured off only while a visible agent opts in", async () => {
+	it("marks agents that declare a result contract while task.structured is off", async () => {
 		mockDiscovery([
 			taskAgent,
 			{ ...taskAgent, name: "reporter", description: "Reports a verdict", structured: true },
+			{ ...taskAgent, name: "auditor", description: "Audits", output: { properties: { ok: { type: "boolean" } } } },
 		]);
 		const session = createSession({ settings: { "task.batch": true, "async.enabled": true } });
 		const tool = await TaskTool.create(session);
@@ -227,12 +230,15 @@ describe("task.batch schema gating", () => {
 
 		const optedIn = tool.description;
 		expect(optedIn).toContain(navigation);
+		expect(optedIn).toContain("`outputSchema` or STRUCTURED agent parsed payload, even invalid");
 		expect(optedIn).toContain("- `reporter` (STRUCTURED; schema result): Reports a verdict");
-		expect(optedIn).not.toContain("outputSchema");
-		expect(optedIn).not.toContain("schemaMode");
+		expect(optedIn).toContain("- `auditor` (STRUCTURED; schema result): Audits");
+		expect(optedIn).toContain("- `task`: General-purpose task agent");
 
-		cfgTaskDisabledAgents.override(session.settings, ["reporter"]);
-		expect(tool.description).not.toContain(navigation);
+		cfgTaskDisabledAgents.override(session.settings, ["reporter", "auditor"]);
+		const noneOptedIn = tool.description;
+		expect(noneOptedIn).toContain("`outputSchema` parsed payload, even invalid");
+		expect(noneOptedIn).not.toContain("STRUCTURED");
 
 		cfgTaskDisabledAgents.override(session.settings, []);
 		cfgTaskStructured.override(session.settings, true);
@@ -745,8 +751,8 @@ describe("task.batch spawning", () => {
 		expect(captured?.outputSchemaOverridesAgent).toBe(true);
 	});
 
-	it("spawns schema-less, yield-less children by default even with caller and agent schemas", async () => {
-		mockDiscovery({ ...taskAgent, output: { type: "object", properties: { agent: { type: "string" } } } });
+	it("spawns schema-less, yield-less children by default when nothing declares a schema", async () => {
+		mockDiscovery();
 		let captured: { structured?: boolean; outputSchema?: unknown; outputSchemaSource?: string } | undefined;
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			captured = {
@@ -765,12 +771,54 @@ describe("task.batch spawning", () => {
 			agent: "task",
 			name: "Prose",
 			task: "Do the thing.",
-			outputSchema: { type: "object", properties: { caller: { type: "number" } } },
-			schemaMode: "strict",
 		} as TaskParams);
 
 		await manager.getJob(result.details!.async!.jobId)!.promise;
 		expect(captured).toEqual({ structured: false, outputSchema: undefined, outputSchemaSource: undefined });
+	});
+
+	it.each([
+		{
+			declared: "a caller outputSchema",
+			agent: taskAgent,
+			outputSchema: { type: "object", properties: { caller: { type: "number" } } },
+			source: "caller",
+		},
+		{
+			declared: "an agent output",
+			agent: { ...taskAgent, output: { type: "object", properties: { agent: { type: "string" } } } },
+			outputSchema: undefined,
+			source: "agent",
+		},
+	])("keeps the result contract with task.structured off for $declared", async ({ agent, outputSchema, source }) => {
+		mockDiscovery(agent);
+		let captured: { structured?: boolean; outputSchema?: unknown; outputSchemaSource?: string } | undefined;
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			captured = {
+				structured: options.structured,
+				outputSchema: options.outputSchema,
+				outputSchemaSource: options.outputSchemaSource,
+			};
+			return makeResult(options.id ?? "?");
+		});
+
+		const manager = createManager();
+		const tool = await TaskTool.create(
+			createSession({ manager, settings: { "async.enabled": true, "task.batch": true } }),
+		);
+		const result = await tool.execute("tc-declared", {
+			agent: "task",
+			name: "Declared",
+			task: "Do the thing.",
+			...(outputSchema ? { outputSchema } : {}),
+		} as TaskParams);
+
+		await manager.getJob(result.details!.async!.jobId)!.promise;
+		expect(captured).toEqual({
+			structured: true,
+			outputSchema: outputSchema ?? agent.output,
+			outputSchemaSource: source,
+		});
 	});
 
 	it("blocks batch execution when async.enabled is false even with a job manager", async () => {

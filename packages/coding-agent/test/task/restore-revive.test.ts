@@ -1,7 +1,8 @@
 /**
- * `omp --restore` end to end for a subagent: a transcript a crash cut off mid tool
- * call is revived from disk, its cut-off call runs again, the agent answers, and the
- * parent receives the answer as the subagent's job.
+ * `omp --restore` end to end for a subagent, through `/recover`'s implementation:
+ * a transcript a crash cut off mid tool call is revived from disk, the cut-off call
+ * gets an interruption result instead of running again, the agent answers the
+ * resume message, and the parent receives the answer as the subagent's job.
  */
 import { afterEach, beforeEach, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -18,11 +19,17 @@ import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
+import {
+	createSessionOpenData,
+	INTERRUPTED_TOOL_RESULT_TEXT,
+	SESSION_OPEN_CUSTOM_TYPE,
+} from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
-import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const AGENT_ID = "Restored";
 const MOCK_API_SOURCE = "test/restore-revive";
@@ -72,40 +79,40 @@ afterEach(async () => {
 	await removeWithRetries(root);
 });
 
-const SPAWN_MODEL = "mock-model";
-const HANDOFF_MODEL = "mock-handoff";
-
-/** The mock carries no effort ladder; without one every configured effort clamps away. */
-const thinking = { mode: "effort", efforts: [Effort.Medium, Effort.High] } as const;
-
-/**
- * Writes a main session whose subagent died inside its `read` call (no tool result, no
- * exit record), restores the session, and returns the answer the parent received with
- * the `read` results and efforts each model saw when the cut-off call ran again.
- * `handoff` records a prewalk handoff to `high` effort before the cut-off call;
- * `fallback` follows that handoff with a retry fallback hop back to the spawn model.
- */
-async function restoreInterruptedChild(options: { transcript?: "handoff" | "fallback" } = {}) {
+it("revives a subagent a crash cut off mid tool call, does not run the call again, and delivers its answer to the parent", async () => {
 	const cwd = path.join(root, "home", "work");
 	await fs.mkdir(cwd, { recursive: true });
 	const notes = path.join(cwd, "notes.txt");
 	await Bun.write(notes, "the answer is 42\n");
 
 	const main = SessionManager.create(cwd, path.join(root, "sessions"));
-	main.appendMessage({ role: "user", content: "fan out", timestamp: Date.now() });
 	const mainFile = main.getSessionFile();
 	if (!mainFile) throw new Error("Expected a persisted session file");
-	await main.close();
-	const child = await SessionManager.open(
-		path.join(mainFile.slice(0, -6), `${AGENT_ID}.jsonl`),
-		undefined,
-		undefined,
-		{
-			initialCwd: cwd,
-			parentSession: mainFile,
-			suppressBreadcrumb: true,
+	main.appendMessage({ role: "user", content: "fan out", timestamp: Date.now() });
+	main.appendMessage({
+		...createAssistantMessage(""),
+		content: [{ type: "toolCall", id: "spawn", name: "task", arguments: { tasks: [] } }],
+		stopReason: "toolUse",
+	});
+	main.appendMessage({
+		role: "toolResult",
+		toolCallId: "spawn",
+		toolName: "task",
+		content: [{ type: "text", text: "spawned" }],
+		isError: false,
+		details: {
+			async: { state: "running", jobId: AGENT_ID, type: "task" },
+			progress: [{ id: AGENT_ID, status: "running", description: "report notes.txt" }],
 		},
-	);
+		timestamp: Date.now(),
+	});
+	main.appendMessage(createAssistantMessage("waiting on the subagent"));
+	const childFile = path.join(mainFile.slice(0, -6), `${AGENT_ID}.jsonl`);
+	const child = await SessionManager.open(childFile, undefined, undefined, {
+		initialCwd: cwd,
+		parentSession: mainFile,
+		suppressBreadcrumb: true,
+	});
 	child.appendSessionInit({
 		systemPrompt: ["test"],
 		task: "report what notes.txt says",
@@ -138,28 +145,33 @@ async function restoreInterruptedChild(options: { transcript?: "handoff" | "fall
 		timestamp: Date.now(),
 	});
 	await child.close();
+	AgentRegistry.global().register({
+		id: AGENT_ID,
+		displayName: AGENT_ID,
+		kind: "sub",
+		parentId: MAIN_AGENT_ID,
+		session: null,
+		sessionFile: childFile,
+		status: "parked",
+	});
+	// This process opened the session after the crash.
+	main.appendCustomEntry(SESSION_OPEN_CUSTOM_TYPE, createSessionOpenData());
 
 	const authStorage = createInMemoryAuthStorage();
 	authStorage.keys.setRuntime("mock", "test-key");
 	const modelRegistry = new ModelRegistry(authStorage);
-	const readResults: Record<string, string[]> = { [SPAWN_MODEL]: [], [HANDOFF_MODEL]: [] };
-	const readEfforts: Record<string, (string | undefined)[]> = { [SPAWN_MODEL]: [], [HANDOFF_MODEL]: [] };
-	const mocks = [SPAWN_MODEL, HANDOFF_MODEL].map(id =>
-		Object.assign(
-			createMockModel({
-				id,
-				reasoning: true,
-				handler: (context, streamOptions) => {
-					const last = context.messages.at(-1);
-					if (last?.role !== "toolResult" || last.toolName !== "read") return { content: ["label"] };
-					readResults[id]!.push(JSON.stringify(last.content));
-					readEfforts[id]!.push(streamOptions?.reasoning);
-					return { content: [`restored: 42 (${id})`] };
-				},
-			}),
-			{ thinking },
-		),
-	);
+	const readResults: string[] = [];
+	const mock = createMockModel({
+		handler: context => {
+			for (const message of context.messages) {
+				if (message.role === "toolResult" && message.toolName === "read")
+					readResults.push(JSON.stringify(message.content));
+			}
+			const last = context.messages.at(-1);
+			if (last?.role !== "user") return { content: ["label"] };
+			return { content: ["restored: the read was interrupted"] };
+		},
+	});
 	const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
 	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [...mocks, ...catalogAvailable(kind)]);
 	const settings = Settings.isolated({
@@ -172,17 +184,19 @@ async function restoreInterruptedChild(options: { transcript?: "handoff" | "fall
 		modelRoles: { default: `mock/${SPAWN_MODEL}` },
 		defaultThinkingLevel: Effort.Medium,
 	});
+	const bus = new EventBus();
 	const session = {
-		sessionManager: {
-			getSessionFile: () => mainFile,
-			getCwd: () => cwd,
-			getArtifactManager: () => undefined,
-		},
+		sessionManager: main,
 		asyncJobManager: manager,
 		settings,
+		eventBus: bus,
+		subagentEventBus: bus,
+		agent: { replaceMessages: () => {} },
+		buildDisplaySessionContext: () => main.buildSessionContext(),
+		getAgentId: () => MAIN_AGENT_ID,
+		sendCustomMessage: async () => true,
 		effectiveExtensionRoots: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
 		preparedExtensions: undefined,
-		restoreInterruptedTurn: async () => false,
 	} as unknown as AgentSession;
 	AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
 		createPersistedSubagentReviverFactory({ session, authStorage, modelRegistry, settings, enableLsp: false }),
@@ -196,9 +210,15 @@ async function restoreInterruptedChild(options: { transcript?: "handoff" | "fall
 	try {
 		const outcome = await restoreSession(session);
 		expect(outcome.subagents).toEqual([AGENT_ID]);
-		return { delivered: await delivered.promise, readResults, readEfforts };
+
+		expect(await delivered.promise).toContain("restored: the read was interrupted");
+		// The cut-off read was answered by its interruption result, never re-run.
+		expect(readResults.length).toBeGreaterThan(0);
+		expect(readResults.every(result => result.includes(INTERRUPTED_TOOL_RESULT_TEXT))).toBe(true);
+		expect(readResults.some(result => result.includes("the answer is 42"))).toBe(false);
 	} finally {
 		authStorage.close();
+		await main.close();
 	}
 }
 

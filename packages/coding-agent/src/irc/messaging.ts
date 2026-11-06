@@ -3,6 +3,7 @@ import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { CoordinationDetails } from "@oh-my-pi/pi-tui/tools/wait";
 import type { Settings } from "../config/settings";
 import { IrcBus } from "./bus";
+import { escapeHarnessText, getRenderedEnvelope } from "../harness/content";
 import type { AgentRegistryApi } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { canSpawnAtDepth } from "../task/types";
@@ -23,7 +24,7 @@ export function isIrcEnabled(settings: Settings, taskDepth: number): boolean {
 export function formatIncoming(msg: IrcMessage): string {
 	const replyTag = msg.replyTo ? ` (reply to ${msg.replyTo})` : "";
 	const progressTag = msg.progress ? " (progress; reply follows)" : "";
-	return `[${msg.id}] ${msg.from}${replyTag}${progressTag}: ${msg.body}`;
+	return `[${escapeHarnessText(msg.id)}] ${escapeHarnessText(msg.from + replyTag + progressTag)}: ${getRenderedEnvelope(msg, msg.body) ?? escapeHarnessText(msg.body)}`;
 }
 
 /** Takes every message buffered in `senderId`'s session inbox before automatic injection; with `ifAny`, none unless one satisfies it. */

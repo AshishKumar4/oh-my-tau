@@ -224,6 +224,19 @@ const CLAUDE_CODE_SKILL: HarnessFacadeSpec<typeof claudeCodeSkillSchema> = {
 	},
 };
 
+
+/**
+ * `agent://` URL for a facade's recipient string. A `?query` (`?progress` for a
+ * quiet note) stays on the URL; the vendor's `main` names omp's main agent.
+ */
+function agentMessageUrl(recipient: string): string {
+	const trimmed = recipient.trim();
+	const queryAt = trimmed.indexOf("?");
+	const id = queryAt < 0 ? trimmed : trimmed.slice(0, queryAt);
+	const query = queryAt < 0 ? "" : trimmed.slice(queryAt);
+	return `agent://${id.toLowerCase() === "main" ? MAIN_AGENT_ID : id}${query}`;
+}
+
 const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 	{
 		target: "task",
@@ -247,10 +260,10 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 		description: claudeCodeSendMessage,
 		parameters: claudeCodeSendMessageSchema,
 		mounts: peerMessaging,
-		toParams: (args: typeof claudeCodeSendMessageSchema.infer) => {
-			const to = args.to.trim();
-			return { path: `agent://${to.toLowerCase() === "main" ? MAIN_AGENT_ID : to}`, content: args.message };
-		},
+		toParams: (args: typeof claudeCodeSendMessageSchema.infer) => ({
+			path: agentMessageUrl(args.to),
+			content: args.message,
+		}),
 	},
 	{
 		target: "read",
@@ -398,7 +411,7 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 		description: codexSendMessage,
 		parameters: codexTargetMessageSchema,
 		toParams: (args: typeof codexTargetMessageSchema.infer) => ({
-			path: `agent://${args.target}`,
+			path: agentMessageUrl(args.target),
 			content: args.message,
 		}),
 	},
@@ -409,7 +422,7 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 		description: codexFollowupTask,
 		parameters: codexTargetMessageSchema,
 		toParams: (args: typeof codexTargetMessageSchema.infer) => ({
-			path: `agent://${args.target}`,
+			path: agentMessageUrl(args.target),
 			content: args.message,
 		}),
 	},

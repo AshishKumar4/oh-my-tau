@@ -1,4 +1,4 @@
-import type { Agent, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Message, Model, TextContent, ToolChoice } from "@oh-my-pi/pi-ai";
 import { isRecord, logger, prompt, stringProperty } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
@@ -80,7 +80,8 @@ export interface TodoTrackerHost {
 	hasPendingAsyncWake(): boolean;
 	getActiveToolNames(): string[];
 	getEnabledToolNames(): string[];
-	toolRegistry(): Map<string, AgentTool>;
+	/** Wire name a registry tool presents under the active harness profile; undefined when unrenamed or unknown. */
+	presentedWireName(name: string): string | undefined;
 	planModeEnabled(): boolean;
 	/** Whether prewalk will hand off after its plan nudge owns todo creation. */
 	prewalkWillHandoff(): boolean;
@@ -358,10 +359,7 @@ export class TodoTracker {
 	}
 
 	#buildEagerPreludeContext(): { toolRefs: Record<string, string>; taskBatch: boolean } {
-		const wireName = (name: string): string => {
-			const tool = this.#host.toolRegistry().get(name);
-			return typeof tool?.customWireName === "string" ? tool.customWireName : name;
-		};
+		const wireName = (name: string): string => this.#host.presentedWireName(name) ?? name;
 		return {
 			toolRefs: { task: wireName("task"), todo: wireName("todo") },
 			taskBatch: cfgTaskBatch.get(this.#host.settings),

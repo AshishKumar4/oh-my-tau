@@ -26,6 +26,8 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env, hasFsCode, isRecord, logger, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
+import { SafeString } from "@oh-my-pi/pi-utils/template";
+import { escapeHarnessText, getRenderedEnvelope, withRenderedEnvelope } from "../harness/content";
 import type { ToolSession } from "..";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import type { Settings } from "../config/settings";
@@ -39,6 +41,8 @@ import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { typ
 import { TASK_EFFORTS, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { hasWaitTool } from "../tools/wait";
+import { sessionToolRefs } from "../harness/effective-profile";
+import { harnessToolRefs } from "../harness/manifest";
 import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
@@ -52,12 +56,18 @@ import {
 	MAX_TASK_FILE_BYTES,
 	type TaskToolSchemaInstance,
 } from "./types";
-import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
+import type {
+	AgentProgress,
+	TaskParams as BaseTaskParams,
+	SingleResult,
+	TaskItem,
+	TaskToolDetails,
+} from "@oh-my-pi/pi-tui/tools/task";
 import { AsyncJobError, type AsyncJobManagerApi } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlRouter } from "../internal-urls/router";
-import { AgentRegistry, isResumable } from "../registry/agent-registry";
+import { AgentRegistry, isResumable, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import {
@@ -68,6 +78,7 @@ import {
 	taskFileRestrictionPaths,
 } from "./file-approval";
 import { getPerCallModelAdvertisement, type PerCallModelAdvertisement } from "./model-approval";
+import { forkMessages, type ForkSnapshot } from "./fork";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
@@ -76,13 +87,14 @@ import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
 import {
 	invalidModelSelectorReason,
 	renderSubagentUserPrompt,
+	declaresStructuredResult,
 	resolveEffectiveSubagentPolicy,
 	runStructuredSubagent,
 	StructuredSubagentError,
 	type StructuredSubagentRequest,
 } from "./structured-subagent";
-import { SpawnRun, type SpawnPermit } from "./spawn-run";
-import { type TaskLauncher, TaskLaunchSession } from "./speculative-launch";
+import { SpawnRun, type SpawnPermit, type SpawnRunOwner } from "./spawn-run";
+import { type TaskLauncher, type TaskLaunchProjection, TaskLaunchSession } from "./speculative-launch";
 import type { TextTap } from "../job-widgets/text-tap";
 import type { SubagentToolResult } from "./executor";
 import { appendToolResult, createTaskWidgetInputs } from "./widget-inputs";
@@ -150,7 +162,15 @@ export { discoverAgents, getAgent } from "./discovery";
 export { AgentOutputManager } from "./output-manager";
 export * from "./read-only-policy";
 export type { AgentDefinition, SubagentEventPayload, SubagentLifecyclePayload, SubagentProgressPayload } from "./types";
-export type { AgentProgress, SingleResult, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
+export type { AgentProgress, SingleResult, TaskToolDetails, TaskItem } from "@oh-my-pi/pi-tui/tools/task";
+
+/**
+ * Fork extension: upstream pi-tui TaskParams carries no `fork`; the fork owns
+ * conversation forking (flat-form `fork: "all" | N`), so extend locally.
+ */
+export interface TaskParams extends BaseTaskParams {
+	fork?: "all" | number;
+}
 export * from "./result-summary";
 export {
 	TASK_SUBAGENT_EVENT_CHANNEL,
@@ -177,6 +197,8 @@ interface TaskDescriptionOptions {
 	planMode: boolean;
 	asyncGuidance: string;
 	parentSpawns: string;
+	/** Presented tool names (`toolRefs`), for a harness facade's own description. */
+	toolRefs: Readonly<Record<string, string>>;
 }
 
 /** Plan mode hides seance; a `spawns` list led by it defaults to the next permitted agent. */
@@ -185,8 +207,8 @@ function defaultAgentFor(spawnPolicy: ResolvedSpawnPolicy, planMode: boolean): s
 	return spawnPolicy.allowedAgents?.find(agent => agent !== SEANCE_AGENT_NAME) ?? spawnPolicy.defaultAgent;
 }
 
-/** Render the tool description from a cached agent list and current settings. */
-function renderDescription(options: TaskDescriptionOptions): string {
+/** Render a tool description template from a cached agent list and current settings. */
+function renderDescription(template: string, options: TaskDescriptionOptions): string {
 	const spawnPolicy = resolveSpawnPolicy(options.parentSpawns);
 	const spawningDisabled = !spawnPolicy.enabled;
 	const agents = [...options.agents, ...options.sessionAgents];
@@ -207,11 +229,11 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		readOnly: isReadOnlyAgent(agent),
 		blocking: agent.blocking === true,
 		// Marked only while `task.structured` is off; with it on, every agent's result is structured.
-		structured: !options.structured && agent.structured === true,
+		structured: !options.structured && declaresStructuredResult(agent),
 	}));
 	const seanceAgent = filteredAgents.find(agent => agent.name === SEANCE_AGENT_NAME);
 	const scoutAvailable = isScoutSpawnable(options.disabledAgents, options.parentSpawns);
-	return prompt.render(taskDescriptionTemplate, {
+	return prompt.render(template, {
 		agents: renderedAgents,
 		scoutAvailable,
 		spawningDisabled,
@@ -232,14 +254,32 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		seanceGuidance: seanceAgent && isBundledSeance(seanceAgent) ? seanceTaskGuidance : "",
 		ircEnabled: options.ircEnabled,
 		asyncGuidance: options.asyncGuidance,
+		toolRefs: options.toolRefs,
 	});
 }
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
 	return {
-		content: [{ type: "text", text }],
+		content: [{ type: "text", text: escapeHarnessText(text) }],
 		isError: true,
 		details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
 	};
+}
+
+function appendTaskNotice(
+	result: AgentToolResult<TaskToolDetails>,
+	notice: SafeString,
+): AgentToolResult<TaskToolDetails> {
+	let text: string | undefined;
+	const content = result.content.map(part => {
+		if (text !== undefined || part.type !== "text") return part;
+		text = `${getRenderedEnvelope(result, part.text) ?? escapeHarnessText(part.text)}\n\n${notice}`;
+		return { ...part, text };
+	});
+	if (text === undefined) {
+		text = notice.toString();
+		content.push({ type: "text", text });
+	}
+	return withRenderedEnvelope({ ...result, content }, new SafeString(text));
 }
 
 /**
@@ -314,6 +354,10 @@ function validateSpawnParams(
 	settings: Settings,
 ): string | undefined {
 	const tasks = params.tasks;
+	// Forking is a flat-form feature: an explicit `fork` beside `tasks[]` is a
+	// rejected combination, never silently ignored.
+	if (tasks !== undefined && params.fork !== undefined) {
+		return "`fork` inherits this conversation and only applies to a single spawn. Remove `tasks[]` or drop `fork`.";
 	if (
 		!fileEnabled &&
 		(params.taskFile !== undefined || (Array.isArray(tasks) && tasks.some(item => item?.taskFile !== undefined)))
@@ -355,6 +399,13 @@ function validateSpawnParams(
 	}
 	if (batchEnabled && params.task === undefined && params.taskFile === undefined) {
 		return "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`.";
+	}
+	if (
+		params.fork !== undefined &&
+		params.fork !== "all" &&
+		(typeof params.fork !== "number" || !Number.isSafeInteger(params.fork) || params.fork <= 0)
+	) {
+		return 'The call has an invalid `fork` value. Use "all" or a positive integer of turns.';
 	}
 	return (
 		validateTaskInput(params, "The call", fileEnabled) ??
@@ -494,6 +545,8 @@ function spawnParamsFor(params: TaskParams, item: ResolvedTaskItem, defaultAgent
 	if ("effort" in item) spawn.effort = item.effort;
 	if ("sourceSession" in item) spawn.sourceSession = item.sourceSession;
 	if ("model" in item) spawn.model = item.model;
+	// Forking is a flat-form feature: batch items never inherit parent history.
+	if (params.tasks === undefined && params.fork !== undefined) spawn.fork = params.fork;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -522,7 +575,7 @@ function planSpawns(
 	seanceAdvertised: boolean,
 	settings: Settings,
 ): SpawnPlan | string {
-	const params = repairTaskParams(rawParams as TaskParams);
+	const params = repairTaskParams(rawParams as TaskParams) as TaskParams;
 	const error =
 		validateShapeParams(batchEnabled, params) ??
 		validateSpawnParams(params, batchEnabled, fileEnabled, defaultAgent, settings) ??
@@ -576,13 +629,13 @@ function mergeSyncPayloads(
 		const payload = payloads[position];
 		const { item, index } = spawns[position];
 		if (!payload) {
-			contentParts.push(`Task ${item.name?.trim() || `#${index + 1}`}: cancelled before start.`);
+			contentParts.push(`Task ${escapeHarnessText(item.name?.trim() || `#${index + 1}`)}: cancelled before start.`);
 			continue;
 		}
 		isError ||= payload.isError === true;
 		projectAgentsDir ??= payload.details?.projectAgentsDir ?? null;
 		const text = payload.content.find(part => part.type === "text")?.text;
-		if (text) contentParts.push(text);
+		if (text) contentParts.push(getRenderedEnvelope(payload, text)?.toString() ?? escapeHarnessText(text));
 		for (const result of payload.details?.results ?? []) {
 			results.push({ ...result, index });
 			if (result.usage) {
@@ -602,13 +655,10 @@ function mergeSyncPayloads(
 	};
 }
 
-/** Generic worker agent types; several in one call usually means a more specific type exists. */
-const GENERIC_SPAWN_AGENTS: ReadonlySet<string> = new Set(["task", "sonic"]);
-
 /**
  * Advisory — never a rejection — nudging the spawner toward tailored
- * specific agent types when one call resolves ≥2 items to a generic
- * `task`/`sonic` worker and the spawner still holds spawn capacity
+ * specific agent types when one call resolves ≥2 items to the generic
+ * `task` worker and the spawner still holds spawn capacity
  * (DepthCapacity: it currently has the `task` tool). `agentNames` are the
  * per-item resolved agent types. Returns undefined when no nudge applies.
  */
@@ -616,15 +666,17 @@ export function buildSpecializationAdvisory(
 	agentNames: string[],
 	depthCapacity: boolean,
 	scoutAvailable = true,
+	toolRefs = harnessToolRefs(undefined),
 ): string | undefined {
 	if (!depthCapacity) return undefined;
-	const generics = agentNames.filter(name => GENERIC_SPAWN_AGENTS.has(name));
+	const generics = agentNames.filter(name => name === "task");
 	if (generics.length < 2) return undefined;
 	return prompt
 		.render(taskSpecializationAdvisoryTemplate, {
 			count: generics.length,
 			agent: generics[0],
 			scoutAvailable,
+			toolRefs,
 		})
 		.trim();
 }
@@ -639,9 +691,10 @@ export function buildCoordinationAdvisory(
 	items: TaskItem[],
 	depthCapacity: boolean,
 	ircEnabled: boolean,
+	toolRefs = harnessToolRefs(undefined),
 ): string | undefined {
 	if (!depthCapacity || !ircEnabled || items.length < 2) return undefined;
-	return prompt.render(taskCoordinationAdvisoryTemplate, { count: items.length }).trim();
+	return prompt.render(taskCoordinationAdvisoryTemplate, { count: items.length, toolRefs }).trim();
 }
 
 /**
@@ -660,11 +713,15 @@ export function composeSpawnAdvisory(args: {
 	ircEnabled: boolean;
 	willRunAsync: boolean;
 	scoutAvailable?: boolean;
+	/** Tool names under the spawner's harness profile; native names when omitted. */
+	toolRefs?: Readonly<Record<string, string>>;
 }): string | undefined {
 	return (
 		[
-			buildSpecializationAdvisory(args.agents, args.depthCapacity, args.scoutAvailable),
-			args.willRunAsync ? buildCoordinationAdvisory(args.items, args.depthCapacity, args.ircEnabled) : undefined,
+			buildSpecializationAdvisory(args.agents, args.depthCapacity, args.scoutAvailable, args.toolRefs),
+			args.willRunAsync
+				? buildCoordinationAdvisory(args.items, args.depthCapacity, args.ircEnabled, args.toolRefs)
+				: undefined,
 		]
 			.filter(Boolean)
 			.join("\n\n") || undefined
@@ -871,25 +928,35 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * Batch calls start each subagent as soon as its `tasks[]` item streams in;
 	 * see `./speculative-launch` for the abort/adoption contract.
 	 */
-	readonly speculation: ToolSpeculationPolicy = {
-		stream: {
-			open: async context => {
-				if (!cfgTaskSpeculativeLaunch.get(this.session.settings) || !this.#isBatchEnabled()) return undefined;
-				if (!context.coordinator.authorizeLaunch) return undefined;
-				const id = context.parentToolCallId;
-				const session = new TaskLaunchSession({
-					sink: context.coordinator,
-					tool: this,
-					launcher: this.#launcher,
-					onClose: () => {
-						if (this.#launchSessions.get(id) === session) this.#launchSessions.delete(id);
-					},
-				});
-				this.#launchSessions.set(id, session);
-				return session;
+	readonly speculation: ToolSpeculationPolicy = this.speculationFor();
+
+	/**
+	 * The batch stream speculation for calls in another shape (a harness
+	 * facade's shared brief + `tasks`): `projection` maps each streamed prefix
+	 * to task params before planning, so the facade's items launch early too.
+	 */
+	speculationFor(projection?: TaskLaunchProjection): ToolSpeculationPolicy {
+		return {
+			stream: {
+				open: async context => {
+					if (!cfgTaskSpeculativeLaunch.get(this.session.settings) || !this.#isBatchEnabled()) return undefined;
+					if (!context.coordinator.authorizeLaunch) return undefined;
+					const id = context.parentToolCallId;
+					const session = new TaskLaunchSession({
+						sink: context.coordinator,
+						tool: this,
+						launcher: this.#launcher,
+						projection,
+						onClose: () => {
+							if (this.#launchSessions.get(id) === session) this.#launchSessions.delete(id);
+						},
+					});
+					this.#launchSessions.set(id, session);
+					return session;
+				},
 			},
-		},
-	};
+		};
+	}
 
 	get parameters(): TaskToolSchemaInstance {
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
@@ -899,7 +966,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
 			evalToolsEnabled: evalToolsEnabled(this.session),
-			structured: this.#isStructured(),
 			file: cfgTaskFile.get(this.session.settings),
 			defaultAgent: this.#defaultAgent(),
 			seanceFields: this.#seanceSchemaFields(),
@@ -913,14 +979,25 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	/** Background-job lifecycle contract; inherited by extension replacements that delegate to Task. */
 	get delegationGuidance(): string {
 		if (!cfgAsyncEnabled.get(this.session.settings)) return "";
+		const toolRefs = sessionToolRefs(this.session);
 		return prompt.render(taskAsyncContractTemplate, {
 			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
-			waitTool: hasWaitTool(this.session),
+			waitTool: hasWaitTool(this.session) && toolRefs.wait !== undefined,
+			toolRefs,
 		});
 	}
 
 	/** Dynamic description that reflects current task settings. */
 	get description(): string {
+		return this.renderDescriptionAs(taskDescriptionTemplate);
+	}
+
+	/**
+	 * Renders `template` over the data behind {@link description} (the agent
+	 * roster and spawn settings), so a harness facade serves its own text with
+	 * the same live roster.
+	 */
+	renderDescriptionAs(template: string): string {
 		const disabledAgents = cfgTaskDisabledAgents.get(this.session.settings);
 		const agents =
 			discoverySnapshots.get(discoveryCacheKey(this.session.cwd, this.session.effectiveExtensionRoots?.())) ??
@@ -929,8 +1006,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationEnabled = cfgTaskIsolationEnabled.get(this.session.settings);
 		const perCallModel = perCallModelEnabled(this.session.settings, "task");
-		return renderDescription({
-			agents,
+		const pinned = this.session.pinnedAgents ?? [];
+		return renderDescription(template, {
+			agents: [...pinned, ...agents.filter(agent => !pinned.some(entry => entry.name === agent.name))],
 			sessionAgents,
 			isolationEnabled: !planMode && isolationEnabled,
 			applyIsolatedChanges: cfgTaskIsolationApply.get(this.session.settings),
@@ -953,6 +1031,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			planMode,
 			asyncGuidance: this.delegationGuidance,
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
+			toolRefs: sessionToolRefs(this.session),
 		});
 	}
 	private constructor(
@@ -972,14 +1051,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	/**
-	 * Result contract for a spawn: with `task.structured` the caller's
-	 * `outputSchema`/`schemaMode` pass through; without it the child gets no
-	 * schema or `yield` tool and returns its final message, unless its agent
-	 * declares `structured: true` (resolved in the shared subagent policy).
+	 * Result contract for a spawn: the caller's `outputSchema`/`schemaMode`
+	 * always pass through. Without `task.structured` the spawn opts out, so a
+	 * child returns its final message unless the call or its agent declares a
+	 * schema (resolved in the shared subagent policy).
 	 */
 	#resultParams(params: TaskParams): Pick<StructuredSubagentRequest, "outputSchema" | "schemaMode" | "structured"> {
-		if (!this.#isStructured()) return { structured: false };
 		return {
+			...(this.#isStructured() ? {} : { structured: false }),
 			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 		};
@@ -1040,6 +1119,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		index: number;
 		agentId?: string;
 		detached: boolean;
+		/** Parent conversation snapshot, taken by dispatch once the call finished streaming. */
+		fork?: ForkSnapshot;
 	}): SpawnRun {
 		return new SpawnRun(
 			this.#permit,
@@ -1055,9 +1136,40 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					run.timing,
 					spawn.detached ? run.onArtifactsRetained : undefined,
 					run.tools,
+					spawn.fork,
 				),
 			{ agentId: spawn.agentId, detached: spawn.detached },
 		);
+	}
+
+	/**
+	 * Attach this turn to an inline run it is about to await. The turn stays
+	 * parked on the child until the returned release runs, reading no message
+	 * meanwhile: publish that, so the child's message-only `wait` returns instead
+	 * of blocking on an owner that cannot answer. Only a pre-claimed id is known
+	 * up front; otherwise the hold starts with the first progress naming the
+	 * child, which precedes any tool call the child makes.
+	 */
+	#attachInline(run: SpawnRun, owner: SpawnRunOwner): () => void {
+		const registry = this.session.agentRegistry;
+		let release: (() => void) | undefined;
+		let released = false;
+		const hold = (id: string | undefined): void => {
+			if (!registry || !id || release || released) return;
+			release = registry.awaits.hold(this.session.getAgentId?.() ?? MAIN_AGENT_ID, [id], { interruptible: false });
+		};
+		hold(run.identity.agentId);
+		run.attach({
+			...owner,
+			onUpdate: update => {
+				hold(update.details?.progress?.[0]?.id);
+				return owner.onUpdate?.(update);
+			},
+		});
+		return () => {
+			released = true;
+			release?.();
+		};
 	}
 
 	/**
@@ -1071,6 +1183,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		index: number,
 		signal: AbortSignal,
 	): Promise<SpawnRun | undefined> {
+		// A forking spawn inherits the parent conversation, which is still
+		// streaming here: the journal lacks this turn and the produced-request
+		// snapshot is the previous request's. Dispatch snapshots both once the
+		// call has finished, so a forking spawn always takes that path.
+		if (spawn.fork !== undefined) return undefined;
 		// File bytes must be captured at dispatch, not while arguments stream.
 		if (spawn.taskFile !== undefined) return undefined;
 		if (spawn.tools?.length && this.session.getPlanModeState?.()?.enabled === true) return undefined;
@@ -1181,6 +1298,23 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			return createTaskModeError(error instanceof Error ? error.message : String(error));
 		}
 		const normalizedSpawnParams = spawnItems.map(item => spawnParamsFor(params, item, defaultAgent));
+		// The fork snapshot freezes the parent's resolved context at call time —
+		// before any await (eval-tool description, preflight) or queued
+		// semaphore — so a spawn that starts later cannot absorb parent turns
+		// newer than the call that created it.
+		const fork =
+			params.tasks === undefined && params.fork !== undefined
+				? {
+						messages: forkMessages(
+							this.session,
+							params.fork === "all" ? "all" : { lastTurns: params.fork },
+							toolCallId,
+						),
+						// Prefix reuse is whole-history only: an N-turn slice can never be
+						// a byte-exact wire prefix of the parent's captured request.
+						...(params.fork === "all" ? { request: this.session.getForkRequestSnapshot?.() } : {}),
+					}
+				: undefined;
 		const evalToolNames = spawnItems.flatMap(item => item.tools ?? []);
 		if (evalToolNames.length > 0) {
 			if (this.session.getPlanModeState?.()?.enabled === true) {
@@ -1266,6 +1400,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							cfgTaskDisabledAgents.get(this.session.settings),
 							this.session.getSessionSpawns?.() ?? "*",
 						),
+						toolRefs: sessionToolRefs(this.session),
 					});
 			const result = await this.#executeSyncFanout(
 				toolCallId,
@@ -1274,18 +1409,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				defaultAgent,
 				signal,
 				onUpdate,
+				fork,
 			);
 			if (!advisory) return result;
-			let appended = false;
-			const content = result.content.map(part => {
-				if (!appended && part.type === "text" && typeof part.text === "string") {
-					appended = true;
-					return { ...part, text: `${part.text}\n\n${advisory}` };
-				}
-				return part;
-			});
-			if (!appended) content.push({ type: "text", text: advisory });
-			return { ...result, content };
+			return appendTaskNotice(result, new SafeString(advisory));
 		}
 
 		// Coordination only makes sense for spawns that keep running after this
@@ -1303,22 +1430,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						cfgTaskDisabledAgents.get(this.session.settings),
 						this.session.getSessionSpawns?.() ?? "*",
 					),
+					toolRefs: sessionToolRefs(this.session),
 				});
 		// Returns a fresh result (copied content array, copied text part) rather
 		// than mutating the caller's — task results are short-lived here, but an
 		// in-place edit on a shared/cached AgentToolResult would be a hidden trap.
 		const withAdvisory = (result: AgentToolResult<TaskToolDetails>): AgentToolResult<TaskToolDetails> => {
 			if (!advisory) return result;
-			let appended = false;
-			const content = result.content.map(part => {
-				if (!appended && part.type === "text" && typeof part.text === "string") {
-					appended = true;
-					return { ...part, text: `${part.text}\n\n${advisory}` };
-				}
-				return part;
-			});
-			if (!appended) content.push({ type: "text", text: advisory });
-			return { ...result, content };
+			return appendTaskNotice(result, new SafeString(advisory));
 		};
 		const outputManager = this.#outputManager();
 		const callStartedAt = Date.now();
@@ -1414,6 +1533,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						settledCount += 1;
 						if (failed) failedCount += 1;
 					},
+					fork,
 				});
 				if (started.length === 0) primaryJobId = jobId;
 				started.push({ agentId: spawn.agentId, jobId });
@@ -1433,7 +1553,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				content: [
 					{
 						type: "text",
-						text: `Failed to start background task job${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.join("; ")}`,
+						text: `Failed to start background task job${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.map(escapeHarnessText).join("; ")}`,
 					},
 				],
 				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
@@ -1442,7 +1562,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 
 		const scheduleFailureSummary =
 			failedSchedules.length > 0
-				? ` Failed to schedule ${failedSchedules.length} spawn${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.join("; ")}.`
+				? ` Failed to schedule ${failedSchedules.length} spawn${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.map(escapeHarnessText).join("; ")}.`
 				: "";
 		const renderSpawnFeedback = (mixed: boolean): string =>
 			prompt
@@ -1452,10 +1572,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					singleCall: spawns.length === 1,
 					showListing: mixed || spawns.length > 1,
 					count: started.length,
-					agentId: started[0]?.agentId,
-					jobId: started[0]?.jobId,
-					agentLabel,
-					started,
+					agentId: started[0] ? escapeHarnessText(started[0].agentId) : undefined,
+					jobId: started[0] ? escapeHarnessText(started[0].jobId) : undefined,
+					agentLabel: escapeHarnessText(agentLabel),
+					started: started.map(item => ({
+						agentId: escapeHarnessText(item.agentId),
+						jobId: escapeHarnessText(item.jobId),
+					})),
 					scheduleFailureSummary,
 				})
 				.trim();
@@ -1553,14 +1676,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const spawnedSummary = started.length > 0 ? renderSpawnFeedback(true) : scheduleFailureSummary.trim();
-		const text = [merged.contentParts.join("\n\n"), spawnedSummary]
-			.filter(section => section.trim().length > 0)
-			.join("\n\n");
-		return withAdvisory({
-			content: [{ type: "text", text: text.length > 0 ? text : "No results." }],
-			...(merged.isError ? { isError: true } : {}),
-			details: buildAsyncDetails(),
-		});
+		const text =
+			[merged.contentParts.join("\n\n"), spawnedSummary].filter(section => section.trim().length > 0).join("\n\n") ||
+			"No results.";
+		return withAdvisory(
+			withRenderedEnvelope(
+				{
+					content: [{ type: "text", text }],
+					...(merged.isError ? { isError: true } : {}),
+					details: buildAsyncDetails(),
+				},
+				new SafeString(text),
+			),
+		);
 	}
 
 	/**
@@ -1581,6 +1709,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		buildDetails: () => TaskToolDetails;
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
 		onSettled?: (failed: boolean) => void;
+		fork?: ForkSnapshot;
 	}): string {
 		const {
 			manager,
@@ -1593,6 +1722,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			buildDetails,
 			onUpdate,
 			onSettled,
+			fork,
 		} = options;
 		// A queued job launches (or adopts) its run when it starts; until then
 		// its widget has no tool tap to read.
@@ -1606,10 +1736,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const isolated = spawnParams.isolated === true;
 			const ref = aborted ? AgentRegistry.global().get(agentId) : undefined;
 			return `\n\n${prompt.render(taskFollowUpTemplate, {
-				agentId,
+				agentId: escapeHarnessText(agentId),
 				aborted,
 				isolated,
 				ircEnabled,
+				toolRefs: sessionToolRefs(this.session),
 				resumable: !isolated && isResumable(ref),
 				transcriptAvailable: aborted ? await hasResolvableTranscript(agentId) : true,
 			})}`;
@@ -1666,6 +1797,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					index: progress.index,
 					agentId,
 					detached: true,
+					fork,
 				}));
 				activeRun.attach({
 					signal: runSignal,
@@ -1748,13 +1880,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						? `Background task ${agentId} failed.`
 						: `Background task ${agentId} complete.`;
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
-					const deliveryText = `${finalText}${await buildFollowUpHint(singleResult?.aborted === true)}`;
+					const deliveryText = `${getRenderedEnvelope(result, finalText) ?? escapeHarnessText(finalText)}${await buildFollowUpHint(singleResult?.aborted === true)}`;
 					const structured = singleResult?.structuredOutput;
 					if (resultFailed) {
 						// Mark the job itself failed; the failed agent stays interrogable.
-						throw new TaskJobError(deliveryText, structured);
+						throw withRenderedEnvelope(new TaskJobError(deliveryText, structured), new SafeString(deliveryText));
 					}
-					return structured ? { text: deliveryText, structured } : deliveryText;
+					return withRenderedEnvelope({ text: deliveryText, structured }, new SafeString(deliveryText));
 				} catch (error) {
 					if (error instanceof TaskJobError) {
 						throw error;
@@ -1766,7 +1898,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					await reportProgress(statusText, buildDetails() as unknown as Record<string, unknown>);
 					const message = error instanceof Error ? error.message : String(error);
 					const hint = AgentRegistry.global().get(agentId) ? await buildFollowUpHint(false) : "";
-					throw new TaskJobError(`${message}${hint}`);
+					const text = `${escapeHarnessText(message)}${hint}`;
+					throw withRenderedEnvelope(new TaskJobError(text), new SafeString(text));
 				}
 			},
 			{
@@ -1802,6 +1935,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		defaultAgent: string,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+		fork?: ForkSnapshot,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		if (spawns.length === 1) {
 			const spawn = spawns[0]!;
@@ -1813,9 +1947,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					index: spawn.index,
 					agentId: spawn.preAllocatedId,
 					detached: false,
+					fork,
 				});
-			run.attach({ signal, onUpdate });
-			return await run.result;
+			const release = this.#attachInline(run, { signal, onUpdate });
+			try {
+				return await run.result;
+			} finally {
+				release();
+			}
 		}
 
 		const startTime = Date.now();
@@ -1849,17 +1988,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		});
 
 		const merged = mergeSyncPayloads(spawns, payloads);
-		return {
-			content: [{ type: "text", text: merged.contentParts.join("\n\n") }],
-			...(merged.isError ? { isError: true } : {}),
-			details: {
-				projectAgentsDir: merged.projectAgentsDir,
-				results: merged.results,
-				totalDurationMs: Date.now() - startTime,
-				usage: merged.usage,
-				outputPaths: merged.outputPaths,
+		const text = merged.contentParts.join("\n\n");
+		return withRenderedEnvelope(
+			{
+				content: [{ type: "text", text }],
+				...(merged.isError ? { isError: true } : {}),
+				details: {
+					projectAgentsDir: merged.projectAgentsDir,
+					results: merged.results,
+					totalDurationMs: Date.now() - startTime,
+					usage: merged.usage,
+					outputPaths: merged.outputPaths,
+				},
 			},
-		};
+			new SafeString(text),
+		);
 	}
 
 	/**
@@ -1892,7 +2035,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						agentId: spawn.preAllocatedId,
 						detached: false,
 					});
-				run.attach({
+				const release = this.#attachInline(run, {
 					signal: workerSignal,
 					onUpdate: onItemProgress
 						? update => {
@@ -1902,12 +2045,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						: undefined,
 				});
 				try {
-					await run.started;
-				} catch (error) {
-					if (workerSignal.aborted) return undefined;
-					throw error;
+					try {
+						await run.started;
+					} catch (error) {
+						if (workerSignal.aborted) return undefined;
+						throw error;
+					}
+					return await run.result;
+				} finally {
+					release();
 				}
-				return await run.result;
 			},
 			signal,
 		);
@@ -1944,6 +2091,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		launchTiming?: { invokedAt: number; acquiredAt: number },
 		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
 		tools?: TextTap,
+		fork?: ForkSnapshot,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const assignment = (params.task ?? "").trim();
@@ -1961,6 +2109,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				sourceSession: params.sourceSession,
 				...spawnModelFields(params),
 				...this.#resultParams(params),
+				fork,
 				...this.#effortParams(params),
 				solutionSpace: params.solutionSpace,
 				...(params.tools?.length
@@ -2027,7 +2176,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					}
 				: undefined;
 			return {
-				content: [{ type: "text", text: `Task execution failed: ${message}` }],
+				content: [{ type: "text", text: `Task execution failed: ${escapeHarnessText(message)}` }],
 				isError: true,
 				details: {
 					projectAgentsDir: null,
@@ -2048,17 +2197,31 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		totalDurationMs: number,
 		mergeSummary: string,
 	): AgentToolResult<TaskToolDetails> {
-		const summary = formatTaskResultSummary(result, { totalDurationMs, mergeSummary });
-		return {
-			content: [{ type: "text", text: summary }],
-			details: {
-				projectAgentsDir,
-				results: [result],
-				totalDurationMs,
-				usage: result.usage,
-				outputPaths: result.outputPath ? [result.outputPath] : undefined,
+		const summary = formatTaskResultSummary(
+			result,
+			withRenderedEnvelope(
+				{
+					totalDurationMs,
+					mergeSummary,
+					toolRefs: sessionToolRefs(this.session),
+				},
+				new SafeString(mergeSummary),
+			),
+		);
+
+		return withRenderedEnvelope(
+			{
+				content: [{ type: "text", text: summary }],
+				details: {
+					projectAgentsDir,
+					results: [result],
+					totalDurationMs,
+					usage: result.usage,
+					outputPaths: result.outputPath ? [result.outputPath] : undefined,
+				},
 			},
-		};
+			new SafeString(summary),
+		);
 	}
 }
 

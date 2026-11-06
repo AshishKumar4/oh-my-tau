@@ -3,7 +3,8 @@ import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { nothingToWaitForResult } from "@oh-my-pi/pi-coding-agent/async/job-control";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { buildJobResult, runningAgentsOutsideJobs } from "@oh-my-pi/pi-coding-agent/async/job-control";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { VendorTool } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import { sessionToolRefs } from "@oh-my-pi/pi-coding-agent/harness/effective-profile";
@@ -323,8 +324,11 @@ describe("multi-agent templates under claude-code", () => {
 				agentRegistry: AgentRegistry.global(),
 				...(refs && { getToolRefs: () => refs }),
 			}) as unknown as ToolSession;
+		// The running-agents section a `wait` or `cancel` result lists agents without a job in.
 		const textOf = (refs: Readonly<Record<string, string>> | undefined) => {
-			const part = nothingToWaitForResult(session(refs)).content[0];
+			const host = session(refs);
+			const manager = new AsyncJobManager({ maxRunningJobs: 1 });
+			const part = buildJobResult(host, manager, "wait", [], [], runningAgentsOutsideJobs(host)).content[0];
 			return part?.type === "text" ? part.text : "";
 		};
 		const claudeCode = textOf(CLAUDE_CODE);

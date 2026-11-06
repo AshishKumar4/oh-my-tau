@@ -9,10 +9,10 @@
  * every completion — regardless of owner — into the first top-level session.
  */
 import { prompt } from "@oh-my-pi/pi-utils";
+import { escapeHarnessText, getRenderedEnvelope } from "../harness/content";
 import type { AsyncJob, AsyncJobType } from "../async";
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
-import { escapeHarnessTags } from "./harness-tags";
 import type { CustomMessage } from "./messages";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { truncateMiddle } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -55,6 +55,8 @@ type AsyncResultJobDetails = {
 	agentId?: string;
 	label?: string;
 	durationMs?: number;
+	/** When the job started, in epoch ms; see `JobSnapshot.startedAt`. */
+	startedAt?: number;
 	/** Source capture metadata belongs to this job, not to the enclosing delivery report. */
 	meta?: OutputMeta;
 	/** Full structured payload (source/mode/status/data/error), when the job used an output schema. */
@@ -148,21 +150,22 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			agentUrlId,
 			showAgentUrl: handles === "agent",
 			showHistoryUrl: handles === "history",
-			result: escapeHarnessTags(entry.result),
+			result: entry.result,
 			type: entry.job?.type,
 			status: entry.job?.status,
 			agentId: entry.job?.agentId,
 			label: entry.job?.label,
-			headerLabel: headerLabel ? escapeHarnessTags(headerLabel) : undefined,
+			headerLabel,
 			namedByCommand: command !== undefined,
 			durationMs: entry.durationMs,
+			startedAt: entry.job?.startTime,
 			meta: entry.job?.latestDetails?.meta,
 			structured,
-			structuredJson: structuredJson === undefined ? undefined : escapeHarnessTags(structuredJson),
+			structuredJson,
 			hasStructuredData,
 			schemaStatus: structured?.status,
 			schemaStatusLabel: structured ? structuredStatusLabel(structured.status) : undefined,
-			schemaError: structured?.error === undefined ? undefined : escapeHarnessTags(structured.error),
+			schemaError: structured?.error,
 			schemaValid: structured?.status === "valid",
 		};
 	});
@@ -175,13 +178,23 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			agentId: job.agentId,
 			label: job.label,
 			durationMs: job.durationMs,
+			startedAt: job.startedAt,
 			...(job.meta ? { meta: job.meta } : {}),
 			...(job.structured ? { schema: job.structured } : {}),
 		})),
 	};
 	const text = prompt.render(asyncResultTemplate, {
 		multiple: jobs.length > 1,
-		jobs,
+		jobs: jobs.map((job, index) => ({
+			...job,
+			jobId: escapeHarnessText(job.jobId),
+			agentUrlId: escapeHarnessText(job.agentUrlId),
+			label: job.label === undefined ? undefined : escapeHarnessText(job.label),
+			headerLabel: job.headerLabel === undefined ? undefined : escapeHarnessText(job.headerLabel),
+			result: getRenderedEnvelope(entries[index].job, job.result) ?? escapeHarnessText(job.result),
+			schemaError: job.schemaError === undefined ? undefined : escapeHarnessText(job.schemaError),
+			structuredJson: job.structuredJson === undefined ? undefined : escapeHarnessText(job.structuredJson),
+		})),
 	});
 	const images = entries.flatMap(entry => entry.job?.latestDetails?.images ?? []);
 	return {

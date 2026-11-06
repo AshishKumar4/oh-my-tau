@@ -28,6 +28,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { SingleResult, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { type BlockedAwait, blockedAwaitsOf } from "@oh-my-pi/pi-coding-agent/tools/wait";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -277,5 +278,37 @@ describe("task per-item blocking split", () => {
 		expect(result.details?.results.map(r => r.id)).toEqual(["ScoutThree"]);
 		expect(result.details?.async?.state).toBe("failed");
 		expect(manager.getJob("WorkerThree")).toBeUndefined();
+	});
+
+	it("holds the turn on a pre-claimed inline spawn and releases it when the spawn hook refuses", async () => {
+		mockDiscovery();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options =>
+			makeResult(options.id ?? "?", options.agent.name),
+		);
+		const registry = AgentRegistry.global();
+		const manager = createManager();
+		const session = createSession({ manager });
+		session.agentRegistry = registry;
+		const heldAtRefusal: BlockedAwait[][] = [];
+		session.emitBeforeSubagentSpawn = async event => {
+			if (event.agent !== "scout") return undefined;
+			heldAtRefusal.push(blockedAwaitsOf(registry, "Main"));
+			return { block: true, reason: "scout pool exhausted" };
+		};
+		const tool = await TaskTool.create(session);
+
+		const result = await tool.execute("tc-mixed-refused", {
+			context: "ctx",
+			tasks: [
+				{ name: "ScoutFour", agent: "scout", task: "Research." },
+				{ name: "WorkerFour", agent: "task", task: "Build." },
+			],
+		} as TaskParams);
+
+		// The mixed call claims the scout's id up front, so its hold starts before the hook runs.
+		expect(heldAtRefusal).toEqual([[{ agents: ["ScoutFour"], inline: true }]]);
+		expect(firstText(result)).toContain("scout pool exhausted");
+		expect(blockedAwaitsOf(registry, "Main")).toEqual([]);
+		await manager.getJob("WorkerFour")?.promise;
 	});
 });

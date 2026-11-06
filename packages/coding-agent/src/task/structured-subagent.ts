@@ -43,6 +43,7 @@ import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "./executor";
+import type { ForkSnapshot } from "./fork";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -131,6 +132,13 @@ export interface StructuredSubagentRequest {
 	assignment: string;
 	context?: string;
 	agent?: string;
+	/**
+	 * A pre-resolved definition that bypasses agent discovery and the session's
+	 * `spawns` allow-list. The caller owns its spawnability (e.g. the Fusion
+	 * sidekick, which `task` must never list); every other policy, including
+	 * `task.maxRecursionDepth`, still applies.
+	 */
+	agentDefinition?: AgentDefinition;
 	/** Saved source session selected for the bundled seance agent. */
 	sourceSession?: string;
 	/**
@@ -156,15 +164,23 @@ export interface StructuredSubagentRequest {
 	outputSchema?: unknown;
 	schemaMode?: StructuredSubagentSchemaMode;
 	/**
-	 * `false` = no output schema (caller, agent, or session) and no `yield` tool:
-	 * the child's final assistant message is its result. An agent declaring
-	 * `structured: true` keeps both, resolved as if this were `true`. Default `true`.
+	 * `false` = no output schema and no `yield` tool: the child's final
+	 * assistant message is its result. A declared schema (this request's
+	 * `outputSchema`, or the agent's; see {@link declaresStructuredResult})
+	 * keeps both, resolved as if this were `true`. Default `true`.
 	 */
 	structured?: boolean;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
 	effort?: TaskEffort;
 	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
 	solutionSpace?: string;
+	/**
+	 * Resolved parent history for a forked spawn, seeded into the child's
+	 * journal before its first prompt (Codex `fork_turns` / Claude Code
+	 * `subagent_type: "fork"`). Captured by the caller via `forkMessages` at
+	 * spawn-call time.
+	 */
+	fork?: ForkSnapshot;
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -288,6 +304,14 @@ function trimToUndefined(value: string | undefined): string | undefined {
 	return trimmed || undefined;
 }
 
+/**
+ * Whether an agent's definition declares a result contract: an `output` schema
+ * or `structured: true`. Such an agent keeps `yield` under `task.structured` off.
+ */
+export function declaresStructuredResult(agent: AgentDefinition): boolean {
+	return agent.output !== undefined || agent.structured === true;
+}
+
 function resolveSchema(
 	request: StructuredSubagentRequest,
 	agent: AgentDefinition,
@@ -353,6 +377,13 @@ function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentNam
 			`Cannot spawn ${blockedAgent} agent from within itself (recursion prevention). Use a different agent type.`,
 		);
 	}
+	// A caller-supplied definition owns its own spawnability (see
+	// `StructuredSubagentRequest.agentDefinition`): the Fusion sidekick is
+	// dispatched by the `sidekick` tool, never through `task`, so a subagent
+	// lead's `spawns` allow-list (or absent `spawns`, which disables `task`
+	// spawning) must not block it. The depth check above still applies: the
+	// sidekick occupies one recursion level under its lead like any child.
+	if (request.agentDefinition) return;
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
 	if (!spawnPolicy.enabled || (spawnPolicy.allowedAgents !== null && !spawnPolicy.allowedAgents.includes(agentName))) {
 		throw new StructuredSubagentError(
@@ -508,7 +539,7 @@ export async function resolveEffectiveSubagentPolicy(
 		includeParents: request.perCallModel !== undefined || request.seanceModel !== undefined,
 	});
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
-	const agentName = request.agent?.trim() || spawnPolicy.defaultAgent;
+	const agentName = request.agentDefinition?.name ?? (request.agent?.trim() || spawnPolicy.defaultAgent);
 	const planMode = request.session.getPlanModeState?.()?.enabled === true;
 	if (agentName !== SEANCE_AGENT_NAME) assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
@@ -516,7 +547,10 @@ export async function resolveEffectiveSubagentPolicy(
 	const discovery = await discoverAgentsShared(request.session.cwd, request.session.effectiveExtensionRoots?.());
 	const sessionAgents = request.session.getSessionAgents?.() ?? [];
 	const agents = [...discovery.agents, ...sessionAgents];
-	const agent = getAgent(agents, agentName);
+	const agent =
+		request.agentDefinition ??
+		request.session.pinnedAgents?.find(pinned => pinned.name === agentName) ??
+		getAgent(agents, agentName);
 	if (!agent) {
 		const available = agents.map(candidate => candidate.name).join(", ") || "none";
 		const searched = discovery.searchedDirs?.map(dir => shortenPath(dir)).join(", ") || "none";
@@ -559,8 +593,11 @@ export async function resolveEffectiveSubagentPolicy(
 	}
 
 	const effectiveAgent = planMode ? createPlanModeAgent(agent) : agent;
-	// An agent declaring `structured: true` keeps its result contract when the caller opts out (`task.structured` off).
-	const structured = request.structured !== false || effectiveAgent.structured === true;
+	// A declared schema keeps the result contract when the caller opts out (`task.structured` off).
+	const structured =
+		request.structured !== false ||
+		Object.hasOwn(request, "outputSchema") ||
+		declaresStructuredResult(effectiveAgent);
 	const schema = resolveSchema(request, effectiveAgent, structured);
 	if (schema.source === "caller" || (schema.source !== "none" && schema.mode === "strict")) {
 		const { error } = buildOutputValidator(schema.schema);
@@ -786,6 +823,7 @@ function buildExecutorOptions(
 		preparedSession,
 		context: request.context?.trim() || undefined,
 		planReference: undefined,
+		fork: request.fork,
 		// Task `name` is the spawn handle (id allocation). Eval `label` is a
 		// real UI description. Copy it only for eval so generateTaskLabel can run.
 		description: request.invocationKind === "eval" ? trimToUndefined(request.identity?.label) : undefined,

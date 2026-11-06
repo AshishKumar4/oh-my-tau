@@ -178,8 +178,14 @@ export interface InternalResource {
 	sourcePath?: string;
 	/** First source-file line of an excerpt; selectors remain relative to `content`. */
 	sourceStartLine?: number;
-	/** Additional notes about resolution */
+	/** Additional notes about resolution, for hosts (RPC `host-uris`); `read` does not show them. */
 	notes?: string[];
+	/**
+	 * Warnings the model must see with this resource, kept out of `content`
+	 * so a {@link shape} `value` read stays exactly the extracted value. `read`
+	 * shows each in its own text block ahead of the content.
+	 */
+	warnings?: string[];
 	/** Structured snapshots used only for transcript rendering. */
 	details?: {
 		proc?: ProcReadDetails;

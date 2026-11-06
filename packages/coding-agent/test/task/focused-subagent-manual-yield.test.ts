@@ -190,11 +190,14 @@ it("a focused manual prompt's yield rewrites the artifact and notifies the paren
 	}
 }, 15_000);
 
-it("a prompt typed while the previous turn awaits owned background work reports each turn's own result", async () => {
+it("a prompt typed while the lane's run awaits its own background work joins that run, which reports once", async () => {
+	// One run per lane (task/lane-runs.ts): a yield made while the lane's own
+	// background work runs is a pause, not a result, so the prompt typed
+	// meanwhile joins the run, and the parent receives its final result once.
 	const child = await spawnKeptAliveChild();
 	try {
-		// Owned background work keeps the first manual turn's observation open
-		// after the turn itself returns, leaving the child idle for another prompt.
+		// Owned background work keeps the first manual turn's run open after the
+		// turn itself returns, leaving the child idle for another prompt.
 		const gate = Promise.withResolvers<void>();
 		manager.register(
 			"bash",
@@ -212,13 +215,9 @@ it("a prompt typed while the previous turn awaits owned background work reports 
 		await child.firstDelivery;
 		await manager.waitForOwnerJobs(PARENT_ID);
 		await manager.drainDeliveries({ filter: { ownerId: PARENT_ID } });
-		// One completion per turn, each carrying only that turn's yield.
-		const manual = child.deliveries.filter(text => text.includes("manual result"));
-		const final = child.deliveries.filter(text => text.includes("final result"));
-		expect(child.deliveries).toHaveLength(2);
-		expect(manual).toHaveLength(1);
-		expect(final).toHaveLength(1);
-		expect(manual[0]).not.toContain("final result");
+		expect(child.deliveries).toHaveLength(1);
+		expect(child.deliveries[0]).toContain("final result");
+		expect(child.deliveries[0]).not.toContain("manual result");
 		expect(await Bun.file(child.artifact).text()).toContain("final result");
 	} finally {
 		child.close();

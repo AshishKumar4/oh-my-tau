@@ -1,1 +1,1 @@
-{{count}} siblings run together. Overlapping files? Give each file one owner via `write agent://<id>`; siblings message only to unblock, never to announce edits. `read proc://` shows running jobs and agents.
+{{count}} siblings run together. Overlapping files? Give each file one owner{{#if toolRefs.SendMessage}} via `{{toolRefs.SendMessage}}`{{else}}{{#if toolRefs.deviceWrite}} via `write agent://<id>`{{/if}}{{/if}}; siblings message only to unblock, never to announce edits.{{#if toolRefs.read}} `{{toolRefs.read}} proc://` shows running jobs and agents.{{/if}}

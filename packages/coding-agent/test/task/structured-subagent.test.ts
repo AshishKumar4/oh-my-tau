@@ -36,9 +36,13 @@ import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import { fingerprintForkMessage, FORK_REQUEST_CONTEXT_TYPE } from "@oh-my-pi/pi-coding-agent/session/fork-context";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { createEvalCustomTools } from "@oh-my-pi/pi-coding-agent/task/eval-tools";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import { forkMessages } from "@oh-my-pi/pi-coding-agent/task/fork";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import {
 	buildStructuredSubagentRecoveryHint,
@@ -50,7 +54,8 @@ import {
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 import { createSessionDefaults } from "../helpers/session-defaults";
 
@@ -74,6 +79,8 @@ function session(
 		parentSpawns?: string;
 		outputSchema?: unknown;
 		maxDepth?: number;
+		taskDepth?: number;
+		spawns?: string;
 		isolationEnabled?: boolean;
 		isolationApply?: boolean;
 		modelRoles?: Record<string, string>;
@@ -103,9 +110,10 @@ function session(
 					: {}),
 			}),
 		getSessionFile: () => null,
-		getSessionSpawns: () => options.parentSpawns ?? "*",
+		getSessionSpawns: () => options.parentSpawns ?? options.spawns ?? "*",
 		getSessionAgents: () => options.sessionAgents ?? [],
 		getPlanModeState: () => (options.planMode ? { enabled: true } : undefined),
+		taskDepth: options.taskDepth,
 	} as unknown as ToolSession;
 }
 
@@ -347,6 +355,25 @@ describe("structured subagent primitive", () => {
 			if (previous === undefined) delete Bun.env.PI_BLOCKED_AGENT;
 			else Bun.env.PI_BLOCKED_AGENT = previous;
 		}
+	});
+
+	it("lets a caller-supplied definition past the spawns allow-list but not past the recursion depth", async () => {
+		mockDiscovery();
+		// A subagent lead with no `spawns` (task spawning disabled) still dispatches its own sidekick.
+		const explicit = await resolveEffectiveSubagentPolicy(
+			request({ agent: undefined, agentDefinition: AGENT, session: session({ spawns: "", taskDepth: 1 }) }),
+		);
+		expect(explicit.effectiveAgent.name).toBe("worker");
+		// `task` spawning itself is not loosened by the same session policy.
+		await expect(resolveEffectiveSubagentPolicy(request({ session: session({ spawns: "" }) }))).rejects.toThrow(
+			"Cannot spawn 'worker'. Allowed: none (spawns disabled for this agent)",
+		);
+		// The explicit definition occupies a recursion level like any child.
+		await expect(
+			resolveEffectiveSubagentPolicy(
+				request({ agent: undefined, agentDefinition: AGENT, session: session({ maxDepth: 1, taskDepth: 1 }) }),
+			),
+		).rejects.toThrow("Cannot spawn another agent at task depth 1; maximum depth is 1.");
 	});
 
 	it("attenuates plan-mode agents and rejects mutable isolation controls before discovery", async () => {
@@ -1414,6 +1441,151 @@ describe("structured subagent primitive", () => {
 		expect(await fs.stat(artifactsDir ?? "")).toBeDefined();
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
+
+	it("seeds a forked child's journal with the inherited history before the brief", async () => {
+		mockDiscovery({ ...AGENT, output: undefined });
+		using tempDir = TempDir.createSync("@omp-forked-subagent-");
+		const parentFile = path.join(tempDir.path(), "parent.jsonl");
+
+		// A real createAgentSession with a mock model: the child session is built
+		// on the executor's seeded journal and its first provider request carries
+		// the inherited history ahead of the brief.
+		registerMockApi();
+		const mockModel = createMockModel({
+			provider: "mock",
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "call_yield_1",
+							name: "yield",
+							arguments: { data: { phrase: "BLUE-HERON-42" } },
+						},
+					],
+					stopReason: "toolUse",
+				},
+			],
+			handler: () => ({ content: ["done"], stopReason: "stop" }),
+		});
+		const authStorage = createInMemoryAuthStorage();
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		authStorage.keys.setRuntime("mock", "test-key");
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([mockModel]);
+		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+		vi.spyOn(modelRegistry, "hasConfiguredAuth").mockReturnValue(true);
+
+		const parentManager = SessionManager.inMemory();
+		parentManager.appendMessage({ role: "user", content: "remember BLUE-HERON-42", timestamp: 1 } as never);
+		parentManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "Noted." }],
+			api: "openai-responses",
+			provider: "openai",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 2,
+		} as never);
+
+		const forkedSession = {
+			...session(),
+			cwd: tempDir.path(),
+			authStorage,
+			modelRegistry,
+			sessionManager: parentManager,
+			eventBus: new EventBus(),
+			getSessionFile: () => parentFile,
+			enableMCP: false,
+			enableLsp: false,
+			extensionPaths: [] as string[],
+			preparedExtensions: [],
+			customToolPaths: [],
+			effectiveExtensionRoots: () => ({
+				explicit: [] as string[],
+				mode: "explicit-only" as const,
+				configured: [] as string[],
+				configuredLevel: "project" as const,
+			}),
+		} as unknown as ToolSession;
+		const inherited = forkMessages(forkedSession, "all", undefined);
+
+		let childManager: SessionManager | undefined;
+		let contextAtCreate: unknown[] | undefined;
+		const realCreateAgentSession = sdkModule.createAgentSession;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			childManager = options?.sessionManager as SessionManager | undefined;
+			contextAtCreate = childManager?.buildSessionContext().messages;
+			return realCreateAgentSession(options);
+		});
+
+		const settled = await runStructuredSubagent(
+			request({
+				session: forkedSession,
+				model: "mock/mock-model",
+				assignment: "Reply with the phrase only.",
+				fork: {
+					messages: inherited,
+					request: {
+						request: {
+							provider: "openai-codex-responses",
+							model: "gpt-5",
+							baseUrl: "https://api.openai.com/v1",
+							accountId: "acct-parent",
+							sessionId: "sess-parent",
+							threadId: "thread-parent",
+							input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "seed" }] }],
+						},
+						messageFingerprints: inherited.map(fingerprintForkMessage),
+					},
+				},
+			}),
+		);
+
+		expect(settled.result.exitCode).toBe(0);
+		// The session was built on top of the inherited history…
+		expect(contextAtCreate).toEqual(inherited);
+		// …and the first provider request saw that history ahead of the brief.
+		expect(mockModel.calls).toHaveLength(1);
+		const firstContext = mockModel.calls[0]!.context.messages;
+		expect(JSON.stringify(firstContext[0])).toContain("remember BLUE-HERON-42");
+		expect(firstContext[1]?.role).toBe("assistant");
+		expect(JSON.stringify(firstContext[1])).toContain("Noted.");
+		expect(JSON.stringify(firstContext[inherited.length])).toContain("Reply with the phrase only.");
+		// The child journal is its own file under the parent's artifacts dir,
+		// with the inherited turns persisted ahead of the brief.
+		const journalFile = path.join(tempDir.path(), "parent", `${settled.result.id}.jsonl`);
+		const journal = (await fs.readFile(journalFile, "utf8"))
+			.trim()
+			.split("\n")
+			.map(
+				line =>
+					JSON.parse(line) as {
+						type?: string;
+						customType?: string;
+						data?: { request?: { sessionId?: string } };
+						message?: { role?: string; content?: unknown };
+					},
+			);
+		const messageEntries = journal.filter(entry => entry.type === "message");
+		const roles = messageEntries.map(entry => entry.message?.role);
+		expect(roles.slice(0, 3)).toEqual(["user", "assistant", "user"]);
+		expect(messageEntries[0]?.message?.content).toBe("remember BLUE-HERON-42");
+		expect(JSON.stringify(messageEntries[2]?.message?.content)).toContain("Reply with the phrase only.");
+		// The inherited provider-native request is persisted as a custom marker
+		// so restarts and nested forks keep the shared prompt-cache lineage.
+		const forkMarker = journal.find(
+			entry => entry.type === "custom" && entry.customType === FORK_REQUEST_CONTEXT_TYPE,
+		);
+		expect(forkMarker?.data?.request?.sessionId).toBe("sess-parent");
+	});
 });
 
 describe("agent frontmatter structured opt-in", () => {
@@ -1432,21 +1604,25 @@ describe("agent frontmatter structured opt-in", () => {
 		Bun.env[key] = value;
 	}
 
-	/** A user agent whose `output` requires `verdict`; only the frontmatter `structured` flag varies. */
-	function agentFile(name: string, structured: boolean): string {
+	/** A user agent that may declare an `output` requiring `verdict` and may set frontmatter `structured: true`. */
+	function agentFile(name: string, declares: { output: boolean; flag: boolean }): string {
 		return [
 			"---",
 			`name: ${name}`,
 			"description: Reports a verdict",
 			"model: mock/mock-model",
-			...(structured ? ["structured: true"] : []),
-			"output:",
-			"  properties:",
-			"    verdict:",
-			"      type: string",
-			"  optionalProperties:",
-			"    note:",
-			"      type: string",
+			...(declares.flag ? ["structured: true"] : []),
+			...(declares.output
+				? [
+						"output:",
+						"  properties:",
+						"    verdict:",
+						"      type: string",
+						"  optionalProperties:",
+						"    note:",
+						"      type: string",
+					]
+				: []),
 			"---",
 			"",
 			`Role marker ${name}.`,
@@ -1479,18 +1655,21 @@ describe("agent frontmatter structured opt-in", () => {
 		await removeWithRetries(root);
 	});
 
+	// `schema`: yield validated against the agent's `output`; `yield`: yield with no
+	// schema; `prose`: no yield, the final message is the result.
 	it.each([
-		{ setting: false, structured: { reporter: true, plain: false } },
-		{ setting: true, structured: { reporter: true, plain: true } },
-	])(
-		"task.structured=$setting: yield and schema follow the agent opt-in",
-		async ({ setting, structured }) => {
+		{ setting: false, contract: { reporter: "schema", flagged: "yield", plain: "prose" } },
+		{ setting: true, contract: { reporter: "schema", flagged: "yield", plain: "yield" } },
+	] as const)(
+		"task.structured=$setting: yield and schema follow a declared output or structured: true",
+		async ({ setting, contract }) => {
 			// Under the isolated HOME so project discovery stops before the developer's real ~/.omp.
 			const cwd = path.join(root, "home", "work");
 			await fs.mkdir(cwd, { recursive: true });
 			const agentsDir = path.join(root, "home", ".omp", "agent", "agents");
-			await Bun.write(path.join(agentsDir, "reporter.md"), agentFile("reporter", true));
-			await Bun.write(path.join(agentsDir, "plain.md"), agentFile("plain", false));
+			await Bun.write(path.join(agentsDir, "reporter.md"), agentFile("reporter", { output: true, flag: false }));
+			await Bun.write(path.join(agentsDir, "flagged.md"), agentFile("flagged", { output: false, flag: true }));
+			await Bun.write(path.join(agentsDir, "plain.md"), agentFile("plain", { output: false, flag: false }));
 
 			const authStorage = createInMemoryAuthStorage();
 			authStorage.keys.setRuntime("mock", "test-key");
@@ -1500,7 +1679,7 @@ describe("agent frontmatter structured opt-in", () => {
 			const mock = createMockModel({
 				handler: context => {
 					const system = context.systemPrompt?.join("\n") ?? "";
-					const agent = ["reporter", "plain"].find(name => system.includes(`Role marker ${name}.`));
+					const agent = ["reporter", "flagged", "plain"].find(name => system.includes(`Role marker ${name}.`));
 					if (!agent) return { content: ["label"] };
 					const tools = (context.tools ?? []).map(tool => tool.name);
 					if (!childTools.has(agent)) childTools.set(agent, tools);
@@ -1547,14 +1726,15 @@ describe("agent frontmatter structured opt-in", () => {
 					context: "Report a verdict.",
 					tasks: [
 						{ agent: "reporter", name: "Reporter", task: "Report.", solutionSpace: "one fix: verdict given" },
+						{ agent: "flagged", name: "Flagged", task: "Report.", solutionSpace: "one fix: verdict given" },
 						{ agent: "plain", name: "Plain", task: "Report.", solutionSpace: "one fix: verdict given" },
 					],
 				} as TaskParams);
 				const results = new Map((result.details?.results ?? []).map(child => [child.agent, child]));
-				for (const [agent, expectStructured] of Object.entries(structured)) {
+				for (const [agent, expected] of Object.entries(contract)) {
 					const child = results.get(agent);
 					expect(child?.exitCode).toBe(0);
-					if (expectStructured) {
+					if (expected === "schema") {
 						expect(childTools.get(agent)).toContain("yield");
 						expect(rejections.get(agent)).toContain("does not match schema: verdict: is required");
 						expect(child?.structuredOutput).toMatchObject({
@@ -1562,6 +1742,10 @@ describe("agent frontmatter structured opt-in", () => {
 							status: "valid",
 							data: { verdict: agent },
 						});
+					} else if (expected === "yield") {
+						expect(childTools.get(agent)).toContain("yield");
+						expect(rejections.has(agent)).toBe(false);
+						expect(child?.output).toContain("no verdict yet");
 					} else {
 						expect(childTools.get(agent)).not.toContain("yield");
 						expect(rejections.has(agent)).toBe(false);

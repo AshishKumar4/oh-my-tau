@@ -1,7 +1,7 @@
-Results auto-deliver; NEVER poll.{{#if waitTool}} Completely blocked? Call `wait` to receive the first settled job you started.{{/if}}
+Results auto-deliver; NEVER poll.{{#if waitTool}} Completely blocked? Call `{{toolRefs.wait}}` to receive the first settled job you started.{{/if}}
 
-`read proc://` lists jobs/services; `read proc://<id>` inspects status/output without consuming delivery. `write proc://<id>/kill` cancels/stops; omit `content`.
+{{#if toolRefs.read}}`{{toolRefs.read}} proc://` lists jobs/services; `{{toolRefs.read}} proc://<id>` inspects status/output without consuming delivery.{{/if}}{{#if toolRefs.TaskStop}} `{{toolRefs.TaskStop}}` (`task_id: "<id>"`) cancels/stops.{{else}}{{#if toolRefs.deviceWrite}} `write proc://<id>/kill` cancels/stops; omit `content`.{{/if}}{{/if}}
 
-Job IDs are process-local; delivered results expire shortly (~30s), unconsumed results within ~5min. Agent output/transcripts remain readable at `agent://<id>` / `history://<id>`.{{#if ircEnabled}} `write agent://<id>` messages a live agent.{{/if}}
+Job IDs are process-local; delivered results expire shortly (~30s), unconsumed results within ~5min. Agent output/transcripts remain readable at `agent://<id>` / `history://<id>`.{{#if ircEnabled}}{{#if toolRefs.SendMessage}} `{{toolRefs.SendMessage}}` messages a live agent.{{else}}{{#if toolRefs.deviceWrite}} `write agent://<id>` messages a live agent.{{/if}}{{/if}}{{/if}}
 
 `completed`: subagent yielded successfully; claimed artifacts unverified.

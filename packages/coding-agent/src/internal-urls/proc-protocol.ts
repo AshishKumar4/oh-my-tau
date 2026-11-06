@@ -21,6 +21,7 @@ import {
 	stopService,
 } from "../launch/services";
 import type { ProcReadDetails } from "@oh-my-pi/pi-tui/tools/proc-render";
+import { sessionToolRefs } from "../harness/effective-profile";
 import procPromptDoc from "../prompts/internal-urls/proc.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import type {
@@ -197,7 +198,7 @@ export class ProcProtocolHandler implements ProtocolHandler {
 				}),
 				...runningAgentsOutsideJobs(session).map(
 					agent =>
-						`${agent.id} [task] running up ${formatDuration(agent.ageMs)} — ${agent.activity ?? "agent"}${agentStaleNote(agent)}`,
+						`${agent.id} [task] running up ${formatDuration(agent.ageMs)} — ${agent.activity ?? "agent"}${agentStaleNote(agent, sessionToolRefs(session))}`,
 				),
 				...services.map(service => serviceStatus(service)),
 				...(servicesError ? [`Services unavailable (daemon broker): ${servicesError}`] : []),
@@ -250,7 +251,7 @@ export class ProcProtocolHandler implements ProtocolHandler {
 		if (agent)
 			return textResource(
 				url,
-				`${agent.id} [task] — running — ${agent.activity ?? "agent"}${agentStaleNote(agent)}\nhistory://${agent.id}`,
+				`${agent.id} [task] — running — ${agent.activity ?? "agent"}${agentStaleNote(agent, sessionToolRefs(session))}\nhistory://${agent.id}`,
 				undefined,
 				false,
 				{ agents: [agent] },

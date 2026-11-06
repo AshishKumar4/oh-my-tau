@@ -3,22 +3,22 @@
  *
  * Agents are embedded at build time via Bun's import with { type: "text" }.
  */
-import { Effort } from "@oh-my-pi/pi-ai";
 import { parseFrontmatter, prompt } from "@oh-my-pi/pi-utils";
 import { parseAgentFields } from "../discovery/helpers";
 // Embed agent markdown files at build time
 import agentFrontmatterTemplate from "../prompts/agents/frontmatter.md" with { type: "text" };
 import reviewerMd from "../prompts/agents/reviewer.md" with { type: "text" };
 import scoutMd from "../prompts/agents/scout.md" with { type: "text" };
-import securityReviewerMd from "../prompts/agents/security-reviewer.md" with { type: "text" };
 import seanceMd from "../prompts/agents/seance.md" with { type: "text" };
+import sidekickMd from "../prompts/agents/sidekick.md" with { type: "text" };
 import taskMd from "../prompts/agents/task.md" with { type: "text" };
 import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
 
 import type { AgentSource } from "@oh-my-pi/pi-tui/tools/task";
 import type { AgentDefinition } from "./types";
 
-interface AgentFrontmatter {
+/** Frontmatter slots of the bundled agent template (`prompts/agents/frontmatter.md`). */
+export interface AgentFrontmatter {
 	name: string;
 	description: string;
 	tools?: string[];
@@ -28,6 +28,9 @@ interface AgentFrontmatter {
 	blocking?: boolean;
 	prewalk?: boolean | string;
 	advisor?: boolean | string;
+	autoloadSkills?: string[];
+	sidekick?: boolean;
+	pinModel?: boolean;
 }
 
 interface EmbeddedAgentDef {
@@ -36,23 +39,27 @@ interface EmbeddedAgentDef {
 	template: string;
 }
 
+/** Render an agent markdown file (frontmatter block + body) the way the bundled agents are embedded. */
+export function renderAgentMarkdown(frontmatter: AgentFrontmatter, body: string): string {
+	return prompt.render(agentFrontmatterTemplate, { ...frontmatter, body });
+}
+
 function buildAgentContent(def: EmbeddedAgentDef): string {
 	const body = prompt.render(def.template);
 	if (!def.frontmatter) return body;
-	return prompt.render(agentFrontmatterTemplate, { ...def.frontmatter, body });
+	return renderAgentMarkdown(def.frontmatter, body);
 }
 
 const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 	{ fileName: "scout.md", template: scoutMd },
 	{ fileName: "reviewer.md", template: reviewerMd },
-	{ fileName: "security-reviewer.md", template: securityReviewerMd },
 	{ fileName: "seance.md", template: seanceMd },
 	{
 		fileName: "task.md",
 		frontmatter: {
 			name: "task",
-			description: "General-purpose subagent with full capabilities for delegated multi-step tasks",
-			spawns: "*",
+			description:
+				"General-purpose laborer for well-defined, fully specified implementation and test work. Cannot spawn subagents.",
 			model: "@task",
 			thinkingLevel: AUTO_THINKING,
 			// No `prewalk` frontmatter: the generic task hand-off (strong model
@@ -62,17 +69,32 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 		},
 		template: taskMd,
 	},
-	{
-		fileName: "sonic.md",
-		frontmatter: {
-			name: "sonic",
-			description: "Low-reasoning agent for strictly mechanical updates or data collection only",
-			model: "@smol",
-			thinkingLevel: Effort.Medium,
-		},
-		template: taskMd,
-	},
 ];
+
+/** Removed bundled agents, mapped to the bundled agent that took over their role. */
+const RETIRED_BUNDLED_AGENTS: Record<string, string> = {
+	sonic: "task",
+	"security-reviewer": "reviewer",
+};
+
+/**
+ * The bundled agent that replaced a removed bundled agent, else `name` itself.
+ * Old transcripts and vibe lifecycle entries still record removed names.
+ */
+export function resolveRetiredAgentName(name: string): string {
+	return Object.hasOwn(RETIRED_BUNDLED_AGENTS, name) ? RETIRED_BUNDLED_AGENTS[name] : name;
+}
+
+/**
+ * The Fusion sidekick is deliberately NOT a discoverable bundled agent: the
+ * `sidekick` tool owns its one-per-session lifecycle, so `task` must never be
+ * able to spawn a second one. Its body is the worker prompt template, parsed
+ * once and kept unrendered — `{{modelName}}`/`{{effort}}` slots are filled at
+ * spawn from the resolved pairing, so the parsed definition must not go
+ * through the render pass that other bundled templates use (it also
+ * normalises whitespace).
+ */
+const SIDEKICK_AGENT_FILE = "sidekick.md";
 
 // Computed lazily on first loadBundledAgents() call to avoid eager prompt.render at module load.
 
@@ -157,6 +179,14 @@ export function getBundledAgentsMap(): Map<string, AgentDefinition> {
 		map.set(agent.name, agent);
 	}
 	return map;
+}
+
+let sidekickAgentCache: AgentDefinition | null = null;
+
+/** The Fusion sidekick definition, parsed once and unrendered. Not part of {@link loadBundledAgents}. */
+export function getSidekickAgent(): AgentDefinition {
+	sidekickAgentCache ??= parseAgent(`embedded:${SIDEKICK_AGENT_FILE}`, sidekickMd, "bundled");
+	return sidekickAgentCache;
 }
 
 /**

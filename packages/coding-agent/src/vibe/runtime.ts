@@ -24,6 +24,7 @@ import {
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Effort } from "@oh-my-pi/pi-ai";
 import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManagerApi, AsyncJobRunResult } from "../async/job-manager";
 import { validateAgentAccountPools } from "../config/account-pools";
@@ -35,7 +36,7 @@ import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with {
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
-import { getBundledAgent } from "../task/agents";
+import { getBundledAgent, resolveRetiredAgentName } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
 import { generateTaskName, sanitizeAgentId } from "../task/name-generator";
 import { AgentOutputManager } from "../task/output-manager";
@@ -58,16 +59,31 @@ import {
 import { type VibeCli } from "@oh-my-pi/pi-tui/tools/vibe";
 
 import { cfgTaskAgentAccountPools, cfgTaskAgentModelOverrides, cfgTaskEnableLsp } from "../task/settings";
+/** Bundled agent every vibe worker runs: workers write code. */
+const VIBE_WORKER_AGENT = "task";
+
 /**
- * CLI flavor → bundled agent type. This IS the model-tier mapping: `sonic`
- * carries `model: "@smol"` (the configured fast/low-latency role) and `task`
- * carries `model: "@task"` (inherits the session's strong model).
- * Resolution goes through {@link resolveAgentModelSelection} exactly like a
- * `task` spawn, so `task.agentModelOverrides` and model-role settings apply.
+ * The `fast` tier over {@link VIBE_WORKER_AGENT}: the `@smol` role (the
+ * configured fast/low-latency model) at medium thinking. `good` keeps the
+ * agent's own `@task` model. Resolution goes through
+ * {@link resolveAgentModelSelection} exactly like a `task` spawn, so
+ * model-role settings apply; only `good` takes `task.agentModelOverrides.task`,
+ * so `fast` stays cheap.
  */
-export const VIBE_CLI_AGENT: Record<VibeCli, string> = {
-	fast: "sonic",
-	good: "task",
+const VIBE_FAST_TIER: Pick<AgentDefinition, "model" | "thinkingLevel"> = {
+	model: ["@smol"],
+	thinkingLevel: Effort.Medium,
+};
+
+/**
+ * Settings layered over the parent's for `fast` workers. The executor reads
+ * `task.agentPrewalk` / `task.agentAdvisor` (and the `task.prewalk` toggle) by
+ * agent name; those target ordinary `task` spawns and would move a `fast`
+ * worker off `@smol` or pair it with an advisor.
+ */
+const VIBE_FAST_TIER_SETTINGS: Readonly<Record<string, unknown>> = {
+	"task.agentPrewalk": { [VIBE_WORKER_AGENT]: "off" },
+	"task.agentAdvisor": { [VIBE_WORKER_AGENT]: "off" },
 };
 
 /** One completed tool call in the per-turn activity trace. */
@@ -292,7 +308,7 @@ export class VibeSessionRegistry {
 			ownerId: record.ownerId,
 			parentSessionId: scope.parentSessionId,
 			parentSessionFile: scope.parentSessionFile,
-			agent: getBundledAgent("sonic")!,
+			agent: this.#workerAgent(record.cli ?? "fast"),
 			state: record.state ?? "running",
 			createdAt: now,
 			lastActivityAt: now,
@@ -350,18 +366,21 @@ export class VibeSessionRegistry {
 		}
 	}
 
-	#resolveWorker(session: VibeParentSession, cli: VibeCli): ResolvedVibeWorker {
-		const agentName = VIBE_CLI_AGENT[cli];
-		const agent = getBundledAgent(agentName);
+	#workerAgent(cli: VibeCli): AgentDefinition {
+		const agent = getBundledAgent(VIBE_WORKER_AGENT);
 		if (!agent) {
-			throw new ToolError(`Bundled agent "${agentName}" for vibe cli "${cli}" is unavailable.`);
+			throw new ToolError(`Bundled agent "${VIBE_WORKER_AGENT}" for vibe cli "${cli}" is unavailable.`);
 		}
-		const agentModelOverrides = cfgTaskAgentModelOverrides.get(session.settings);
+		return cli === "fast" ? { ...agent, ...VIBE_FAST_TIER } : agent;
+	}
+
+	#resolveWorker(session: VibeParentSession, cli: VibeCli): ResolvedVibeWorker {
+		const agent = this.#workerAgent(cli);
 		// Same contract as the task spawn path: the expansion discards the role
 		// alias (`@task`, `@smol`), so patterns and role identity come from one
 		// call — the child's inherited retry-fallback chain is keyed off the role.
 		const { patterns, role } = resolveAgentModelSelection({
-			settingsOverride: agentModelOverrides[agentName],
+			settingsOverride: cli === "fast" ? undefined : cfgTaskAgentModelOverrides.get(session.settings)[agent.name],
 			agentModel: agent.model,
 			settings: session.settings,
 			activeModelPattern: session.getActiveModelString?.(),
@@ -592,7 +611,9 @@ export class VibeSessionRegistry {
 		spawn: VibeSpawnLifecycleEvent,
 		options?: { requireAgentMatch?: boolean },
 	): Promise<string | undefined> {
-		if (options?.requireAgentMatch !== false && spawn.agent !== VIBE_CLI_AGENT[spawn.cli]) return undefined;
+		if (options?.requireAgentMatch !== false && resolveRetiredAgentName(spawn.agent) !== VIBE_WORKER_AGENT) {
+			return undefined;
+		}
 		if (!/^[A-Za-z0-9_-]+$/.test(spawn.id) || spawn.childSessionFile !== `${spawn.id}.jsonl`) return undefined;
 		const artifactsDir = path.resolve(parentSessionFile.slice(0, -6));
 		const childSessionFile = path.resolve(artifactsDir, spawn.childSessionFile);
@@ -1308,7 +1329,7 @@ export class VibeSessionRegistry {
 			onProgress,
 			authStorage: session.authStorage,
 			modelRegistry: session.modelRegistry,
-			settings: session.settings,
+			settings: record.cli === "fast" ? session.settings.overlay(VIBE_FAST_TIER_SETTINGS) : session.settings,
 			asyncJobManager: session.asyncJobManager,
 			inheritedSessionAgents: session.getSessionAgents?.(),
 			mcpManager: session.mcpManager ?? MCPManager.instance(),
@@ -1402,6 +1423,7 @@ export class VibeSessionRegistry {
 								eventBus: session.eventBus,
 								subagentEventBus: session.subagentEventBus,
 								artifactsDir: session.getSessionFile()?.slice(0, -6),
+								resultOwnerId: record.ownerId,
 							});
 					return await this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result);
 				} catch (error) {
