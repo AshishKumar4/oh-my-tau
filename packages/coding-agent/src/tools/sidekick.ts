@@ -184,23 +184,26 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			"task",
 			`${SIDEKICK_LABEL} handoff ${handoff}`,
 			async ({ jobId: ownJobId, signal: runSignal, reportProgress }) => {
-				const result = await run(runSignal, progress => {
+				const running = run(runSignal, progress => {
 					void reportProgress(describeProgress(progress));
 					forwardProgress(progress);
 				});
+				// A first handoff's job learns its agent id once the spawn registers the
+				// sidekick, long before the run ends: a second call looks the running job
+				// up by that id to steer it. A worker's job manager starts the body only
+				// after `register` returns, so the spawn is known only in here.
+				if (!ref) {
+					void this.#spawning?.then(
+						spawned => manager.setJobAgent(ownJobId, spawned.id),
+						() => {},
+					);
+				}
+				const result = await running;
 				manager.setJobAgent(ownJobId, result.id);
 				return reportOf(result);
 			},
 			{ id: `${ref?.id ?? SIDEKICK_LABEL}-h${handoff}`, ownerId: leadId, agentId: ref?.id },
 		);
-		// A first-handoff job learns its agent id once the spawn registers it;
-		// the mid-handoff interrupt lookup keys on it.
-		if (!ref) {
-			void this.#spawning?.then(
-				spawned => manager.setJobAgent(jobId, spawned.id),
-				() => {},
-			);
-		}
 
 		if (!block) {
 			return textResult(`Handoff ${handoff} dispatched to the sidekick (job \`${jobId}\`). ${this.#waitHint()}`, {

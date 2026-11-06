@@ -373,8 +373,27 @@ describe("fusion sidekick tool", () => {
 			expect(await backgroundHint(served)).toContain("wait for it with `TaskOutput` rather than polling.");
 		});
 
-		it("steers a call that arrives mid-handoff into the running turn instead of spawning a second sidekick", async () => {
+		it.each([
+			{ name: "a body started during register", deferStart: false },
+			// A worker's job manager registers on main and starts the body over RPC later.
+			{ name: "a body started after register returns", deferStart: true },
+		])("steers a call that arrives mid-handoff into the running turn ($name)", async ({ deferStart }) => {
+			if (deferStart) {
+				const register = manager.register.bind(manager);
+				vi.spyOn(manager, "register").mockImplementation((kind, label, run, options) =>
+					register(
+						kind,
+						label,
+						async context => {
+							await Bun.sleep(0);
+							return run(context);
+						},
+						options,
+					),
+				);
+			}
 			const release = Promise.withResolvers<void>();
+			const registered = Promise.withResolvers<void>();
 			const steered: string[] = [];
 			const liveSession = {
 				isStreaming: true,
@@ -399,6 +418,7 @@ describe("fusion sidekick tool", () => {
 					cost: 0,
 					durationMs: 0,
 				});
+				registered.resolve();
 				await release.promise;
 				return {
 					result: singleResult("done"),
@@ -414,6 +434,8 @@ describe("fusion sidekick tool", () => {
 			if (!tool) throw new Error("sidekick tool should mount");
 
 			const first = await tool.execute("c1", { message: "Go", block: false });
+			// The lead's next call comes a turn later, once the sidekick has registered.
+			await registered.promise;
 			const interrupt = await tool.execute("c2", { message: "Change of plan" });
 			expect(interrupt.details?.mode).toBe("interrupt");
 			expect(interrupt.details?.jobId).toBe(first.details?.jobId);
