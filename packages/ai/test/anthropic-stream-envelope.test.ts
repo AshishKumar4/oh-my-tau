@@ -1721,7 +1721,12 @@ describe("anthropic stream envelope handling", () => {
 			expect(result.errorMessage).toBe(`Anthropic stream error (${type}): ${message}`);
 			expect(AIError.isStreamEnvelopeErrorText(result.errorMessage ?? "")).toBe(false);
 			expect(AIError.isStreamEnvelopeTruncationText(result.errorMessage ?? "")).toBe(false);
-			expect(AIError.retriable(AIError.classifyMessage(result))).toBe(false);
+			// A spent credit balance is the account's state, not the request's: it is a
+			// usage limit that sets this credential aside for a sibling, never a replay
+			// on the same one (`created` stays 1 above).
+			const id = AIError.classifyMessage(result);
+			if (type === "billing_error") expect(AIError.is(id, AIError.Flag.UsageLimit)).toBe(true);
+			else expect(AIError.retriable(id)).toBe(false);
 			vi.restoreAllMocks();
 		}
 	});

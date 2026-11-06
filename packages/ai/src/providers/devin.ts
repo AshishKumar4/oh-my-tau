@@ -5,17 +5,18 @@ import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import {
 	AssignModelRequestSchema,
 	AssignModelResponseSchema,
-	CacheControlType,
 	type ChatMessagePrompt,
 	ChatMessagePromptSchema,
 	ChatMessageRequestType,
 	ChatMessageSource,
 	type ChatToolCall,
 	ChatToolCallSchema,
-	ChatToolChoiceSchema,
 	ChatToolDefinitionSchema,
 	CompletionConfigurationSchema,
 	ConversationalPlannerMode,
+	CortexStepType,
+	CortexTrajectoryReferenceSchema,
+	CortexTrajectoryType,
 	GetChatMessageRequestSchema,
 	GetChatMessageResponseSchema,
 	GetUserJwtRequestSchema,
@@ -24,7 +25,6 @@ import {
 	ImageDataSchema,
 	MetadataSchema,
 	type ModelAssignment,
-	PromptCacheOptionsSchema,
 	StopReason,
 } from "@oh-my-pi/pi-catalog/discovery/devin-proto";
 import { create, fromBinary, toBinary } from "@oh-my-pi/pi-catalog/discovery/protobuf";
@@ -244,7 +244,6 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			const chatBaseUrl = auth.baseUrl ?? baseUrl;
 			const turn: DevinTurn = {
 				apiKey: options?.apiKey,
-				userJwt: auth.userJwt,
 				cascadeId: options?.conversationId ?? options?.sessionId ?? crypto.randomUUID(),
 				// Foreign ids (cross-model calls and their results alike): Responses
 				// composites (`call_id|item_id`) keep their wire `call_id`; opaque ids
@@ -557,7 +556,6 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 /** Per-turn wire state shared by `AssignModel` and `GetChatMessage`. */
 interface DevinTurn {
 	apiKey: string | undefined;
-	userJwt: string;
 	/** Cascade thread id; assignment and chat must agree on it or the JWT is rejected. */
 	cascadeId: string;
 	/** History already run through {@link transformMessages}, shared by both calls. */
@@ -569,7 +567,7 @@ async function fetchDevinAuthMetadata(
 	baseUrl: string,
 	fetchImpl: NonNullable<StreamOptions["fetch"]>,
 	signal: AbortSignal | undefined,
-): Promise<{ userJwt: string; baseUrl?: string }> {
+): Promise<{ baseUrl?: string }> {
 	const request = create(GetUserJwtRequestSchema, { metadata: create(MetadataSchema, devinCliMetadata(apiKey)) });
 	const response = await fetchImpl(`${baseUrl}${DEVIN_AUTH_PATH}`, {
 		method: "POST",
@@ -591,7 +589,7 @@ async function fetchDevinAuthMetadata(
 		});
 	}
 	const customBaseUrl = decoded.customApiServerUrl.trim();
-	return { userJwt: decoded.userJwt, ...(customBaseUrl ? { baseUrl: customBaseUrl.replace(/\/+$/, "") } : undefined) };
+	return customBaseUrl ? { baseUrl: customBaseUrl.replace(/\/+$/, "") } : {};
 }
 
 /**
@@ -653,10 +651,30 @@ function buildRouterPrompt(messages: Message[]): ChatMessagePrompt | undefined {
 }
 
 /**
- * Build a {@link GetChatMessageRequest} for one Cascade turn. Auth rides inside
- * `Metadata.apiKey`; the system prompt is the flattened `prompt` string and the
- * conversation history maps to `chatMessagePrompts`. `assignment` is present only
- * for router models and supplies both the resolved uid and its JWT.
+ * The completion configuration the Devin CLI (3000.10.21) sends on every
+ * `GetChatMessage`, the same for every model, standalone or in a Fusion pair.
+ * A caller's explicit temperature, top-p or stop sequences still win.
+ * `numCompletions` is required; the backend answers `invalid_argument` when
+ * it is absent.
+ */
+const DEVIN_CLI_COMPLETION_CONFIGURATION = {
+	numCompletions: 1n,
+	maxTokens: 128000n,
+	maxNewlines: 400n,
+	temperature: 1,
+	topK: 40n,
+	topP: Math.fround(0.95),
+} as const;
+
+/**
+ * Build a {@link GetChatMessageRequest} for one Cascade turn, field for field as
+ * the Devin CLI builds its own. Auth rides inside `Metadata.apiKey`; the system
+ * prompt is the flattened `prompt` string and the conversation history maps to
+ * `chatMessagePrompts`. `assignment` is present only for router models and
+ * supplies both the resolved uid and its JWT. The CLI sends no tool choice,
+ * cache options or execution id, and no user JWT on this call; the backend
+ * applies its defaults for each. Parallel tool calls follow the model features
+ * the server declares, which is unset (enabled) for the Devin models omp pairs.
  */
 function buildDevinChatRequest(
 	model: Model<"devin-agent">,
@@ -665,13 +683,17 @@ function buildDevinChatRequest(
 	turn: DevinTurn,
 	assignment: ModelAssignment | undefined,
 ) {
-	const chatModelUid = assignment?.modelUid ?? options?.chatModelUid ?? model.requestModelId ?? model.id;
+	// The CLI references one trajectory per session and numbers its steps; the
+	// first step is the user's input. Derived from the cascade so it stays
+	// stable across turns without session state of its own.
+	const stepIndex = turn.messages.filter(message => message.role === "assistant").length;
 	// Devin routes multiple provider families through one Cascade envelope. Its
 	// Gemini backend applies Google's tool-schema constraints and rejects JSON
-	// Schema type arrays (e.g. `["number", "null"]`) as an opaque internal
-	// `invalid_argument`; normalize both direct Gemini models and router-assigned
-	// enum-style UIDs (`MODEL_GOOGLE_GEMINI_*`) before serializing tools. The UID
-	// prefix is the server's own enum namespace, which classifyModel cannot parse.
+	// Schema type arrays as an opaque internal `invalid_argument`; normalize
+	// direct Gemini models and router-assigned enum-style UIDs before
+	// serializing tools. The UID prefix is the server's own enum namespace,
+	// which classifyModel cannot parse.
+	const chatModelUid = assignment?.modelUid ?? options?.chatModelUid ?? model.requestModelId ?? model.id;
 	const googleToolSchema =
 		classifyModel("devin", model.id, { lenient: true }).class === "gemini" ||
 		classifyModel("devin", chatModelUid, { lenient: true }).class === "gemini" ||
@@ -686,27 +708,29 @@ function buildDevinChatRequest(
 		});
 	});
 	return create(GetChatMessageRequestSchema, {
-		metadata: create(MetadataSchema, devinCliMetadata(turn.apiKey, turn.userJwt)),
+		metadata: create(MetadataSchema, devinCliMetadata(turn.apiKey)),
 		prompt: normalizeSystemPrompts(context.systemPrompt).join("\n\n"),
 		chatMessagePrompts: buildChatMessagePrompts(turn.messages, turn.cascadeId, model),
 		chatModelUid,
 		...(assignment ? { modelAssignmentJwt: assignment.assignmentJwt } : undefined),
 		requestType: ChatMessageRequestType.CASCADE,
 		plannerMode: ConversationalPlannerMode.DEFAULT,
-		toolChoice: create(ChatToolChoiceSchema, { choice: { case: "optionName", value: "auto" } }),
-		systemPromptCacheOptions: create(PromptCacheOptionsSchema, { type: CacheControlType.EPHEMERAL }),
 		disableParallelToolCalls: !model.compat.supportsParallelToolCalls,
 		cascadeId: turn.cascadeId,
-		executionId: crypto.randomUUID(),
+		trajectoryReference: create(CortexTrajectoryReferenceSchema, {
+			trajectoryId: deterministicUuid(`${turn.cascadeId}\0trajectory`),
+			trajectoryType: CortexTrajectoryType.CASCADE,
+			...(stepIndex === 0 ? { stepType: CortexStepType.USER_INPUT } : { stepIndex }),
+		}),
 		configuration: create(CompletionConfigurationSchema, {
-			numCompletions: 1n,
-			maxTokens: BigInt(options?.maxTokens ?? model.maxTokens ?? 64000),
-			maxNewlines: 400n,
-			temperature: options?.temperature ?? 1,
-			topK: 40n,
+			...DEVIN_CLI_COMPLETION_CONFIGURATION,
+			...(options?.maxTokens !== undefined ? { maxTokens: BigInt(options.maxTokens) } : undefined),
+			...(options?.temperature !== undefined ? { temperature: options.temperature } : undefined),
 			// Devin's CLI sends topP as a float32 widened to double; round the same way.
-			topP: Math.fround(options?.topP ?? 0.95),
-			stopPatterns: options?.stopSequences ?? [],
+			...(options?.topP !== undefined ? { topP: Math.fround(options.topP) } : undefined),
+			...(options?.stopSequences && options.stopSequences.length > 0
+				? { stopPatterns: options.stopSequences }
+				: undefined),
 		}),
 		tools,
 	});

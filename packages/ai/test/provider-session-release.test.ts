@@ -1,16 +1,81 @@
 import { describe, expect, it } from "bun:test";
-import type { ServerWebSocket } from "bun";
-import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import {
+	prewarmOpenAICodexResponses,
+	setCodexAttestationProvider,
+	streamOpenAICodexResponses,
+} from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { getOpenAICodexTransportDetails } from "@oh-my-pi/pi-ai/providers/openai-codex-state";
-import type { Message, Model, ProviderSessionState } from "@oh-my-pi/pi-ai/types";
-import { createCodexModel } from "./helpers";
+import type { Message, ProviderSessionState } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 
-describe("provider routing session release", () => {
-	it("closes every Codex credential and Lite socket for one session while preserving another response chain", async () => {
-		const requests: Record<string, unknown>[] = [];
-		const closed = Promise.withResolvers<void>();
+describe("routing session release", () => {
+	it("does not open a prewarm socket after its owner is released during attestation", async () => {
+		let opened = 0;
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request, server) {
+				if (server.upgrade(request)) return undefined;
+				return new Response("upgrade", { status: 400 });
+			},
+			websocket: {
+				open() {
+					opened++;
+				},
+				message() {},
+			},
+		});
+		const model = buildModel({
+			id: "gpt-5.5",
+			name: "Codex prewarm",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: `http://127.0.0.1:${server.port}`,
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8192,
+		});
+		const entered = Promise.withResolvers<void>();
+		const attestation = Promise.withResolvers<string | undefined>();
+		setCodexAttestationProvider(() => {
+			entered.resolve();
+			return attestation.promise;
+		});
+		const states = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: `aaa.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "audit" } })).toBase64()}.bbb`,
+			sessionId: "released-prewarm",
+			providerSessionState: states,
+			preferWebsockets: true,
+		};
+		try {
+			const pending = prewarmOpenAICodexResponses(model, options);
+			await entered.promise;
+			for (const state of states.values()) state.releaseSession?.(options.sessionId);
+			attestation.resolve(undefined);
+			await pending;
+			expect(opened).toBe(0);
+			expect(getOpenAICodexTransportDetails(model, options)).toMatchObject({
+				hasSessionState: false,
+				websocketConnected: false,
+			});
+			await prewarmOpenAICodexResponses(model, { ...options, sessionId: "replacement-owner" });
+			expect(opened).toBe(1);
+		} finally {
+			attestation.resolve(undefined);
+			setCodexAttestationProvider(undefined);
+			for (const state of states.values()) state.close();
+			await server.stop(true);
+		}
+	});
+	it("releases both credential variants of a side session while the parent socket continues its chain", async () => {
+		const previousIds: Array<string | undefined> = [];
 		let opened = 0;
 		let closedCount = 0;
+		const released = Promise.withResolvers<void>();
 		const server = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
@@ -22,9 +87,13 @@ describe("provider routing session release", () => {
 				open() {
 					opened++;
 				},
-				message(socket: ServerWebSocket<unknown>, message) {
-					requests.push(JSON.parse(String(message)) as Record<string, unknown>);
-					const id = `resp_${requests.length}`;
+				message(socket, message) {
+					const payload = JSON.parse(String(message));
+					if (!isRecord(payload)) throw new Error("Expected a provider request");
+					previousIds.push(
+						typeof payload.previous_response_id === "string" ? payload.previous_response_id : undefined,
+					);
+					const id = `resp_${previousIds.length}`;
 					const item = {
 						type: "message",
 						id: `msg_${id}`,
@@ -46,55 +115,65 @@ describe("provider routing session release", () => {
 								usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 },
 							},
 						},
-					]) {
+					])
 						socket.send(JSON.stringify(event));
-					}
 				},
 				close() {
-					if (++closedCount === 2) closed.resolve();
+					if (++closedCount === 2) released.resolve();
 				},
 			},
 		});
-		const model: Model<"openai-codex-responses"> = {
-			...createCodexModel("gpt-5.5"),
+		const model = buildModel({
+			id: "gpt-5.5",
+			name: "Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
 			baseUrl: `http://127.0.0.1:${server.port}`,
-		};
-		const providerSessionState = new Map<string, ProviderSessionState>();
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 8192,
+		});
+		const states = new Map<string, ProviderSessionState>();
 		const token = (account: string) =>
 			`aaa.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: account } })).toBase64()}.bbb`;
-		const options = { apiKey: token("account-a"), providerSessionState, preferWebsockets: true };
+		const options = { apiKey: token("account-a"), providerSessionState: states, preferWebsockets: true };
 		const messages: Message[] = [{ role: "user", content: "First question", timestamp: 1 }];
-		const context = { systemPrompt: ["system prompt"], messages };
-		const mainOptions = { ...options, sessionId: "main" };
-		const sideSessionId = `side:${"long-session-id".repeat(8)}`;
-		const sideOptions = { ...options, sessionId: sideSessionId };
+		const context = { systemPrompt: ["system"], messages };
+		const parent = { ...options, sessionId: "main" };
+		const sideId = `side:${"long-session-id".repeat(8)}`;
+		const side = { ...options, sessionId: sideId };
 		try {
-			const mainReply = await streamOpenAICodexResponses(model, context, mainOptions).result();
-			expect(mainReply.stopReason).toBe("stop");
-			for (const variant of [sideOptions, { ...sideOptions, apiKey: token("account-b"), responsesLite: true }]) {
+			const reply = await streamOpenAICodexResponses(model, context, parent).result();
+			expect(reply.stopReason).toBe("stop");
+			for (const variant of [side, { ...side, apiKey: token("account-b"), responsesLite: true }]) {
 				expect((await streamOpenAICodexResponses(model, context, variant).result()).stopReason).toBe("stop");
 			}
 			expect(opened).toBe(3);
-			expect(getOpenAICodexTransportDetails(model, sideOptions).hasSessionState).toBe(true);
-			for (const state of providerSessionState.values()) state.releaseSession?.(sideSessionId);
-			expect(getOpenAICodexTransportDetails(model, sideOptions)).toMatchObject({
+			expect(getOpenAICodexTransportDetails(model, side).hasSessionState).toBe(true);
+			for (const state of states.values()) state.releaseSession?.(sideId);
+			expect(getOpenAICodexTransportDetails(model, side)).toMatchObject({
 				hasSessionState: false,
 				hasTurnState: false,
 				websocketConnected: false,
 			});
-			await closed.promise;
+			await released.promise;
 			expect(closedCount).toBe(2);
-			expect(getOpenAICodexTransportDetails(model, mainOptions).websocketConnected).toBe(true);
-			const followup = await streamOpenAICodexResponses(
+			expect(getOpenAICodexTransportDetails(model, parent).websocketConnected).toBe(true);
+			const next = await streamOpenAICodexResponses(
 				model,
-				{ ...context, messages: [...messages, mainReply, { role: "user", content: "Follow-up", timestamp: 2 }] },
-				mainOptions,
+				{
+					...context,
+					messages: [...messages, reply, { role: "user", content: "Follow up", timestamp: 2 }],
+				},
+				parent,
 			).result();
-			expect(followup.stopReason).toBe("stop");
-			expect(requests[3].previous_response_id).toBe("resp_1");
+			expect(next.stopReason).toBe("stop");
+			expect(previousIds.at(-1)).toBe("resp_1");
 			expect(opened).toBe(3);
 		} finally {
-			for (const state of providerSessionState.values()) state.close();
+			for (const state of states.values()) state.close();
 			await server.stop(true);
 		}
 	});

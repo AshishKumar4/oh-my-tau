@@ -1,8 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
+import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { carriesReasoning } from "@oh-my-pi/pi-catalog/compat/reasoning-carry";
 import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
-import { renderDemotedThinking } from "../dialect/demotion";
+import { isRecord } from "@oh-my-pi/pi-utils";
+import { dropsUnreplayableThinking, renderDemotedThinking } from "../dialect/demotion";
 import type {
 	Api,
 	AssistantMessage,
@@ -10,17 +12,12 @@ import type {
 	KnownApi,
 	Message,
 	Model,
+	Tool,
 	ToolCall,
 	ToolResultMessage,
 	UserMessage,
 } from "../types";
-import {
-	isDemotedThinking,
-	kCarriedReasoning,
-	kDemotedThinking,
-	kSyntheticUser,
-	type SyntheticUserCarrier,
-} from "../utils/block-symbols";
+import { kCarriedReasoning, kDemotedThinking, kSyntheticUser, type SyntheticUserCarrier } from "../utils/block-symbols";
 
 const enum ToolCallStatus {
 	/** A tool result has already been emitted for this tool call; later duplicates must be skipped. */
@@ -789,6 +786,19 @@ export function redactSensitiveInObject(val: unknown): { result: unknown; change
 	return { result: val, changed: false };
 }
 
+/** Both persisted payloads carry the same call, so a credential in one is in the other. */
+function redactToolCallPayloads(block: ToolCall): ToolCall {
+	const args = redactSensitiveInObject(block.arguments);
+	const native = block.nativeArguments === undefined ? undefined : redactSensitiveInObject(block.nativeArguments);
+	if (!args.changed && !native?.changed) return block;
+	return {
+		...block,
+		arguments: isRecord(args.result) ? args.result : {},
+		...(native === undefined ? {} : { nativeArguments: isRecord(native.result) ? native.result : {} }),
+		thoughtSignature: undefined,
+	};
+}
+
 function redactSensitiveCredentialsInMessages(messages: Message[]): Message[] {
 	if (!isCredentialRedactionActive()) return messages;
 	return messages.map((msg): Message => {
@@ -847,20 +857,10 @@ function redactSensitiveCredentialsInMessages(messages: Message[]): Message[] {
 						return { ...block, thinking: redacted, thinkingSignature: undefined };
 					}
 				} else if (block.type === "toolCall") {
-					if (block.arguments) {
-						const { result: redactedArgs, changed: argsChanged } = redactSensitiveInObject(block.arguments);
-						if (argsChanged) {
-							changed = true;
-							const castArgs =
-								redactedArgs && typeof redactedArgs === "object" && !Array.isArray(redactedArgs)
-									? (redactedArgs as Record<string, unknown>)
-									: undefined;
-							return {
-								...block,
-								arguments: castArgs,
-								thoughtSignature: undefined,
-							} as AssistantMessage["content"][number];
-						}
+					const redacted = redactToolCallPayloads(block);
+					if (redacted !== block) {
+						changed = true;
+						return redacted;
 					}
 				}
 				return block;
@@ -899,6 +899,9 @@ export function transformMessages<TApi extends Api>(
 	// normalized id. Only Responses-origin ids populate this (opaque Chat
 	// Completions ids pair by raw equality and must never be canonicalized).
 	const responsesCompositeIdMap = new Map<string, string>();
+	// Claude targets drop prior reasoning they cannot replay natively instead
+	// of demoting it to text (`dropsUnreplayableThinking`).
+	const dropsUnreplayable = dropsUnreplayableThinking(model.id);
 
 	const latestSurvivingAssistantIndex = getLatestSurvivingAssistantIndex(messages, model);
 	const invalidBoundThinkingAssistantIndexes = new Set<number>();
@@ -1021,9 +1024,10 @@ export function transformMessages<TApi extends Api>(
 			const signingAnthropicInvolved = isOfficialAnthropicSource || isSigningAnthropicTarget;
 			// Compatible Anthropic-messages reasoning targets that accept
 			// unsigned thinking natively (Z.AI, DeepSeek, the generic
-			// `reasoning && !official` case in the compat builder). Used to keep
+			// `reasoning && !official` case in the compat builder). Keeps
 			// `redacted_thinking` siblings beside unsigned visible thinking on
-			// targets that won't text-demote it.
+			// targets that won't text-demote it, and bounds the unsigned
+			// blocks a Claude target may replay to its own turns.
 			const replaysUnsignedAnthropicThinking = isAnthropicTarget && model.compat.replayUnsignedThinking;
 			// Thinking signatures can be untrustworthy for two distinct reasons with very
 			// different blast radii:
@@ -1092,7 +1096,9 @@ export function transformMessages<TApi extends Api>(
 				if (block.type === "thinking") {
 					// Only an aborted/errored turn's final (mid-stream) block can hold a
 					// partial signature; abandoned tool-use turns strip all. Drop the
-					// untrustworthy signature so the encoder can downgrade the block to text.
+					// untrustworthy signature so the target's unsigned-thinking policy
+					// applies (native unsigned replay, text demotion, or — for Claude —
+					// dropping the block).
 					const signatureUntrustworthy = abandonedToolUse || (invalidStopReason && blockIndex === lastBlockIndex);
 					let sanitized: typeof block =
 						signatureUntrustworthy && block.thinkingSignature
@@ -1142,6 +1148,20 @@ export function transformMessages<TApi extends Api>(
 						) {
 							return [];
 						}
+						// Claude replays prior reasoning only as a native thinking
+						// block it accepts: signed, or its own unsigned output where
+						// the endpoint replays unsigned thinking natively. Unsigned
+						// reasoning from another model or provider — or any unsigned
+						// block once unsigned replay is off, e.g. after the
+						// signing-proxy auto-demote — is dropped, never demoted to
+						// text (`dropsUnreplayableThinking`).
+						if (
+							dropsUnreplayable &&
+							(!sanitized.thinkingSignature || sanitized.thinkingSignature.trim() === "") &&
+							!(isSameModel && replaysUnsignedAnthropicThinking)
+						) {
+							return [];
+						}
 						return sanitized;
 					}
 					// Cross-API target: same-model replay keeps signatures untouched
@@ -1155,11 +1175,13 @@ export function transformMessages<TApi extends Api>(
 					// Cross-model + cross-API: preserve native thinking only for
 					// targets proven to read unsigned foreign reasoning (Z.AI-format
 					// OpenAI-compatible targets, plus Anthropic-compatible
-					// `replayUnsignedThinking`). Tool-call schema requirements and
-					// llama.cpp cache-prefix replay are orthogonal encoder concerns;
+					// `replayUnsignedThinking`). Claude never reads foreign reasoning
+					// natively — only its own signed blocks verify — so a Claude target
+					// falls through to the drop below. Tool-call schema requirements
+					// and llama.cpp cache-prefix replay are orthogonal encoder concerns;
 					// keeping inert foreign CoT native for those flags loses the
 					// canonical visible-text fallback without adding model context.
-					if (targetReadsForeignThinking(model, targetCompat)) {
+					if (!dropsUnreplayable && targetReadsForeignThinking(model, targetCompat)) {
 						return sanitized.thinkingSignature ? { ...sanitized, thinkingSignature: undefined } : sanitized;
 					}
 					// Same model from another host: keep the full trace natively, minus
@@ -1178,21 +1200,25 @@ export function transformMessages<TApi extends Api>(
 					// Demote to text so the reasoning survives as context, wrapped in the
 					// TARGET model's own canonical thinking-block dialect (e.g. a ```thinking
 					// fence for Gemini) so it reads as reasoning rather than bare prose the
-					// model might mimic.
+					// model might mimic. Claude targets drop it instead: re-sent reasoning
+					// trips Anthropic's `reasoning_extraction` classifier, so
+					// `renderDemotedThinking` renders nothing for them.
+					const demoted = renderDemotedThinking(model.id, sanitized.thinking);
+					if (!demoted) return [];
 					// Mark the demoted block (symbol-keyed, never serialized) instead of
 					// baking a separator into its text: the openai-completions flatten —
 					// the one consumer that joins adjacent text blocks into a single
-					// string — inserts a paragraph break after marked blocks, so the
-					// bare Anthropic-dialect output (or any dialect's wrapped output
-					// whose closing tag isn't a natural word boundary) can't glue onto
-					// the following visible-text block, while ordinary adjacent text
-					// blocks stitched from streaming / bridges / imported transcripts
-					// stay byte-identical. A separator baked into the block text would
-					// leak to non-flattening targets: Anthropic/Bedrock reject a
-					// terminal assistant message whose text ends with whitespace.
+					// string — inserts a paragraph break after marked blocks, so a
+					// dialect's wrapped output whose closing tag isn't a natural word
+					// boundary can't glue onto the following visible-text block, while
+					// ordinary adjacent text blocks stitched from streaming / bridges /
+					// imported transcripts stay byte-identical. A separator baked into
+					// the block text would leak to non-flattening targets:
+					// Anthropic/Bedrock reject a terminal assistant message whose text
+					// ends with whitespace.
 					return {
 						type: "text" as const,
-						text: renderDemotedThinking(model.id, sanitized.thinking),
+						text: demoted,
 						[kDemotedThinking]: true,
 					};
 				}
@@ -1304,18 +1330,6 @@ export function transformMessages<TApi extends Api>(
 
 				return block;
 			});
-
-			// A demoted-thinking block that survived as the message's final block can
-			// still end with the thinking text's own trailing whitespace (bare
-			// Anthropic-dialect demotion copies it verbatim), and Anthropic rejects a
-			// terminal assistant message whose text ends with trailing whitespace
-			// ("final assistant content cannot end with trailing whitespace").
-			// trimEnd() is safe: demoted text is synthesized context, never
-			// byte-exact replay material.
-			const finalBlock = transformedContent[transformedContent.length - 1];
-			if (finalBlock?.type === "text" && isDemotedThinking(finalBlock)) {
-				transformedContent[transformedContent.length - 1] = { ...finalBlock, text: finalBlock.text.trimEnd() };
-			}
 
 			// Record this turn's tool-call ids into the origin scope. Origin scope
 			// must be complete before dedup reads it: filled here off the SAME
@@ -1576,4 +1590,81 @@ export function transformMessages<TApi extends Api>(
 	flushPendingAbortedToolCalls();
 
 	return result;
+}
+
+/** Every name the model can call in this request: each tool's own name plus its wire alias. */
+export function declaredToolNames(tools: readonly Tool[] | undefined): ReadonlySet<string> | undefined {
+	if (!tools || tools.length === 0) return undefined;
+	const names = new Set<string>();
+	for (const tool of tools) {
+		names.add(tool.name);
+		if (tool.customWireName !== undefined) names.add(tool.customWireName);
+	}
+	return names;
+}
+
+/** Omp name <-> vendor wire name for every tool a harness profile renames on this request. */
+export interface HarnessToolNames {
+	readonly toWire: ReadonlyMap<string, string>;
+	readonly fromWire: ReadonlyMap<string, string>;
+}
+
+/**
+ * The renames `profile` applies to this request's tools, or `undefined` when
+ * the resolved profile differs or no tool is renamed — callers treat absence
+ * as "vendor naming rules apply" rather than consulting an empty map.
+ *
+ * `override` is the session's effective profile (`harness.mode`). When set it
+ * replaces the model's catalog profile (`undefined` forces native); when
+ * omitted the model's own profile applies, preserving today's behavior.
+ */
+export function buildHarnessToolNames(
+	model: Model,
+	profile: HarnessProfile,
+	tools: readonly Tool[] | undefined,
+	override?: HarnessProfile | null,
+): HarnessToolNames | undefined {
+	const effective = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
+	if (effective !== profile) return undefined;
+	const toWire = new Map<string, string>();
+	const fromWire = new Map<string, string>();
+	for (const tool of tools ?? []) {
+		const wireName = tool.customWireName;
+		if (wireName === undefined || wireName === tool.name) continue;
+		toWire.set(tool.name, wireName);
+		fromWire.set(wireName, tool.name);
+	}
+	return toWire.size > 0 ? { toWire, fromWire } : undefined;
+}
+
+export interface FacadeToolCallReplay {
+	/** The omp pair (`name`/`nativeArguments`) rather than the vendor pair (`wireName`/`arguments`). */
+	native: boolean;
+	name: string;
+	arguments: Record<string, unknown>;
+}
+
+/**
+ * Which identity a harness-facade call replays under.
+ *
+ * A facade call persists two shapes of the same call: the vendor pair the
+ * model made (`wireName`/`arguments`) and the omp pair it executed as
+ * (`name`/`nativeArguments`). The vendor pair replays verbatim while a tool of
+ * that name is still declared; once the facade is gone (a fallback-chain
+ * switch to a model without the profile) the omp pair replays instead, so the
+ * transcript never pairs an omp name with a payload its schema rejects.
+ * Nothing is converted here — both shapes were recorded at dispatch.
+ *
+ * `undefined` for a call with a single identity: no facade was involved, or
+ * the block predates `nativeArguments` and carries no omp payload. The caller
+ * replays such a block exactly as it did before this field existed.
+ */
+export function facadeToolCallReplay(
+	block: ToolCall,
+	declaredNames: ReadonlySet<string> | undefined,
+): FacadeToolCallReplay | undefined {
+	if (block.wireName === undefined) return undefined;
+	if (declaredNames?.has(block.wireName)) return { native: false, name: block.wireName, arguments: block.arguments };
+	if (block.nativeArguments === undefined) return undefined;
+	return { native: true, name: block.name, arguments: block.nativeArguments };
 }

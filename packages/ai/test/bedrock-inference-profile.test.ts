@@ -177,6 +177,14 @@ describe("Bedrock cross-region inference-profile geo routing", () => {
 	// A `us-east-1` ambient region exercises the mismatch-correction path: a non-`us`
 	// geo profile must be rerouted off the ambient `us` region, not pass through it.
 	const US_AMBIENT = { AWS_REGION: "us-east-1", AWS_DEFAULT_REGION: undefined } as const;
+	// The selected shared-config profile's `region` is ambient too, so a host
+	// `AWS_PROFILE` (or `AWS_SDK_LOAD_CONFIG`) must not leak one in.
+	const NO_AMBIENT = {
+		AWS_REGION: undefined,
+		AWS_DEFAULT_REGION: undefined,
+		AWS_PROFILE: undefined,
+		AWS_SDK_LOAD_CONFIG: undefined,
+	} as const;
 
 	// Repro: an `eu.` profile defaulted to us-east-1 → HTTP 400 "The provided model identifier is invalid."
 	test("routes an eu. profile to an EU region instead of us-east-1", async () => {
@@ -204,7 +212,7 @@ describe("Bedrock cross-region inference-profile geo routing", () => {
 	});
 
 	test("falls back to us-east-1 for a geo profile when no ambient region is set", async () => {
-		await withEnv({ AWS_REGION: undefined, AWS_DEFAULT_REGION: undefined }, async () => {
+		await withEnv(NO_AMBIENT, async () => {
 			expect(await capturedRequestHost(bedrockModel("us.anthropic.claude-opus-4-8"))).toBe(
 				"bedrock-runtime.us-east-1.amazonaws.com",
 			);
@@ -212,7 +220,7 @@ describe("Bedrock cross-region inference-profile geo routing", () => {
 	});
 
 	test("leaves region-agnostic global. profiles on the ambient region", async () => {
-		await withEnv({ AWS_REGION: undefined, AWS_DEFAULT_REGION: undefined }, async () => {
+		await withEnv(NO_AMBIENT, async () => {
 			expect(await capturedRequestHost(bedrockModel("global.anthropic.claude-opus-4-8"))).toBe(
 				"bedrock-runtime.us-east-1.amazonaws.com",
 			);

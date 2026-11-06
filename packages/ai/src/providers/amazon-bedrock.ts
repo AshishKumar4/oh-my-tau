@@ -16,7 +16,7 @@ import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort, requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { $flag, fetchWithRetry, logger, parseStreamingJsonThrottled, USER_AGENT } from "@oh-my-pi/pi-utils";
-import { renderDemotedThinking } from "../dialect/demotion";
+import { dropsUnreplayableThinking, renderDemotedThinking } from "../dialect/demotion";
 import * as AIError from "../error";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import { resolveAwsBearerToken } from "../registry/aws";
@@ -1368,6 +1368,23 @@ function convertMessages(
 	promptCachePolicy: BedrockPromptCachePolicy,
 ): WireMessage[] {
 	const result: WireMessage[] = [];
+	// Converse rejects consecutive same-role turns ("A conversation must
+	// alternate between user and assistant roles"). A Claude target drops prior
+	// reasoning it cannot replay (`dropsUnreplayableThinking`), so an assistant
+	// turn whose only content was such reasoning is skipped and would leave two
+	// user turns adjacent. For Claude, a user or developer turn that follows
+	// another user turn folds into it, after any toolResult blocks: tool results
+	// stay first, the order Anthropic requires when text accompanies them. A
+	// toolResult turn always follows its tool-use assistant turn, so it never
+	// folds. Llama and Mistral reject text beside tool results ("Conversation
+	// blocks and tool result blocks cannot be provided in the same turn"), so
+	// other models keep one Converse turn per message.
+	const dropsUnreplayable = dropsUnreplayableThinking(model.id);
+	const pushUserTurn = (content: UserContent[]): void => {
+		const previous = result.at(-1);
+		if (dropsUnreplayable && previous?.role === "user") previous.content.push(...content);
+		else result.push({ role: "user", content });
+	};
 	const transformedMessages = transformMessages(context.messages, model, id => normalizeToolCallId(id));
 
 	for (let i = 0; i < transformedMessages.length; i++) {
@@ -1379,7 +1396,7 @@ function convertMessages(
 				if (typeof m.content === "string") {
 					// Skip empty user messages
 					if (!m.content || m.content.trim() === "") continue;
-					result.push({ role: "user", content: [{ text: m.content.toWellFormed() }] });
+					pushUserTurn([{ text: m.content.toWellFormed() }]);
 				} else {
 					const contentBlocks: UserContent[] = [];
 					for (const c of m.content) {
@@ -1399,7 +1416,7 @@ function convertMessages(
 					}
 					// Skip message if all blocks filtered out
 					if (contentBlocks.length === 0) continue;
-					result.push({ role: "user", content: contentBlocks });
+					pushUserTurn(contentBlocks);
 				}
 				break;
 			case "assistant": {
@@ -1442,10 +1459,12 @@ function convertMessages(
 								// rejects it on replay with HTTP 400 "User messages cannot contain reasoning
 								// content. Please remove the reasoning content and try again.", which wedges the
 								// agent loop on every turn after the first. Demote to plain text instead — the
-								// content survives, just no longer typed as a reasoning block. This matches how
-								// every other provider (Anthropic, Google, OpenAI-completions) handles thinking
-								// blocks it can't safely replay.
-								contentBlocks.push({ text: renderDemotedThinking(model.id, c.thinking) });
+								// content survives, just no longer typed as a reasoning block — except on Claude,
+								// where re-sent reasoning trips Anthropic's `reasoning_extraction` classifier:
+								// `renderDemotedThinking` renders nothing there and the block is dropped. This
+								// matches every other provider's handling of thinking it can't safely replay.
+								const demoted = renderDemotedThinking(model.id, c.thinking);
+								if (demoted) contentBlocks.push({ text: demoted });
 							}
 							break;
 						default:

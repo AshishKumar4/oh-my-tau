@@ -1,3 +1,4 @@
+import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { $env } from "@oh-my-pi/pi-utils";
@@ -49,6 +50,12 @@ export interface CodexRequestOptions {
 	 * Responses so the model can emit independent tool calls in parallel.
 	 */
 	responsesLite?: boolean;
+	/**
+	 * Session effective harness profile (`harness.mode`). Overrides the
+	 * model's catalog profile for the `reasoning.context` default: `null`
+	 * forces native, a profile forces that surface, omission keeps catalog.
+	 */
+	harnessProfile?: HarnessProfile | null;
 }
 
 export interface InputItem {
@@ -233,7 +240,6 @@ function orphanFunctionOutputToMessage(item: InputItem, callId: string): InputIt
  *   tool-result child is dropped from the reconstructed history) or when a turn
  *   is aborted/crashes after the call streamed but before its result persisted.
  */
-
 /**
  * Sanitize an OpenAI Responses/Codex tool call ID to <= 64 characters and valid charset.
  * Composite IDs with '|' or '\n' have their secondary/item part stripped.
@@ -332,9 +338,9 @@ function stripImageDetails(input: unknown[]): void {
 }
 
 /**
- * Structural view of a Responses-style body mutated by the Lite rewrite.
- * Loose (`unknown`) property types let the turn transformer (`RequestBody`)
- * and the agent's remote-compaction payloads reuse one shaper.
+ * Extract the declared tools into a leading additional_tools developer item.
+ * Upstream inlined the same shape into applyCodexResponsesLiteShape; this
+ * entry stays because the fork harness relocation reuses it standalone.
  */
 export interface CodexLiteShapedBody {
 	instructions?: unknown;
@@ -342,6 +348,45 @@ export interface CodexLiteShapedBody {
 	tool_choice?: unknown;
 	input?: unknown;
 	parallel_tool_calls?: unknown;
+}
+
+function matchesForcedToolChoice(tool: unknown, choice: Record<string, unknown>): boolean {
+	if (tool === null || typeof tool !== "object" || !("type" in tool)) return false;
+	if (choice.type === "computer") return tool.type === "computer";
+	return (
+		choice.type === "function" &&
+		tool.type === "function" &&
+		typeof choice.name === "string" &&
+		"name" in tool &&
+		tool.name === choice.name
+	);
+}
+
+function selectForcedTool(declaredTools: readonly unknown[], choice: Record<string, unknown>): unknown {
+	for (const tool of declaredTools) {
+		if (tool !== null && typeof tool === "object" && "type" in tool && tool.type === "namespace") {
+			const members = "tools" in tool && Array.isArray(tool.tools) ? tool.tools : [];
+			const member = members.find(entry => matchesForcedToolChoice(entry, choice));
+			if (member !== undefined) return { ...tool, tools: [member] };
+			continue;
+		}
+		if (matchesForcedToolChoice(tool, choice)) return tool;
+	}
+	return undefined;
+}
+
+export function takeCodexToolSurface(body: CodexLiteShapedBody): InputItem {
+	const declaredTools = Array.isArray(body.tools) ? body.tools : [];
+	let additionalTools = declaredTools;
+	if (body.tool_choice && typeof body.tool_choice === "object" && "type" in body.tool_choice) {
+		const selected = selectForcedTool(declaredTools, body.tool_choice);
+		if (selected !== undefined) {
+			additionalTools = [selected];
+			body.tool_choice = "required";
+		}
+	}
+	delete body.tools;
+	return { type: "additional_tools", role: "developer", tools: additionalTools };
 }
 
 /**
@@ -364,28 +409,7 @@ export function applyCodexResponsesLiteShape(body: CodexLiteShapedBody): void {
 	stripImageDetails(input);
 	sanitizeInputCallIds(input as InputItem[]);
 	body.parallel_tool_calls = false;
-	const declaredTools = Array.isArray(body.tools) ? body.tools : [];
-	let additionalTools = declaredTools;
-	if (body.tool_choice && typeof body.tool_choice === "object" && "type" in body.tool_choice) {
-		const choice = body.tool_choice;
-		const selected = declaredTools.find(tool => {
-			if (tool === null || typeof tool !== "object" || !("type" in tool)) return false;
-			if (choice.type === "computer") return tool.type === "computer";
-			return (
-				choice.type === "function" &&
-				tool.type === "function" &&
-				"name" in choice &&
-				typeof choice.name === "string" &&
-				"name" in tool &&
-				tool.name === choice.name
-			);
-		});
-		if (selected) {
-			additionalTools = [selected];
-			body.tool_choice = "required";
-		}
-	}
-	const prefix: InputItem[] = [{ type: "additional_tools", role: "developer", tools: additionalTools }];
+	const prefix: InputItem[] = [takeCodexToolSurface(body)];
 	if (typeof body.instructions === "string" && body.instructions.length > 0) {
 		prefix.push({
 			type: "message",
@@ -398,7 +422,6 @@ export function applyCodexResponsesLiteShape(body: CodexLiteShapedBody): void {
 		body.tool_choice = "auto";
 	}
 	delete body.instructions;
-	delete body.tools;
 }
 
 export async function transformRequestBody(
@@ -500,6 +523,14 @@ export async function transformRequestBody(
 			} else {
 				body.reasoning.context = options.reasoningContext;
 			}
+		} else if (
+			(options.harnessProfile !== undefined
+				? (options.harnessProfile ?? undefined)
+				: resolveHarnessProfile(model)) === "codex" &&
+			model.compat.supportsAllTurnsReasoningContext
+		) {
+			// codex-rs sends reasoning.context: "all_turns" on profiled turns.
+			body.reasoning.context = "all_turns";
 		}
 	} else {
 		delete body.reasoning;
@@ -507,9 +538,6 @@ export async function transformRequestBody(
 	if (!model.compat.supportsReasoningSummary && body.reasoning) {
 		delete body.reasoning.summary;
 	}
-	// Catalog pro aliases (`gpt-5.6-*-pro`): applied after the effort branch so
-	// the mode is sent even when no effort is set (the branch above deletes
-	// `body.reasoning` in that case) — mode and effort are independent fields.
 	if (model.reasoningMode && !options.reasoningOff) {
 		body.reasoning = { ...body.reasoning, mode: model.reasoningMode };
 	}

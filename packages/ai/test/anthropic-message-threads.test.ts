@@ -322,7 +322,7 @@ describe("anthropic message threads", () => {
 
 		await chat.turn("first");
 		const reminder: Message = { role: "developer", content: "per-call reminder", timestamp: 99 };
-		markPerCallContextMessage(reminder);
+		markPerCallContextMessage(reminder, "added");
 		await chat.turn("second", [reminder]);
 		await chat.turn("third");
 

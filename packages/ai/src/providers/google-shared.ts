@@ -42,7 +42,7 @@ import type {
 	ThinkingLevel,
 	UsageMetadata,
 } from "./google-types";
-import { transformMessages } from "./transform-messages";
+import { declaredToolNames, facadeToolCallReplay, transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 
 export type {
@@ -212,6 +212,7 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 	const callOrder = new FunctionCallOrder();
 
 	const transformedMessages = transformMessages(context.messages, model, id => normalizeToolCallId(id));
+	const declaredNames = declaredToolNames(context.tools);
 
 	// Gemini < 3 image tool results go in a separate user turn, but parallel tool results must
 	// stay a single contiguous functionResponse turn ("number of function response parts is not
@@ -290,12 +291,14 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 							...(thoughtSignature && { thoughtSignature }),
 						});
 					} else {
-						parts.push({
-							text: renderDemotedThinking(model.id, block.thinking),
-						});
+						// Claude targets (e.g. via Antigravity) drop it: `renderDemotedThinking`
+						// renders nothing for them.
+						const demoted = renderDemotedThinking(model.id, block.thinking);
+						if (demoted) parts.push({ text: demoted });
 					}
 				} else if (block.type === "toolCall") {
-					emittedToolCallNames.set(block.id, block.name);
+					const facade = facadeToolCallReplay(block, declaredNames);
+					emittedToolCallNames.set(block.id, facade?.name ?? block.name);
 					callOrder.call(block.id);
 					// Gemini 3 requires a thought signature on function calls it makes. The
 					// public API requires the bypass sentinel on every unsigned call. Cloud
@@ -311,8 +314,8 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 
 					const part: Part = {
 						functionCall: {
-							name: block.name,
-							args: block.arguments ?? {},
+							name: facade?.name ?? block.name,
+							args: facade?.arguments ?? block.arguments ?? {},
 							...(model.compat.supportsFunctionPartId ? { id: block.id } : {}),
 						},
 					};

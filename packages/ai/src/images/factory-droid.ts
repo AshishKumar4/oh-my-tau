@@ -1,7 +1,7 @@
 import type { Model } from "@oh-my-pi/pi-catalog/types";
 import { prompt, readSseJson } from "@oh-my-pi/pi-utils";
 import { type ApiKey, isApiKeyResolver, resolvedApiKeyBearer, withAuth } from "../auth-retry";
-import type { OAuthRequestIdentity } from "../auth/types";
+import type { CredentialRequestScope } from "../auth/types";
 import * as AIError from "../error";
 import { factoryDroidImageRoute } from "../providers/factory-droid";
 import { googleStreamChunkError } from "../providers/google-shared";
@@ -34,16 +34,16 @@ type GeminiImageChunk = GeminiImageResponse &
  */
 function trackIdentities(apiKey: ApiKey): {
 	apiKey: ApiKey;
-	identityOf: (bearer: string) => OAuthRequestIdentity | undefined;
+	identityOf: (bearer: string) => CredentialRequestScope | undefined;
 } {
-	const identities = new Map<string, OAuthRequestIdentity>();
+	const identities = new Map<string, CredentialRequestScope>();
 	if (!isApiKeyResolver(apiKey)) return { apiKey, identityOf: () => undefined };
 	return {
 		apiKey: async context => {
 			const resolved = await apiKey(context);
 			const bearer = resolvedApiKeyBearer(resolved);
-			if (bearer && typeof resolved === "object" && resolved.oauthIdentity) {
-				identities.set(bearer, resolved.oauthIdentity);
+			if (bearer && typeof resolved === "object" && resolved.credentialScope) {
+				identities.set(bearer, resolved.credentialScope);
 			}
 			return resolved;
 		},

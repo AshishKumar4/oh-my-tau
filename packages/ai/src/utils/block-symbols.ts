@@ -1,3 +1,5 @@
+import type { Message } from "../types";
+
 /** Stores streamed tool-call argument JSON for live renderers and parser recovery. */
 export const kStreamingPartialJson = Symbol("provider.block.partialJson");
 
@@ -39,6 +41,27 @@ export const kStreamingEnvelopeId = Symbol("provider.block.envelopeId");
 
 /** Marks streamed tool-call arguments that already received an authoritative done payload. */
 export const kStreamingArgumentsDone = Symbol("provider.block.argumentsDone");
+
+/** Exact output-array slot established by the provider's stream-item router. Never persisted as model input. */
+export const kResponsesReplayItem = Symbol("provider.block.responsesReplayItem");
+export interface ResponsesReplayItemLocator {
+	readonly index: number;
+	readonly type: "function_call" | "custom_tool_call" | "computer_call";
+	readonly callId: string;
+	readonly itemId?: string;
+}
+export type ResponsesReplayItemCarrier = object & { [kResponsesReplayItem]?: ResponsesReplayItemLocator };
+
+export function bindResponsesReplayItem(block: ResponsesReplayItemCarrier, index: number, item: object): void {
+	if (!("type" in item) || !("call_id" in item) || typeof item.call_id !== "string") return;
+	if (item.type !== "function_call" && item.type !== "custom_tool_call" && item.type !== "computer_call") return;
+	block[kResponsesReplayItem] = {
+		index,
+		type: item.type,
+		callId: item.call_id,
+		itemId: "id" in item && typeof item.id === "string" ? item.id : undefined,
+	};
+}
 
 /** Classifies Cursor's in-flight tool-call kind without leaking provider-private state. */
 export const kStreamingBlockKind = Symbol("provider.block.kind");
@@ -169,12 +192,19 @@ export function isSyntheticUser(message: SyntheticUserCarrier | null | undefined
  */
 export const kPerCallContextMessage = Symbol("agent.message.perCallContext");
 
+/**
+ * How a per-call message came to be: `added` has no place in the history, `rewritten`
+ * replaces the history message at its position, and `untraced` could be either: the
+ * transform restructured the history past tracing.
+ */
+export type PerCallContextOrigin = "added" | "rewritten" | "untraced";
+
 /** Carries per-call context provenance without exposing a string-keyed property. */
-export type PerCallContextMessageCarrier = object & { [kPerCallContextMessage]?: true };
+export type PerCallContextMessageCarrier = object & { [kPerCallContextMessage]?: PerCallContextOrigin };
 
 /** Marks a message as synthesized for the current provider call. */
-export function markPerCallContextMessage(message: PerCallContextMessageCarrier): void {
-	message[kPerCallContextMessage] = true;
+export function markPerCallContextMessage(message: PerCallContextMessageCarrier, origin: PerCallContextOrigin): void {
+	message[kPerCallContextMessage] = origin;
 }
 
 /** Copies per-call context provenance to a converted or projected message. */
@@ -182,12 +212,18 @@ export function copyPerCallContextMessage(
 	target: PerCallContextMessageCarrier,
 	source: PerCallContextMessageCarrier,
 ): void {
-	if (source[kPerCallContextMessage] === true) target[kPerCallContextMessage] = true;
+	const origin = source[kPerCallContextMessage];
+	if (origin !== undefined) target[kPerCallContextMessage] = origin;
 }
 
 /** True when a message was synthesized for the current provider call. */
 export function isPerCallContextMessage(message: PerCallContextMessageCarrier | null | undefined): boolean {
-	return message?.[kPerCallContextMessage] === true;
+	return message?.[kPerCallContextMessage] !== undefined;
+}
+
+/** True when a context transform added the message for the current call: it is not part of the history. */
+export function isAddedContextMessage(message: PerCallContextMessageCarrier | null | undefined): boolean {
+	return message?.[kPerCallContextMessage] === "added";
 }
 
 /**
@@ -214,4 +250,128 @@ export function setContextHistoryIndex(message: ContextHistoryIndexCarrier, inde
 /** Removes context-history tracking before provider conversion. */
 export function clearContextHistoryIndex(message: ContextHistoryIndexCarrier): void {
 	delete message[kContextHistoryIndex];
+}
+
+/**
+ * History position of a message a context transform kept from its history, set by
+ * the extension runner on every message it hands back (absent on added ones). A
+ * native compaction cut uses it to tell the summarized history from the turns kept
+ * after it. Object spread retains it.
+ */
+export const kContextHistoryPosition = Symbol("agent.message.contextHistoryPosition");
+
+/** Carries the history position a context transform kept a message from. */
+export type ContextHistoryPositionCarrier = object & { [kContextHistoryPosition]?: number };
+
+/** Reads the history position a context transform kept a message from. */
+export function getContextHistoryPosition(
+	message: ContextHistoryPositionCarrier | null | undefined,
+): number | undefined {
+	return message?.[kContextHistoryPosition];
+}
+
+/** Records the history position a context transform kept a message from, or removes it. */
+export function setContextHistoryPosition(message: ContextHistoryPositionCarrier, position: number | undefined): void {
+	if (position === undefined) delete message[kContextHistoryPosition];
+	else message[kContextHistoryPosition] = position;
+}
+
+/**
+ * The message a per-call copy stands for. A message converted once and handed to
+ * each call as a provenance copy keeps one identity whatever position or origin a
+ * call gives it, so state kept per message across requests (the date/cwd reminder
+ * a turn went out with) survives a position change. Object spread retains it.
+ */
+export const kContextIdentity = Symbol("agent.message.contextIdentity");
+
+/** Carries the message a per-call copy stands for. */
+export type ContextIdentityCarrier = object & { [kContextIdentity]?: object };
+
+/** The message `message` stands for across calls: itself unless it is a per-call copy. */
+export function contextIdentity(message: ContextIdentityCarrier): object {
+	return message[kContextIdentity] ?? message;
+}
+
+/** Marks `copy`, a per-call rewrite of `source`, as standing for the message `source` stands for. */
+export function inheritContextIdentity<T extends object>(copy: T, source: ContextIdentityCarrier): T {
+	const carrier: ContextIdentityCarrier = copy;
+	carrier[kContextIdentity] = contextIdentity(source);
+	return copy;
+}
+
+/** Provenance copies of each converted message, by the origin and history position they carry. */
+const provenanceCopies = new WeakMap<Message, Map<string, Message>>();
+
+/**
+ * `message`, converted from `source`, as this call sends it. Conversions cached by
+ * identity are shared across calls, but a context transform's provenance (origin and
+ * history position) belongs to one call: a source carrying it gets a copy with its
+ * current values, so no later call can change what this call read. A copy is never
+ * changed once made, so calls with the same provenance share it, and caches keyed by
+ * message identity hold across them; every copy of `message` has its
+ * {@link contextIdentity}.
+ */
+export function withContextProvenance(
+	message: Message,
+	source: PerCallContextMessageCarrier & ContextHistoryPositionCarrier,
+): Message {
+	const origin = source[kPerCallContextMessage];
+	const position = source[kContextHistoryPosition];
+	if (origin === undefined && position === undefined) return message;
+	let copies = provenanceCopies.get(message);
+	const key = `${origin ?? ""}:${position ?? ""}`;
+	const shared = copies?.get(key);
+	if (shared) return shared;
+	const copy = { ...message };
+	const carrier: PerCallContextMessageCarrier & ContextHistoryPositionCarrier = copy;
+	if (origin === undefined) delete carrier[kPerCallContextMessage];
+	else carrier[kPerCallContextMessage] = origin;
+	setContextHistoryPosition(carrier, position);
+	inheritContextIdentity(copy, message);
+	if (!copies) {
+		copies = new Map();
+		provenanceCopies.set(message, copies);
+	}
+	copies.set(key, copy);
+	return copy;
+}
+
+/**
+ * Re-applies the symbol-keyed metadata that `structuredClone` cannot carry.
+ *
+ * Every marker in this module rides on a message or content block as a symbol
+ * property, and `structuredClone` drops symbols outright. A cloned message
+ * therefore compares unequal to its source under `Bun.deepEquals` even when the
+ * outbound bytes are identical — which made per-call change detection report
+ * every freshly streamed assistant message as rewritten, truncating the
+ * Anthropic cacheable prefix at the last user turn for the rest of the turn.
+ *
+ * Own symbols are enumerated rather than listed so a new marker cannot silently
+ * fall out of the clone. Content blocks are restored positionally: the clone is
+ * structurally identical, so indices align.
+ */
+export function restoreClonedMessageMetadata(target: object, source: object): void {
+	copyOwnSymbols(target, source);
+	const targetContent = (target as { content?: unknown }).content;
+	const sourceContent = (source as { content?: unknown }).content;
+	if (!Array.isArray(targetContent) || !Array.isArray(sourceContent)) return;
+	const shared = Math.min(targetContent.length, sourceContent.length);
+	for (let index = 0; index < shared; index++) {
+		const targetBlock = targetContent[index];
+		const sourceBlock = sourceContent[index];
+		if (
+			targetBlock !== null &&
+			typeof targetBlock === "object" &&
+			sourceBlock !== null &&
+			typeof sourceBlock === "object"
+		) {
+			copyOwnSymbols(targetBlock, sourceBlock);
+		}
+	}
+}
+
+function copyOwnSymbols(target: object, source: object): void {
+	for (const symbol of Object.getOwnPropertySymbols(source)) {
+		(target as Record<symbol, unknown>)[symbol] = (source as Record<symbol, unknown>)[symbol];
+	}
 }

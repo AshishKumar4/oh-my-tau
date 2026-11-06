@@ -35,9 +35,10 @@ import type {
 	WriteResult,
 } from "@oh-my-pi/pi-catalog/discovery/cursor-proto";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import type { Api, FetchImpl, KnownApi, Model, Provider, ThinkingBudgets, Usage } from "@oh-my-pi/pi-catalog/types";
 import type { ApiKey } from "./auth-retry";
-import type { OAuthRequestIdentity } from "./auth/types";
+import type { CredentialRequestScope } from "./auth/types";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { FallbackParam, MessageCreateParamsStreaming, StopDetails } from "./providers/anthropic-wire";
@@ -452,6 +453,40 @@ export interface CodexCompactionRequestContext extends CodexCompactionMetadata {
 	operationId: string;
 }
 
+/**
+ * Point-in-time identity and serialized input of one completed Codex
+ * Responses request, captured via {@link StreamOptions.onCodexRequestSnapshot}.
+ * Consumers persist this as the {@link CodexForkContext.source} for a later
+ * same-provider fork so the child can inherit the parent's wire prefix and
+ * share its root lineage. The provider adds no authentication material to the
+ * snapshot — no keys, tokens, or headers — though the replayed input itself
+ * can still contain user-provided text.
+ */
+export interface CodexRequestSnapshot {
+	provider: Provider;
+	model: string;
+	baseUrl: string;
+	accountId: string | undefined;
+	sessionId: string;
+	threadId: string;
+	promptCacheKey?: string;
+	input: OpenAIResponsesHistoryPayload["items"];
+}
+
+/**
+ * Fork linkage supplied by a caller that owns conversation lineage (e.g.
+ * subagent spawn). `source` is the parent request's {@link CodexRequestSnapshot};
+ * `messageCount` marks how many leading context messages are byte-identical to
+ * the tail of `source.input`. The provider replays `source.input` verbatim and
+ * converts only the trailing messages, so the child request shares the parent's
+ * prompt-cache prefix. Omit `messageCount` when compaction or pruning changed
+ * the inherited prefix — lineage metadata still applies without prefix reuse.
+ */
+export interface CodexForkContext {
+	source: CodexRequestSnapshot;
+	messageCount?: number;
+}
+
 /** On-demand compaction request (`compact-2026-09-04` beta). */
 export interface AnthropicCompactionRequest {
 	/** Custom summarization prompt; replaces the API default entirely when set. */
@@ -516,7 +551,7 @@ export interface StreamOptions {
 	/** @internal Stored credential row serving this request, when known. */
 	credentialId?: number;
 	/** @internal Non-secret identity of the bearer serving this attempt; never persisted in history. */
-	oauthIdentity?: OAuthRequestIdentity;
+	credentialScope?: CredentialRequestScope;
 	cacheRetention?: CacheRetention;
 	/**
 	 * Anthropic preserved-thinking behavior when a signed block no longer matches
@@ -651,6 +686,18 @@ export interface StreamOptions {
 	liveSteering?: LiveSteering;
 	/** Canonical Codex compaction classification; ignored by other providers. */
 	codexCompaction?: CodexCompactionRequestContext;
+	/** Codex fork lineage for cache-sharing child requests; ignored by other providers. */
+	codexFork?: CodexForkContext;
+	/**
+	 * Codex request snapshot observer, invoked once after a turn's successful
+	 * terminal response event with the effective request identity and the full
+	 * serialized `input` array that was actually sent. Consumers store the
+	 * result as a later {@link CodexForkContext.source}. Ignored by other
+	 * providers; not invoked for compaction requests or failed turns.
+	 */
+	onCodexRequestSnapshot?: (snapshot: CodexRequestSnapshot) => void;
+	/** Codex Code Mode tool exposure snapshot emitted as `tool_namespaces_info` turn metadata; ignored by other providers. */
+	toolNamespacesInfo?: unknown;
 	/**
 	 * Optional per-provider concurrent request cap for LLM stream calls. Keys are
 	 * provider ids (`model.provider`); positive numeric values cap in-flight
@@ -753,6 +800,22 @@ export interface StreamOptions {
 
 	/** Cursor exec/MCP tool handlers (cursor-agent only). */
 	execHandlers?: CursorExecHandlers;
+	/**
+	 * Session effective harness profile threaded by the session stream layer.
+	 * Overrides the model's catalog profile for wire naming, head caching,
+	 * replay, and Codex request shape: `null` forces native (omp surface), a
+	 * profile forces that surface on any model, and omission keeps catalog
+	 * behavior. Ignored by providers without harness-specific wire formats.
+	 */
+	harnessProfile?: HarnessProfile | null;
+	/**
+	 * `clientVersion` of the harness capture whose prompt and tools the session
+	 * serves (e.g. `2.1.284.b93`), threaded by the session stream layer. Under
+	 * the claude-code profile the Anthropic transport claims that release in
+	 * its User-Agent and billing header instead of the pinned default, so the
+	 * wire names the client the served text came from. Ignored otherwise.
+	 */
+	harnessClientVersion?: string;
 	/**
 	 * Anthropic fallback credit redemption handle from a prior classifier refusal.
 	 * When present, the Anthropic provider replays the frozen request body and betas with
@@ -1074,6 +1137,21 @@ export interface ToolCall {
 	 * JSON function tools.
 	 */
 	customWireName?: string;
+	namespace?: string;
+	/**
+	 * Name the model called this tool by when it differs from `name`: a harness
+	 * facade dispatches under its vendor name and persists under the omp tool
+	 * it executed as. `arguments` keep the vendor shape that name was declared
+	 * with, so the call replays verbatim while the facade is still declared.
+	 */
+	wireName?: string;
+	/**
+	 * `arguments` projected into `name`'s own schema, recorded at dispatch when
+	 * `wireName` is set. Replay uses it once the facade is no longer declared,
+	 * so an omp name never carries a vendor payload; absent when the projection
+	 * failed or the call predates this field.
+	 */
+	nativeArguments?: Record<string, unknown>;
 	/** Provider-native metadata required to execute and faithfully replay this call. */
 	providerMetadata?: ToolCallProviderMetadata;
 }
@@ -1655,6 +1733,11 @@ export type ToolExample<TArgs = Record<string, unknown>> =
 	| ToolCompareExample<TArgs>
 	| ToolNoteExample;
 
+export interface ToolNamespace {
+	name: string;
+	description?: string;
+}
+
 export interface Tool<TParameters extends TSchema = TSchema> {
 	name: string;
 	description: string;
@@ -1663,6 +1746,7 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 	strict?: boolean;
 	/** Withhold this Anthropic tool until a `tool_addition` message references it. */
 	deferLoading?: boolean;
+	namespace?: ToolNamespace;
 	/**
 	 * Optional grammar constraint for OpenAI custom-tool emission.
 	 * When set, providers that support grammar-constrained tools (currently only

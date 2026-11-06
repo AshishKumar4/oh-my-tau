@@ -18,7 +18,7 @@ import {
 	resolveFactoryDroidInferenceRegion,
 } from "@oh-my-pi/pi-catalog/wire/factory-droid";
 import { NO_AUTH_SENTINEL } from "../auth-retry";
-import type { OAuthRequestIdentity } from "../auth/types";
+import type { CredentialRequestScope } from "../auth/types";
 import * as AIError from "../error";
 import { mapAnthropicToolChoice } from "../stream";
 import type {
@@ -132,7 +132,7 @@ function scopeToAccount(
 	model: Model<"factory-droid-agent">,
 	registry: FactoryDroidModelPolicy | undefined,
 	wire: FactoryDroidWire,
-	identity: OAuthRequestIdentity | undefined,
+	identity: CredentialRequestScope | undefined,
 	token: string,
 ): AccountScope {
 	if (!identity) {
@@ -471,6 +471,10 @@ function streamMessagesWire(a: Attempt, inner: Model<"anthropic-messages">): Ass
 		taskBudget: options?.taskBudget,
 		fallbackCreditRedemption: options?.fallbackCreditRedemption,
 		anthropicSlowMode: options?.anthropicSlowMode,
+		// The inner Messages model would resolve its own catalog harness profile
+		// (claude-code for recent Claude lineages); the factory-droid-agent model
+		// the session presents has none, so only the caller's override applies.
+		harnessProfile: options?.harnessProfile ?? null,
 		thinkingEnabled: !a.disabled,
 		effort: outputEffort as AnthropicOptions["effort"],
 		// Token budgets come from the KDL ladder; adaptive thinking has none.
@@ -671,7 +675,7 @@ export function factoryDroidImageRoute(
 	token: string,
 	sessionId: string | undefined,
 	/** Account identity of the credential serving this attempt; host, org and upstream follow it. */
-	identity: OAuthRequestIdentity | undefined,
+	identity: CredentialRequestScope | undefined,
 ): FactoryDroidImageRoute {
 	const registry = resolveFactoryDroidPolicy(model);
 	const wire = registry?.wire;
@@ -726,7 +730,7 @@ export const streamFactoryDroid: StreamFunction<"factory-droid-agent"> = (
 			}
 			const registry = resolveFactoryDroidPolicy(model);
 			const wire = registry?.wire ?? "openai-completions";
-			const scope = scopeToAccount(model, registry, wire, options?.oauthIdentity, harnessToken);
+			const scope = scopeToAccount(model, registry, wire, options?.credentialScope, harnessToken);
 			// The proxy expects v4-shaped ids; the OMP session id is a UUIDv7-style
 			// timestamp id, so it maps through a deterministic v4 shape that stays
 			// stable per session.

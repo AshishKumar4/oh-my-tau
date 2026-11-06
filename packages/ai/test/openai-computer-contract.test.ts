@@ -1,3 +1,4 @@
+import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { describe, expect, test } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import {
@@ -177,21 +178,38 @@ describe("OpenAI GA computer contract", () => {
 				toolChoice: { type: "computer" },
 				responsesLite: false,
 			});
-			expect(regular.tools).toMatchObject([
-				{ type: "function", name: "computer" },
-				{ type: "function", name: "read" },
-			]);
-			expect(regular.tool_choice).toEqual({ type: "function", name: "computer" });
+			if (resolveHarnessProfile(subscription) === undefined) {
+				expect(regular.tools).toMatchObject([
+					{ type: "function", name: "computer" },
+					{ type: "function", name: "read" },
+				]);
+				expect(regular.tool_choice).toEqual({ type: "function", name: "computer" });
+			} else {
+				expect(regular.tools).toBeUndefined();
+				expect(regular.input?.[0]).toMatchObject({
+					type: "additional_tools",
+					role: "developer",
+					tools: [{ type: "namespace", name: "functions", tools: [{ type: "function", name: "computer" }] }],
+				});
+				expect(regular.tool_choice).toBe("required");
+			}
 
 			const lite = await buildTransformedCodexRequestBody(subscription, context, {
 				toolChoice: { type: "computer" },
 				responsesLite: true,
 			});
 			expect(lite.tools).toBeUndefined();
-			expect(lite.input?.[0]).toMatchObject({
-				type: "additional_tools",
-				tools: [{ type: "function", name: "computer" }],
-			});
+			if (resolveHarnessProfile(subscription) === undefined) {
+				expect(lite.input?.[0]).toMatchObject({
+					type: "additional_tools",
+					tools: [{ type: "function", name: "computer" }],
+				});
+			} else {
+				expect(lite.input?.[0]).toMatchObject({
+					type: "additional_tools",
+					tools: [{ type: "namespace", name: "functions", tools: [{ type: "function", name: "computer" }] }],
+				});
+			}
 			expect(lite.tool_choice).toBe("required");
 		}
 	});
@@ -222,6 +240,70 @@ describe("OpenAI GA computer contract", () => {
 		expect(lite.tools).toBeUndefined();
 		expect(lite.input?.[0]).toEqual({ type: "additional_tools", role: "developer", tools: [{ type: "computer" }] });
 		expect(lite.tool_choice).toBe("required");
+	});
+
+	const namespacedTools: Tool[] = [
+		computerTool,
+		{ name: "read", description: "read", parameters: type({ path: "string" }) },
+		{
+			name: "task",
+			description: "delegate",
+			parameters: type({ prompt: "string" }),
+			namespace: { name: "collaboration", description: "Delegation" },
+		},
+	];
+
+	interface AdditionalToolsSurface {
+		type: string;
+		role: string;
+		tools: Array<{ type: string; name?: string; tools?: Array<{ type: string; name?: string }> }>;
+	}
+
+	async function codexToolSurface(profiled: Model<"openai-codex-responses">): Promise<AdditionalToolsSurface> {
+		const context: Context = {
+			messages: [{ role: "user", content: "capture the screen", timestamp: 1 }],
+			tools: namespacedTools,
+		};
+		const body = await buildTransformedCodexRequestBody(profiled, context, { responsesLite: false });
+		expect(body.tools).toBeUndefined();
+		return JSON.parse(JSON.stringify(body.input?.[0])) as AdditionalToolsSurface;
+	}
+
+	test("keeps a codex-profile native computer opt-in beside the namespace groups", async () => {
+		const astra = model("openai-codex-responses", "gpt-6-astra", true);
+		expect(resolveHarnessProfile(astra)).toBe("codex");
+
+		const surface = await codexToolSurface(astra);
+
+		expect(surface).toMatchObject({ type: "additional_tools", role: "developer" });
+		expect(surface.tools[0]).toEqual({ type: "computer" });
+		expect(surface.tools.filter(entry => entry.type === "namespace").map(entry => entry.name)).toEqual([
+			"functions",
+			"collaboration",
+		]);
+		for (const group of surface.tools.filter(entry => entry.type === "namespace")) {
+			expect(group.tools?.map(entry => entry.type)).not.toContain("computer");
+		}
+		expect(surface.tools.find(entry => entry.name === "functions")?.tools?.map(entry => entry.name)).toEqual([
+			"read",
+		]);
+	});
+
+	test("groups a codex-profile computer fallback inside the functions namespace", async () => {
+		const astra = model("openai-codex-responses", "gpt-6-astra");
+		expect(resolveHarnessProfile(astra)).toBe("codex");
+		expect(astra.supportsComputerUse).toBe(false);
+
+		const surface = await codexToolSurface(astra);
+
+		expect(surface.tools.map(entry => entry.type)).toEqual(["namespace", "namespace"]);
+		expect(surface.tools.find(entry => entry.name === "functions")?.tools).toMatchObject([
+			{ type: "function", name: "computer" },
+			{ type: "function", name: "read" },
+		]);
+		expect(surface.tools.find(entry => entry.name === "collaboration")?.tools).toMatchObject([
+			{ type: "function", name: "task" },
+		]);
 	});
 	test("pairs in-memory computer results for an explicit Codex native opt-in", () => {
 		const optedIn = model("openai-codex-responses", "gpt-5.6-terra", true);

@@ -21,13 +21,17 @@ export interface JsonSchemaToTsOptions {
 	 * indented bodies; `harmony` renders the flat OpenAI-Harmony convention —
 	 * `//` line comments, `,` delimiters, no indentation.
 	 */
-	readonly style?: "default" | "harmony";
+	readonly style?: "default" | "harmony" | "codex";
+	readonly declarationName?: string;
+	readonly resultSchema?: unknown;
 }
 
 interface Ctx {
 	readonly indent: string;
 	readonly comments: boolean;
+	readonly lineComments: boolean;
 	readonly harmony: boolean;
+	readonly verboseArrays: boolean;
 	readonly defs: Record<string, unknown> | undefined;
 	readonly seen: Set<unknown>;
 }
@@ -56,7 +60,7 @@ function joinUnion(parts: readonly string[]): string {
 }
 
 function emitDescription(lines: string[], description: string, ctx: Ctx, pad: string): void {
-	if (ctx.harmony) {
+	if (ctx.lineComments) {
 		for (const line of description.split("\n")) lines.push(`${pad}// ${line}`.trimEnd());
 		return;
 	}
@@ -77,10 +81,10 @@ function convertArray(node: Record<string, unknown>, ctx: Ctx, pad: string): str
 		return `[${prefixItems.map(item => convert(item, ctx, pad)).join(", ")}]`;
 	}
 	const items = node.items;
-	if (items === undefined || items === true) return "unknown[]";
-	if (items === false) return "never[]";
+	if (items === undefined || items === true) return ctx.verboseArrays ? "Array<unknown>" : "unknown[]";
+	if (items === false) return ctx.verboseArrays ? "Array<never>" : "never[]";
 	const inner = convert(items, ctx, pad);
-	if (inner.includes("\n") || inner.includes(" | ") || inner.length > INLINE_ARRAY_LIMIT) {
+	if (ctx.verboseArrays || inner.includes("\n") || inner.includes(" | ") || inner.length > INLINE_ARRAY_LIMIT) {
 		return `Array<${inner}>`;
 	}
 	return `${inner}[]`;
@@ -187,26 +191,36 @@ function convert(node: unknown, ctx: Ctx, pad: string): string {
 	return "unknown";
 }
 
-/** Convert a JSON Schema object into a simplified TypeScript type string. */
-export function jsonSchemaToTypeScript(schema: unknown, options?: JsonSchemaToTsOptions): string {
-	const root = isJsonObject(schema) ? schema : undefined;
-	let defs: Record<string, unknown> | undefined;
-	if (root) {
-		for (const key of ["definitions", "$defs"] as const) {
-			const value = root[key];
-			if (isJsonObject(value)) {
-				defs ??= {};
-				Object.assign(defs, value);
-			}
+function collectDefs(schema: unknown, into: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+	if (!isJsonObject(schema)) return into;
+	let defs = into;
+	for (const key of ["definitions", "$defs"] as const) {
+		const value = schema[key];
+		if (isJsonObject(value)) {
+			defs ??= {};
+			Object.assign(defs, value);
 		}
 	}
-	const harmony = options?.style === "harmony";
+	return defs;
+}
+
+export function jsonSchemaToTypeScript(schema: unknown, options?: JsonSchemaToTsOptions): string {
+	const style = options?.style ?? "default";
+	const harmony = style === "harmony";
+	const codex = style === "codex";
+	let defs = collectDefs(schema, undefined);
+	if (options?.resultSchema !== undefined) defs = collectDefs(options.resultSchema, defs);
 	const ctx: Ctx = {
 		indent: options?.indent ?? (harmony ? "" : "  "),
 		comments: options?.comments ?? true,
+		lineComments: harmony || codex,
 		harmony,
+		verboseArrays: codex,
 		defs,
 		seen: new Set(),
 	};
-	return convert(schema, ctx, "");
+	const args = convert(schema, ctx, "");
+	if (options?.declarationName === undefined) return args;
+	const result = options.resultSchema === undefined ? "unknown" : convert(options.resultSchema, ctx, "");
+	return `${options.declarationName}(args: ${args}): Promise<${result}>;`;
 }

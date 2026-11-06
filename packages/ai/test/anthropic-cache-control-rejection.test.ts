@@ -802,7 +802,8 @@ describe("Anthropic cache_control rejection fallback", () => {
 		// and the identity block survives it. Only the rung below it drops the
 		// breakpoint the block defaults to.
 		expect(capture.bodies).toHaveLength(3);
-		expect(breakpointTtls(capture.bodies[0])).toEqual(["1h"]);
+		// Default retention caches the head for 1h and the message tail for 5m.
+		expect(breakpointTtls(capture.bodies[0])).toEqual(["1h", "default"]);
 		expect(countBreakpoints(capture.bodies[1])).toBeGreaterThan(0);
 		expect(countBreakpoints(capture.bodies[2])).toBe(0);
 		// The OAuth defaults advertise prompt-caching-scope unconditionally; that
@@ -1022,6 +1023,94 @@ describe("Anthropic fast-mode re-arm through an opaque injected client", () => {
 		// once more, then the replay succeeds.
 		expect(capture.bodies).toHaveLength(5);
 	});
+});
+
+/**
+ * A fresh request cannot carry a redemption's credit token, so a cache_control
+ * replay of a frozen redemption body forfeits the credit, and once the refused
+ * turn already ran server tools it must surface the rejection instead: a
+ * tokenless replay would run and bill those tools again.
+ */
+describe("Anthropic cache_control rejection during a fallback-credit redemption", () => {
+	const SERVER_TOOL_CALL: AssistantMessage["content"][number] = {
+		type: "anthropicServerTool",
+		block: { type: "server_tool_use", id: "srvtoolu_1", name: "web_search", input: { query: "hi" } },
+	};
+
+	function redeemTurn(
+		fetchImpl: FetchImpl,
+		retention: "short" | "long",
+		refusedContent: AssistantMessage["content"],
+	): Promise<AssistantMessage> {
+		const cacheControl: CacheControlEphemeral =
+			retention === "long" ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" };
+		return streamAnthropic(MODEL, CONTEXT, {
+			apiKey: "sk-ant-api-test",
+			cacheRetention: retention,
+			fetch: fetchImpl,
+			fallbackCreditRedemption: {
+				token: "fct_cache_rung",
+				prefillClaim: false,
+				params: {
+					model: MODEL.id,
+					max_tokens: 1024,
+					stream: true,
+					system: [{ type: "text", text: "You are a precise assistant.", cache_control: cacheControl }],
+					messages: [{ role: "user", content: "Say hi" }],
+				},
+				// Saved betas only the frozen body needed.
+				betas: [CUSTOM_BETA, EXTENDED_CACHE_TTL_BETA],
+				betaHeader: `${CUSTOM_BETA},${EXTENDED_CACHE_TTL_BETA}`,
+				expiresAt: Date.now() + 60_000,
+				refusedContent,
+			},
+		}).result();
+	}
+
+	it.each(["short", "long"] as const)(
+		"surfaces the rejection without a tokenless replay once server tools ran (%s retention)",
+		async retention => {
+			const capture: Capture = { bodies: [], betaHeaders: [] };
+
+			const message = await redeemTurn(createBreakpointRejectingFetch(capture), retention, [
+				SERVER_TOOL_CALL,
+				{ type: "text", text: "Partial" },
+			]);
+
+			expect(message.stopReason).toBe("error");
+			expect(message.errorMessage).toContain("cache_control");
+			expect(capture.bodies).toHaveLength(1);
+			expect(capture.bodies[0]?.fallback_credit_token).toBe("fct_cache_rung");
+		},
+	);
+
+	it.each(["short", "long"] as const)(
+		"forfeits the credit and drops the frozen headers on the replay (%s retention)",
+		async retention => {
+			const capture: Capture = { bodies: [], betaHeaders: [] };
+
+			const message = await redeemTurn(createBreakpointRejectingFetch(capture), retention, [
+				{ type: "text", text: "Partial" },
+			]);
+
+			expect(message.stopReason).toBe("stop");
+			expect(capture.bodies[0]?.fallback_credit_token).toBe("fct_cache_rung");
+			const replays = capture.bodies.slice(1);
+			// Long retention takes the options rung first, then the field rung.
+			expect(replays).toHaveLength(retention === "long" ? 2 : 1);
+			for (const [index, body] of replays.entries()) {
+				expect(body.fallback_credit_token).toBeUndefined();
+				// A fresh body from the context, not the frozen one.
+				expect(body.tools?.map(tool => tool.name)).toEqual(["lookup"]);
+				const betas = capture.betaHeaders[index + 1] ?? "";
+				expect(betas).not.toContain(CUSTOM_BETA);
+				expect(betas).not.toContain(EXTENDED_CACHE_TTL_BETA);
+			}
+			expect(countBreakpoints(capture.bodies.at(-1)!)).toBe(0);
+			// The refused turn's content is not prepended to a forfeited answer.
+			expect(message.content.map(block => (block.type === "text" ? block.text : block.type))).toEqual(["hi"]);
+		},
+	);
 });
 
 describe("isCacheControlUnsupported", () => {

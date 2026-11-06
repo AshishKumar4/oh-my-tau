@@ -81,7 +81,7 @@ it("replays only Bedrock-valid tool names and their paired results", async () =>
 	) {
 		throw new Error("Missing Bedrock messages");
 	}
-	expect(payload.messages.slice(0, 3)).toMatchObject([
+	expect(payload.messages.slice(0, 2)).toMatchObject([
 		{ role: "user", content: [{ text: "Read a.txt" }] },
 		{
 			role: "assistant",
@@ -90,12 +90,14 @@ it("replays only Bedrock-valid tool names and their paired results", async () =>
 				{ toolUse: { name: "read", toolUseId: "call_read" } },
 			],
 		},
-		{
-			role: "user",
-			content: [
-				{ toolResult: { toolUseId: "call_limit", status: "success" } },
-				{ toolResult: { toolUseId: "call_read", status: "success" } },
-			],
-		},
+	]);
+	// Converse rejects adjacent user turns, so on Claude the following prompt
+	// folds into the tool-result turn after its results.
+	expect(payload.messages).toHaveLength(3);
+	expect(payload.messages[2]).toMatchObject({ role: "user" });
+	expect(payload.messages[2].content.slice(0, 3)).toMatchObject([
+		{ toolResult: { toolUseId: "call_limit", status: "success" } },
+		{ toolResult: { toolUseId: "call_read", status: "success" } },
+		{ text: "Continue" },
 	]);
 });

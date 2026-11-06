@@ -44,12 +44,12 @@ import {
 	type ComputerAction,
 	type ComputerToolCallMetadata,
 	type Context,
+	getPremiumServiceTierRequests,
 	type ImageContent,
 	type Message,
 	type MessageAttribution,
 	type Model,
 	OPENAI_MAX_OUTPUT_TOKENS,
-	getPremiumServiceTierRequests,
 	parseServiceTier,
 	type ServiceTier,
 	type StopReason,
@@ -134,7 +134,13 @@ import {
 	resolveOpenCodeGoCacheAffinity,
 	setHeaderIfAbsent,
 } from "./inference-headers";
-import { isMalformedToolCallName, isValidToolCallId, transformMessages } from "./transform-messages";
+import {
+	declaredToolNames,
+	facadeToolCallReplay,
+	isMalformedToolCallName,
+	isValidToolCallId,
+	transformMessages,
+} from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
 export interface OpenAIModelIdentity {
@@ -432,7 +438,7 @@ function getOpenAIResponsesServiceTierCostMultiplier(
  * counts the premium request the tier bills.
  */
 export function applyOpenAIResponsesServiceTierCost(
-	model: Pick<Model, "provider" | "serviceTierCost" | "api" | "identity">,
+	model: Pick<Model, "provider" | "api" | "identity" | "serviceTierCost">,
 	usage: AssistantMessage["usage"],
 	responseServiceTier: unknown,
 	requestServiceTier: ServiceTier | null | undefined,
@@ -441,8 +447,11 @@ export function applyOpenAIResponsesServiceTierCost(
 	// The response echo is authoritative when present (OpenAI may downgrade a
 	// requested priority/flex turn to default under load); only fall back to the
 	// requested tier when the response omits the echo entirely.
-	const served = parseServiceTier(responseServiceTier) ?? requestServiceTier ?? undefined;
-	usage.premiumRequests ??= getPremiumServiceTierRequests(served, model);
+	const served =
+		typeof responseServiceTier === "string"
+			? (parseServiceTier(responseServiceTier) ?? "default")
+			: (requestServiceTier ?? "default");
+	usage.premiumRequests ??= getPremiumServiceTierRequests(served, model, { served: true });
 	const multiplier = getOpenAIResponsesServiceTierCostMultiplier(model, served);
 	if (multiplier === 1) return served;
 	usage.cost.input *= multiplier;
@@ -1949,16 +1958,11 @@ export function convertResponsesInputContent(
  * Built once per request; `apply_patch` → `edit` is the OMP default.
  */
 function buildCustomToolWireNameMap(tools: readonly Tool[] | undefined): ReadonlyMap<string, string> | undefined {
-	if (!tools?.length) return undefined;
-	const map = new Map<string, string>();
-	for (const tool of tools) {
+	const map = new Map<string, string>([["apply_patch", "edit"]]);
+	for (const tool of tools ?? []) {
 		if (tool.customWireName) map.set(tool.customWireName, tool.name);
 	}
 	return map.size > 0 ? map : undefined;
-}
-
-function resolveReplayCustomToolName(wireName: string, wireNameMap: ReadonlyMap<string, string> | undefined): string {
-	return wireNameMap?.get(wireName) ?? (wireName === "apply_patch" ? "edit" : wireName);
 }
 
 /**
@@ -1983,7 +1987,7 @@ function adaptResponsesReplayItemsForModel(
 				type: "function_call",
 				...(item.id ? { id: item.id } : {}),
 				call_id: item.call_id,
-				name: resolveReplayCustomToolName(item.name, wireNameMap),
+				name: wireNameMap?.get(item.name) ?? item.name,
 				arguments: JSON.stringify({ input: item.input }),
 				...(item.namespace ? { namespace: item.namespace } : {}),
 			});
@@ -2195,6 +2199,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 	const customToolWireNameMap = supportsCustomToolCalls
 		? undefined
 		: buildCustomToolWireNameMap(options.context.tools);
+	const declaredNames = declaredToolNames(options.context.tools);
 	const knownCallIds = new Set<string>();
 	const customCallIds = new Set<string>();
 	const computerCallIds = new Set<string>();
@@ -2357,6 +2362,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 										false,
 										false,
 										options.toolNaming,
+										declaredNames,
 									),
 								]
 							: nativeItems;
@@ -2403,6 +2409,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				options.requiresReasoningReplayForAllTurns ?? false,
 				options.requiresReasoningReplayForToolCalls ?? false,
 				options.toolNaming,
+				declaredNames,
 			);
 			const outputItems = suppressHiddenEmptyFallback
 				? sanitizeOpenAIResponsesAssistantFallbackItemsForReplay(convertedOutputItems)
@@ -2577,6 +2584,7 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	requiresReasoningReplayForAllTurns = false,
 	requiresReasoningReplayForToolCalls = false,
 	toolNaming?: ResponsesToolNaming,
+	declaredNames?: ReadonlySet<string>,
 ): ResponseInput {
 	const outputItems: ResponseInput = [];
 	let unsignedTextBlocks = 0;
@@ -2710,19 +2718,23 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 				call_id: normalized.callId,
 				name: block.customWireName,
 				input: rawInput,
+				...(block.namespace ? { namespace: block.namespace } : {}),
 			} as ResponseInput[number]);
 			continue;
 		}
+		const facade = facadeToolCallReplay(block, declaredNames);
 		const functionName =
 			block.customWireName && !supportsCustomToolCalls
-				? resolveReplayCustomToolName(block.customWireName, customToolWireNameMap)
-				: block.name;
+				? (customToolWireNameMap?.get(block.customWireName) ?? block.customWireName)
+				: (facade?.name ?? block.wireName ?? block.name);
+		const namespace = facade?.native ? undefined : block.namespace;
 		outputItems.push({
 			type: "function_call",
 			...(itemId ? { id: itemId } : {}),
 			call_id: normalized.callId,
 			name: encodeResponsesToolName(functionName, toolNaming),
-			arguments: stringifyJson(block.arguments) ?? "null",
+			arguments: stringifyJson(facade?.arguments ?? block.arguments) ?? "null",
+			...(namespace ? { namespace } : {}),
 		});
 	}
 
@@ -3285,7 +3297,7 @@ function getOpenAIResponsesTerminalEvent(event: ResponseStreamEvent): OpenAIResp
 
 export interface ProcessResponsesStreamOptions {
 	onFirstToken?: () => void;
-	onOutputItemDone?: (item: ResponseOutputItem) => void;
+	onOutputItemDone?: (item: ResponseOutputItem, toolCall?: ToolCall) => void;
 	/**
 	 * Called when a terminal `response.completed`, `response.incomplete`, or
 	 * `response.done` event is successfully processed. Only invoked on the
@@ -3778,6 +3790,7 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.output_item.done") {
 			const item = cloneJsonTree(event.item);
+			let finalizedToolCall: ToolCall | undefined;
 			const entry =
 				item.type === "function_call" || item.type === "custom_tool_call"
 					? lookupOpenItem({ output_index: event.output_index, item_id: item.id ?? item.call_id })
@@ -3845,6 +3858,7 @@ export async function processResponsesStream<TApi extends Api>(
 					// throttled delta parser may have skipped the last partial parse,
 					// leaving block.arguments stale (often `{}`); the emitted toolCall
 					// and the persisted block must agree.
+					block.id = toolCall.id;
 					block.arguments = args;
 					clearStreamingPartialJson(block);
 					contentIndex = contentIndexOf(block);
@@ -3856,6 +3870,7 @@ export async function processResponsesStream<TApi extends Api>(
 					contentIndex = output.content.length - 1;
 				}
 				closeOpenItem(event.output_index, item.id, entry, item.call_id, prefixedFunctionCallItemKey(item.call_id));
+				finalizedToolCall = block ?? toolCall;
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			} else if (item.type === "computer_call") {
 				const block = entry?.block.type === "toolCall" ? entry.block : undefined;
@@ -3877,6 +3892,7 @@ export async function processResponsesStream<TApi extends Api>(
 					contentIndex = output.content.length - 1;
 				}
 				closeOpenItem(event.output_index, item.id, entry, item.call_id);
+				finalizedToolCall = block ?? toolCall;
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			} else if (item.type === "custom_tool_call") {
 				const block = entry?.block.type === "toolCall" ? entry.block : undefined;
@@ -3908,6 +3924,7 @@ export async function processResponsesStream<TApi extends Api>(
 				if (block) {
 					// Persist the final input on the stored block and drop the transient
 					// accumulation buffer, mirroring the function_call branch above.
+					block.id = toolCall.id;
 					block.arguments = { input: rawInput };
 					clearStreamingPartialJson(block);
 					contentIndex = contentIndexOf(block);
@@ -3916,6 +3933,7 @@ export async function processResponsesStream<TApi extends Api>(
 					contentIndex = output.content.length - 1;
 				}
 				closeOpenItem(event.output_index, item.id, entry, item.call_id, prefixedFunctionCallItemKey(item.call_id));
+				finalizedToolCall = block ?? toolCall;
 				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
 			} else if (item.type === "web_search_call" && (item.status === undefined || item.status === "completed")) {
 				// A completed provider-hosted web search is progress evidence even when
@@ -3925,7 +3943,7 @@ export async function processResponsesStream<TApi extends Api>(
 				appendResponsesImageResult(output, stream, item.result);
 			}
 			// After the branches so the native history item carries any normalization above.
-			options?.onOutputItemDone?.(item);
+			options?.onOutputItemDone?.(item, finalizedToolCall);
 		} else if (terminalEvent) {
 			const response = terminalEvent.response;
 			const shouldPromoteIncompleteToolUse =
@@ -3942,7 +3960,7 @@ export async function processResponsesStream<TApi extends Api>(
 			output.serviceTier = applyOpenAIResponsesServiceTierCost(
 				model,
 				output.usage,
-				(response as { service_tier?: unknown } | undefined)?.service_tier,
+				response && typeof response === "object" && "service_tier" in response ? response.service_tier : undefined,
 				options?.requestServiceTier,
 			);
 			output.stopReason = mapOpenAIResponsesStopReason(response?.status);

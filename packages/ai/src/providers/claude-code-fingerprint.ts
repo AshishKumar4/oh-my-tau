@@ -17,24 +17,61 @@ export const DEFAULT_CLAUDE_CODE_VERSION = "2.1.280";
 export const claudeCodeSdkVersion = "0.112.1";
 
 const SEMVER_PATTERN = /^(\d+)\.(\d+)\.(\d+)$/;
+// A capture's `clientVersion` is the billing header's `cc_version` verbatim:
+// the CLI version, then the fingerprint of the recording's first prompt.
+const CAPTURE_CLIENT_VERSION_PATTERN = /^(\d+\.\d+\.\d+)(?:\.[0-9a-f]{3})?$/;
 const VERSION_TOO_OLD_CODE = "claude_code_version_too_old";
 const REQUIRED_VERSION_PATTERN = /version (\d+\.\d+\.\d+) or newer is required/i;
 
 let adoptedClaudeCodeVersion: string | null = null;
 
 /**
- * Claude Code CLI version represented on the Anthropic wire (User-Agent, billing
- * header): `PI_AI_CLAUDE_CODE_VERSION` → version adopted from a server rejection
- * (see {@link adoptRequiredClaudeCodeVersion}) → {@link DEFAULT_CLAUDE_CODE_VERSION}.
+ * CLI version a Claude Code harness capture was recorded from. The capture
+ * stores `cc_version` (`2.1.284.b93`); its three-hex suffix fingerprints the
+ * recording's own first prompt, so only the version carries over to another
+ * conversation. Undefined for anything that is not a Claude Code version
+ * (`bundled`, blank).
  */
-export function getClaudeCodeVersion(): string {
-	return process.env.PI_AI_CLAUDE_CODE_VERSION || adoptedClaudeCodeVersion || DEFAULT_CLAUDE_CODE_VERSION;
+export function claudeCodeCaptureVersion(clientVersion: string | undefined): string | undefined {
+	if (clientVersion === undefined) return undefined;
+	return CAPTURE_CLIENT_VERSION_PATTERN.exec(clientVersion.trim())?.[1];
+}
+
+/**
+ * Claude Code CLI version represented on the Anthropic wire (User-Agent, billing
+ * header): `PI_AI_CLAUDE_CODE_VERSION`, else the newer of the version adopted
+ * from a server rejection (see {@link adoptRequiredClaudeCodeVersion}) and
+ * {@link DEFAULT_CLAUDE_CODE_VERSION}.
+ *
+ * `servedClientVersion` is the `clientVersion` of the claude-code harness
+ * capture whose prompt and tools the request carries. It takes the default's
+ * place, so the header names the release the served text came from. The
+ * adopted version is a floor: it replaces an older capture version (or the
+ * default) but never downgrades a newer one. The env pin wins over all.
+ */
+export function getClaudeCodeVersion(servedClientVersion?: string): string {
+	const pinned = process.env.PI_AI_CLAUDE_CODE_VERSION;
+	if (pinned) return pinned;
+	const base = claudeCodeCaptureVersion(servedClientVersion) ?? DEFAULT_CLAUDE_CODE_VERSION;
+	return adoptedClaudeCodeVersion && compareSemver(adoptedClaudeCodeVersion, base) > 0
+		? adoptedClaudeCodeVersion
+		: base;
 }
 
 /** User-Agent emitted by Claude Code's CLI inference entrypoint. */
-export function getClaudeCodeUserAgent(): string {
-	return `claude-cli/${getClaudeCodeVersion()} (external, cli)`;
+export function getClaudeCodeUserAgent(servedClientVersion?: string): string {
+	return `claude-cli/${getClaudeCodeVersion(servedClientVersion)} (external, cli)`;
 }
+
+/** Entrypoint Claude Code's CLI reports in the billing header. */
+export const claudeCodeEntrypoint = "cli";
+
+/**
+ * Billing-header prefix. Exported here rather than from `providers/anthropic` so
+ * the harness capture/record path (`coding-agent/src/harness/*`) can parse it
+ * without importing the provider module.
+ */
+export const claudeCodeBillingHeaderPrefix = "x-anthropic-billing-header:";
 
 function compareSemver(a: string, b: string): number {
 	const pa = SEMVER_PATTERN.exec(a);
@@ -55,18 +92,43 @@ function compareSemver(a: string, b: string): number {
  * Returns true only when the wire version actually increased — callers retry on
  * true, so a repeated rejection at the same version cannot loop. Always false
  * while `PI_AI_CLAUDE_CODE_VERSION` pins the version explicitly.
+ * `servedClientVersion` is the one the rejected request resolved its version
+ * with (see {@link getClaudeCodeVersion}), so the comparison is against the
+ * version it actually sent.
+ *
+ * The adopted floor is process-wide, so it never drops below what requests
+ * serving no capture already send: a rejected older capture (2.1.269 against
+ * a 2.1.275 minimum) must not pull native, side-request, OAuth-refresh or
+ * usage User-Agents under the pinned default.
  */
-export function adoptRequiredClaudeCodeVersion(error: unknown): boolean {
+export function adoptRequiredClaudeCodeVersion(error: unknown, servedClientVersion?: string): boolean {
 	if (process.env.PI_AI_CLAUDE_CODE_VERSION) return false;
 	const message = error instanceof Error ? error.message : String(error);
 	if (!message.includes(VERSION_TOO_OLD_CODE)) return false;
 	const required = REQUIRED_VERSION_PATTERN.exec(message)?.[1];
-	if (!required || compareSemver(required, getClaudeCodeVersion()) <= 0) return false;
-	adoptedClaudeCodeVersion = required;
+	if (!required || compareSemver(required, getClaudeCodeVersion(servedClientVersion)) <= 0) return false;
+	const floor = getClaudeCodeVersion();
+	adoptedClaudeCodeVersion = compareSemver(required, floor) > 0 ? required : floor;
 	return true;
+}
+
+/** Test seam: forgets the version {@link adoptRequiredClaudeCodeVersion} adopted. */
+export function resetAdoptedClaudeCodeVersion(): void {
+	adoptedClaudeCodeVersion = null;
 }
 
 /** Prefix used to isolate custom Anthropic OAuth tools from built-in tools. */
 export const claudeToolPrefix: string = "_";
 /** Identity block prepended by Claude Code's CLI runtime. */
 export const claudeCodeSystemInstruction = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/**
+ * Tag wrapping a subagent's per-spawn system block (`<subagent-context>…
+ * </subagent-context>`): assignment context, worktree and peer roster, text
+ * that differs between siblings spawned from one agent definition. The coding
+ * agent emits it only under the claude-code profile on this transport, where
+ * the opening tag is a volatile system segment: the head cache breakpoint
+ * anchors on the block before it, so siblings share the vendor prompt, footer
+ * and project context as one cached prefix.
+ */
+export const SUBAGENT_CONTEXT_TAG = "subagent-context";

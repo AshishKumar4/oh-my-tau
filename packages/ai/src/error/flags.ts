@@ -235,7 +235,15 @@ const MALFORMED_FUNCTION_CALL_PATTERN =
 const PROVIDER_FINISH_ERROR_PATTERN = /\bProvider (?:returned error finish_reason|finish_reason:\s*error)\b/i;
 const EMPTY_RESPONSE_PATTERN = /\bthought-only response without final output\b/i;
 const CONTENT_FILTER_PATTERN = /\b(?:incomplete:\s*)?content_filter\b/i;
+const ORG_OAUTH_DENIAL_PATTERN =
+	/\boauth_not_allowed_for_organization\b|oauth authentication is currently not allowed for this organization/i;
 const ACCOUNT_POLICY_PATTERN = /\bcyber_policy\b|trusted access for cyber/i;
+/**
+ * An Anthropic API key rejected for its workspace: the key is not scoped to
+ * one and the request named none, or named one the key cannot use. Both
+ * messages name the `anthropic-workspace-id` header.
+ */
+const ANTHROPIC_WORKSPACE_DENIAL_PATTERN = /\bnot scoped to a workspace\b|\banthropic-workspace-id\b/i;
 export const ANTHROPIC_ACCOUNT_POLICY_PATTERN =
 	/\b(?:oauth_not_allowed_for_organization|permission_error)\b|\bOAuth authentication is currently not allowed for this organization\b/i;
 
@@ -297,6 +305,16 @@ function isCodexChatGPTAccountPolicyText(
 }
 const STALE_RESPONSE_ITEM_PATTERNS = [/\bItem with id ['"][^'"]+['"] not found\.?/i, /previous[ _]?response/i] as const;
 const STALE_RESPONSE_ITEM_DETAIL_PATTERN = /not[ _]?found|invalid|expired|stale|zero[ _-]?data[ _-]?retention/i;
+/**
+ * Codex refuses a stateful socket message (a steer) while its native turn lane is still running, and asks for "a new
+ * independent response.create turn instead": the same recovery as a stale item, a reset provider session and a fresh
+ * same-model request. 343 refusals in omp sessions to 2026-10-09: 325 next attempts on the same model succeeded.
+ *
+ * Deliberately differs from upstream 1979aea2dc (#14242), which keeps it transient and falls back to
+ * `retry.fallbackChains` once the retry budget is spent: the refusal is session state, not a model failure, and a
+ * fallback pins the session to another model, the bug this fixed.
+ */
+const CODEX_NATIVE_INFLIGHT_PATTERN = /\bunsupported_native_inflight_message\b/;
 /**
  * Local llama.cpp / Ollama deterministic tool-call argument JSON parse failure.
  * The model emitted invalid JSON in a tool call and the server returned HTTP 500
@@ -605,7 +623,8 @@ function isAuthFailureText(text: string): boolean {
 function isStaleResponsesText(text: string): boolean {
 	return (
 		STALE_RESPONSE_ITEM_PATTERNS[0].test(text) ||
-		(STALE_RESPONSE_ITEM_PATTERNS[1].test(text) && STALE_RESPONSE_ITEM_DETAIL_PATTERN.test(text))
+		(STALE_RESPONSE_ITEM_PATTERNS[1].test(text) && STALE_RESPONSE_ITEM_DETAIL_PATTERN.test(text)) ||
+		CODEX_NATIVE_INFLIGHT_PATTERN.test(text)
 	);
 }
 
@@ -654,6 +673,11 @@ function classifyText(
 		if (isContentBlockedText(errorMessage)) kinds |= Flag.ContentBlocked;
 		const statusClean = errorStatus ? errorStatus : (status({ message: errorMessage }) ?? undefined);
 
+		// An org OAuth denial is deliberately absent here: it is account-scoped,
+		// not a content refusal, and `ContentBlocked` would stop the rotation that
+		// reaches a working credential. `isAnthropicAccountPolicyText` below marks
+		// it `AccountPolicy` alone; `isStandingAccountDenial` still drives the longer
+		// set-aside window in `RateLimits.rotate`.
 		if (
 			ACCOUNT_POLICY_PATTERN.test(errorMessage) ||
 			isCodexChatGPTAccountPolicyText(errorMessage, provider, modelId) ||
@@ -662,6 +686,13 @@ function classifyText(
 			kinds |= Flag.AccountPolicy | Flag.ContentBlocked;
 		}
 		if (isAnthropicAccountPolicyText(errorMessage, provider, statusClean)) {
+			kinds |= Flag.AccountPolicy;
+		}
+		// A sibling key or a subscription may still serve, so rotate like a policy denial.
+		if (
+			(provider === undefined || provider === "anthropic") &&
+			ANTHROPIC_WORKSPACE_DENIAL_PATTERN.test(errorMessage)
+		) {
 			kinds |= Flag.AccountPolicy;
 		}
 		if (isAuthFailureText(errorMessage)) kinds |= Flag.AuthFailed;
@@ -878,6 +909,37 @@ export function isAccountPolicyError(error: unknown, api?: Api): boolean {
 }
 
 /**
+ * Whether the denial holds until someone changes a setting: an
+ * organization-wide OAuth prohibition, or an Anthropic API key rejected for its
+ * workspace. Unlike the per-request content denials that share the
+ * account-policy flag, retrying soon only repeats it, so the credential is
+ * worth setting aside for longer than a rotate-and-retry window.
+ */
+export function isStandingAccountDenial(error: unknown): boolean {
+	return matchesErrorText(error, text => ORG_OAUTH_DENIAL_PATTERN.test(text)) || isAnthropicWorkspaceDenial(error);
+}
+
+/** Whether Anthropic rejected an API key for its workspace: none named for an unscoped key, or one it cannot use. */
+export function isAnthropicWorkspaceDenial(error: unknown): boolean {
+	return matchesErrorText(error, text => ANTHROPIC_WORKSPACE_DENIAL_PATTERN.test(text));
+}
+
+/**
+ * Run a text predicate over every message an error carries: the value itself,
+ * `errorMessage`, `message`, then down the `cause` chain. Provider errors arrive
+ * wrapped to varying depths, so a predicate that only reads `message` misses the
+ * body it needs.
+ */
+function matchesErrorText(error: unknown, test: (text: string) => boolean, depth = 0): boolean {
+	if (depth > 6) return false;
+	if (typeof error === "string") return test(error);
+	if (!error || typeof error !== "object") return false;
+	if ("errorMessage" in error && typeof error.errorMessage === "string" && test(error.errorMessage)) return true;
+	if ("message" in error && typeof error.message === "string" && test(error.message)) return true;
+	return "cause" in error && matchesErrorText(error.cause, test, depth + 1);
+}
+
+/**
  * Model id from Codex's exact ChatGPT-account entitlement denial. Generic
  * unsupported-model invalid requests deliberately do not match.
  */
@@ -908,19 +970,8 @@ export function isCodexChatGPTAccountPolicyError(
 }
 
 /** Whether Cursor returned a non-retryable plan entitlement denial for this account. */
-export function isCursorPlanAccountPolicyError(error: unknown, provider: string, depth = 0): boolean {
-	if (provider !== "cursor" || depth > 6) return false;
-	if (typeof error === "string") return isCursorPlanPolicyText(error);
-	if (!error || typeof error !== "object") return false;
-	if (
-		"errorMessage" in error &&
-		typeof error.errorMessage === "string" &&
-		isCursorPlanPolicyText(error.errorMessage)
-	) {
-		return true;
-	}
-	if ("message" in error && typeof error.message === "string" && isCursorPlanPolicyText(error.message)) return true;
-	return "cause" in error && isCursorPlanAccountPolicyError(error.cause, provider, depth + 1);
+export function isCursorPlanAccountPolicyError(error: unknown, provider: string): boolean {
+	return provider === "cursor" && matchesErrorText(error, isCursorPlanPolicyText);
 }
 
 /**

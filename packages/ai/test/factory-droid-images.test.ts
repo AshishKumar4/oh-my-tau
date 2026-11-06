@@ -255,8 +255,8 @@ describe("Factory Droid image generation", () => {
 			{
 				apiKey: () =>
 					calls++ === 0
-						? { apiKey: WORKOS_TOKEN, oauthIdentity: { region: "global", inferenceRegion: "global" } }
-						: { apiKey: euToken, oauthIdentity: { region: "eu", inferenceRegion: "eu", orgId: "org-eu" } },
+						? { apiKey: WORKOS_TOKEN, credentialScope: { region: "global", inferenceRegion: "global" } }
+						: { apiKey: euToken, credentialScope: { region: "eu", inferenceRegion: "eu", orgId: "org-eu" } },
 				fetch: fetchImpl,
 			},
 		);

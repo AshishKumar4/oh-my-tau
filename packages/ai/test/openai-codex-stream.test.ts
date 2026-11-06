@@ -18,6 +18,7 @@ import {
 } from "@oh-my-pi/pi-ai/providers/openai-codex-state";
 import type {
 	CodexCompactionRequestContext,
+	CodexRequestSnapshot,
 	Context,
 	FetchImpl,
 	Model,
@@ -2107,6 +2108,7 @@ describe("openai-codex streaming", () => {
 				clientMetadata: {
 					workspace_kind: "repo",
 					parent_turn_id: "forged-parent-turn",
+					code_mode_tool_names: "forged-code-mode",
 					"x-codex-turn-metadata": '{"thread_id":"caller"}',
 				},
 				parentTurnId: "turn_parent-1",
@@ -2140,6 +2142,11 @@ describe("openai-codex streaming", () => {
 		// x-codex-turn-metadata JSON blob.
 		expect(metadata.parent_turn_id).toBe("turn_parent-1");
 		expect(turnMetadata.parent_turn_id).toBe("turn_parent-1");
+		// `code_mode_tool_names` is likewise reserved (codex-rs
+		// CODE_MODE_TOOL_NAMES_KEY, #35271): OMP never emits it, and caller extras
+		// cannot smuggle it into either projection.
+		expect(metadata.code_mode_tool_names).toBeUndefined();
+		expect(turnMetadata.code_mode_tool_names).toBeUndefined();
 		expect(capturedHeaders?.["x-codex-installation-id"]).toBeUndefined();
 		expect(metadata.session_id).toBe(capturedHeaders?.["session-id"]);
 		expect(metadata.thread_id).toBe(capturedHeaders?.["thread-id"]);
@@ -2333,6 +2340,65 @@ describe("openai-codex streaming", () => {
 		expect(result.usage.cost.output).toBeCloseTo(0.000012);
 		expect(result.usage.cost.total).toBeCloseTo(0.000022);
 	});
+	it("accounts for included Fast usage on explicit and inherited model rate cards", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+
+		const payload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+			"utf8",
+		).toBase64();
+		const token = `aaa.${payload}.bbb`;
+
+		const sse = `${[
+			`data: ${JSON.stringify({ type: "response.output_item.added", item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Hello" }] } })}`,
+			`data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", service_tier: "priority", usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } } } })}`,
+		].join("\n\n")}\n\n`;
+		const fetchMock: FetchImpl = async () =>
+			new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+
+		const context: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+		const spec: Omit<ModelSpec<"openai-codex-responses">, "id"> = {
+			name: "Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+
+		// gpt-5.5: the exact `service-tier-cost` rule bakes { flex: 0.5, priority: 2.5 }.
+		const tiered = buildModel({ ...spec, id: "gpt-5.5" });
+		expect(tiered.serviceTierCost).toEqual({ flex: 0.5, priority: 2.5 });
+		const tieredResult = await streamOpenAICodexResponses(tiered, context, {
+			fetch: fetchMock,
+			apiKey: token,
+			serviceTier: "priority",
+		}).result();
+		// 5 input tokens at $1/MTok * 2.5, 3 output at $2/MTok * 2.5.
+		expect(tieredResult.usage.cost.input).toBeCloseTo(0.0000125, 10);
+		expect(tieredResult.usage.cost.output).toBeCloseTo(0.000015, 10);
+		expect(tieredResult.serviceTier).toBe("priority");
+
+		// Other Codex models use the same included-usage multiplier.
+		const generic = buildModel({ ...spec, id: "gpt-5.1-codex" });
+		expect(generic.serviceTierCost).toEqual({ flex: 0.5, priority: 2.5 });
+		const genericResult = await streamOpenAICodexResponses(generic, context, {
+			fetch: fetchMock,
+			apiKey: token,
+			serviceTier: "priority",
+		}).result();
+		expect(genericResult.usage.cost.input).toBeCloseTo(0.0000125, 10);
+		expect(genericResult.usage.cost.output).toBeCloseTo(0.000015, 10);
+		expect(genericResult.usage.premiumRequests).toBe(1);
+	});
+
 	it("bills priority turns at the Codex provider's baked 2.5x serviceTierCost multiplier", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
@@ -4508,6 +4574,92 @@ describe("openai-codex streaming", () => {
 		expect(stats?.lastInputItems).toBe(1);
 		expect(stats?.lastDeltaInputItems).toBe(1);
 		expect(stats?.lastPreviousResponseId).toBe("resp_2");
+	});
+
+	it("snapshots the full websocket request input, not the sent delta", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+
+		class SnapshotWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
+				const responseIndex = sentRequests.length;
+				this.emitCodexResponse({
+					messageId: `msg_${responseIndex}`,
+					responseId: `resp_${responseIndex}`,
+					text: `Answer ${responseIndex}`,
+					terminalType: "response.completed",
+					includeCreated: true,
+				});
+			}
+		}
+
+		global.WebSocket = SnapshotWebSocket as unknown as typeof WebSocket;
+		const model: Model<"openai-codex-responses"> = buildModel({
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			preferWebsockets: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272000,
+			maxTokens: 128000,
+		});
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const snapshots: CodexRequestSnapshot[] = [];
+		const baseOptions = {
+			fetch: fetchMock as FetchImpl,
+			apiKey: createCodexTestToken(),
+			sessionId: "ws-snapshot-session",
+			providerSessionState,
+			onCodexRequestSnapshot: (snapshot: CodexRequestSnapshot) => snapshots.push(snapshot),
+		};
+		const startedAt = Date.now();
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: startedAt }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, baseOptions).result();
+		const secondContext: Context = {
+			systemPrompt: firstContext.systemPrompt,
+			messages: [
+				...firstContext.messages,
+				firstResponse,
+				{ role: "user", content: "Second question", timestamp: startedAt + 1 },
+			],
+		};
+		await streamOpenAICodexResponses(model, secondContext, baseOptions).result();
+
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests).toHaveLength(2);
+		expect(snapshots).toHaveLength(2);
+
+		// The wire's second frame is an append delta chained on resp_1; the
+		// snapshot must carry the whole request body so a fork can replay it.
+		expect(sentRequests[1]?.previous_response_id).toBe("resp_1");
+		expect(JSON.stringify(sentRequests[1]?.input)).toContain("Second question");
+		expect(JSON.stringify(sentRequests[1]?.input)).not.toContain("First question");
+		const secondSnapshotInput = JSON.stringify(snapshots[1]?.input);
+		expect(secondSnapshotInput).toContain("First question");
+		expect(secondSnapshotInput).toContain("Answer 1");
+		expect(secondSnapshotInput).toContain("Second question");
+		// The first turn has no append baseline, so its snapshot equals the frame.
+		expect(JSON.stringify(snapshots[0]?.input)).toBe(JSON.stringify(sentRequests[0]?.input));
+		expect(snapshots[0]?.sessionId).toBe("ws-snapshot-session");
+		expect(snapshots[1]?.sessionId).toBe("ws-snapshot-session");
+		expect(snapshots[1]?.model).toBe("gpt-6-astra");
 	});
 
 	it("sends a full websocket create when entering or leaving the advertised Ultrafast tier", async () => {
@@ -7137,6 +7289,116 @@ describe("openai-codex streaming", () => {
 			expect(details.websocketConnected).toBe(true);
 		},
 	);
+	it("binds a forked child's prewarmed socket to the root lineage and rebinds on clear", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+
+		const payload = Buffer.from(
+			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+			"utf8",
+		).toBase64();
+		const token = `aaa.${payload}.bbb`;
+
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+
+		let constructorCount = 0;
+		let sendCount = 0;
+		const handshakeHeaders: Array<WsHeaders | undefined> = [];
+		class ForkedWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				constructorCount += 1;
+				handshakeHeaders.push(options?.headers);
+				this.scheduleOpen();
+			}
+
+			override send(_data: string): void {
+				sendCount += 1;
+				this.emitCodexResponse({
+					messageId: `msg_${sendCount}`,
+					responseId: `resp_${sendCount}`,
+					text: `Hello ${sendCount}`,
+				});
+			}
+		}
+
+		global.WebSocket = ForkedWebSocket as unknown as typeof WebSocket;
+
+		const model: Model<"openai-codex-responses"> = buildModel({
+			id: "gpt-5.3-codex-spark",
+			name: "GPT-5.3 Codex Spark",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			preferWebsockets: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128000,
+			maxTokens: 128000,
+		});
+
+		const forkSource = {
+			provider: "openai-codex",
+			model: model.id,
+			baseUrl: model.baseUrl,
+			accountId: "acc_test",
+			sessionId: "parent-root-session",
+			threadId: "parent-root-thread",
+			input: [],
+		};
+		const providerSessionState = new Map<string, ProviderSessionState>();
+
+		// Prewarm with the fork source: the handshake must already project the
+		// shared root identity — socket headers are frozen at upgrade.
+		await prewarmOpenAICodexResponses(model, {
+			apiKey: token,
+			sessionId: "child-session",
+			providerSessionState,
+			codexFork: { source: forkSource },
+		});
+		const prewarmHeaders = handshakeHeaders[0];
+		expect(prewarmHeaders?.["session-id"]).toBe("parent-root-session");
+		expect(prewarmHeaders?.["session_id"]).toBe("parent-root-session");
+		expect(prewarmHeaders?.["x-codex-parent-thread-id"]).toBe("parent-root-thread");
+		expect(prewarmHeaders?.["conversation_id"]).toBe("child-session");
+		expect(prewarmHeaders?.["thread-id"]).toBeDefined();
+		expect(prewarmHeaders?.["thread-id"]).not.toBe("parent-root-thread");
+
+		// The first real request under the same fork reuses the warmed socket.
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "Child turn", timestamp: Date.now() }],
+		};
+		await streamOpenAICodexResponses(model, firstContext, {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "child-session",
+			providerSessionState,
+			codexFork: { source: forkSource },
+		}).result();
+		expect(constructorCount).toBe(1);
+		expect(sendCount).toBe(1);
+
+		// Clearing the fork (e.g. /clear retires the origin) changes the
+		// connection-scoped lineage, so the next request must handshake a fresh
+		// socket bound to the child's own root.
+		await streamOpenAICodexResponses(model, firstContext, {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "child-session",
+			providerSessionState,
+		}).result();
+		expect(constructorCount).toBe(2);
+		expect(sendCount).toBe(2);
+		const reboundHeaders = handshakeHeaders[1];
+		expect(reboundHeaders?.["session-id"]).toBe("child-session");
+		expect(reboundHeaders?.["session_id"]).toBe("child-session");
+		expect(reboundHeaders?.["x-codex-parent-thread-id"]).toBeUndefined();
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
 
 	it("does not throw when closing a stale socket", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");

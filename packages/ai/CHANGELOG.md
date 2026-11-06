@@ -323,6 +323,15 @@
 - Fixed the auth gateway's `POST /v1/chat/completions` streams being dropped (`terminated`) after ~255 s without upstream output, e.g. while xAI generates a large tool call's arguments, which arrive only when complete; the stream now sends an SSE `: keepalive` comment every 15 s ([#15940](https://github.com/can1357/oh-my-pi/pull/15940) by [@radkawar](https://github.com/radkawar))
 - Fixed Anthropic models with mid-conversation system messages (e.g. Claude Opus 5.5) receiving `@file` mention contents and hidden extension messages as a trailing `system` message instead of ending the request on the user's turn ([#15881](https://github.com/can1357/oh-my-pi/issues/15881))
 
+### Changed
+
+- A session restricted to an OAuth account pool (`sessions.restrict`, `task.agentAccountPools`, gateway client `accounts`) never serves a pooled API key, whatever `auth.poolOrder` says. `limits.pools(provider, modelId, sessionId)` and model usage health count only that session's accounts
+- `OAuthRequestIdentity` / `oauthIdentity` are now `CredentialRequestScope` / `credentialScope`: the per-attempt request scope also carries an API key's workspace, not only an OAuth account's identity. `isOrgOAuthDenialError` is now `isStandingAccountDenial` and also covers a key rejected for its workspace
+- Claude Code harness requests now claim the release of the served capture (for example `claude-cli/2.1.284`) in the User-Agent and billing header instead of the pinned default, and seed the billing fingerprint from the user's own words like Claude Code does; `PI_AI_CLAUDE_CODE_VERSION` still overrides it and native mode keeps the pinned default. A minimum version adopted after the server rejects an older capture never lowers requests that serve no capture (native, side requests, OAuth refresh, usage) below the pinned default.
+
+### Fixed
+
+- Fixed Factory Droid requests for Claude Opus 5+ and Fable 5+ taking the Claude Code harness profile's head caching (no tool cache anchor) from their inner Messages route; only a profile the session forces with `harness.mode` now applies
 ## [18.11.2] - 2026-10-16
 
 ### Breaking Changes
@@ -391,7 +400,7 @@
 
 ### Removed
 
-- Removed the `toolNamespacesInfo` stream option; Codex requests no longer send `tool_namespaces_info` turn metadata, and `code_mode_tool_names`/`tool_namespaces_info` are no longer reserved client metadata keys.
+- Removed the `toolNamespacesInfo` stream option; Codex requests no longer send `tool_namespaces_info` turn metadata, and `code_mode_tool_names`/`tool_namespaces_info` are no longer reserved client metadata keys. (Upstream only: oh-my-tau keeps Codex Code Mode and this metadata.)
 
 ## [18.10.3] - 2026-10-12
 
@@ -676,6 +685,7 @@
 
 ### Added
 
+- An API-key credential can carry an Anthropic `workspaceId`; `credentials.addApiKey(provider, key, { workspaceId })` stores it and every Anthropic request the key serves sends `anthropic-workspace-id`. `resolveAnthropicKeyWorkspace` (in `registry/api-key-validation`) settles a key's workspace before it is stored, and `withAuth` passes each attempt's credential scope to its callback
 - Added `createAuthGatewayRouter`, the auth-gateway's routes without the HTTP listener, and `serveAuthGatewayStdio`, which serves them as JSON lines (`{"id", "path", "body"}` in, `{"id", "status", "body"}` out) for a parent process.
 
 ## [18.4.11] - 2026-10-02
@@ -739,9 +749,15 @@
 
 ### Fixed
 
+- Fixed sibling subagents under the Claude Code harness re-writing the shared prompt cache on every spawn: a system block that opens with `<subagent-context>` is now a claude-code volatile segment, so the head breakpoint lands before a subagent's per-spawn prompt and siblings share the cached vendor prompt, footer and project context.
+- Fixed DeepSeek `/responses` requests failing with `400 No tool output found` when a repaired orphan tool-result note landed between two outputs of the same tool round, and with `400 The reasoning_text in the thinking mode must be passed back` when replayed history lacked reasoning for an assistant turn ([#13083](https://github.com/can1357/oh-my-pi/issues/13083)).
+- Fixed `harness.mode: native` on models whose catalog profile is `claude-code` (Claude Opus 5, Fable 5.1) still getting the claude-code cache placement and vendor tool-name replay on Anthropic requests; a native override now takes the native path, with the system breakpoint before `<project-context>`/`<memories>` and the last tool anchored.
 - Fixed Claude on Amazon Bedrock's Anthropic Messages routes (`/anthropic` on bedrock-runtime and bedrock-mantle): runtime requests no longer fail with a request-metadata 400, and both routes use Anthropic's on-demand compaction ([#13311](https://github.com/can1357/oh-my-pi/pull/13311) by [@mustafaabidali](https://github.com/mustafaabidali)).
 - `/usage` no longer shows an always-empty `gpt-4 requests` row for Cursor accounts on usage-based plans; the Cursor Models and Other Models meters remain ([#13726](https://github.com/can1357/oh-my-pi/pull/13726) by [@will-bogusz](https://github.com/will-bogusz)).
 - Cursor turns routed through an HTTP proxy now finish instead of hanging after the response completes ([#13724](https://github.com/can1357/oh-my-pi/pull/13724) by [@will-bogusz](https://github.com/will-bogusz)).
+- Fixed Claude refusing long multi-model sessions with `Refusal (reasoning_extraction): This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs`. Prior reasoning Claude cannot replay as a native thinking block — other models' or providers' reasoning, unsigned or stale-signature blocks, and unsigned blocks after the signing-proxy auto-demote — was re-sent as plain assistant text; Claude targets on every provider (Anthropic, Bedrock, Vertex, gateways) now drop it instead, keeping visible text, tool calls, and signed thinking unchanged. On Bedrock, Claude requests keep alternating when a dropped reasoning-only turn leaves user turns adjacent: the following user text folds into the preceding user turn, after its tool results; other Bedrock models are unchanged.
+### Changed
+
 - Fixed Codex requests sending `priority` (and `scale`) to models whose discovered service tiers list other tiers but not that one, matching the Codex CLI; an empty or missing list is treated as not reported, so `priority` is still sent and `/fast` keeps working on accounts whose `/models` lists no tiers (`flex` is always allowed) ([#13782](https://github.com/can1357/oh-my-pi/pull/13782) by [@H4vC](https://github.com/H4vC)).
 - Fixed Codex priority cost: a turn the backend reports as served at `default` is no longer billed at the priority multiplier ([#13782](https://github.com/can1357/oh-my-pi/pull/13782) by [@H4vC](https://github.com/H4vC)).
 
@@ -937,6 +953,9 @@
 
 ## [18.2.4] - 2026-09-17
 
+### Changed
+
+- Models post-trained on a vendor harness are now served that vendor's own request surface: `claude-opus-5`, `claude-fable-5` and `claude-fable-5-1` on the Anthropic Messages API get the Claude Code shape, and `gpt-6-astra` and `gpt-5.6-sol` on the Codex route get the Codex CLI shape (tools as a namespaced `additional_tools` item, base prompt as a developer message with no top-level `instructions`, no `tool_namespaces_info` extension, namespace-qualified tool calls resolved back to the declared tool). Every other model keeps omp's native surface. The auth-gateway also accepts an opt-in harness recorder that is handed the inbound body of every `/v1/messages` and `/v1/responses` call before model resolution, so a real vendor client's surface can be captured through the gateway, and the pinned Codex client version is now `0.154.0`.
 ### Added
 
 - Added the `judgment` module for typed questions over JSON state, including choice, yes/no, and score judgments through the `Judge` interface.

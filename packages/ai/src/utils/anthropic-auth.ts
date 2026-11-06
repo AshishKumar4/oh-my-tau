@@ -22,6 +22,8 @@ export interface AnthropicAuthConfig {
 	apiKey: string;
 	baseUrl: string;
 	isOAuth: boolean;
+	/** The stored key's workspace (`anthropic-workspace-id`), from its credential scope. */
+	workspaceId?: string;
 }
 
 const DEFAULT_BASE_URL = "https://api.anthropic.com";
@@ -51,6 +53,11 @@ export function isOAuthToken(apiKey: string): boolean {
 export interface AnthropicAuthOptions {
 	/** Override token detection; false explicitly disables OAuth-style request shaping. */
 	isOAuth?: boolean;
+	/**
+	 * The stored API key's workspace (`anthropic-workspace-id`), from the
+	 * credential scope of the row that supplied `apiKey`. Never an OAuth orgId.
+	 */
+	workspaceId?: string;
 }
 
 /**
@@ -74,6 +81,7 @@ export function buildAnthropicAuthConfig(
 		apiKey,
 		baseUrl: normalizeBaseUrl(baseUrl) ?? resolveAnthropicBaseUrlFromEnv() ?? DEFAULT_BASE_URL,
 		isOAuth: options.isOAuth ?? isOAuthToken(apiKey),
+		...(options.workspaceId ? { workspaceId: options.workspaceId } : {}),
 	};
 }
 
@@ -105,6 +113,7 @@ export function buildAnthropicSearchHeaders(
 		stream: false,
 		modelHeaders: mergeHeaders(options.modelHeaders, resolveAnthropicCustomHeadersForBaseUrl(auth.baseUrl)),
 		allowAnthropicHeaderOverrides: options.allowAnthropicHeaderOverrides,
+		workspaceId: auth.workspaceId,
 	});
 }
 

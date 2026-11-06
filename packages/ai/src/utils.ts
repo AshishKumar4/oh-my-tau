@@ -2,7 +2,14 @@ import { $env } from "@oh-my-pi/pi-utils";
 import type { ResponseInput, ResponseInputItem } from "./providers/openai-responses-wire";
 import { isMalformedToolCallName, redactSensitiveCredentials } from "./providers/transform-messages";
 export { normalizeToolCallId } from "./providers/transform-messages";
-import type { CacheRetention, OpenAIResponsesHistoryPayload, ProviderPayload } from "./types";
+import type {
+	AssistantMessage,
+	CacheRetention,
+	OpenAIResponsesHistoryPayload,
+	ProviderPayload,
+	ToolCall,
+} from "./types";
+import { kResponsesReplayItem, type ResponsesReplayItemCarrier } from "./utils/block-symbols";
 import { invalidToolCallArguments } from "./utils/tool-call-arguments";
 
 type OpenAIResponsesReplayItem = ResponseInput[number];
@@ -42,14 +49,19 @@ export function normalizeResponsesToolCallId(
 	id: string,
 	itemPrefix: ResponsesToolItemIdPrefix = "fc",
 ): { callId: string; itemId: string } {
-	const sep = id.search(/[\n|]/);
-	if (sep > 0) {
-		const callId = id.slice(0, sep);
-		const itemId = id.slice(sep + 1);
-		return { callId, itemId: normalizeResponsesItemId(itemId, itemPrefix) };
-	}
+	const parts = splitResponsesToolCallId(id);
+	if (parts.itemId !== undefined)
+		return { callId: parts.callId, itemId: normalizeResponsesItemId(parts.itemId, itemPrefix) };
 	const hash = Bun.hash(id).toString(36);
 	return { callId: id, itemId: `${itemPrefix}_${hash}` };
+}
+
+function splitResponsesToolCallId(id: string): { callId: string; itemId?: string } {
+	const sep = id.search(/[\n|]/);
+	if (sep > 0) {
+		return { callId: id.slice(0, sep), itemId: id.slice(sep + 1) };
+	}
+	return { callId: id };
 }
 
 function getExplicitIdPrefix(id: string): string | undefined {
@@ -678,6 +690,57 @@ export function createOpenAIResponsesHistoryPayload(
 	};
 }
 
+/** Re-key only decoded output slots, never the server's append baseline or an older full-snapshot occurrence. */
+export function repairResponsesHistoryCallIds(
+	message: AssistantMessage,
+	repairs: ReadonlyArray<{ call: ToolCall & ResponsesReplayItemCarrier; id: string }>,
+): void {
+	const payload = message.providerPayload;
+	if (payload?.type !== "openaiResponsesHistory" || repairs.length === 0) return;
+	const slotOwners = new Map<number, number>();
+	for (const block of message.content) {
+		if (block.type !== "toolCall") continue;
+		const carrier: ResponsesReplayItemCarrier = block;
+		const locator = carrier[kResponsesReplayItem];
+		if (locator) slotOwners.set(locator.index, (slotOwners.get(locator.index) ?? 0) + 1);
+	}
+	const replacements = repairs.map(({ call, id }) => {
+		const locator = call[kResponsesReplayItem];
+		const item = locator && payload.items[locator.index];
+		if (
+			!locator ||
+			!item ||
+			slotOwners.get(locator.index) !== 1 ||
+			item.type !== locator.type ||
+			item.call_id !== locator.callId ||
+			item.id !== locator.itemId
+		) {
+			throw new Error(
+				"Cannot safely repair an ambiguous Responses tool-call ID without its original output-item association.",
+			);
+		}
+		const ids = splitResponsesToolCallId(id);
+		const itemId = ids.itemId ?? locator.itemId;
+		return {
+			call,
+			index: locator.index,
+			item: { ...item, call_id: ids.callId, ...(locator.itemId === undefined ? {} : { id: itemId }) },
+			itemId,
+		};
+	});
+	const items = payload.items.slice();
+	for (const replacement of replacements) {
+		items[replacement.index] = replacement.item;
+		if (replacement.call.providerMetadata?.type === "computer" && replacement.itemId !== undefined) {
+			replacement.call.providerMetadata = {
+				...replacement.call.providerMetadata,
+				providerItemId: replacement.itemId,
+			};
+		}
+	}
+	message.providerPayload = { ...payload, items };
+}
+
 export function getOpenAIResponsesHistoryPayload(
 	providerPayload: ProviderPayload | undefined,
 	currentProvider: string,
@@ -708,8 +771,16 @@ export function resolveCacheRetention(
 	cacheRetention?: CacheRetention,
 	fallback: CacheRetention = "short",
 ): CacheRetention {
+	return explicitCacheRetention(cacheRetention) ?? fallback;
+}
+
+/**
+ * The retention the caller or environment actually asked for, or undefined when
+ * neither did. Lets a provider treat "the user chose long" differently from
+ * "long is this route's default".
+ */
+export function explicitCacheRetention(cacheRetention?: CacheRetention): CacheRetention | undefined {
 	if (cacheRetention) return cacheRetention;
 	const env = $env.PI_CACHE_RETENTION;
-	if (env === "long" || env === "short" || env === "none") return env;
-	return fallback;
+	return env === "long" || env === "short" || env === "none" ? env : undefined;
 }

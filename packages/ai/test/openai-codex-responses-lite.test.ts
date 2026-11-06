@@ -723,7 +723,7 @@ describe("openai-codex Responses Lite and client metadata wire format", () => {
 
 		expect(result.stopReason).toBe("stop");
 		expect(captured?.headers.get("x-openai-internal-codex-responses-lite")).toBeNull();
-		expect(captured?.body.instructions).toBe("You are a helpful assistant.");
+		expect(captured?.body.reasoning).toBeUndefined();
 		expect(captured?.body.parallel_tool_calls).toBeUndefined();
 		expect(captured?.body.client_metadata).toBeDefined();
 	});

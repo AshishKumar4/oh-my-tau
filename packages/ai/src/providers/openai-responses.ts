@@ -11,6 +11,8 @@ import {
 } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getEnvApiKey } from "../env-api-key";
+import { parseServiceTier } from "../types";
+import { bindResponsesReplayItem } from "../utils/block-symbols";
 import type {
 	AssistantMessage,
 	CacheRetention,
@@ -1229,14 +1231,15 @@ const streamOpenAIResponsesOnce = (
 						onFirstToken: () => {
 							if (!firstTokenTime) firstTokenTime = performance.now();
 						},
-						onOutputItemDone: item => {
+						onOutputItemDone: (item, toolCall) => {
+							if (toolCall) bindResponsesReplayItem(toolCall, nativeOutputItems.length, item);
 							// The processor hands over a private clone; no second deep copy needed.
 							nativeOutputItems.push(item as unknown as Record<string, unknown>);
 						},
 						onCompleted: () => {
 							sawTerminalResponseEvent = true;
 						},
-						requestServiceTier: options?.serviceTier,
+						requestServiceTier: parseServiceTier(chained.params.service_tier),
 						toolNamesByWire: wireToolNames,
 					});
 

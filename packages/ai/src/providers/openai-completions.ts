@@ -121,7 +121,12 @@ import {
 	shouldDropAutoToolChoiceForReasoning,
 	shouldRetryWithoutStrictTools,
 } from "./openai-shared";
-import { completionsSendsOwnThinking, transformMessages } from "./transform-messages";
+import {
+	completionsSendsOwnThinking,
+	declaredToolNames,
+	facadeToolCallReplay,
+	transformMessages,
+} from "./transform-messages";
 import {
 	isOpenAICompletionsVisionSupported,
 	joinTextWithImagePlaceholder,
@@ -2466,6 +2471,7 @@ export function convertMessages(
 		duplicateToolCallIdSuffixPrefix,
 		compat,
 	);
+	const declaredNames = declaredToolNames(context.tools);
 
 	const remappedToolCallIds = new Map<string, string[]>();
 	let generatedToolCallIdCounter = 0;
@@ -2598,9 +2604,9 @@ export function convertMessages(
 				// Join ordinary adjacent text blocks with no separator so bridge
 				// stitching, imported transcripts, and streaming chunks keep their
 				// original byte sequence. Demoted-thinking blocks (kDemotedThinking,
-				// synthesized by transformMessages) are the one exception: bare
-				// Anthropic-dialect reasoning would otherwise glue onto the first word
-				// of the visible answer. Insert a paragraph break after them — only
+				// synthesized by transformMessages) are the one exception: their
+				// closing delimiter would otherwise glue onto the first word of the
+				// visible answer. Insert a paragraph break after them — only
 				// when another block actually follows, so a trailing demoted block
 				// never ships trailing whitespace.
 				assistantMsg.content = nonEmptyTextBlocks
@@ -2630,15 +2636,20 @@ export function convertMessages(
 				assistantMsg.content = parts;
 			} else if (nonEmptyThinkingBlocks.length > 0) {
 				if (compat.requiresThinkingAsText) {
+					// Claude targets render nothing (`dropsUnreplayableThinking`), so
+					// their reasoning is dropped rather than prepended.
 					const thinkingText = nonEmptyThinkingBlocks
 						.map(b => renderDemotedThinking(model.id, b.thinking))
+						.filter(text => text.length > 0)
 						.join(" ");
 					// `content` is a plain string at this point (set above) or null —
 					// never an array. Prepend the demoted thinking to the string form.
-					assistantMsg.content =
-						typeof assistantMsg.content === "string" && assistantMsg.content.length > 0
-							? `${thinkingText} ${assistantMsg.content}`
-							: thinkingText;
+					if (thinkingText.length > 0) {
+						assistantMsg.content =
+							typeof assistantMsg.content === "string" && assistantMsg.content.length > 0
+								? `${thinkingText} ${assistantMsg.content}`
+								: thinkingText;
+					}
 				} else if (compat.requiresReasoningContentForToolCalls) {
 					// Use the streamed signature when the backend accepts whichever
 					// recognized field name was emitted (allowsSynthetic=true). Backends
@@ -2796,12 +2807,13 @@ export function convertMessages(
 				assistantMsg.tool_calls = toolCalls.map((tc, toolCallIndex) => {
 					const toolCallId = ensureToolCallId(tc.id, `${i}:${toolCallIndex}:${tc.name}`, msg);
 					rememberToolCallId(tc.id, toolCallId);
+					const facade = facadeToolCallReplay(tc, declaredNames);
 					const replayedToolCall: OpenAICompletionsFunctionToolCall = {
 						id: normalizeMistralToolId(toolCallId, compat.requiresMistralToolIds),
 						type: "function",
 						function: {
-							name: tc.name,
-							arguments: serializeToolArguments(tc.arguments),
+							name: facade?.name ?? tc.name,
+							arguments: serializeToolArguments(facade?.arguments ?? tc.arguments),
 						},
 					};
 					const stored = normalizeStoredGeminiSignature(parseStoredThoughtSignature(tc.thoughtSignature));
