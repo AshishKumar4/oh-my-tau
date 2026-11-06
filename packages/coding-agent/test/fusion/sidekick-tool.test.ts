@@ -82,6 +82,8 @@ describe("fusion sidekick tool", () => {
 	const authStorage = createInMemoryAuthStorage();
 
 	beforeEach(() => {
+		AgentRegistry.resetGlobalForTests();
+		IrcBus.resetGlobalForTests();
 		tempDir = TempDir.createSync("@pi-fusion-");
 		modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
 		const sidekickModel = createMockModel({ provider: "devin", id: "swe-2" });
