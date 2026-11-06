@@ -150,7 +150,7 @@ The CLI broker refresh hook also handles managed `mcp_oauth:*` credentials using
 ### CLI
 
 ```
-omp auth-gateway serve   [--bind=host:port] [--no-auth] [--trust-proxy-headers] [--clients=<file>]
+omp auth-gateway serve   [--bind=host:port] [--no-auth] [--record-harness] [--trust-proxy-headers] [--clients=<file>]
 omp auth-gateway stdio
 omp auth-gateway token   [--regenerate] [--json]
 omp auth-gateway status  [--json]
@@ -162,6 +162,33 @@ omp auth-gateway check   [--strict] [--json]
 - `token` manages the token file; `--regenerate` requires a running gateway to restart before accepting the replacement. `status` checks the local token file and an authenticated broker snapshot; it does not probe the gateway listener.
 - `check` constructs its own broker-backed store and probes the credentials the gateway would use, without calling a running gateway. Without `--strict` it uses provider usage probes. `--strict` additionally tries suitable bundled chat models and can consume quota; providers with no suitable candidate (including pi-native forwarding, Bedrock, Vertex, and Cursor transports) cannot be completion-probed.
 
+- `serve --record-harness` turns on harness record mode (off by default; see below).
+
+### Harness record mode
+
+A profiled model can be served the vendor harness prompt its lineage was post-trained against instead of omp's own template, but that text is never vendored into this repo — it is read from a recording of the user's own client install, cached under `~/.omp/cache/harness/<profile>/<clientVersion>-<entrypoint>.json` (`OMP_HARNESS_CACHE_DIR` relocates the root). `serve --record-harness` is how that recording is produced: point the vendor client at the gateway and take one turn.
+
+```
+omp auth-gateway serve --no-auth --record-harness
+
+# Claude Code, in the repo you want recorded
+ANTHROPIC_BASE_URL=http://127.0.0.1:4000 ANTHROPIC_AUTH_TOKEN=recording claude
+
+# Codex
+codex -c model_provider=omp \
+      -c 'model_providers.omp.name="omp"' \
+      -c 'model_providers.omp.base_url="http://127.0.0.1:4000/v1"' \
+      -c 'model_providers.omp.wire_api="responses"' \
+      -c 'model_providers.omp.requires_openai_auth=false'
+```
+
+The token is never checked upstream, so a dummy value is enough and the capture costs no quota: recording happens before the gateway resolves a model, so the client's own model id does not have to be routable. `--no-auth` is what lets a client that sends no bearer through.
+
+Because a capture becomes the system prompt of every later session on a profiled model, `--record-harness` combined with `--no-auth` refuses to start unless the bind host is loopback — on a routable bind, any host that could reach the gateway would author those instructions. Keep the bearer check on if the gateway must be reachable. Captures are written `0600`, and a session that serves one names the file in `/model` and in the session-status overlay instead of only in the debug log.
+
+Every field of the capture comes out of the request: the profile from the route plus the client's identity block, `clientVersion`/`entrypoint` from that block (Claude Code states both in its `x-anthropic-billing-header:` system block; Codex states the entrypoint in `originator` and the version in its User-Agent), the prompt blocks and the declared tool inventory, and — under `ambient` — only the trimmed `CLAUDE.md`/`AGENTS.md` needles a recorded prompt block equals or contains, so the reader can strip them. Nothing else you typed during the run is persisted. For Codex only the first developer message is recorded: its later developer blocks state the recording machine's own memory folder, installed skills and sandbox/approval policy, which would be a false environment for any other session. The first capture a `<clientVersion>-<entrypoint>` identity produces is the one kept: a second turn, or a side-call the client makes under the same identity with its own prompt, is logged and dropped rather than overwriting it. Delete the file to re-record.
+
+A capture is only written if the coding agent's own capture reader accepts it — the recorder validates with that reader's projector rather than a second copy of its rules. Refusals are logged with a reason and write nothing: a client surface other than the profile's target (Claude Code's `sdk-cli` entrypoint, say), an empty prompt or tool surface (a title/summary side-call), or a degraded client path such as Codex's fallback-metadata requests. Only `POST /v1/messages` and `POST /v1/responses` are recorded; no other route or response is affected, and with the flag absent the gateway behaves exactly as before.
 ### Client tokens
 
 `serve --clients=<file>` admits bearers besides the gateway token, each limited by the gateway itself. The file maps each client name to its token digest and limits:
@@ -321,6 +348,8 @@ Use server-side broker authorization, not account pools, when a process holding 
 ### Per-agent and per-session pools
 
 A process-wide pool decides which accounts a client sees; a session pool narrows one session further with the same identity keys, which `omp usage accounts` lists for every OAuth account the process sees (with organization names and no tokens). Set `task.agentAccountPools` to pool a task agent by exact name ([Settings](./settings.md#providers-and-services)), pass `oauthAccountPools` to `createAgentSession()`, or call `authStorage.sessions.restrict(provider, sessionId, identityKeys)` directly. For each listed provider the session authenticates only with visible OAuth accounts in its list: selection, pins, fallback passes, rotation, and saved-reset restores stay inside it, stored, runtime, and environment API keys are never used, and a request fails rather than borrow another account when none can serve. A config key (a `models.yml` `apiKey`, often for a proxy `baseUrl`) also fails a pooled request, so no pooled OAuth token is sent to that endpoint. An empty list allows no account. Saved resets about to expire are still salvaged on every account, pooled or not, because salvage serves the account that holds the reset. A session created with `oauthAccountPools` enforces its pools on every key lookup through its model registry, whatever provider session id the lookup carries (title generation, skill compression, advisors, and subagents it spawns without their own entry); a lookup with no session id resolves under the session's own id. It lifts its pools when it is disposed, or, when a run outlives the dispose deadline, once that run settles. A direct `restrict` caller passes the lease that `restrict` returned to `authStorage.sessions.unrestrict(provider, sessionId, lease)` once that session ends; a lease never lifts a restriction installed on the same session since. `authStorage.sessions.permits(provider, sessionId, credentialId)` tells whether a stored account may serve a session. Session pools are the same trusted-client routing policy as client pools, not an authorization boundary.
+
+Two routing models meet here. An unrestricted session serves from both stored pools in `auth.poolOrder` ([Credential pools](./providers.md#credential-pools-subscriptions-and-api-keys)): OAuth subscriptions and pooled API keys rotate, and the session keeps a pin in each pool, so a detour through one does not cost it the account it warmed in the other. A session pool is OAuth-only: for a listed provider, `auth.poolOrder` and pooled API keys do not apply, an explicit pin to an account outside the pool is refused, and a pin inherited from a parent or restored from the session file that falls outside it is ignored, so the session re-ranks inside its pool.
 
 ## Operator opt-in
 

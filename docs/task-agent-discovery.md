@@ -27,7 +27,7 @@ It covers runtime behavior as implemented today, including precedence, invalid-d
 Task agents normalize into `AgentDefinition` (`src/task/types.ts`):
 
 - required `name`, `description`, and `systemPrompt`
-- optional `tools`, `spawns`, prioritized `model` list, `thinkingLevel`, `output`, `blocking`, `structured`, `autoloadSkills`, `readSummarize`, `prewalk`, `advisor`
+- optional `tools`, `spawns`, prioritized `model` list, `thinkingLevel`, `output`, `blocking`, `structured`, `autoloadSkills`, `readSummarize`, `prewalk`, `advisor`, `sidekick`, `pinModel`
 - `source`: `"bundled" | "user" | "project"` (extension agents are tagged with their extension root's project/user level)
 - optional `filePath`
 
@@ -38,15 +38,17 @@ Parsing comes from frontmatter via `parseAgentFields()` (`src/discovery/helpers.
 - `tools` accepts CSV or array; legacy tool aliases are normalized and mixed arrays retain their string entries. Omitted or YAML-null `tools` selects the default built-in toolset. Any other declaration with no tool names (including `tools: []`, empty CSV, or malformed scalar/array values) selects no built-ins. Structured children still receive the required `yield` tool; MCP, extension, and custom tools remain additive.
 - `spawns` accepts `*`, CSV, or array
 - backward-compat behavior: if `spawns` missing but `tools` includes `task`, `spawns` becomes `*`
-- `output` is passed through as opaque schema data
+- `output` is passed through as opaque schema data. Declaring it keeps structured results for the agent while `task.structured` is off (see `structured` below).
+- `pinModel: true` runs the agent's sessions with no retry fallback chain: a transient provider error is retried on the same model instead of walking the parent's `retry.fallbackChains` onto another one. `runSubprocess` applies it as an empty `retry.fallbackChains.default` override on the subagent's isolated settings. The Fusion `sidekick` ships with it set, because its model is the pairing.
 - `read-summarize: false` (normalized to `readSummarize`) disables structural summaries for the subagent's `read` tool — `runSubprocess` applies a `read.summarize.enabled: false` override on the child's isolated settings (`src/task/executor.ts`). `scout` ships with it disabled. When absent, the child inherits the parent's read-summary setting.
 - `model` accepts one selector, CSV, or an array. Entries are tried in order after role aliases are expanded.
 - `thinking-level` / `thinking` selects the agent's configured effort. When `task.enableEffort` (default `false`) exposes it, a task item's coarse `effort` (`lo`, `med`, `hi`) takes precedence at launch, except for a [user-tagged model agent](#effort-level-suffix) whose tag names a level. OMP maps that hint to the selected model's lowest, middle, or highest supported effort, then clamps it to `task.maxEffort` (default `max`). The ceiling is carried across retry-fallback model switches. If the selected model has no supported effort at or below the ceiling, the spawn fails; models without a controllable effort surface instead fall back to their normal selector.
 - `blocking: true` makes the parent wait for that agent even when async task execution is enabled
-- `structured: true` keeps structured results for that agent while `task.structured` (default `false`) is off: its task spawns get the `yield` tool and resolve their output schema exactly as with `task.structured: true` (see [structured-output precedence](#model-and-structured-output-precedence)). With `task.structured` on, the field changes nothing; `false` or absent follows the setting. The caller-side `outputSchema`/`schemaMode` task parameters stay hidden while the setting is off. The decision is made from the resolved agent in `resolveEffectiveSubagentPolicy()`, so plan-mode spawns keep it, and cold revival restores `yield` from the child's persisted tool list.
+- `structured: true` keeps structured results for that agent while `task.structured` (default `false`) is off: its task spawns get the `yield` tool and resolve their output schema exactly as with `task.structured: true` (see [structured-output precedence](#model-and-structured-output-precedence)). An agent that declares `output` already keeps them; the field opts in an agent without one. With `task.structured` on, the field changes nothing; `false` or absent follows the setting. The decision is made from the resolved agent in `resolveEffectiveSubagentPolicy()` (`declaresStructuredResult`), so plan-mode spawns keep it, and cold revival restores `yield` from the child's persisted tool list.
 - `autoloadSkills` names skills from the parent session to inject before the first child prompt; unknown names are ignored
 - `prewalk: true` starts the subagent on its resolved model and hands off to the default prewalk target (the `smol` role) at its first edit/write, exactly like the session-level `--prewalk`; a string value (e.g. `prewalk: "@smol"` or `prewalk: "openai/gpt-5-mini"`) picks a custom target. The `task.agentPrewalk` settings record (agent name → `"on"` / `"off"` / pattern, configured per agent from the `/agents` hub via its prewalk strip) overrides the frontmatter. Resolution happens in `runSubprocess` (`src/task/executor.ts`). An unavailable target is skipped instead of failing the spawn. A resolved target is skipped only when both its model identity and its effective thinking mode/level match the starting selection after model clamping; a same-model effort downgrade is a real hand-off and still arms and switches at the first edit/write.
 - `advisor: true` pairs spawned sessions of the agent with an advisor running the model resolved for the `advisor` role; a string value (e.g. `advisor: "deepseek/deepseek-v4-flash"` or `advisor: "@smol:high"`) sets an explicit advisor model pattern (optional `:level` suffix), applied as the spawned session's `modelRoles.advisor`. The `task.agentAdvisor` settings record (agent name → `"on"` / `"off"` / pattern, configured per agent from the `/agents` hub via its advisor strip) overrides the frontmatter. Resolution happens in `runSubprocess` (`src/task/executor.ts`); subagents default to no advisor, and the effective opt-in is persisted in `session_init` so cold revival restores it.
+- `sidekick: true` makes spawned sessions of the agent a Fusion lead of their own when `fusion.enabled` is on: they get the `sidekick` tool, the lead prompt section, and exactly one sidekick registered under their own id (`isFusionLead` in `src/fusion/config.ts`). The sidekick counts as one recursion level under the lead and is not subject to the lead's `spawns` list. Default off; the bundled `sidekick` agent never sets it.
 
 ## Role-backed custom agents
 
@@ -123,21 +125,20 @@ After dispatch, press `Alt+A` to open [Agent Hub](./agent-hub.md). Its live rost
 
 ### `vibe_spawn` tier routing
 
-`vibe_spawn` maps `fast` to bundled `sonic` and `good` to bundled `task`. Both resolve through `task.agentModelOverrides` before their bundled agent model defaults (`src/vibe/runtime.ts`, `src/task/agents.ts`).
+Both `vibe_spawn` tiers run bundled `task` (`src/vibe/runtime.ts`). `good` keeps `task`'s model, so `task.agentModelOverrides.task` applies. `fast` runs on the `@smol` role at medium thinking and ignores that override, so it stays cheap; `task`'s prewalk and advisor settings do not apply to it either.
 
-Route these tiers through roles by keeping aliases in `task.agentModelOverrides` and concrete selectors only in `modelRoles`:
+Route the tiers through roles by keeping aliases in `task.agentModelOverrides` and concrete selectors only in `modelRoles`:
 
 ```yaml
 task:
    agentModelOverrides:
-      sonic: "@fast_worker"
       task: "@good_worker"
 modelRoles:
-   fast_worker: openai/gpt-5-mini
+  smol: openai/gpt-5-mini
    good_worker: openai/gpt-5.4:high
 ```
 
-The `vibe_spawn` `cli` remains `fast` or `good`; update `modelRoles` to change the worker model.
+The `vibe_spawn` `cli` remains `fast` or `good`; update `modelRoles` to change the worker model. The `smol` role also drives `scout`.
 
 ## Bundled agents
 
@@ -145,8 +146,10 @@ Bundled agents are embedded at build time (`src/task/agents.ts`) using text impo
 
 `EMBEDDED_AGENT_DEFS` defines:
 
-- `scout`, `reviewer`, and `security-reviewer` from prompt files
-- `task` and `sonic` from the shared `task.md` body plus injected frontmatter; no bundled agent sets `prewalk` — the generic `task` agent's hand-off is armed by the `task.prewalk` setting (default off), or per agent via `/agents` / `task.agentPrewalk` / user agent frontmatter
+- `scout` and `reviewer` from prompt files
+- `task` from the `task.md` body plus injected frontmatter; no bundled agent sets `prewalk` — the generic `task` agent's hand-off is armed by the `task.prewalk` setting (default off), or per agent via `/agents` / `task.agentPrewalk` / user agent frontmatter
+
+`task` is the laborer for fully specified implementation and test work and cannot spawn subagents. `scout` has `bash` for git and data collection but no edit or write tools. `reviewer` reviews on two axes, correctness and design quality, loads the relevant review skills from its skill list, and tags each finding `kind: bug` or `kind: design`; only bugs make its verdict `incorrect`. `sonic` and `security-reviewer` were removed: `/security` runs `reviewer` pinned to its read-only scan contract, and `/recover` restarts old `sonic` and `security-reviewer` transcripts as `task` and `reviewer`.
 
 Loading path:
 
@@ -222,7 +225,7 @@ Lookup is exact-name linear search:
 1. atomically reloads the live session's persisted global, project, and explicit overlay settings while preserving runtime overrides
 2. resolves the omitted or explicit agent name from the parent spawn policy
 3. enforces depth, blocked-self-recursion, and parent spawn-policy guards
-4. rediscovers agents with the session's cwd and effective extension-root configuration, appends user-tagged session agents, and performs exact lookup
+4. rediscovers agents with the session's cwd and effective extension-root configuration, appends user-tagged session agents, and performs exact lookup; a definition in the session's `pinnedAgents` wins over both
 5. checks `task.disabledAgents`
 6. resolves plan-mode restrictions, output schema, model policy, and isolation policy
 
@@ -343,11 +346,11 @@ Runtime output schema precedence is:
 
 The task item's optional `schemaMode` overrides the parent session mode; the default is `permissive`.
 
-These schemas apply only to structured runs. With `task.structured` off (the default), task spawns get no output schema and no `yield` tool and return their final assistant message, except for agents whose definition sets `structured: true`; those resolve the agent `output`, then the parent session schema, because the task item's `outputSchema` is not exposed. Eval `agent()` and workpool spawns are always structured.
+These schemas apply only to structured runs. With `task.structured` off (the default), task spawns get no output schema and no `yield` tool and return their final assistant message, unless a schema is declared: the task item passes `outputSchema`, or the agent's definition sets `output` or `structured: true`. Those spawns resolve the precedence above. Eval `agent()` and workpool spawns are always structured.
 
 Explicit caller schemas are validated during preflight in both modes. Agent/session schemas are preflight-validated when the effective mode is `strict`. Invalid schemas fail before child execution.
 
-The model-facing prompt (`src/prompts/tools/task.md`) tags read-only agents and warns against offloading reasoning to `scout`/`sonic`.
+The model-facing prompt (`src/prompts/tools/task.md`) tags read-only agents and warns against offloading reasoning to `scout`.
 
 ## Command discovery interaction
 

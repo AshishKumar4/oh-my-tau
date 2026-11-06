@@ -532,7 +532,7 @@ Cancelable pre-events:
 
 - `session_before_switch` → `{ cancel?: boolean }`
 - `session_before_branch` → `{ cancel?: boolean; skipConversationRestore?: boolean }`
-- `session_before_compact` → `{ cancel?: boolean; compaction?: CompactionResult }`
+- `session_before_compact` → `{ cancel?: boolean; compaction?: CompactionResult; rewrite?: SessionHistoryRewrite[] }`
 - `session_before_tree` → `{ cancel?: boolean; summary?: { summary: string; details?: unknown } }`
 
 `session_before_branch` and `session_branch` carry `reason`, which decides what `session_before_branch.entryId` means. For `"branch"` (`branch(entryId)`, `/branch`) it is the user message being rewound: it and everything after it are dropped. For `"fork"` (`AgentSession.fork(entryId)`, RPC `fork` with an `entryId`) and `"btw"` (`/btw` promotion) it is the last entry kept in the new session.
