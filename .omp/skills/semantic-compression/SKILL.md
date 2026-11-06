@@ -1,6 +1,7 @@
 ---
 name: semantic-compression
 description: Re-encode verbose prose into a dense telegraphic register — punctuation as connectives, label frames, verbless assertions — without losing normativity or precision. Use when compressing system prompts, tool/function descriptions, skill bodies, or agent instructions; reducing token count or context bloat; making documentation token-efficient for LLM input; or rewriting text in compressed notation.
+disable-model-invocation: true
 ---
 
 # Semantic Compression
