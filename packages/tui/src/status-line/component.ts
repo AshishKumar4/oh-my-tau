@@ -33,7 +33,12 @@ import type { Editor } from "../components/editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../theme/session-color";
 import { sanitizeHookStatusText, sanitizeStatusText } from "../chrome/shared";
 import { getThemeEpoch, theme } from "../theme";
-import { type CompactionBoundaries, EMPTY_STRING_PARTS, getToolSchemaMetadataRevision } from "./context-usage";
+import {
+	type CompactionBoundaries,
+	EMPTY_STRING_PARTS,
+	getToolSchemaMetadataRevision,
+	promptCacheHealthTextOfMessages,
+} from "./context-usage";
 import {
 	type CodexResetFireworksEvent,
 	type CodexResetUsageSnapshot,
@@ -877,6 +882,22 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	) {
 		this.#settings = host.getSettings();
 		this.#unwatchNativeRendering = onNativeRenderingChange(() => this.#syncActiveWindowRepaint());
+		this.#attachPromptCacheHealth(session);
+	}
+
+	/**
+	 * Lazily bind the host session's message feed to the prompt-cache health
+	 * readout. Cache accounting lives in the agent session, which pi-tui must
+	 * not import; the session object itself carries the messages. Re-run on
+	 * every `setSession` (resume/move/fork swap the ref).
+	 */
+	#attachPromptCacheHealth(session: TSession): void {
+		const source = session as Partial<StatusLineSession>;
+		source.promptCacheHealthText = () => {
+			const messages = source.messages;
+			if (!messages) return undefined;
+			return promptCacheHealthTextOfMessages(messages);
+		};
 	}
 
 	#gitEnabled(): boolean {
@@ -975,6 +996,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 	 * from it. `focusedAgentId` is the focused subagent id while the view is proxied, undefined for main.
 	 */
 	setSession(session: TSession, focusedAgentId?: string): void {
+		this.#attachPromptCacheHealth(session);
 		const sessionChanged = this.session !== session;
 		if (!sessionChanged && this.#focusedAgentId === focusedAgentId) return;
 		this.session = session;
@@ -2721,6 +2743,7 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 					: null,
 			goalMode: this.#goalModeStatus,
 			goalStatusInFooter: this.#goalModeStatus ? this.host.goalStatusInFooter(this.session) : false,
+			fusionSidekick: this.host.fusionSidekick?.(this.session),
 			vibeMode: this.#vibeModeStatus,
 			vim: this.#vimStatus,
 			collab: this.#collabStatus,
@@ -3353,16 +3376,47 @@ export class StatusLineComponent<TSession extends StatusLineSession = StatusLine
 			return leftGroup + (leftGroup && rightGroup ? " " : "") + rightGroup;
 		}
 
-		const gapWidth = Math.max(1, topFillWidth - leftWidth - rightWidth);
+		const cacheHealth = this.#promptCacheHealthChunk(ctx, topFillWidth, leftWidth, rightWidth, embedContext);
+		const gapWidth = Math.max(1, topFillWidth - leftWidth - rightWidth - cacheHealth.width);
 		if (plain) {
 			// Standalone composers: no gauge line between the groups, just air.
-			return leftGroup + padding(gapWidth) + rightGroup;
+			return leftGroup + padding(gapWidth) + cacheHealth.text + rightGroup;
 		}
 		// Box layout: with one group absent (an unnamed session hides
 		// `session_name`, emptying the default preset's right group) the gauge
 		// runs to the border edge instead of disappearing, so embedded context
 		// labels don't fall back to a context chip until the session is titled.
-		return leftGroup + this.#buildContextGaugeFill(gapWidth, ctx, effectiveSettings, embedContext) + rightGroup;
+		return (
+			leftGroup +
+			this.#buildContextGaugeFill(gapWidth, ctx, effectiveSettings, embedContext) +
+			cacheHealth.text +
+			rightGroup
+		);
+	}
+
+	// Prompt-cache health readout pinned to the gauge's right end, between the
+	// bar and the right group. Yields its width to the bar first: full, then
+	// compact, then nothing, always leaving the embedded context labels intact.
+	#promptCacheHealthChunk(
+		ctx: SegmentContext,
+		topFillWidth: number,
+		leftWidth: number,
+		rightWidth: number,
+		embedContext: boolean,
+	): { text: string; width: number } {
+		const empty = { text: "", width: 0 };
+		const health = this.session.promptCacheHealthText?.();
+		if (!health) return empty;
+		const candidates = health.compact === undefined ? [health.full] : [health.full, health.compact];
+		const minGauge = embedContext ? embeddedContextGaugeMinWidth(ctx.contextPercent ?? 0, ctx.contextWindow) : 1;
+		const available = topFillWidth - leftWidth - rightWidth;
+		for (const candidate of candidates) {
+			const parts = [theme.icon.cache, theme.fg("statusLineSpend", candidate)].filter(part => part !== "");
+			const text = ` ${parts.join(" ")}`;
+			const width = visibleWidth(text);
+			if (available - width >= minGauge) return { text, width };
+		}
+		return empty;
 	}
 
 	/**

@@ -387,6 +387,16 @@
 - Fixed a streamed Markdown list keeping every item out of native scrollback until the turn ended, so rows that scrolled off screen were unreachable mid-stream; items in front of the newest one now retire as soon as it begins ([#13676](https://github.com/can1357/oh-my-pi/issues/13676), [#15993](https://github.com/can1357/oh-my-pi/pull/15993) by [@shgew](https://github.com/shgew))
 - Fixed SIXEL charts and SVG figures being resampled before display, which softened their text, on terminals whose cell height is not a multiple of 6 such as Windows Terminal ([#16007](https://github.com/can1357/oh-my-pi/issues/16007))
 
+### Fixed
+
+- Record settings no longer count as changed in the settings panel while they match their default
+- Editing one provider's in-flight request limit no longer copies project-level limits into the global config
+- The terminal read card shows every text block of a result, so a warning such as a superseded `agent://` value no longer hides the value itself.
+
+### Added
+
+- `ModelHubOptions.roleAgents` takes a promise of the agents per role; once it resolves, the Roles view lists the agents on the selected role and marks a custom role nothing uses with a `no agents` badge
+- A record setting whose ui declares `options` and a `defaultOption` edits as a per-provider choice in the settings panel: pick a provider, then one of the options; choosing the default removes that provider's entry. `SettingsHost.setEntry` writes one entry of a record setting to the global config, and `validateProviderLimits` is gone
 ## [18.11.2] - 2026-10-16
 
 ### Changed
@@ -474,7 +484,7 @@
 
 ### Removed
 
-- Removed `tools/eval-format/code-mode-declarations` (`generateCodeModeDeclarations`), which only served Codex Code Mode.
+- Removed `tools/eval-format/code-mode-declarations` (`generateCodeModeDeclarations`), which only served Codex Code Mode. (Upstream only: oh-my-tau keeps Codex Code Mode and this module.)
 
 ## [18.10.3] - 2026-10-12
 

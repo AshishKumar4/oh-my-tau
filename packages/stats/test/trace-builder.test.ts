@@ -314,7 +314,7 @@ const ORPHAN_ENTRIES: unknown[] = [
 		id: "osi1",
 		parentId: null,
 		timestamp: iso(T + 20_000),
-		agent: "sonic",
+		agent: "scout",
 		task: "orphan work",
 		resolvedModel: "p/m-orphan",
 	},

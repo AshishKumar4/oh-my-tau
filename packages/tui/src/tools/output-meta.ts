@@ -38,6 +38,12 @@ export interface TruncationMeta {
 	/** Next offset for pagination (head truncation only) */
 	nextOffset?: number;
 	/**
+	 * Parameter that carries `nextOffset` in the continuation hint (`offset=N`),
+	 * for a tool whose served schema pages by argument rather than by an inline
+	 * `:N` selector.
+	 */
+	nextOffsetParam?: string;
+	/**
 	 * The single shown line is a byte-capped preview of one oversized line, not
 	 * a complete line. `outputBytes`/`totalBytes` are the preview vs full line
 	 * size; renders a distinct "partial" notice instead of a line range.
@@ -277,6 +283,12 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta, source?: 
 			: source?.type === "report"
 				? `Read artifact://${truncation.artifactId} for full report (${source.value})`
 				: formatFullOutputReference(truncation.artifactId, truncation.artifactElidedBytes);
+	const continuation =
+		truncation.nextOffset == null
+			? undefined
+			: truncation.nextOffsetParam === undefined
+				? `Use :${truncation.nextOffset} to continue`
+				: `Use ${truncation.nextOffsetParam}=${truncation.nextOffset} to continue`;
 
 	if (truncation.direction === "middle") {
 		const head = truncation.headRange;
@@ -293,8 +305,8 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta, source?: 
 		} else {
 			notice = `Showing ${Math.min(truncation.outputLines, totalLines)} of ${totalLines} lines; middle elided`;
 		}
-		if (truncation.nextOffset != null) {
-			notice += `. Use :${truncation.nextOffset} to continue`;
+		if (continuation) {
+			notice += `. ${continuation}`;
 		}
 		if (artifactReference) {
 			notice += `. ${artifactReference}`;
@@ -323,8 +335,8 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta, source?: 
 		notice += ` (${formatBytes(maxBytes)} limit)`;
 	}
 
-	if (truncation.nextOffset != null) {
-		notice += `. Use :${truncation.nextOffset} to continue`;
+	if (continuation) {
+		notice += `. ${continuation}`;
 	}
 
 	if (artifactReference) {

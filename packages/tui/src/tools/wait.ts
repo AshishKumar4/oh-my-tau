@@ -54,6 +54,11 @@ export interface JobSnapshot {
 	/** What the job is for, in the model's words (a process job's `label` is its command line). */
 	intent?: string;
 	durationMs: number;
+	/**
+	 * When the job started, in epoch ms. Recovery tells runs of one agent apart by it:
+	 * a settled row that started before a later run was requested belongs to an older run.
+	 */
+	startedAt?: number;
 	/** Process exit status when the job reports one. */
 	exitCode?: number;
 	/** Effective task model selector, including an explicit reasoning suffix when configured. */

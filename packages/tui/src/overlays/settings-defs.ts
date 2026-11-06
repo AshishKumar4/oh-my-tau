@@ -11,6 +11,7 @@ export type SettingTab =
 	| "shell"
 	| "tools"
 	| "tasks"
+	| "fusion"
 	| "providers";
 
 /** Tab display metadata - icon is resolved via theme.symbol() */
@@ -27,6 +28,7 @@ export const SETTING_TABS: SettingTab[] = [
 	"shell",
 	"tools",
 	"tasks",
+	"fusion",
 	"providers",
 ];
 
@@ -41,6 +43,7 @@ export const TAB_METADATA: Record<SettingTab, TabMetadata> = {
 	shell: { label: "Shell", icon: "tab.shell" },
 	tools: { label: "Tools", icon: "tab.tools" },
 	tasks: { label: "Tasks", icon: "tab.tasks" },
+	fusion: { label: "Fusion", icon: "tab.fusion" },
 	providers: { label: "Providers", icon: "tab.providers" },
 };
 
@@ -55,6 +58,7 @@ export const TAB_LEADS: Record<SettingTab, string> = {
 	shell: "The bash tool and the eval runtimes.",
 	tools: "Which tools the model has, their limits and the external integrations.",
 	tasks: "Modes, subagents, isolation and custom commands.",
+	fusion: "The lead model paired with a sidekick subagent that implements and verifies.",
 	providers: "Services, provider protocols, timeouts and privacy.",
 };
 
@@ -98,6 +102,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Developer",
 	],
 	tasks: ["Modes", "Subagents", "Isolation", "Commands & Skills"],
+	fusion: ["Fusion"],
 	providers: ["Services", "Fireworks", "Tiny Model", "Protocol", "Timeouts", "Privacy"],
 };
 
@@ -129,6 +134,8 @@ export type AnyUiMetadata = UiBase & {
 	options?: ReadonlyArray<SubmenuOption> | "runtime";
 	secret?: boolean;
 	ordered?: boolean;
+	/** Record settings with `options`: the choice a provider without an entry gets. */
+	defaultOption?: string;
 	editor?: "json";
 };
 
@@ -152,8 +159,13 @@ export interface SettingsHost {
 	 * variable, that configures the setting still applies; otherwise the default does.
 	 */
 	unset(path: string): void;
+	/**
+	 * Persists one entry of record setting `path` to the global config; `undefined` removes it.
+	 * Its other entries, from any layer, stay as they are, so editing one provider never copies
+	 * project-level entries into the global config.
+	 */
+	setEntry(path: string, key: string, value: unknown): void;
 	normalizeProviderLimits(value: unknown): Record<string, number>;
-	validateProviderLimits(value: unknown): Record<string, number>;
 }
 
 /** Primitive value displayed by a settings control. */
@@ -205,6 +217,14 @@ export interface ProviderLimitsSettingDef extends BaseSettingDef {
 	type: "providerLimits";
 }
 
+/** Provider-keyed record whose values are one of `options`, edited one provider at a time. */
+export interface ProviderChoiceSettingDef extends BaseSettingDef {
+	type: "providerChoice";
+	options: OptionList;
+	/** The choice a provider without an entry gets; choosing it removes the entry. */
+	defaultOption: string;
+}
+
 /** Array-of-enum setting edited as a toggle list; `ordered` lists render positions and support reordering. */
 export interface MultiSelectSettingDef extends BaseSettingDef {
 	type: "multiselect";
@@ -218,6 +238,7 @@ export type SettingDef =
 	| SubmenuSettingDef
 	| TextInputSettingDef
 	| ProviderLimitsSettingDef
+	| ProviderChoiceSettingDef
 	| MultiSelectSettingDef;
 
 function resolveOptions(ui: AnyUiMetadata): OptionList | "runtime" | undefined {
@@ -287,9 +308,11 @@ function entryToSettingDef(entry: SettingsDisplayEntry): SettingDef | null {
 	}
 
 	if (schemaType === "record") {
-		return path === "providers.maxInFlightRequests"
-			? { ...base, type: "providerLimits" }
-			: { ...base, type: "text", secret: false };
+		if (path === "providers.maxInFlightRequests") return { ...base, type: "providerLimits" };
+		if (options && options !== "runtime" && ui.defaultOption !== undefined) {
+			return { ...base, type: "providerChoice", options, defaultOption: ui.defaultOption };
+		}
+		return { ...base, type: "text", secret: false };
 	}
 
 	return null;

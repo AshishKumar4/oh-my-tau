@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
-import type { ServiceTier, Usage } from "@oh-my-pi/pi-ai";
+import { parseServiceTier, type Usage } from "@oh-my-pi/pi-ai";
 import { pricingPeerFor } from "@oh-my-pi/pi-catalog/compat/behavior";
 import {
 	calculateUncachedInputCost,
@@ -1169,7 +1169,8 @@ export function insertMessageStats(stats: Iterable<MessageStatsInput>): number {
 		],
 		identity: ["entry_id", "timestamp"],
 		upsert: `ON CONFLICT(session_file, entry_id) DO UPDATE SET
-			premium_requests = MAX(messages.premium_requests, excluded.premium_requests),
+			premium_requests = CASE WHEN excluded.service_tier IS NOT NULL THEN excluded.premium_requests
+				ELSE MAX(messages.premium_requests, excluded.premium_requests) END,
 			cost_input = excluded.cost_input,
 			cost_output = excluded.cost_output,
 			cost_cache_read = excluded.cost_cache_read,
@@ -1270,7 +1271,7 @@ function rowToMessageStats(row: any): MessageStats {
 			},
 		},
 		agentType: (row.agent_type as AgentType) ?? "main",
-		serviceTier: (row.service_tier as ServiceTier | null) ?? null,
+		serviceTier: typeof row.service_tier === "string" ? (parseServiceTier(row.service_tier) ?? null) : null,
 		costUnpriced: row.cost_unpriced === 1,
 	};
 }

@@ -269,7 +269,11 @@ function extractStats(
 	const servedTier = parseServiceTier(msg.serviceTier);
 	const tier = servedTier ?? resolveModelServiceTier(currentServiceTier, model);
 	const derived =
-		recorded > 0 ? recorded : getPremiumServiceTierRequests(tier, model, { served: servedTier !== undefined });
+		servedTier !== undefined && isFiniteCount(rawUsage.premiumRequests)
+			? rawUsage.premiumRequests
+			: recorded > 0
+				? recorded
+				: getPremiumServiceTierRequests(tier, model, { served: servedTier !== undefined });
 	const wellFormed =
 		isFiniteCount(rawUsage.input) &&
 		isFiniteCount(rawUsage.output) &&

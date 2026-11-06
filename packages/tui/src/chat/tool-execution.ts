@@ -71,7 +71,7 @@ import { compactRows, presentNative, TranscriptPresentationState } from "./trans
 
 /** Resolves the canonical renderer key while retaining the provider's wire name in message history. */
 export function toolRenderName(wireName: string, tool: AgentTool | undefined): string {
-	return tool?.name ?? wireName;
+	return tool?.persistAs ?? tool?.name ?? wireName;
 }
 type DisplaceableToolName = "wait" | "todo";
 
@@ -756,6 +756,15 @@ export class ToolExecutionComponent extends Container {
 		this.#ui.requestRender();
 	}
 
+	renameToolCall(id: string): void {
+		this.#toolCallId = id;
+		this.invalidate();
+	}
+
+	get toolName(): string {
+		return this.#toolName;
+	}
+
 	updateArgs(args: unknown, _toolCallId?: string): void {
 		// Reference-equality short-circuit before any further work. Callers
 		// always allocate a new arg object on each streamed delta (see
@@ -1312,6 +1321,7 @@ export class ToolExecutionComponent extends Container {
 		};
 		const presentation = this.#presentation.draw();
 		const key = [
+			this.#toolCallId,
 			dataFirst,
 			this.#resultVersion,
 			this.#toolCallId,

@@ -49,7 +49,7 @@ import { type ComposerPreviewStatusSource, ComposerShapePreview } from "./compos
 import { getComposerShapeOptions } from "./composer-shape-registry";
 import { bottomBorder, divider, row, topBorder } from "../chrome/overlay-box";
 import { PluginSettingsComponent, type PluginSettingsHost } from "./plugin-settings";
-import { getSettingDef, getSettingsForTab, type SettingDef } from "./settings-defs";
+import { getSettingDef, getSettingsForTab, type ProviderChoiceSettingDef, type SettingDef } from "./settings-defs";
 import { SnapcompactShapePreview } from "./snapcompact-shape-preview";
 import { themePickerOptions } from "./theme-selector";
 import type { SelectPickerOptions } from "../native/picker";
@@ -500,18 +500,18 @@ class ProviderLimitsSubmenu extends Container {
 					return undefined;
 				},
 				onSubmit: value => {
-					const next = { ...limits };
 					const trimmed = value.trim();
-					if (trimmed === "") {
-						delete next[provider];
-					} else {
-						const limit = Number(trimmed);
+					let limit: number | undefined;
+					if (trimmed !== "") {
+						limit = Number(trimmed);
 						if (!Number.isFinite(limit) || limit <= 0) throw new Error("Limit must be a positive number.");
-						next[provider] = Math.max(1, Math.floor(limit));
+						limit = Math.max(1, Math.floor(limit));
 					}
-					const normalized = this.#settings.validateProviderLimits(next);
-					this.#settings.set("providers.maxInFlightRequests", normalized);
-					this.#onChange(normalized);
+					// One entry only: the merged view also holds project-level limits.
+					this.#settings.setEntry("providers.maxInFlightRequests", provider, limit);
+					this.#onChange(
+						this.#settings.normalizeProviderLimits(this.#settings.get("providers.maxInFlightRequests")),
+					);
 					this.#showProviderList();
 					this.#requestRender?.();
 				},
@@ -534,6 +534,119 @@ class ProviderLimitsSubmenu extends Container {
 			return;
 		}
 		this.children[0]?.handleInput?.(data);
+	}
+}
+
+/** A provider-choice record's entries, keeping only values that name one of its options. */
+function providerChoices(def: ProviderChoiceSettingDef, value: unknown): Record<string, string> {
+	const choices: Record<string, string> = {};
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return choices;
+	for (const [provider, choice] of Object.entries(value)) {
+		if (typeof choice === "string" && def.options.some(option => option.value === choice)) {
+			choices[provider] = choice;
+		}
+	}
+	return choices;
+}
+
+/** How a provider's choice reads; a provider without an entry shows the default, marked as such. */
+function choiceLabel(def: ProviderChoiceSettingDef, choice: string | undefined): string {
+	const label = def.options.find(option => option.value === (choice ?? def.defaultOption))?.label ?? def.defaultOption;
+	return choice === undefined ? `${label} (default)` : label;
+}
+
+/** Edits a provider-choice record: pick a provider, then one of the setting's options. */
+class ProviderChoiceSubmenu extends Container {
+	#field: SelectFormField;
+	readonly #def: ProviderChoiceSettingDef;
+	readonly #settings: SettingsHost;
+	readonly #providers: readonly string[];
+	readonly #onChange: (value: Record<string, string>) => void;
+	readonly #onCancel: () => void;
+	readonly #requestRender: (() => void) | undefined;
+
+	constructor(
+		def: ProviderChoiceSettingDef,
+		settings: SettingsHost,
+		providers: readonly string[],
+		onChange: (value: Record<string, string>) => void,
+		onCancel: () => void,
+		requestRender?: () => void,
+	) {
+		super();
+		this.#def = def;
+		this.#settings = settings;
+		this.#providers = providers;
+		this.#onChange = onChange;
+		this.#onCancel = onCancel;
+		this.#requestRender = requestRender;
+		this.#field = this.#providerList();
+		this.addChild(this.#field);
+	}
+
+	#choices(): Record<string, string> {
+		return providerChoices(this.#def, this.#settings.get(this.#def.path));
+	}
+
+	#show(field: SelectFormField): void {
+		this.clear();
+		this.#field = field;
+		this.addChild(field);
+		this.#requestRender?.();
+	}
+
+	#providerList(): SelectFormField {
+		const choices = this.#choices();
+		const providers = [...new Set([...this.#providers, ...Object.keys(choices)])].sort((a, b) => a.localeCompare(b));
+		return new SelectFormField({
+			theme: formTheme,
+			label: this.#def.label,
+			description: this.#def.description,
+			items: providers.map(provider => {
+				const choice = choices[provider];
+				return {
+					value: provider,
+					label: provider,
+					description: choiceLabel(this.#def, choice),
+				};
+			}),
+			maxVisible: 12,
+			selectTheme: getSelectListTheme(),
+			hint: `  ${editorKey("tui.select.confirm")} to choose · ${editorKey("tui.select.cancel")} to go back`,
+			onSubmit: provider => this.#show(this.#choiceList(provider)),
+			onCancel: this.#onCancel,
+			requestRender: this.#requestRender,
+		});
+	}
+
+	#choiceList(provider: string): SelectFormField {
+		return new SelectFormField({
+			theme: formTheme,
+			label: `${this.#def.label}: ${provider}`,
+			items: this.#def.options.map(option => ({
+				value: option.value,
+				label: option.label,
+				description: option.description,
+			})),
+			currentValue: this.#choices()[provider] ?? this.#def.defaultOption,
+			selectTheme: getSelectListTheme(),
+			hint: `  ${editorKey("tui.select.confirm")} to save · ${editorKey("tui.select.cancel")} to go back`,
+			onSubmit: choice => {
+				// The default is what an unlisted provider gets, so choosing it removes the entry.
+				this.#settings.setEntry(this.#def.path, provider, choice === this.#def.defaultOption ? undefined : choice);
+				this.#onChange(this.#choices());
+			},
+			onCancel: () => this.#show(this.#providerList()),
+			requestRender: this.#requestRender,
+		});
+	}
+
+	routeMouse(event: SgrMouseEvent, line: number, col: number): void {
+		this.#field.routeMouse(event, line, col);
+	}
+
+	handleInput(data: string): void {
+		this.#field.handleInput(data);
 	}
 }
 
@@ -960,6 +1073,7 @@ export class SettingsSelectorComponent implements Component {
 					mono: !def.secret && MONO_TEXT_SETTING.test(def.path) ? true : undefined,
 				};
 			case "providerLimits":
+			case "providerChoice":
 				return { k: "action", label: "Edit…", act: "edit" };
 			case "multiselect":
 				return {
@@ -983,6 +1097,8 @@ export class SettingsSelectorComponent implements Component {
 			}
 			case "multiselect":
 				return this.#formatMultiSelectValue(def, value);
+			case "providerChoice":
+				return this.#formatProviderChoiceValue(def, value);
 			case "text":
 				return def.secret ? "" : this.#formatTextInputEditValue(def.path, value);
 			default:
@@ -1122,6 +1238,7 @@ export class SettingsSelectorComponent implements Component {
 				return;
 			}
 			case "providerLimits":
+			case "providerChoice":
 				return;
 		}
 	}
@@ -1524,6 +1641,24 @@ export class SettingsSelectorComponent implements Component {
 					submenu: (_cv, done) => this.#createProviderLimitsInput(done),
 				};
 
+			case "providerChoice":
+				return {
+					...item,
+					currentValue: this.#formatProviderChoiceValue(def, currentValue),
+					submenu: (_cv, done) =>
+						new ProviderChoiceSubmenu(
+							def,
+							this.#context.settings,
+							this.#context.providers,
+							value => {
+								this.#callbacks.onChange(def.path, value);
+								done(this.#formatProviderChoiceValue(def, value));
+							},
+							() => done(),
+							this.#context.requestRender,
+						),
+				};
+
 			case "multiselect":
 				return {
 					...item,
@@ -1531,6 +1666,13 @@ export class SettingsSelectorComponent implements Component {
 					submenu: (_cv, done) => this.#createMultiSelect(def, done),
 				};
 		}
+	}
+
+	/** The providers with a non-default choice (`anthropic: API keys first`), else the default for all. */
+	#formatProviderChoiceValue(def: ProviderChoiceSettingDef, value: unknown): string {
+		const entries = Object.entries(providerChoices(def, value)).sort(([a], [b]) => a.localeCompare(b));
+		if (entries.length === 0) return choiceLabel(def, undefined);
+		return entries.map(([provider, choice]) => `${provider}: ${choiceLabel(def, choice)}`).join(", ");
 	}
 
 	/**
@@ -1541,14 +1683,8 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	#isChanged(def: SettingDef, currentValue: unknown): boolean {
-		const defaultValue: unknown = def.defaultValue;
-		if (Array.isArray(currentValue) && Array.isArray(defaultValue)) {
-			return (
-				currentValue.length !== defaultValue.length ||
-				currentValue.some((entry, index) => entry !== defaultValue[index])
-			);
-		}
-		return !Object.is(currentValue, defaultValue);
+		// Structural: array and record values reach here as copies of their default, never the same object.
+		return !Bun.deepEquals(currentValue, def.defaultValue);
 	}
 
 	#getSubmenuCurrentValue(path: string, value: unknown): string {
@@ -1801,9 +1937,6 @@ export class SettingsSelectorComponent implements Component {
 			}
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 				throw new Error(`Invalid record JSON for ${path}`);
-			}
-			if (path === "providers.maxInFlightRequests") {
-				parsed = this.#context.settings.validateProviderLimits(parsed);
 			}
 			this.#context.settings.set(path, parsed);
 		} else if (typeof currentValue === "number") {

@@ -5,6 +5,12 @@ import type { JobWidgetEntry } from "../tools/job-widget";
 import type { CompactionBoundaries } from "./context-usage";
 import type { StatusLineSettings, StatusResetExpiry } from "./types";
 
+/** Preformatted prompt-cache health candidates, widest-first. */
+export interface PromptCacheHealthText {
+	readonly full: string;
+	readonly compact?: string;
+}
+
 export interface StatusAccountIdentity {
 	accountId?: string;
 	email?: string;
@@ -109,6 +115,12 @@ export interface StatusLineSession {
 	/** Widgets of the running background jobs, in job order; the jobs segment appends the freshest one's glance. */
 	getRunningJobWidgets?(): readonly JobWidgetEntry[];
 	getGoalModeState(): { goal?: { status: string; tokensUsed: number; tokenBudget?: number } } | undefined;
+	/**
+	 * Preformatted prompt-cache health readout for the status-line gauge, or
+	 * `undefined` when unavailable. Supplied by the host: cache accounting
+	 * lives in the agent session, which pi-tui must not import.
+	 */
+	promptCacheHealthText?: () => PromptCacheHealthText | undefined;
 	getAdvisorStatusOverview?(): { configured: boolean; advisors: readonly { status: string; yielded: boolean }[] };
 	getAdvisorCost?(): number;
 	isAdvisorUsingSubscription?(): boolean;
@@ -145,6 +157,8 @@ export interface StatusLineHost<TSession extends StatusLineSession = StatusLineS
 	getSessionSettingsIdentity(session: TSession): unknown;
 	getSessionSettingsRevision(session: TSession): number;
 	goalStatusInFooter(session: TSession): boolean;
+	/** Fusion sidekick selector ("provider/id") paired with `session`'s lead, or undefined while Fusion is off. */
+	fusionSidekick?(session: TSession): string | undefined;
 	activeAccount(session: TSession, provider: string): StatusAccountIdentity | undefined;
 	canFetchUsageReports(session: TSession): boolean;
 	fetchUsageReports(session: TSession, signal: AbortSignal): Promise<unknown>;

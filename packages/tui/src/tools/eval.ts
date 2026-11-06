@@ -153,6 +153,8 @@ interface EvalRenderCellArg {
 }
 
 interface EvalRenderArgs extends EvalRenderCellArg {
+	/** Codex `exec` tool payload: a single JS source string. */
+	input?: string;
 	cells?: EvalRenderCellArg[];
 	__partialJson?: string;
 }
@@ -177,7 +179,13 @@ function normalizeRenderLanguage(value: string | undefined): EvalLanguage {
 
 function getRenderCells(args: EvalRenderArgs | undefined): EvalRenderCell[] {
 	if (!args) return [];
-	const raw = Array.isArray(args.cells) ? args.cells : typeof args.code === "string" ? [args] : [];
+	const raw = Array.isArray(args.cells)
+		? args.cells
+		: typeof args.code === "string"
+			? [args]
+			: typeof args.input === "string"
+				? [{ language: "js", code: args.input }]
+				: [];
 	const out: EvalRenderCell[] = [];
 	for (const cell of raw) {
 		if (!cell || typeof cell !== "object") continue;

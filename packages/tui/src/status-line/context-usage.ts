@@ -4,14 +4,15 @@ import { effectiveReserveTokens, resolveThresholdTokens } from "@oh-my-pi/pi-age
 import type { Tool as AiTool, Model } from "@oh-my-pi/pi-ai";
 import { renderToolExamples } from "@oh-my-pi/pi-ai/dialect";
 import { stripSchemaDescriptions, toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import type { PromptCacheHealthText } from "./host";
 
-interface ContextSkill {
+export interface ContextSkill {
 	readonly name: string;
 	readonly description?: string;
 	readonly hide?: boolean;
 }
 
-type ContextTool = Pick<AiTool, "name" | "description" | "parameters" | "examples">;
+export type ContextTool = Pick<AiTool, "name" | "description" | "parameters" | "examples">;
 
 /** Savings computed by the host's inline-image planner, not by the renderer. */
 export interface ContextSavingsEstimate {
@@ -135,6 +136,8 @@ export interface NonMessageTokenSource {
 		prunesToolDescriptions?(model: Model | undefined): boolean;
 	};
 	readonly skills?: readonly ContextSkill[];
+	/** Reference to the served vendor prompt when block 0 carries it, for skills-subtraction placement. */
+	readonly vendorPromptRef?: { readonly text: string };
 	/** Provider-facing, session-frozen descriptions when available. */
 	readonly renderedSkills?: readonly ContextSkill[];
 }
@@ -328,8 +331,9 @@ export function estimateContextToolSchemaTokens(
 
 /**
  * Compute just the NON-MESSAGE token total: system prompt (with its skills
- * section subtracted, since skills are tokenized separately) + system context
- * (the rest of the system-prompt array) + tools + skills.
+ * section subtracted from whichever block carries it, since skills are
+ * tokenized separately) + system context (the rest of the system-prompt
+ * array) + tools + skills.
  *
  * Exposed so callers like `StatusLineComponent` can cache the non-message
  * total separately from the growing message total. A model switch can change
@@ -351,6 +355,9 @@ interface NonMessageTokenCache {
 	// The Agent swaps its Tokenizer instance when the model's encoding changes,
 	// so instance identity doubles as the encoding key.
 	tokenizerRef: Tokenizer;
+	// Which block carries the skills listing depends on whether block 0 is a
+	// served vendor prompt; the reference object is stable per profile.
+	vendorPromptRef: { readonly text: string } | undefined;
 	tokens: number | undefined;
 	breakdown:
 		| {
@@ -380,6 +387,7 @@ function nonMessageTokenCacheEntry(
 	const pruneToolDescriptions = session.agent?.prunesToolDescriptions?.(session.model) === true;
 	const toolsRevision = getToolSchemaMetadataRevision(toolsRef);
 	const skillsRef = session.renderedSkills ?? session.skills ?? EMPTY_SKILLS;
+	const vendorPromptRef = session.vendorPromptRef;
 	let entry = cachedSession[NON_MESSAGE_TOKEN_CACHE];
 	if (
 		entry &&
@@ -390,7 +398,8 @@ function nonMessageTokenCacheEntry(
 		entry.toolsRevision === toolsRevision &&
 		entry.sourceRevision === sourceRevision &&
 		entry.skillsRef === skillsRef &&
-		entry.tokenizerRef === tokenizer
+		entry.tokenizerRef === tokenizer &&
+		entry.vendorPromptRef === vendorPromptRef
 	) {
 		return entry;
 	}
@@ -404,11 +413,121 @@ function nonMessageTokenCacheEntry(
 		skillful: true,
 		skillsRef,
 		tokenizerRef: tokenizer,
+		vendorPromptRef,
 		tokens: undefined,
 		breakdown: undefined,
 	};
 	cachedSession[NON_MESSAGE_TOKEN_CACHE] = entry;
 	return entry;
+}
+
+/** One per-request usage sample for cache-health accounting. */
+export interface PromptCacheSample {
+	requests?: number;
+	input: number;
+	cacheRead: number;
+	cacheWrite: number;
+}
+
+// Alpha 0.3 tracks a step change to ~83% within 5 turns while a single cold
+// miss moves the readout by less than a third, so the legitimately-low first
+// request stops dominating after a handful of turns without hiding re-writes.
+export const PROMPT_CACHE_HEALTH_EMA_ALPHA = 0.3;
+// Below 5 samples the EMA is still turn-1 dominated and nearest-rank P95 is
+// provably the max, so the indicator holds a placeholder instead of a number.
+export const PROMPT_CACHE_HEALTH_MIN_SAMPLES = 5;
+
+export function promptCacheHitRatio(sample: PromptCacheSample): number | undefined {
+	const total = sample.cacheRead + sample.cacheWrite + sample.input;
+	if (!(total > 0)) return undefined;
+	return sample.cacheRead / total;
+}
+
+export function promptCacheEma(ratios: readonly number[]): number | undefined {
+	let ema: number | undefined;
+	for (const ratio of ratios) {
+		ema =
+			ema === undefined ? ratio : PROMPT_CACHE_HEALTH_EMA_ALPHA * ratio + (1 - PROMPT_CACHE_HEALTH_EMA_ALPHA) * ema;
+	}
+	return ema;
+}
+
+export function promptCacheP95(ratios: readonly number[]): number | undefined {
+	if (ratios.length === 0) return undefined;
+	const sorted = [...ratios].sort((a, b) => a - b);
+	return sorted[Math.min(sorted.length - 1, Math.ceil(0.95 * sorted.length) - 1)];
+}
+
+export interface PromptCacheHealth {
+	// Valid per-request ratios seen, counting every request including ratios that
+	// have since aged out of the retained P95 window below.
+	samples: number;
+	// EMA(0.3) over arrival-order per-request ratios. Each request counts once no
+	// matter its size, unlike HarnessCacheStats.hitPct which weights by tokens;
+	// the TUI indicator shows this per-request view, not the token-weighted one.
+	ema: number;
+	// Nearest-rank P95 over the retained window (the last
+	// PROMPT_CACHE_HEALTH_RING_SIZE valid requests), not all time. Undefined
+	// below the sample floor so the indicator can hold its placeholder.
+	p95: number | undefined;
+}
+
+export function promptCacheHealth(samples: readonly PromptCacheSample[]): PromptCacheHealth | undefined {
+	const ratios: number[] = [];
+	for (const sample of samples) {
+		const ratio = promptCacheHitRatio(sample);
+		if (ratio !== undefined) ratios.push(ratio);
+	}
+	const ema = promptCacheEma(ratios);
+	if (ema === undefined) return undefined;
+	return {
+		samples: ratios.length,
+		ema,
+		p95: ratios.length >= PROMPT_CACHE_HEALTH_MIN_SAMPLES ? promptCacheP95(ratios) : undefined,
+	};
+}
+
+export function promptCacheSamplesFromMessages(messages: readonly AgentMessage[]): PromptCacheSample[] {
+	const samples: PromptCacheSample[] = [];
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		const usage = message.usage;
+		if (!usage) continue;
+		samples.push(usage);
+	}
+	return samples;
+}
+
+export type PromptCacheHealthBody =
+	| { kind: "ready"; full: string; compact: string }
+	| { kind: "warming"; body: string };
+
+export function formatPromptCacheHealth(health: PromptCacheHealth): PromptCacheHealthBody {
+	if (health.p95 === undefined) return { kind: "warming", body: "cache …" };
+	const ema = Math.round(health.ema * 100);
+	const p95 = Math.round(health.p95 * 100);
+	return { kind: "ready", full: `cache ${ema}% ema / ${p95}% p95`, compact: `cache ${ema}/${p95}` };
+}
+
+// P95 retains the last 100 valid per-request ratios. Nearest-rank P95 needs at
+// least 20 samples to resolve below the max (ceil(0.95N) < N), so 100 ranks a
+// full window on its 6th-largest ratio instead of an outlier. 100 doubles bound
+// render work to a short constant sort however long the session grows, and the
+// EMA has forgotten older requests by then anyway (a sample 20 back weighs
+// 0.3*0.7^19, under a tenth of a percent), so the window covers the same
+// effective horizon the EMA still responds to.
+export const PROMPT_CACHE_HEALTH_RING_SIZE = 100;
+
+/**
+ * Preformatted prompt-cache health text for the status-line gauge, from raw
+ * messages. Pure helper so the component can bind any host session's message
+ * feed without importing agent-session accounting.
+ */
+export function promptCacheHealthTextOfMessages(messages: readonly AgentMessage[]): PromptCacheHealthText | undefined {
+	const health = promptCacheHealth(promptCacheSamplesFromMessages(messages));
+	if (!health) return undefined;
+	const body = formatPromptCacheHealth(health);
+	return body.kind === "ready" ? { full: body.full, compact: body.compact } : { full: body.body };
 }
 
 export function computeNonMessageTokens(
@@ -462,8 +581,14 @@ export function computeNonMessageBreakdown(
 		pruneDescriptions: entry.pruneToolDescriptions,
 	});
 	const systemPromptParts = session.systemPrompt ?? EMPTY_STRING_PARTS;
-	const systemContextTokens = tokenizer.countTokens(Array.from(systemPromptParts.slice(1), part => part ?? ""));
-	const systemPromptTokens = Math.max(0, tokenizer.countTokens(systemPromptParts[0] ?? "") - skillsTokens);
+	const leadTokens = tokenizer.countTokens(systemPromptParts[0] ?? "");
+	const restTokens = tokenizer.countTokens(Array.from(systemPromptParts.slice(1), part => part ?? ""));
+	// Under a harness profile the vendor prompt is served as block 0 and omp's
+	// own template — the block carrying the skills listing — moves to block 1,
+	// so the subtraction has to follow it. The host supplies the reference.
+	const vendorLead = entry.vendorPromptRef !== undefined && systemPromptParts[0] === entry.vendorPromptRef.text;
+	const systemPromptTokens = vendorLead ? leadTokens : Math.max(0, leadTokens - skillsTokens);
+	const systemContextTokens = vendorLead ? Math.max(0, restTokens - skillsTokens) : restTokens;
 	const breakdown = { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens };
 	entry.skillful = skillful;
 	entry.breakdown = breakdown;
