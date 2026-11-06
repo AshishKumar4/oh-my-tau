@@ -58,6 +58,7 @@ function revivalParent(cwd: string): AgentSession {
 			configuredLevel: "user",
 		},
 		preparedExtensions: [],
+		getSessionAgents: () => [],
 	} as unknown as AgentSession;
 }
 

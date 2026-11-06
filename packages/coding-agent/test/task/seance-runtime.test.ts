@@ -114,6 +114,7 @@ function revivalParent(cwd: string, preparedExtensions: PreparedExtension[]): Ag
 			configuredLevel: "user",
 		},
 		preparedExtensions,
+		getSessionAgents: () => [],
 	} as unknown as AgentSession;
 }
 

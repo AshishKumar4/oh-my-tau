@@ -191,6 +191,7 @@ it("revives a subagent a crash cut off mid tool call, does not run the call agai
 		sendCustomMessage: async () => true,
 		effectiveExtensionRoots: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
 		preparedExtensions: undefined,
+		getSessionAgents: () => [],
 	} as unknown as AgentSession;
 	AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
 		createPersistedSubagentReviverFactory({ session, authStorage, modelRegistry, settings, enableLsp: false }),
