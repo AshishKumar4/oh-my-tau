@@ -17,7 +17,6 @@ import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import { resolveCodeMode } from "../src/session/code-mode";
 import { SessionManager } from "../src/session/session-manager";
-import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
 
 import { cfgEvalJs } from "@oh-my-pi/pi-coding-agent/eval/settings";
 import { cfgProvidersOpenaiCodexCodeMode } from "@oh-my-pi/pi-coding-agent/session/settings";

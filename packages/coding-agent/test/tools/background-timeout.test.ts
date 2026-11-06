@@ -238,4 +238,3 @@ describe("EvalTool background deadlines", () => {
 		expect(result.content.some(block => block.type === "text" && block.text.includes("timed out"))).toBe(true);
 	});
 });
-
