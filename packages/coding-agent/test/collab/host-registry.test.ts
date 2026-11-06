@@ -27,6 +27,9 @@ import * as registry from "@oh-my-pi/pi-coding-agent/collab/registry";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -186,22 +189,29 @@ describe("collab host registry lifecycle (#6099)", () => {
 				},
 				streamFn: createMockModel({ responses: [{ content: ["Must not run"] }] }).stream,
 			});
+			const reached = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				api =>
+					api.on("before_agent_start", async () => {
+						reached.resolve();
+						await release.promise;
+					}),
+				manager.getCwd(),
+				new EventBus(),
+				runtime,
+				"collab-admission",
+			);
 			const session = new AgentSession({
 				agent,
 				sessionManager: manager,
 				settings: Settings.isolated({ "compaction.enabled": false }),
 				modelRegistry: models,
+				extensionRunner: new ExtensionRunner([extension], runtime, manager.getCwd(), manager, models),
 			});
 			const { ctx } = makeHostContext();
-			const reached = Promise.withResolvers<void>();
-			const release = Promise.withResolvers<void>();
 			const completed = Promise.withResolvers<boolean>();
-			const getApiKey = models.getApiKey.bind(models);
-			const keyLookup = spyOn(models, "getApiKey").mockImplementation(async (...args) => {
-				reached.resolve();
-				await release.promise;
-				return getApiKey(...args);
-			});
 			const prompt = session.promptCustomMessage.bind(session);
 			const submission = spyOn(session, "promptCustomMessage").mockImplementation(async (...args) => {
 				const result = await prompt(...args);
@@ -249,7 +259,6 @@ describe("collab host registry lifecycle (#6099)", () => {
 			} finally {
 				release.resolve();
 				await host?.stop("test cleanup");
-				keyLookup.mockRestore();
 				submission.mockRestore();
 				await session.dispose();
 				auth.close();

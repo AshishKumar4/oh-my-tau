@@ -21,7 +21,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
-import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
+import { formatDuration, formatPercent, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { getActiveProfile, getConfigDirName } from "@oh-my-pi/pi-utils/dirs";
 import { classifyTerminalMultiplexer } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
@@ -40,6 +40,8 @@ import {
 	seedAlreadyExists,
 	summarizeMentalModel,
 } from "../../hindsight";
+import { servedHarnessPrompt } from "../../harness/capture";
+import { effectiveHarnessProfile } from "../../harness/effective-profile";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../../memory-backend";
 import { BashExecutionComponent, bashPtyViewport } from "@oh-my-pi/pi-tui/chat/bash-execution";
 import { appKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
@@ -65,6 +67,7 @@ import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import { buildJobTree, jobTreeGuide, jobTreeIndent } from "@oh-my-pi/pi-tui/overlays/job-tree";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
+import { promptTokenTotal } from "../../session/prompt-cache-stats";
 import {
 	currentRuntimeIdentity,
 	formatRuntimeIdentity,
@@ -92,7 +95,7 @@ import { resolveTernPane } from "../../tools/browser/tern/kind";
 import { TernError, type TernErrorKind, TernSocketClient } from "../../tools/browser/tern/wire";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
-import { replaceTabs, shortenEmbeddedPaths, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
+import { replaceTabs, shortenEmbeddedPaths, shortenPath, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 import {
 	getChangelogPath,
 	parseChangelog,
@@ -618,6 +621,10 @@ export class CommandController {
 				providerSessionState: this.ctx.session.providerSessionState,
 			});
 			info += renderProviderSection(providerDetails, theme);
+			const harness = servedHarnessPrompt(model, effectiveHarnessProfile(this.ctx.session.settings, model) ?? null);
+			if (harness !== undefined) {
+				info += `${theme.fg("dim", "Harness Prompt:")} ${replaceTabs(sanitizeText(shortenPath(harness.path)))} ${theme.fg("dim", `(${replaceTabs(sanitizeText(harness.clientVersion))})`)}\n`;
+			}
 			if (stats.routedModels !== undefined) {
 				const routed = Object.entries(stats.routedModels)
 					.sort(([aId, aCount], [bId, bCount]) => bCount - aCount || aId.localeCompare(bId))
@@ -663,6 +670,12 @@ export class CommandController {
 			info += `${theme.fg("dim", "Cache Write:")} ${stats.tokens.cacheWrite.toLocaleString()}\n`;
 		}
 		info += `${theme.fg("dim", "Total:")} ${stats.tokens.total.toLocaleString()}\n`;
+		if (stats.promptCacheByHarness !== undefined) {
+			for (const [label, entry] of Object.entries(stats.promptCacheByHarness)) {
+				const prompt = promptTokenTotal(entry);
+				info += `${theme.fg("dim", `Cache Hit (${label}):`)} ${formatPercent(entry.hitPct / 100)} ${theme.fg("dim", `${entry.cacheRead.toLocaleString()}/${prompt.toLocaleString()} over ${entry.requests.toLocaleString()} req`)}\n`;
+			}
+		}
 
 		const cacheStatus = this.ctx.session.getPromptCacheStatus();
 		if (cacheStatus) {

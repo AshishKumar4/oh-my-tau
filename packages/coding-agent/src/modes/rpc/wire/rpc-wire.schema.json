@@ -3205,6 +3205,14 @@
 					},
 					"description": "Failed edits by the engine's `errorKind`."
 				},
+				"promptCacheByHarness": {
+					"type": "object",
+					"properties": {},
+					"additionalProperties": {
+						"$ref": "#/$defs/HarnessCacheStats"
+					},
+					"description": "Prompt-cache totals per harness profile that served this session's requests."
+				},
 				"contextUsage": {
 					"$ref": "#/$defs/ContextUsage"
 				}
@@ -3219,6 +3227,34 @@
 				"tokens",
 				"premiumRequests",
 				"cost"
+			]
+		},
+		"HarnessCacheStats": {
+			"type": "object",
+			"properties": {
+				"requests": {
+					"type": "integer"
+				},
+				"input": {
+					"type": "integer"
+				},
+				"cacheRead": {
+					"type": "integer"
+				},
+				"cacheWrite": {
+					"type": "integer"
+				},
+				"hitPct": {
+					"type": "number",
+					"description": "Cache-read tokens over all prompt tokens, as a percentage, weighted by tokens."
+				}
+			},
+			"required": [
+				"requests",
+				"input",
+				"cacheRead",
+				"cacheWrite",
+				"hitPct"
 			]
 		},
 		"MessagesPage": {
@@ -3650,7 +3686,8 @@
 				"remote",
 				"handoff",
 				"shake",
-				"snapcompact"
+				"snapcompact",
+				"rewrite"
 			],
 			"type": "string"
 		},

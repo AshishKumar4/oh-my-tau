@@ -2,6 +2,11 @@ import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-p
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, UsageReport } from "@oh-my-pi/pi-ai";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
+import type {
+	ANTHROPIC_WORKSPACES_URL as AnthropicWorkspacesUrl,
+	resolveAnthropicKeyWorkspace as ResolveAnthropicKeyWorkspace,
+} from "@oh-my-pi/pi-ai/registry/api-key-validation";
+import { maskApiKey } from "@oh-my-pi/pi-ai/auth-storage";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
 import { Loader, Spacer, Text } from "@oh-my-pi/pi-tui";
@@ -37,7 +42,7 @@ import {
 import { resolveAdvisorRoleSelection, resolveModelRoleValue } from "../../config/model-resolver";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { getRoleInfo } from "../../config/model-roles";
-import { settings } from "../../config/settings";
+import { type SettingProvenance, type Settings, settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import { createPluginSettingsHost } from "../../extensibility/plugins/settings-host";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -102,7 +107,7 @@ import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { getAssistantMessageLinkTargets } from "@oh-my-pi/pi-tui/prompt/interactive-context-helpers";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "@oh-my-pi/pi-tui/overlays/advisor-config";
-import { createAgentsHubDeps } from "../agents-hub-deps";
+import { createAgentsHubDeps, loadRoleAgents } from "../agents-hub-deps";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { collapseSharedUsageReports } from "@oh-my-pi/pi-tui/overlays/usage-display";
 import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
@@ -153,14 +158,25 @@ import { cfgTaskAgentModelOverrides } from "../../task/settings";
 
 /** First-use boundary for provider auth catalog and dialog components. */
 async function loadProviderAuthUi() {
-	const [{ PASTE_CODE_LOGIN_PROVIDERS }, oauth, loginDialog, logoutSelector, oauthSelector] = await Promise.all([
+	const [
+		{ buildAnthropicAuthConfig, PASTE_CODE_LOGIN_PROVIDERS },
+		{ ANTHROPIC_WORKSPACES_URL, resolveAnthropicKeyWorkspace },
+		oauth,
+		loginDialog,
+		logoutSelector,
+		oauthSelector,
+	] = await Promise.all([
 		import("@oh-my-pi/pi-ai"),
+		import("@oh-my-pi/pi-ai/registry/api-key-validation"),
 		import("@oh-my-pi/pi-ai/oauth"),
 		import("@oh-my-pi/pi-tui/overlays/login-dialog"),
 		import("@oh-my-pi/pi-tui/overlays/logout-account-selector"),
 		import("@oh-my-pi/pi-tui/overlays/oauth-selector"),
 	]);
 	return {
+		ANTHROPIC_WORKSPACES_URL,
+		buildAnthropicAuthConfig,
+		resolveAnthropicKeyWorkspace,
 		PASTE_CODE_LOGIN_PROVIDERS,
 		getOAuthProviders: oauth.getOAuthProviders,
 		getOAuthCredentialProvider: oauth.getOAuthCredentialProvider,
@@ -168,6 +184,37 @@ async function loadProviderAuthUi() {
 		LogoutAccountSelectorComponent: logoutSelector.LogoutAccountSelectorComponent,
 		OAuthSelectorComponent: oauthSelector.OAuthSelectorComponent,
 	};
+}
+
+const LOGIN_WITH_BROWSER = "Sign in with browser";
+const LOGIN_WITH_API_KEY = "Add API key";
+
+const SHADOWING_ROLE_SOURCE: Record<Exclude<SettingProvenance, "global" | "default">, string> = {
+	env: "an environment variable",
+	runtime: "a runtime override (CLI flag)",
+	overlay: "a --config overlay",
+	project: "this project's settings (.omp/config.yml)",
+};
+
+/**
+ * A role assignment written to one settings layer can stay invisible because a
+ * higher layer still sets the role (e.g. a project `.omp/config.yml` pin under
+ * global role storage). Returns the warning to show instead of a success
+ * status, or undefined when the assigned value is what now applies.
+ */
+export function shadowedModelRoleNotice(
+	roleSettings: Settings,
+	role: string,
+	assigned: string,
+	roleLabel: string,
+): string | undefined {
+	const effective = roleSettings.getModelRole(role);
+	if (effective === assigned) return undefined;
+	const provenance = roleSettings.getModelRoleProvenance(role);
+	if (provenance === "global" || provenance === "default") return undefined;
+	const hint =
+		provenance === "project" ? " Remove it there, or set modelRoleStorage: project to assign per project." : "";
+	return `${roleLabel} saved as ${assigned}, but ${SHADOWING_ROLE_SOURCE[provenance]} still sets it to ${effective ?? "none"} here.${hint}`;
 }
 
 /** Menus that open at most once: a repeat request focuses the open one. */
@@ -1014,9 +1061,10 @@ export class SelectorController {
 								this.ctx.settings.setModelRole(role, modelRoleValue);
 							}
 							const roleInfo = getRoleInfo(role, settings);
-							this.ctx.showStatus(
-								`${scopeLabel}${roleInfo?.tag ?? roleInfo?.name ?? role} model: ${selector ?? model.id}`,
-							);
+							const roleLabel = `${scopeLabel}${roleInfo?.tag ?? roleInfo?.name ?? role} model`;
+							const shadowed = shadowedModelRoleNotice(this.ctx.settings, role, modelRoleValue, roleLabel);
+							if (shadowed) this.ctx.showWarning(shadowed);
+							else this.ctx.showStatus(`${roleLabel}: ${selector ?? model.id}`);
 						}
 						return true;
 					} catch (error) {
@@ -1205,6 +1253,7 @@ export class SelectorController {
 				currentSelector: this.ctx.session.model
 					? `${this.ctx.session.model.provider}/${this.ctx.session.model.id}`
 					: undefined,
+				roleAgents: loadRoleAgents(getProjectDir(), this.ctx.settings, this.ctx.session.effectiveExtensionRoots),
 			},
 		);
 		const menu = this.#claimMenu("model-hub");
@@ -1213,7 +1262,7 @@ export class SelectorController {
 
 	/** /login round-trip for a locked provider; reopen the hub on that provider only after a successful login. */
 	async #loginThenReopenModelHub(providerId: string): Promise<void> {
-		const succeeded = await this.#handleOAuthLogin(providerId);
+		const succeeded = await this.#handleProviderLogin(providerId);
 		if (succeeded) {
 			this.#showModelHub({ initialProviderId: providerId });
 		}
@@ -1354,6 +1403,30 @@ export class SelectorController {
 	}
 
 	/**
+	 * Drop the last turn: the esc-esc rewind with the latest user request picked,
+	 * so the old path stays as a branch and the prompt returns to the editor. A
+	 * turn still running stops first, as the first Esc of esc-esc stops it.
+	 */
+	async undoLastTurn(): Promise<void> {
+		if (this.ctx.session.isStreaming) await this.ctx.session.abort();
+		const last = this.ctx.sessionManager
+			.getBranch()
+			.findLast(entry => isTranscriptEntry(entry) && isUserRequestEntry(entry));
+		if (!last) {
+			this.ctx.showStatus("Nothing to undo");
+			return;
+		}
+		await this.#rewindFromTranscript(
+			last.id,
+			() => {
+				this.focusActiveEditorArea();
+				this.ctx.ui.requestRender();
+			},
+			"Dropped the last turn",
+		);
+	}
+
+	/**
 	 * Alternate branches of `entryId`'s turn for the rewind selector's strip:
 	 * every other child of its parent, each unrolled along its most-recent
 	 * descendants (children are timestamp-ordered, so the last child chain is
@@ -1397,7 +1470,7 @@ export class SelectorController {
 	 * closes the fullscreen selector after the transcript is rebuilt so the
 	 * alternate screen never flashes a stale transcript.
 	 */
-	async #rewindFromTranscript(entryId: string, done: () => void): Promise<void> {
+	async #rewindFromTranscript(entryId: string, done: () => void, status = "Rewound to selected point"): Promise<void> {
 		const entry = this.ctx.sessionManager.getEntry(entryId);
 		if (!entry || !isTranscriptEntry(entry)) {
 			done();
@@ -1431,7 +1504,7 @@ export class SelectorController {
 				this.ctx.editor.setDraft(result.editorText, result.editorImages);
 			}
 			done();
-			this.ctx.showStatus("Rewound to selected point");
+			this.ctx.showStatus(status);
 		} catch (error) {
 			done();
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
@@ -2121,17 +2194,12 @@ export class SelectorController {
 	}
 
 	/**
-	 * Run the OAuth login flow for `providerId` inside a cancellable
-	 * {@link LoginDialogComponent} that replaces the editor slot. Esc aborts:
-	 * the dialog's abort signal reaches the provider flow, any pending prompt
-	 * rejects, and the editor is restored immediately. Returns true when
-	 * credentials were stored.
+	 * Mount a cancellable {@link LoginDialogComponent} in the editor slot. Esc
+	 * aborts `dialog.signal`, which rejects any pending prompt, and restores the
+	 * editor immediately; `restoreEditor` restores it when the flow ends.
 	 */
-	async #handleOAuthLogin(providerId: string): Promise<boolean> {
-		this.ctx.showStatus(`Logging in to ${providerId}…`);
-		const { getOAuthCredentialProvider, LoginDialogComponent, PASTE_CODE_LOGIN_PROVIDERS } =
-			await loadProviderAuthUi();
-		const useManualInput = PASTE_CODE_LOGIN_PROVIDERS.has(providerId);
+	async #openLoginDialog(providerId: string): Promise<{ dialog: LoginDialogComponentType; restoreEditor: () => void }> {
+		const { LoginDialogComponent } = await loadProviderAuthUi();
 		let restored = false;
 		const restoreEditor = () => {
 			if (restored) return;
@@ -2146,7 +2214,7 @@ export class SelectorController {
 			providerId,
 			(_success, message) => {
 				// Fires on Esc: unblock the editor immediately; the aborted flow's
-				// rejection settles the awaited login below.
+				// rejection settles the awaited login.
 				restoreEditor();
 				if (message) this.ctx.showStatus(message);
 			},
@@ -2156,6 +2224,119 @@ export class SelectorController {
 		this.ctx.editorContainer.addChild(dialog);
 		this.ctx.ui.setFocus(dialog);
 		this.ctx.ui.requestRender();
+		return { dialog, restoreEditor };
+	}
+
+	/**
+	 * `/login` for one provider. A provider whose API also accepts a plain API key
+	 * first asks what to add: a browser sign-in (subscription) or a key for its key
+	 * pool. Returns true when a credential was stored.
+	 */
+	async #handleProviderLogin(providerId: string): Promise<boolean> {
+		const provider = (await loadProviderAuthUi()).getOAuthProviders().find(entry => entry.id === providerId);
+		if (provider?.acceptsApiKey) {
+			const choice = await this.ctx.showHookSelector(`Log in to ${provider.name}`, [
+				{ label: LOGIN_WITH_BROWSER, description: "Your subscription account" },
+				{ label: LOGIN_WITH_API_KEY, description: "Joins the key pool; keys rotate when one runs out" },
+			]);
+			if (choice === undefined) {
+				this.ctx.showStatus("Login cancelled");
+				return false;
+			}
+			if (choice === LOGIN_WITH_API_KEY) return this.#handleApiKeyLogin(provider.storeCredentialsAs ?? providerId);
+		}
+		return this.#handleOAuthLogin(providerId);
+	}
+
+	/**
+	 * Read one API key through a masked prompt and add it to the provider's key
+	 * pool. An Anthropic key that is not scoped to a workspace also gets the
+	 * workspace its requests name: its only one, a pick among several, or a typed ID.
+	 */
+	async #handleApiKeyLogin(providerId: string): Promise<boolean> {
+		const { dialog, restoreEditor } = await this.#openLoginDialog(providerId);
+		try {
+			const key = (await dialog.showPrompt({ message: `Paste an API key for ${providerId}:`, secret: true })).trim();
+			// Enter and Esc in one input batch: the prompt resolved, then the dialog
+			// was cancelled before this continuation ran. The cancel wins.
+			if (dialog.signal.aborted) return false;
+			if (!key) {
+				this.ctx.showStatus("No API key entered");
+				return false;
+			}
+			let scope: { workspaceId?: string } | undefined = {};
+			if (providerId === "anthropic") {
+				const { ANTHROPIC_WORKSPACES_URL, buildAnthropicAuthConfig, resolveAnthropicKeyWorkspace } =
+					await loadProviderAuthUi();
+				dialog.showProgress("Checking the key…");
+				scope = await resolveAnthropicKeyWorkspace(
+					key,
+					{
+						pick: async workspaces => {
+							// The selector takes the editor slot; the dialog has nothing left to ask.
+							restoreEditor();
+							const idByLabel = new Map(workspaces.map(({ id, name }) => [`${name} (${id})`, id]));
+							const choice = await this.ctx.showHookSelector(
+								"This key is not scoped to a workspace. Pick the one its requests use",
+								[...idByLabel.keys()],
+							);
+							return choice === undefined ? undefined : idByLabel.get(choice);
+						},
+						ask: () =>
+							dialog.showPrompt({
+								message: `This key is not scoped to a workspace and may not list them. Workspace ID (wrkspc_…), from ${ANTHROPIC_WORKSPACES_URL}:`,
+								secret: false,
+							}),
+					},
+					{ baseUrl: buildAnthropicAuthConfig(key).baseUrl, signal: dialog.signal },
+				);
+				if (dialog.signal.aborted) return false;
+			}
+			if (!scope) {
+				this.ctx.showStatus("No workspace chosen; the API key was not added");
+				return false;
+			}
+			const authStorage = this.ctx.session.modelRegistry.authStorage;
+			const pooledBefore = new Set(authStorage.credentials.pooledApiKeys(providerId).map(row => row.id));
+			const row = await authStorage.credentials.addApiKey(providerId, key, scope);
+			await this.ctx.session.modelRegistry.refreshProvider(providerId, "online");
+			const total = authStorage.credentials.pooledApiKeys(providerId).length;
+			const outcome = pooledBefore.has(row.id) ? "updated for" : "added to";
+			const workspace = scope.workspaceId ? `, workspace ${scope.workspaceId}` : "";
+			const block = new TranscriptBlock();
+			block.addChild(
+				new Text(
+					theme.fg(
+						"success",
+						`${theme.status.success} API key ${maskApiKey(key)} ${outcome} ${providerId}${workspace} (${total} pooled key${total === 1 ? "" : "s"})`,
+					),
+					1,
+					0,
+				),
+			);
+			block.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
+			this.ctx.present(block);
+			return true;
+		} catch (error: unknown) {
+			// User-cancelled: the dialog already restored the editor and said so.
+			if (dialog.signal.aborted) return false;
+			this.ctx.showError(`Adding API key failed: ${error instanceof Error ? error.message : String(error)}`);
+			return false;
+		} finally {
+			restoreEditor();
+		}
+	}
+
+	/**
+	 * Run the OAuth login flow for `providerId` inside the login dialog. Esc
+	 * aborts: the dialog's abort signal reaches the provider flow. Returns true
+	 * when credentials were stored.
+	 */
+	async #handleOAuthLogin(providerId: string): Promise<boolean> {
+		this.ctx.showStatus(`Logging in to ${providerId}…`);
+		const { getOAuthCredentialProvider, PASTE_CODE_LOGIN_PROVIDERS } = await loadProviderAuthUi();
+		const useManualInput = PASTE_CODE_LOGIN_PROVIDERS.has(providerId);
+		const { dialog, restoreEditor } = await this.#openLoginDialog(providerId);
 		try {
 			const identity = await this.ctx.session.modelRegistry.authStorage.oauth.login(providerId as OAuthProvider, {
 				signal: dialog.signal,
@@ -2306,7 +2487,7 @@ export class SelectorController {
 	async showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void> {
 		if (providerId) {
 			if (mode === "login") {
-				await this.#handleOAuthLogin(providerId);
+				await this.#handleProviderLogin(providerId);
 			} else {
 				await this.#showOAuthLogoutAccountSelector(providerId);
 			}
@@ -2334,7 +2515,7 @@ export class SelectorController {
 					selector.stopValidation();
 					done();
 					if (mode === "login") {
-						await this.#handleOAuthLogin(selectedProviderId);
+						await this.#handleProviderLogin(selectedProviderId);
 					} else {
 						await this.#showOAuthLogoutAccountSelector(selectedProviderId);
 					}

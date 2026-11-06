@@ -10,7 +10,7 @@ const MESSAGE_ID = doc("string", "Shared by the start, updates, and end of one m
 
 export const eventDefs = {
 	AutoCompactionReason: "'threshold' | 'overflow' | 'idle' | 'incomplete'",
-	AutoCompactionAction: "'context-full' | 'remote' | 'handoff' | 'shake' | 'snapcompact'",
+	AutoCompactionAction: "'context-full' | 'remote' | 'handoff' | 'shake' | 'snapcompact' | 'rewrite'",
 	CacheWarmingPhase: "'streaming' | 'idle'",
 	CacheWarmingOutcome: "'hit' | 'miss' | 'error' | 'aborted'",
 	NotifyType: "'info' | 'warning' | 'error'",

@@ -7,9 +7,12 @@
 import { formatKeyHint } from "@oh-my-pi/pi-tui/key-hint-format";
 import { truncateToWidth } from "@oh-my-pi/pi-tui/utils";
 import { postmortem } from "@oh-my-pi/pi-utils";
+import type { ModelStats } from "@oh-my-pi/omp-stats/shared-types";
+import { formatNumber, formatPercent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { openStandaloneJudge } from "../judgment/standalone";
 import { openTernPage } from "../tools/browser/tern/user-page";
+import { harnessLabel, PromptCacheRollup, promptTokenTotal } from "../session/prompt-cache-stats";
 import { openPath } from "../utils/open";
 
 /**
@@ -96,6 +99,7 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 			console.log(JSON.stringify(await getDashboardStats(), null, 2));
 		} else {
 			await printStatsSummary();
+			printHarnessCacheSummary((await getDashboardStats()).byModel);
 		}
 		return;
 	}
@@ -137,4 +141,26 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 	}
 	// Keep the process alive
 	await new Promise(() => {});
+}
+
+/** Prompt-cache hit rate per harness profile; the cross-package summary knows models, not profiles. */
+function printHarnessCacheSummary(byModel: readonly ModelStats[]): void {
+	const harness = new PromptCacheRollup();
+	for (const m of byModel) {
+		harness.add(harnessLabel(m.provider, m.model), {
+			requests: m.totalRequests,
+			input: m.totalInputTokens,
+			cacheRead: m.totalCacheReadTokens,
+			cacheWrite: m.totalCacheWriteTokens,
+		});
+	}
+	const rows = harness.entries();
+	if (rows.length === 0) return;
+	console.log(chalk.bold("By Harness Profile:"));
+	for (const [label, row] of rows) {
+		console.log(
+			`  ${label}: ${formatPercent(row.hitPct / 100)} cache hit, ${formatNumber(row.requests)} reqs, ${formatNumber(row.cacheRead)} of ${formatNumber(promptTokenTotal(row))} prompt tokens`,
+		);
+	}
+	console.log("");
 }

@@ -263,7 +263,18 @@ export const stateDefs = {
 		"credits?": "SessionCredits",
 		"routedModels?": "Record<string, number>",
 		"editRejections?": doc("Record<string, number>", "Failed edits by the engine's `errorKind`."),
+		"promptCacheByHarness?": doc(
+			"Record<string, HarnessCacheStats>",
+			"Prompt-cache totals per harness profile that served this session's requests.",
+		),
 		"contextUsage?": "ContextUsage",
+	},
+	HarnessCacheStats: {
+		requests: "number.integer",
+		input: "number.integer",
+		cacheRead: "number.integer",
+		cacheWrite: "number.integer",
+		hitPct: doc("number", "Cache-read tokens over all prompt tokens, as a percentage, weighted by tokens."),
 	},
 	MessagesPage: {
 		messages: "AgentMessage[]",

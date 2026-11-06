@@ -146,8 +146,8 @@ _AUTO_COMPACTION_REASON_VALUES: Final[frozenset[str]] = frozenset({"threshold", 
 _decode_auto_compaction_reason = cast("Decoder[AutoCompactionReason]", literal(_AUTO_COMPACTION_REASON_VALUES))
 
 
-AutoCompactionAction: TypeAlias = Literal["context-full", "remote", "handoff", "shake", "snapcompact"]
-_AUTO_COMPACTION_ACTION_VALUES: Final[frozenset[str]] = frozenset({"context-full", "remote", "handoff", "shake", "snapcompact"})
+AutoCompactionAction: TypeAlias = Literal["context-full", "remote", "handoff", "shake", "snapcompact", "rewrite"]
+_AUTO_COMPACTION_ACTION_VALUES: Final[frozenset[str]] = frozenset({"context-full", "remote", "handoff", "shake", "snapcompact", "rewrite"})
 _decode_auto_compaction_action = cast("Decoder[AutoCompactionAction]", literal(_AUTO_COMPACTION_ACTION_VALUES))
 
 
@@ -845,7 +845,19 @@ class SessionStats:
     routed_models: dict[str, float] | None = None
     edit_rejections: dict[str, float] | None = None
     """Failed edits by the engine's `errorKind`."""
+    prompt_cache_by_harness: dict[str, HarnessCacheStats] | None = None
+    """Prompt-cache totals per harness profile that served this session's requests."""
     context_usage: ContextUsage | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class HarnessCacheStats:
+    requests: int
+    input: int
+    cache_read: int
+    cache_write: int
+    hit_pct: float
+    """Cache-read tokens over all prompt tokens, as a percentage, weighted by tokens."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2238,7 +2250,19 @@ def parse_session_stats(value: object, path: str = "SessionStats") -> SessionSta
         credits=optional(payload, "credits", parse_session_credits, path),
         routed_models=optional(payload, "routedModels", record(decode_float), path),
         edit_rejections=optional(payload, "editRejections", record(decode_float), path),
+        prompt_cache_by_harness=optional(payload, "promptCacheByHarness", record(parse_harness_cache_stats), path),
         context_usage=optional(payload, "contextUsage", parse_context_usage, path),
+    )
+
+
+def parse_harness_cache_stats(value: object, path: str = "HarnessCacheStats") -> HarnessCacheStats:
+    payload = expect_object(value, path)
+    return HarnessCacheStats(
+        requests=required(payload, "requests", decode_int, path),
+        input=required(payload, "input", decode_int, path),
+        cache_read=required(payload, "cacheRead", decode_int, path),
+        cache_write=required(payload, "cacheWrite", decode_int, path),
+        hit_pct=required(payload, "hitPct", decode_float, path),
     )
 
 
@@ -4070,6 +4094,7 @@ __all__ = [
     "GoalStatus",
     "GoalUpdatedEvent",
     "HandoffResult",
+    "HarnessCacheStats",
     "HookMessage",
     "HostToolDefinition",
     "HostUriSchemeDefinition",
@@ -4258,6 +4283,7 @@ __all__ = [
     "parse_goal_result",
     "parse_goal_updated_event",
     "parse_handoff_result",
+    "parse_harness_cache_stats",
     "parse_hook_message",
     "parse_host_tool_definition",
     "parse_host_uri_scheme_definition",

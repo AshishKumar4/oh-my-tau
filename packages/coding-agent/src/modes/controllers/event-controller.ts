@@ -675,13 +675,15 @@ export class EventController {
 	}
 
 	#retractToolCardEntry(toolCallId: string, component: ToolExecutionHandle): void {
-		component.seal();
 		let removeComponent = true;
 		if (component instanceof ReadToolGroupComponent) {
 			removeComponent = component.removeEntry(toolCallId);
-			if (component === this.#lastReadGroup) this.#resetReadGroup();
+			if (removeComponent && component === this.#lastReadGroup) this.#resetReadGroup();
 		}
-		if (removeComponent) this.ctx.chatContainer.removeChild(component);
+		if (removeComponent) {
+			component.seal();
+			this.ctx.chatContainer.removeChild(component);
+		}
 		this.ctx.pendingTools.delete(toolCallId);
 		this.#toolTimelineComponents.delete(toolCallId);
 		this.#clearReadToolCall(toolCallId);
@@ -703,6 +705,7 @@ export class EventController {
 		if (pending && !this.ctx.pendingTools.has(newId)) {
 			this.ctx.pendingTools.delete(oldId);
 			this.ctx.pendingTools.set(newId, pending);
+			if (pending instanceof ToolExecutionComponent) pending.renameToolCall(newId);
 		}
 		const timeline = this.#toolTimelineComponents.get(oldId);
 		if (timeline && !this.#toolTimelineComponents.has(newId)) {
@@ -754,52 +757,50 @@ export class EventController {
 	 * snapshot can carry a per-index id change no delta ever showed — agent-loop
 	 * mints and re-keys tool-call ids at `done`, after the last
 	 * `message_update` — so the `message_end` path replays the same
-	 * reconciliation the delta path runs. Without it the pre-mint card is never
-	 * re-keyed: `tool_execution_start` mounts a second card under the minted id
-	 * and the streamed one ghosts until sealed.
+	 * reconciliation the delta path runs.
 	 *
-	 * Several indices can share one streamed id (a reused provider id, or
-	 * siblings that all streamed before their ids materialized) and then split
-	 * into distinct ids. The shared card migrates only when the old id is no
-	 * longer referenced by any content index — the last referencer keeps the
-	 * card; the other indices pick up their own card at `tool_execution_start`.
-	 * Migrating unconditionally would move the one shared card to the first
-	 * re-keyed sibling and leave the index that kept the old id with no streamed
-	 * card (a reverse ghost).
+	 * Several indices can share one streamed id and then split into distinct
+	 * ids. The shared card stays with the id while any index still references it
+	 * (showing that keeper's arguments); otherwise it migrates to the new id. A
+	 * shared card whose renderer cannot show its owner's tool (a grouped read
+	 * against another tool, or a different tool's card) is retracted, and the
+	 * owner gets its own card at `tool_execution_start`.
 	 */
 	#reconcileStreamedToolCallIds(content: AssistantMessage["content"]): void {
-		const finalIdByIndex = new Map<number, string>();
-		for (let contentIndex = 0; contentIndex < content.length; contentIndex++) {
-			const block = content[contentIndex]!;
-			if (block.type === "toolCall") finalIdByIndex.set(contentIndex, block.id);
+		const finalCounts = new Map<string, number>();
+		const streamedCounts = new Map<string, number>();
+		const keepers = new Map<string, Extract<AssistantMessage["content"][number], { type: "toolCall" }>>();
+		for (const [index, block] of content.entries()) {
+			if (block.type !== "toolCall") continue;
+			finalCounts.set(block.id, (finalCounts.get(block.id) ?? 0) + 1);
+			keepers.set(block.id, block);
+			const prior = this.#streamedToolCallIdByIndex.get(index);
+			if (prior !== undefined) streamedCounts.set(prior, (streamedCounts.get(prior) ?? 0) + 1);
 		}
-		for (const [contentIndex, id] of finalIdByIndex) {
-			const priorId = this.#streamedToolCallIdByIndex.get(contentIndex);
-			if (priorId === undefined || priorId === id) {
-				this.#streamedToolCallIdByIndex.set(contentIndex, id);
-				continue;
-			}
-			const oldIdStaysOwned = [...finalIdByIndex].some(([otherIndex, otherId]) => {
-				if (otherIndex === contentIndex) return false;
-				// The other index either already resolved to the old id or still
-				// streams under it and has not been re-keyed yet.
-				return otherId === priorId || this.#streamedToolCallIdByIndex.get(otherIndex) === priorId;
-			});
-			if (oldIdStaysOwned) {
-				// The shared card stays under `priorId` for its remaining
-				// referencer; make it show THAT call's arguments, not the last
-				// cumulative update's (every sibling updated the one shared card
-				// while the id was still shared).
-				const card = this.ctx.pendingTools.get(priorId);
-				for (const [keeperIndex, keeperId] of finalIdByIndex) {
-					if (keeperId !== priorId || keeperIndex === contentIndex) continue;
-					const keeper = content[keeperIndex];
-					if (card && keeper?.type === "toolCall") card.updateArgs(keeper.arguments, priorId);
+		for (const [index, block] of content.entries()) {
+			if (block.type !== "toolCall") continue;
+			const prior = this.#streamedToolCallIdByIndex.get(index);
+			if (prior !== undefined && prior !== block.id) {
+				streamedCounts.set(prior, (streamedCounts.get(prior) ?? 1) - 1);
+				streamedCounts.set(block.id, (streamedCounts.get(block.id) ?? 0) + 1);
+				const staysOwned = (finalCounts.get(prior) ?? 0) > 0 || (streamedCounts.get(prior) ?? 0) > 0;
+				const owner = staysOwned ? keepers.get(prior) : block;
+				const card = this.ctx.pendingTools.get(prior);
+				if (owner && card) {
+					const name = toolRenderName(owner.name, this.ctx.viewSession.getToolByName(owner.name));
+					const readGroup = name === "read" && readArgsCollapseIntoGroup(owner.arguments);
+					const incompatible =
+						card instanceof ReadToolGroupComponent
+							? !readGroup
+							: card instanceof ToolExecutionComponent && (card.toolName !== name || readGroup);
+					if (incompatible) {
+						this.#retractToolCardEntry(prior, card);
+						this.#pendingStreamPreviews.delete(prior);
+					} else if (staysOwned) card.updateArgs(owner.arguments, prior);
 				}
-			} else {
-				this.#migrateStreamedToolCallId(priorId, id);
+				if (!staysOwned) this.#migrateStreamedToolCallId(prior, block.id);
 			}
-			this.#streamedToolCallIdByIndex.set(contentIndex, id);
+			this.#streamedToolCallIdByIndex.set(index, block.id);
 		}
 	}
 
@@ -2722,6 +2723,7 @@ export class EventController {
 		const isHandoffAction = event.action === "handoff";
 		const isRemoteAction = event.action === "remote";
 		const isShakeAction = event.action === "shake";
+		const isRewriteAction = event.action === "rewrite";
 		const isSnapcompactAction = event.action === "snapcompact";
 		if (event.aborted) {
 			this.ctx.showStatus(
@@ -2731,15 +2733,18 @@ export class EventController {
 						? "Auto server compaction cancelled"
 						: isShakeAction
 							? "Auto-shake cancelled"
-							: isSnapcompactAction
-								? "Auto-snapcompact cancelled"
-								: "Auto context-full maintenance cancelled",
+							: isRewriteAction
+								? "Extension history rewrite cancelled"
+								: isSnapcompactAction
+									? "Auto-snapcompact cancelled"
+									: "Auto context-full maintenance cancelled",
 			);
-		} else if (isShakeAction) {
-			// Shake produces no CompactionResult; rebuild on success, suppress benign skips.
-			// The fallback path (`errorMessage` set, `skipped` false) means shake reclaimed
-			// some tokens before deciding the threshold still wasn't cleared — rebuild so
-			// the chat reflects the dropped regions even though a context-full pass follows.
+		} else if (isShakeAction || isRewriteAction) {
+			// Shake and extension rewrites produce no CompactionResult; rebuild on
+			// success, suppress benign skips. The fallback path (`errorMessage` set,
+			// `skipped` false) means the pass reclaimed some tokens before deciding
+			// the threshold still wasn't cleared — rebuild so the chat reflects the
+			// dropped regions even though another pass follows.
 			if (event.errorMessage) {
 				if (!event.skipped) {
 					this.ctx.rebuildChatFromMessages();
@@ -2752,7 +2757,7 @@ export class EventController {
 				this.ctx.rebuildChatFromMessages();
 				this.ctx.statusLine.invalidate();
 				this.ctx.ui.requestRender(true, { clearScrollback: true });
-				this.ctx.showStatus("Auto-shake completed");
+				this.ctx.showStatus(isShakeAction ? "Auto-shake completed" : "Extension history rewrite completed");
 			}
 		} else if (event.result) {
 			this.ctx.lastAssistantUsage = undefined;

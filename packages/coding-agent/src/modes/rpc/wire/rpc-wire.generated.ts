@@ -670,7 +670,18 @@ export interface SessionStats {
 	routedModels?: Record<string, number>;
 	/** Failed edits by the engine's `errorKind`. */
 	editRejections?: Record<string, number>;
+	/** Prompt-cache totals per harness profile that served this session's requests. */
+	promptCacheByHarness?: Record<string, HarnessCacheStats>;
 	contextUsage?: ContextUsage;
+}
+
+export interface HarnessCacheStats {
+	requests: number;
+	input: number;
+	cacheRead: number;
+	cacheWrite: number;
+	/** Cache-read tokens over all prompt tokens, as a percentage, weighted by tokens. */
+	hitPct: number;
 }
 
 export interface MessagesPage {
@@ -797,7 +808,7 @@ export interface PromptAck {
 
 export type AutoCompactionReason = "threshold" | "overflow" | "idle" | "incomplete";
 
-export type AutoCompactionAction = "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
+export type AutoCompactionAction = "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "rewrite";
 
 export type CacheWarmingPhase = "streaming" | "idle";
 

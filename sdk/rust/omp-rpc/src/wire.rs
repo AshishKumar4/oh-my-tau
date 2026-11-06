@@ -3334,8 +3334,24 @@ pub struct SessionStats {
 	/// Failed edits by the engine's `errorKind`.
 	#[serde(rename = "editRejections", default, skip_serializing_if = "Option::is_none")]
 	pub edit_rejections: Option<BTreeMap<String, f64>>,
+	/// Prompt-cache totals per harness profile that served this session's requests.
+	#[serde(rename = "promptCacheByHarness", default, skip_serializing_if = "Option::is_none")]
+	pub prompt_cache_by_harness: Option<BTreeMap<String, HarnessCacheStats>>,
 	#[serde(rename = "contextUsage", default, skip_serializing_if = "Option::is_none")]
 	pub context_usage: Option<ContextUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HarnessCacheStats {
+	pub requests: i64,
+	pub input: i64,
+	#[serde(rename = "cacheRead")]
+	pub cache_read: i64,
+	#[serde(rename = "cacheWrite")]
+	pub cache_write: i64,
+	/// Cache-read tokens over all prompt tokens, as a percentage, weighted by tokens.
+	#[serde(rename = "hitPct")]
+	pub hit_pct: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3570,6 +3586,8 @@ pub enum AutoCompactionAction {
 	Shake,
 	#[serde(rename = "snapcompact")]
 	Snapcompact,
+	#[serde(rename = "rewrite")]
+	Rewrite,
 }
 
 impl AutoCompactionAction {
@@ -3581,6 +3599,7 @@ impl AutoCompactionAction {
 			Self::Handoff => "handoff",
 			Self::Shake => "shake",
 			Self::Snapcompact => "snapcompact",
+			Self::Rewrite => "rewrite",
 		}
 	}
 }

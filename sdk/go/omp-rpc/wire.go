@@ -3037,7 +3037,9 @@ type SessionStats struct {
 	RoutedModels      map[string]float64 `json:"routedModels,omitempty"`
 	// Failed edits by the engine's `errorKind`.
 	EditRejections map[string]float64 `json:"editRejections,omitempty"`
-	ContextUsage   *ContextUsage      `json:"contextUsage,omitempty"`
+	// Prompt-cache totals per harness profile that served this session's requests.
+	PromptCacheByHarness map[string]HarnessCacheStats `json:"promptCacheByHarness,omitempty"`
+	ContextUsage         *ContextUsage                `json:"contextUsage,omitempty"`
 }
 
 func (v *SessionStats) UnmarshalJSON(data []byte) error {
@@ -3060,7 +3062,36 @@ func (v *SessionStats) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("credits", &out.Credits)
 	d.optional("routedModels", &out.RoutedModels)
 	d.optional("editRejections", &out.EditRejections)
+	d.optional("promptCacheByHarness", &out.PromptCacheByHarness)
 	d.optional("contextUsage", &out.ContextUsage)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type HarnessCacheStats struct {
+	Requests   int64 `json:"requests"`
+	Input      int64 `json:"input"`
+	CacheRead  int64 `json:"cacheRead"`
+	CacheWrite int64 `json:"cacheWrite"`
+	// Cache-read tokens over all prompt tokens, as a percentage, weighted by tokens.
+	HitPct float64 `json:"hitPct"`
+}
+
+func (v *HarnessCacheStats) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "HarnessCacheStats", v.decodeFrom)
+}
+
+func (v *HarnessCacheStats) decodeFrom(raw map[string]json.RawMessage) error {
+	var out HarnessCacheStats
+	d := fieldDecoder{raw: raw, owner: "HarnessCacheStats"}
+	d.required("requests", &out.Requests)
+	d.required("input", &out.Input)
+	d.required("cacheRead", &out.CacheRead)
+	d.required("cacheWrite", &out.CacheWrite)
+	d.required("hitPct", &out.HitPct)
 	if d.err != nil {
 		return d.err
 	}
@@ -3521,6 +3552,7 @@ const (
 	AutoCompactionActionHandoff     AutoCompactionAction = "handoff"
 	AutoCompactionActionShake       AutoCompactionAction = "shake"
 	AutoCompactionActionSnapcompact AutoCompactionAction = "snapcompact"
+	AutoCompactionActionRewrite     AutoCompactionAction = "rewrite"
 )
 
 func (v *AutoCompactionAction) UnmarshalJSON(data []byte) error {
@@ -3529,7 +3561,7 @@ func (v *AutoCompactionAction) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch value := AutoCompactionAction(s); value {
-	case AutoCompactionActionContextFull, AutoCompactionActionRemote, AutoCompactionActionHandoff, AutoCompactionActionShake, AutoCompactionActionSnapcompact:
+	case AutoCompactionActionContextFull, AutoCompactionActionRemote, AutoCompactionActionHandoff, AutoCompactionActionShake, AutoCompactionActionSnapcompact, AutoCompactionActionRewrite:
 		*v = value
 		return nil
 	}

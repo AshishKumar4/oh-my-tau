@@ -402,7 +402,7 @@ export const cfgTuiCompleteScrollback = register({
 		group: "Display",
 		label: "Complete Scrollback",
 		description:
-			"Send transcript rows pushed off screen by a growing HUD or dialog straight to scrollback; when it shrinks, blank rows sit between the transcript and the input until new output fills them",
+			"While idle too, send transcript rows pushed off screen by a growing dialog, report or draft straight to scrollback; when it closes, blank rows sit above the input until new output fills them. During a turn they always go to scrollback",
 	},
 });
 
@@ -1277,53 +1277,6 @@ export const cfgStartupSetupWizard = register({
 		group: "Startup & Updates",
 		label: "Setup Wizard",
 		description: "Show newly added onboarding steps once per setup version",
-	},
-});
-
-export const cfgStartupCheckUpdate = register({
-	id: "startup.checkUpdate",
-	type: "boolean",
-	default: true,
-	ui: {
-		tab: "interaction",
-		group: "Startup & Updates",
-		label: "Check for Updates",
-		description: "Check for omp updates on startup",
-	},
-});
-
-export const cfgUpdateChannel = register({
-	id: "update.channel",
-	type: "enum",
-	values: ["stable", "canary"] as const,
-	default: "stable",
-	ui: {
-		tab: "interaction",
-		group: "Startup & Updates",
-		label: "Update Channel",
-		description: "Update channel used by omp update and the startup update check",
-		options: [
-			{ value: "stable", label: "Stable" },
-			{ value: "canary", label: "Canary" },
-		],
-	},
-});
-
-/**
- * Background self-update: a launch that finds a newer release installs it the
- * way `omp update` would, showing progress beside the welcome banner's version;
- * the next launch runs it. Ignored where omp cannot update itself (Tern, Nix, a
- * source checkout). Offered by the setup wizard.
- */
-export const cfgUpdateAuto = register({
-	id: "update.auto",
-	type: "boolean",
-	default: false,
-	ui: {
-		tab: "interaction",
-		group: "Startup & Updates",
-		label: "Auto Update",
-		description: "Install omp updates in the background on startup; the next launch runs the new version",
 	},
 });
 

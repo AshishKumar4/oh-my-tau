@@ -136,6 +136,8 @@ export interface RenderSessionContextOptions {
 	reuseSettledComponents?: boolean;
 	/** Tool calls whose existing live component remains the sole render owner across a rebuild. */
 	preservedLiveToolCallIds?: ReadonlySet<string>;
+	/** Messages of a long session left out of the rendered tail; a marker row above the tail counts them. */
+	earlierMessages?: number;
 }
 
 /** How {@link InteractiveModeContext.showStatus} shows a notice. */
@@ -446,7 +448,6 @@ export interface InteractiveModeContext {
 	showPinnedError(message: string): void;
 	clearPinnedError(): void;
 	showWarning(message: string, options?: { hideWithToolActivity?: boolean }): void;
-	showNewVersionNotification(newVersion: string): void;
 	clearEditor(): void;
 	updatePendingMessagesDisplay(): void;
 	queueCompactionMessage(
@@ -631,6 +632,8 @@ export interface InteractiveModeContext {
 	switchSessionModel(model: Model, thinkingLevel?: ConfiguredThinkingLevel): Promise<void>;
 	showPluginSelector(mode?: "install" | "uninstall"): void;
 	showUserMessageSelector(): void;
+	/** Drop the last turn, putting its prompt back in the editor; see `/undo`. */
+	undoLastTurn(): Promise<void>;
 	showCopySelector(): void;
 	showTreeSelector(): void;
 	/** Open the `/effort` picker over the levels the current model accepts. */
