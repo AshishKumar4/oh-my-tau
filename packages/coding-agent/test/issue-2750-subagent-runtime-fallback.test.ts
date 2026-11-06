@@ -437,11 +437,11 @@ describe("subagent runtime model resolution", () => {
 			enableLsp: false,
 		});
 
-		// The parent's default chain is replaced by an explicitly empty one and
-		// no per-subagent role chain is installed, so a provider error retries
+		// The parent's default chain is replaced by an explicitly empty one, which
+		// the child's own role keeps as "no fallbacks", so a provider error retries
 		// on the pinned model instead of walking onto another.
 		expect(childFallbackChains?.default).toEqual([]);
-		expect(Object.keys(childFallbackChains ?? {}).some(key => key.startsWith("subagent:"))).toBe(false);
+		expect(childFallbackChains?.["subagent:pinned-model"]).toEqual([]);
 	});
 
 	it("inherits the aliased role's chain, not the default chain, for a role-alias subagent model", async () => {
