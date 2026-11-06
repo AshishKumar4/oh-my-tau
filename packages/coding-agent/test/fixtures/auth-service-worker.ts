@@ -15,6 +15,8 @@ export interface AuthProbe {
 	accountId(provider: string, sessionId: string): Promise<string | undefined>;
 	restrict(provider: string, sessionId: string, identityKeys: string[]): Promise<number>;
 	unrestrict(provider: string, sessionId: string, handle: number): Promise<void>;
+	/** Set a stored account aside through the worker's storage. */
+	hold(provider: string, credentialId: number): Promise<void>;
 	sameStorage(storage: AuthStorage): Promise<boolean>;
 	watchGenerations(): Promise<void>;
 	generations(): Promise<number[]>;
@@ -80,6 +82,7 @@ function buildProbe(storage: AuthStorage): AuthProbe {
 		},
 		generations: async () => [...seen],
 		sourceKinds: async providers => providers.map(provider => storage.keys.source(provider)?.kind),
+		hold: async (provider, credentialId) => storage.holdCredential(provider, credentialId),
 		unwatchGenerations: async () => {
 			unwatch?.();
 			unwatch = undefined;

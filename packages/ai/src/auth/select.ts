@@ -802,11 +802,16 @@ export class CredentialSelector {
 		// reserve), spent allowance (unblocked sibling with allowance left), and
 		// opt-in reclaim (the sibling ranking picks next has higher priority and is
 		// measured at or above its `reclaimAbovePct`).
+		// Only a sibling the first pass may serve can evict the pin: one outside the
+		// request's account entitlement would be skipped, leaving the pin moved for nothing.
+		const mayServeFirst = (candidate: OAuthCandidate): boolean =>
+			!enforceAccounts || entitled?.(candidate.selection.credential) === true;
 		const automaticPinWouldBeEvicted = (excludePreflightFailures: boolean): boolean => {
 			if (sessionPinIsExplicit || preferredCandidate === undefined) return false;
 			const rankedWinner = candidates.find(
 				candidate =>
 					candidate !== preferredCandidate &&
+					mayServeFirst(candidate) &&
 					!(excludePreflightFailures && preflightFailures.has(candidate)) &&
 					!this.#deps.blocks.isBlocked(provider, providerKey, candidate.selection.index, blockScopes),
 			);
@@ -817,7 +822,7 @@ export class CredentialSelector {
 				return true;
 			}
 			return candidates.some(candidate => {
-				if (candidate === preferredCandidate) return false;
+				if (candidate === preferredCandidate || !mayServeFirst(candidate)) return false;
 				if (excludePreflightFailures && preflightFailures.has(candidate)) return false;
 				if (
 					preferredCandidate.inReserve === true &&

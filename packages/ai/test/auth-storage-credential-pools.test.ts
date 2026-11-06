@@ -152,6 +152,19 @@ describe("provider credential pools", () => {
 		expect(pools.every(pool => pool.retryAtMs !== undefined && pool.retryAtMs > Date.now())).toBe(true);
 	});
 
+	it("serves a blocked pooled key when every subscription is held", async () => {
+		await open();
+		await storage.credentials.upsert(PROVIDER, oauth("max@example.com"));
+		await storage.credentials.addApiKey(PROVIDER, "key-a");
+		const [subscription] = storage.oauth.accounts(PROVIDER);
+		if (!subscription) throw new Error("expected the subscription account");
+		storage.holdCredential(PROVIDER, subscription.credentialId);
+		// The key's own failure blocks it; the held subscription is no pool to fall back on.
+		await drain("session-1");
+
+		expect(await storage.keys.get(PROVIDER, "session-2")).toBe("key-a");
+	});
+
 	it("keeps pooled keys through an OAuth login and keeps subscriptions through key adds", async () => {
 		await open();
 		await storage.credentials.addApiKey(PROVIDER, "key-a");

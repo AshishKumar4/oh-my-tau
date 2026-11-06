@@ -113,19 +113,23 @@ export class AccountPolicies {
 	 * Replace the policy set, global reserve, and pool orders in place (live
 	 * settings change). Validates the configuration and every provider in
 	 * `storedCredentials` before committing; on error the previous policies stay active.
+	 * Returns whether any provider's pool order changed, which changes the key source it reports.
 	 */
 	replace(
 		policies: AuthAccountPolicies,
 		defaultReservePct: number | undefined,
 		poolOrders: CredentialPoolOrders,
 		storedCredentials: ReadonlyMap<string, readonly AuthCredential[]> = new Map(),
-	): void {
+	): boolean {
 		const next = new AccountPolicies(policies, defaultReservePct, poolOrders);
 		for (const [provider, credentials] of storedCredentials) next.validateFor(provider, credentials);
+		const providers = new Set([...Object.keys(this.#poolOrders), ...Object.keys(next.#poolOrders)]);
+		const orderChanged = [...providers].some(provider => this.poolOrder(provider)[0] !== next.poolOrder(provider)[0]);
 		this.#accountPolicies = next.#accountPolicies;
 		this.#defaultReservePct = next.#defaultReservePct;
 		this.#poolOrders = next.#poolOrders;
 		this.#warnedUnmatched = next.#warnedUnmatched;
+		return orderChanged;
 	}
 
 	static #validateAccountPolicyConfiguration(accountPolicies: AuthAccountPolicies, defaultReservePct: number): void {

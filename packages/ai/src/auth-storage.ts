@@ -317,7 +317,10 @@ class LocalAuthStorageBackend implements AuthStorageBackend {
 		const pool = this.#modules.pool;
 		const stored = new Map<string, AuthCredential[]>();
 		for (const provider of pool.providers()) stored.set(provider, pool.credentials(provider));
-		this.#policies.replace(config.accountPolicies, config.defaultReservePct, config.poolOrders, stored);
+		// A new pool order changes the key source workers cache until the next generation.
+		if (this.#policies.replace(config.accountPolicies, config.defaultReservePct, config.poolOrders, stored)) {
+			pool.bump("pool-order");
+		}
 	}
 
 	holdCredential(provider: string, credentialId: number): void {

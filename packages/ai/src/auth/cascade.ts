@@ -465,10 +465,15 @@ export class KeyCascade implements KeysApi {
 		// Another process may have added or removed credentials; the pool check
 		// must see them, or a provider whose only account arrived externally reads empty.
 		await this.#deps.pool.adoptExternalChanges();
-		// A session restricted to an account pool counts only the accounts it may use.
+		// A session restricted to an account pool counts only the accounts it may use,
+		// and a held account serves no request, so it makes no pool available.
 		const stored = this.#deps.pool
 			.credentials(provider)
-			.filter(credential => this.#deps.affinity.allows(provider, sessionId, credential));
+			.filter(
+				(credential, index) =>
+					this.#deps.affinity.allows(provider, sessionId, credential) &&
+					!this.#deps.blocks.isHeld(provider, index),
+			);
 		const hasOAuth = stored.some(credential => credential.type === "oauth");
 		const hasPooledKeys = stored.some(credential => this.isPooledApiKey(provider, credential));
 		const available = this.#deps.policies
