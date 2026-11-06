@@ -28,7 +28,8 @@ import {
 } from "../fusion/config";
 import sidekickHandoffTemplate from "../prompts/tools/sidekick-handoff.md" with { type: "text" };
 import sidekickDescription from "../prompts/tools/sidekick.md" with { type: "text" };
-import { type AgentRef, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { getSidekickAgent } from "../task/agents";
 import { runSubagentFollowUpTurn } from "../task/executor";
 import { runStructuredSubagent, StructuredSubagentError } from "../task/structured-subagent";
@@ -142,6 +143,9 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		const leadId = this.#leadId();
 		const manager = cfgAsyncEnabled.get(this.session.settings) ? this.session.asyncJobManager : undefined;
 
+		// A sidekick from before a restart is a parked transcript until the roster
+		// loads it; reviving it keeps the pairing's conversation.
+		if (!this.#spawning) await ensurePersistedRoster(AgentRegistry.global(), this.session.getSessionFile());
 		const ref = this.#spawning ? await this.#spawning : findSidekickRef(leadId);
 		const runningJob =
 			ref && manager ? manager.getRunningJobs({ ownerId: leadId }).find(job => job.agentId === ref.id) : undefined;

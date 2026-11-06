@@ -8,7 +8,8 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { findSidekickRef, listSidekickRefs } from "@oh-my-pi/pi-coding-agent/fusion/config";
 import type { VendorTool } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import { harnessSurface } from "@oh-my-pi/pi-coding-agent/harness/facades";
-import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { getSidekickAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
 import * as executor from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -267,6 +268,33 @@ describe("fusion sidekick tool", () => {
 			expect(deliveries).toEqual([]);
 		});
 
+		it("re-briefs a sidekick restored after a restart instead of spawning a second one", async () => {
+			const spawn = spawnSpy();
+			const followUp = vi
+				.spyOn(executor, "runSubagentFollowUpTurn")
+				.mockResolvedValue(singleResult("resumed report"));
+			// A transcript restored after a restart is listed under its transcript
+			// id; its definition still names the sidekick.
+			AgentRegistry.global().register({
+				id: "Sidekick-2",
+				displayName: "Sidekick-2",
+				kind: "sub",
+				parentId: MAIN_AGENT_ID,
+				session: null,
+				sessionFile: null,
+				status: "parked",
+				history: { agent: "sidekick" },
+			});
+			const tool = SidekickTool.createIf(makeSession());
+			if (!tool) throw new Error("sidekick tool should mount");
+
+			const result = await tool.execute("c1", { message: "Pick up where we left off" });
+			expect(result.content[0]).toEqual({ type: "text", text: "resumed report" });
+			expect(spawn).not.toHaveBeenCalled();
+			expect(followUp.mock.calls[0][0].id).toBe("Sidekick-2");
+			expect(followUp.mock.calls[0][0].message).toStartWith("Assignment update.");
+		});
+
 		it("block:false returns before the handoff settles and delivers the report as a background result", async () => {
 			const release = Promise.withResolvers<void>();
 			vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async () => {
@@ -450,12 +478,16 @@ describe("fusion sidekick tool", () => {
 	});
 
 	describe("blocked awaits", () => {
-		const streaming = { isStreaming: true } as unknown as AgentSession;
+		const streaming = {
+			isStreaming: true,
+			deliverIrcMessage: async () => {},
+			hasQueuedIrcFrom: () => false,
+		} as unknown as AgentSession;
 
 		/**
-		 * Run one first handoff whose sidekick, once registered, waits for a
-		 * message while the lead's turn is parked on it and an unrelated lane
-		 * streams. Returns the sidekick's wait text.
+		 * Run one first handoff whose sidekick, once registered, asks the lead a
+		 * question and waits for the reply while the lead's turn is parked on it
+		 * and an unrelated lane streams. Returns the sidekick's wait text.
 		 */
 		async function sidekickWaitText(overrides: Partial<ToolSession>): Promise<string> {
 			const registry = AgentRegistry.global();
@@ -480,6 +512,7 @@ describe("fusion sidekick tool", () => {
 						agentRegistry: registry,
 						getAgentId: () => SIDEKICK_ID,
 					} as unknown as ToolSession;
+					await IrcBus.global().send({ from: SIDEKICK_ID, to: "Main", body: "Which file?" });
 					const waited = await new WaitTool(waitSession).execute("sidekick-wait", {});
 					waitText = waited.content[0]?.type === "text" ? waited.content[0].text : "";
 					return {
@@ -504,14 +537,16 @@ describe("fusion sidekick tool", () => {
 			}
 		}
 
-		it("holds the lead's turn on an inline handoff, so its waiting sidekick returns", async () => {
+		// The lead cannot answer until the handoff ends, so the sidekick's wait for
+		// its reply returns at once instead of deadlocking the pair.
+		it("holds the lead's turn on an inline handoff, so its sidekick's question returns", async () => {
 			const text = await sidekickWaitText({ asyncJobManager: undefined });
-			expect(text).toContain("`Main` is blocked waiting on your result: it reads no message until you `yield`.");
+			expect(text).toContain("`Main` cannot reply before you finish: it is waiting on your result.");
 		});
 
 		it("holds the lead's turn while it blocks on the handoff job, learning the sidekick's id late", async () => {
 			const text = await sidekickWaitText({});
-			expect(text).toContain("`Main` is blocked waiting on your result: it reads no message until you `yield`.");
+			expect(text).toContain("`Main` cannot reply before you finish: it is waiting on your result.");
 		});
 	});
 });

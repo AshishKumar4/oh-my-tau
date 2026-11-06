@@ -125,11 +125,16 @@ export function resolveSidekickModel(settings: Settings, modelRegistry: ModelReg
 	return { pattern, model: resolved.model };
 }
 
-/** Every live sidekick in this process, one per lead (the top-level session and each opted-in subagent lead). */
+/**
+ * Every sidekick in this process, one per lead (the top-level session and each
+ * opted-in subagent lead). A sidekick is known by its agent definition, which
+ * its transcript keeps: one restored after a restart is listed under its
+ * transcript id, not the name it was spawned with.
+ */
 export function listSidekickRefs(): AgentRef[] {
 	return AgentRegistry.global()
 		.list()
-		.filter(ref => ref.displayName === SIDEKICK_AGENT_NAME && ref.status !== "aborted");
+		.filter(ref => (ref.history?.agent ?? ref.displayName) === SIDEKICK_AGENT_NAME && ref.status !== "aborted");
 }
 
 /**
