@@ -454,7 +454,8 @@ export function capArchiveFrameBytes(context: Context, model: Model): Context {
 		const content = capFrameDataBytes(message.content, budget);
 		if (content === message.content) continue;
 		messages ??= context.messages.slice();
-		messages[index] = { ...message, content };
+		// The capped copy stands for the summary it was cut from.
+		messages[index] = inheritContextIdentity({ ...message, content }, message);
 	}
 	return messages ? { ...context, messages } : context;
 }

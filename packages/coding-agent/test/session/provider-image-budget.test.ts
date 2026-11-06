@@ -605,7 +605,7 @@ describe("provider context image budgets", () => {
 	});
 
 	it("keeps the earlier request byte-identical while screenshots past the inline byte budget accumulate", () => {
-		// Distinct 534 KB screenshots, one per tool result; 46 of them fill 24 MB.
+		// Distinct 534 KB screenshots, one per tool result; 46 of them fill Codex's 24 MB inline budget.
 		const shots = Array.from({ length: 120 }, (_, index) => `${index}:`.padEnd(534_000, "A"));
 		// The text and image payloads of each tool result, as sent.
 		const sentContent = (messages: Context["messages"]) =>
@@ -627,7 +627,7 @@ describe("provider context image budgets", () => {
 				timestamp: index,
 			}));
 			const sent = sentContent(
-				clampProviderContextImageBytes({ systemPrompt: [], tools: [], messages }, ANTHROPIC_MODEL).messages,
+				clampProviderContextImageBytes({ systemPrompt: [], tools: [], messages }, CODEX_MODEL).messages,
 			);
 			const kept = sent.flat().filter(part => part.length === 534_000);
 			expect(kept.reduce((bytes, data) => bytes + data.length, 0)).toBeLessThanOrEqual(24_000_000);
@@ -656,10 +656,11 @@ describe("provider context image budgets", () => {
 		};
 		const clamped = clampProviderContextImageBytes(context, ANTHROPIC_MODEL);
 		const keptImages = imageData(clamped);
-		expect(keptImages).toHaveLength(224);
-		expect(keptImages.reduce((size, data) => size + data.length, 0)).toBe(119_616_000);
-		expect(clamped.messages.slice(0, 16).every(message => message.content.length === 1)).toBe(true);
-		expect(clamped.messages.slice(16).every(message => message.content.length === 2)).toBe(true);
+		// 128.16 MB over the 120 MB image budget: one 30 MB step (a quarter budget) goes, oldest first.
+		expect(keptImages).toHaveLength(183);
+		expect(keptImages.reduce((size, data) => size + data.length, 0)).toBe(97_722_000);
+		expect(clamped.messages.slice(0, 57).every(message => message.content.length === 1)).toBe(true);
+		expect(clamped.messages.slice(57).every(message => message.content.length === 2)).toBe(true);
 		expect(textData(clamped)).toEqual(Array.from({ length: 240 }, (_, index) => `result-${index}`));
 		expect(imageData(context)).toHaveLength(240);
 	});
@@ -697,13 +698,14 @@ describe("provider context image budgets", () => {
 				{ role: "user", content: [text("next")], timestamp: 13 },
 			],
 		};
-		// 114 MB of images fit the 120 MB image budget, but not beside 20 MB of text.
+		// 114 MB of images fit the 120 MB image budget, but not beside 20 MB of text: the room
+		// left (about 108 MB) is exceeded, and one quarter-room step (three images) goes.
 		const clamped = clampProviderContextImageBytes(context, ANTHROPIC_MODEL);
-		expect(imageData(clamped)).toHaveLength(11);
+		expect(imageData(clamped)).toHaveLength(9);
 		expect(clamped.messages[1]?.content).toHaveLength(1);
 		const body = await anthropicRequestBody(ANTHROPIC_MODEL, clamped);
 		expect(Buffer.byteLength(body)).toBeLessThan(ANTHROPIC_BODY_LIMIT);
-		expect(body.split(screenshot)).toHaveLength(12);
+		expect(body.split(screenshot)).toHaveLength(10);
 	});
 
 	it("keeps a Factory-hosted request's inline images under the route body limit, but not a custom gateway's", () => {
@@ -1710,7 +1712,8 @@ describe("provider context image budgets", () => {
 		};
 		const decorated = decorateContextImages(context, () => "https://images.example/frame.png");
 
-		expect(imageData(clampProviderContextImageBytes(context, ANTHROPIC_MODEL))).toHaveLength(224);
+		// Inline, the 128.16 MB of screenshots lose one quarter-budget step; decorated, none.
+		expect(imageData(clampProviderContextImageBytes(context, ANTHROPIC_MODEL))).toHaveLength(183);
 		expect(clampProviderContextImageBytes(decorated, ANTHROPIC_MODEL)).toBe(decorated);
 	});
 
