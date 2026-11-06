@@ -40,6 +40,69 @@ import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/launch-completion";
+
+/**
+ * A primary session as `sdk.ts` builds one: it carries an agent id, so owning
+ * completions by session id (not agent id) is what these tests pin.
+ */
+async function createLaunchCompletionSession(): Promise<{
+	session: AgentSession;
+	mock: MockModel;
+	authStorage: AuthStorage;
+}> {
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("bundled claude-sonnet-4-5 missing");
+	const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [] },
+		convertToLlm,
+		streamFn: mock.stream,
+	});
+	const authStorage = await AuthStorage.create(":memory:");
+	authStorage.keys.setRuntime("anthropic", "test-key");
+	const session = new AgentSession({
+		agent,
+		agentId: "Main",
+		sessionManager: SessionManager.inMemory(),
+		settings: Settings.isolated(),
+		modelRegistry: new ModelRegistry(authStorage),
+	});
+	return { session, mock, authStorage };
+}
+
+function launchCompletion(owner: string, name: string): DaemonCompletionNotification {
+	return {
+		event: "daemon-completed",
+		completionId: `${name}-completion`,
+		owner,
+		daemon: {
+			name,
+			id: `${name}-id`,
+			state: "exited",
+			createdAt: 1,
+			startedAt: 1,
+			exitedAt: 2,
+			exitCode: 0,
+			restartCount: 0,
+			outputBytes: 0,
+			owner,
+			persist: false,
+			detached: false,
+		},
+	};
+}
+
+function modelSaw(mock: MockModel, text: string): boolean {
+	return mock.calls.some(call =>
+		call.context.messages.some(message =>
+			typeof message.content === "string"
+				? message.content.includes(text)
+				: message.content.some(content => content.type === "text" && content.text.includes(text)),
+		),
+	);
+}
 function observeAsyncResultEnqueue(session: AgentSession): Promise<void> {
 	const queued = Promise.withResolvers<void>();
 	const enqueue = session.yieldQueue.enqueueWithReceipt.bind(session.yieldQueue);
@@ -907,6 +970,34 @@ describe("AgentSession owner-routed async delivery", () => {
 				),
 			),
 		).toBe(true);
+	});
+
+	// Services launch under the tool session's `getSessionId() ?? getAgentId()`
+	// (`launch/services.ts`), so the primary's completions carry its session id.
+	// A stale verdict rejects the broker delivery unacked; the broker then
+	// redelivers without end and every redelivery aborts `wait` again.
+	it("delivers a launch completion owned by the primary session", async () => {
+		const { session: owned, mock, authStorage } = await createLaunchCompletionSession();
+		authStorages.push(authStorage);
+		session = owned;
+		const owner = session.sessionManager.getSessionId();
+		await session.queueLaunchCompletion(launchCompletion(owner, "owned-worker"));
+		await session.waitForIdle();
+
+		expect(modelSaw(mock, "owned-worker")).toBe(true);
+		expect(session.yieldQueue.has(LAUNCH_COMPLETION_MESSAGE_TYPE)).toBe(false);
+	});
+
+	it("rejects a launch completion owned by another session", async () => {
+		const { session: owned, mock, authStorage } = await createLaunchCompletionSession();
+		authStorages.push(authStorage);
+		session = owned;
+
+		await expect(session.queueLaunchCompletion(launchCompletion("other-session", "foreign-worker"))).rejects.toThrow(
+			"Yield queue entry became stale",
+		);
+		await session.waitForIdle();
+		expect(modelSaw(mock, "foreign-worker")).toBe(false);
 	});
 
 	it("purges finished owned jobs when starting a new session", async () => {

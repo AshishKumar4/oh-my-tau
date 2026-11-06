@@ -53,6 +53,7 @@ import {
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	generateBranchSummary,
+	NativeCompactionError,
 	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
@@ -87,7 +88,12 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-state";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import { markPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import {
+	getContextHistoryPosition,
+	isAddedContextMessage,
+	isPerCallContextMessage,
+	markPerCallContextMessage,
+} from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
 import { supportsOutputTokenLimit } from "@oh-my-pi/pi-catalog/compat/output-limits";
@@ -179,6 +185,7 @@ import {
 } from "../extensibility/skills";
 import { expandSlashCommand, type FileSlashCommand, loadSlashCommands } from "../extensibility/slash-commands";
 import { normalizeToolEventInput, resolveToolEventInput } from "../extensibility/tool-event-input";
+import { findSidekickRef, type FusionSessionLike, isFusionLead, SIDEKICK_TOOL_NAME } from "../fusion/config";
 import { GoalRuntime } from "../goals/runtime";
 import type { GoalModeState, GoalTokenUsage } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -204,6 +211,8 @@ import goalTodoContextPrompt from "../prompts/goals/goal-todo-context.md" with {
 import anthropicUsageWrapUpPrompt from "../prompts/system/anthropic-usage-wrap-up.md" with { type: "text" };
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import checkpointActiveNoticeTemplate from "../prompts/system/checkpoint-active-notice.md" with { type: "text" };
+import fusionDirectEditReminderTemplate from "../prompts/system/fusion-direct-edit-reminder.md" with { type: "text" };
+import fusionReportFirstPrompt from "../prompts/system/fusion-report-first.md" with { type: "text" };
 import interruptedThinkingTemplate from "../prompts/system/interrupted-thinking.md" with { type: "text" };
 import manualContinuePrompt from "../prompts/system/manual-continue.md" with { type: "text" };
 import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { type: "text" };
@@ -216,6 +225,7 @@ import titleCardPrompt from "../prompts/system/title-card.md" with { type: "text
 import titleForkPrompt from "../prompts/system/title-fork.md" with { type: "text" };
 import skillfulNoticePrompt from "../prompts/system/skillful-notice.md" with { type: "text" };
 import vibeModeActivePrompt from "../prompts/system/vibe-mode-active.md" with { type: "text" };
+import { MAIN_AGENT_ID } from "../registry/agent-registry";
 import {
 	deobfuscateAssistantContent,
 	deobfuscateSessionContext,
@@ -238,6 +248,7 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
+import type { EventBus } from "../utils/event-bus";
 import { resolveApproval } from "../tools/approval";
 import { type ApprovalGrantStore, getApprovalGrants } from "../tools/approval-cache";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
@@ -389,8 +400,9 @@ import {
 	collectPendingToolCalls,
 	createInterruptedToolResults,
 	createInterruptedTurnAbortMessage,
-	hasRestorableTurn,
+	createSessionOpenData,
 	SESSION_EXIT_CUSTOM_TYPE,
+	SESSION_OPEN_CUSTOM_TYPE,
 	type SessionExitData,
 	summarizeToolArguments,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
@@ -504,6 +516,7 @@ import {
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { promptDigestOfEntry, SessionTools, type SessionToolsHost } from "./session-tools";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
@@ -515,6 +528,7 @@ import { YieldQueue } from "./yield-queue";
 
 export * from "./agent-session-events";
 export * from "./agent-session-types";
+export * from "./prompt-cache-stats";
 export type { AdvisorStats, AdvisorStatusOverviewEntry, PerAdvisorStat } from "./session-advisors";
 
 const SESSION_STOP_CONTINUATION_CAP = 8;
@@ -534,6 +548,7 @@ import { cfgBrowserEnabled, cfgBrowserFreezeOnTurnEnd, cfgBrowserIdleCloseSec } 
 import {
 	cfgClaudeResets,
 	cfgClaudeResetsAutoRedeem,
+	cfgCodeModeInputs,
 	cfgCodexResets,
 	cfgCodexResetsAutoRedeem,
 	cfgDefaultThinkingLevel,
@@ -565,6 +580,7 @@ import { cfgSteeringMode } from "../modes/settings";
 import { cfgDisabledProviders, cfgModelRoles } from "../config/model-settings";
 import { cfgEvalJs, cfgEvalPy, cfgEvalToolsEnabled, cfgEvalWorkpoolFreshAgents } from "../eval/settings";
 import { cfgExtensions, type SkillsSettings } from "../extensibility/settings";
+import { cfgHarnessMode } from "../harness/settings";
 import {
 	cfgImagesAutoResize,
 	cfgMagicKeyword,
@@ -858,13 +874,7 @@ type AgentContinueOutcome =
 type PromptDispatchOutcome = { sessionClaimed: boolean };
 
 /** One turn bracketed by the installed turn observer; see {@link AgentSession} `#startTurnObservation`. */
-type TurnObservation = {
-	finish: (error?: unknown) => void | Promise<void>;
-	/** The observed turn returned; the observation only waits for owned async work. */
-	turnEnded: boolean;
-	closed: boolean;
-	turnError: unknown;
-};
+type TurnObservation = { readonly finish: (error?: unknown) => void | Promise<void> };
 
 type ActiveAgentContinue = {
 	schedulerToken: number;
@@ -913,6 +923,25 @@ export function powerAssertionOptions(mode: "off" | "idle" | "display" | "system
 		system: mode === "system",
 		user: mode === "system",
 	};
+}
+
+/**
+ * How many messages of a native compaction's live context are summarized history once
+ * context hooks ran. Each message a hook kept from the history carries its position
+ * there, and messages it added are not counted. The counted messages must be history,
+ * then retained turns; any other order leaves no range to summarize, and the next
+ * compaction method runs instead.
+ */
+function summarizedLengthAfterContextHooks(messages: readonly Message[], historyLength: number): number {
+	const positions = messages.filter(message => !isAddedContextMessage(message)).map(getContextHistoryPosition);
+	const boundary = positions.findIndex(position => position === undefined || position >= historyLength);
+	const summarized = boundary === -1 ? positions.length : boundary;
+	if (positions.slice(summarized).some(position => position === undefined || position < historyLength)) {
+		throw new NativeCompactionError(
+			new Error("A context hook restructured the history, so the summarized range cannot be located"),
+		);
+	}
+	return summarized;
 }
 
 /**
@@ -1194,6 +1223,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	readonly #eval: EvalRunner;
 	readonly #evalToolSession: ToolSession | undefined;
+	readonly #eventBus: EventBus | undefined;
+	readonly #subagentEventBus: EventBus | undefined;
 	/** Manager owned by this top-level session; subagents borrow but never dispose it. */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	/** Manager of this session's root, used for its own job queries and deliveries. */
@@ -1227,6 +1258,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Registry recording this agent blocked on the user while a {@link waitForUser} dialog is open. */
 	readonly #agentRegistry: AgentRegistryApi | undefined;
 	#agentKind: "main" | "sub" = "main";
+	/** What `isFusionLead` needs to know about this session, beyond its settings. */
+	readonly #fusionSession: Pick<FusionSessionLike, "taskDepth" | "agentDefinition">;
+	/** Fusion: the direct-edit nudge fires at most once per turn (reset on `turn_start`). */
+	#fusionEditReminderSent = false;
 	#scoutAllowedBySpawnPolicy = true;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
@@ -1862,21 +1897,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * Starts the installed turn observer (the task executor's subagent run monitor)
 	 * for a turn about to run. At most one observation is open per session, so a
-	 * turn's `yield` is never seen by two monitors.
-	 *
-	 * An open observation whose turn has ended is only waiting for owned async work
-	 * (see {@link #finishTurnObservation}). A new wake or user prompt supersedes it:
-	 * it is finalized now with its own turn's outcome, and the new turn gets a fresh
-	 * monitor. Later async-result continuations then belong to the new turn. An
-	 * observation whose turn is still running means the caller is about to lose the
-	 * prompt race (AgentBusyError), so nothing is started.
+	 * turn's `yield` is never seen by two monitors: an open one belongs to a turn
+	 * still running, and the caller is about to lose the prompt race
+	 * (AgentBusyError), so nothing is started.
 	 */
 	#startTurnObservation(records: AgentMessage[]): TurnObservation | undefined {
-		const open = this.#openTurnObservation;
-		if (open) {
-			if (!open.turnEnded) return undefined;
-			void this.#closeTurnObservation(open);
-		}
+		if (this.#openTurnObservation) return undefined;
 		let finish: TurnObservation["finish"] | undefined;
 		try {
 			finish = this.#ircWakeTurnObserver?.(records);
@@ -1884,45 +1910,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			logger.warn("Turn observer failed to start", { error: String(error) });
 		}
 		if (!finish) return undefined;
-		const observation: TurnObservation = { finish, turnEnded: false, closed: false, turnError: undefined };
-		this.#openTurnObservation = observation;
-		return observation;
+		this.#openTurnObservation = { finish };
+		return this.#openTurnObservation;
 	}
 
 	/**
-	 * Finishes a turn observation once the turn's owned async work has settled.
-	 * Call only after the turn released its in-flight bracket: the bracket
-	 * withholds the yield-queue's idle flush, so settling inside it would deadlock
-	 * the very delivery the settle awaits (robomp review on #13703).
-	 *
-	 * Owner-scoped background work continues past the turn: the async-result
-	 * continuation is where the agent may finally yield. Keeping the observer
-	 * attached across that pause (settle = jobs → deliveries → idle) lets the
-	 * monitor still see the eventual yield — finishing first would unsubscribe it
-	 * and the completion would dead-letter with no parent-owned job and no
-	 * refreshed artifact (#11564). Settles immediately when nothing is pending;
-	 * an interrupt cancels the jobs and settles the wait normally. A newer turn
-	 * may close the observation first (see {@link #startTurnObservation}).
+	 * Finishes `observation` when its turn ends, exactly once: it is detached
+	 * before the first await, so a repeated call does nothing. Owned async work
+	 * that runs past the turn is the executor's run to settle: the lane driver
+	 * keeps its monitor attached across that work (the run's quiescence barrier)
+	 * and drives the run only after this finish, so settling it here first would
+	 * wait on the lane's own background job.
 	 */
 	async #finishTurnObservation(observation: TurnObservation | undefined, turnError: unknown): Promise<void> {
-		if (!observation) return;
-		observation.turnEnded = true;
-		observation.turnError = turnError;
+		if (!observation || this.#openTurnObservation !== observation) return;
+		this.#openTurnObservation = undefined;
 		try {
-			await this.settleAsyncWork();
-		} catch (error) {
-			logger.warn("Turn observation async-work settle failed", { error: String(error) });
-		}
-		await this.#closeTurnObservation(observation);
-	}
-
-	/** Runs an observation's finish exactly once; the observer detaches synchronously before the first await. */
-	async #closeTurnObservation(observation: TurnObservation): Promise<void> {
-		if (observation.closed) return;
-		observation.closed = true;
-		if (this.#openTurnObservation === observation) this.#openTurnObservation = undefined;
-		try {
-			await observation.finish(observation.turnError);
+			await observation.finish(turnError);
 		} catch (error) {
 			logger.warn("Turn observer failed to finish", { error: String(error) });
 		}
@@ -2115,6 +2119,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return listPlanFiles({ localProtocolOptions: this.#localProtocolOptions() });
 	}
 
+	#codeModeState: { namespacesInfo?: unknown };
+
 	/** Live generation tok/s for the working row; fed by this session's own streamed deltas. */
 	readonly tokenRate: TokenRateMeter;
 
@@ -2126,6 +2132,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			(previous, next) =>
 				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
 		);
+		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#ownsCostGate = config.costGate === undefined;
@@ -2172,19 +2179,25 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			kernelOwnerId: config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`,
 		});
 		this.#evalToolSession = config.evalToolSession;
+		this.#eventBus = config.eventBus;
+		this.#subagentEventBus = config.subagentEventBus;
 		const initialEvalStateContext = this.#buildEvalStateContextMessage(this.agent.state.messages);
 		if (initialEvalStateContext) {
-			// Persist the startup snapshot at the slot this process sends it from, so
-			// the next resumed process rebuilds the same request prefix (#15736).
 			this.agent.appendMessage(initialEvalStateContext);
-			this.sessionManager.appendCustomMessageEntry(
-				initialEvalStateContext.customType,
-				initialEvalStateContext.content,
-				initialEvalStateContext.display,
-				undefined,
-				initialEvalStateContext.attribution,
-				initialEvalStateContext.timestamp,
-			);
+			// Persist the startup snapshot at the slot this process sends it from, so
+			// the next resumed process rebuilds the same request prefix (#15736). Not
+			// after a last turn whose calls a crash left without results: /recover
+			// appends those right after the turn, then persists the snapshot itself.
+			if (createInterruptedToolResults(this.sessionManager.getBranch()).length === 0) {
+				this.sessionManager.appendCustomMessageEntry(
+					initialEvalStateContext.customType,
+					initialEvalStateContext.content,
+					initialEvalStateContext.display,
+					undefined,
+					initialEvalStateContext.attribution,
+					initialEvalStateContext.timestamp,
+				);
+			}
 		}
 		const ircHost: IrcBridgeHost = {
 			agent: this.agent,
@@ -2194,6 +2207,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			wakeForIrc: records => this.#wakeForIrc(records),
+			toolRefs: () => this.getToolRefs(),
 		};
 		this.#irc = new IrcBridge(ircHost);
 		const prewalkHost: PrewalkCoordinatorHost = {
@@ -2252,7 +2266,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			hasPendingAsyncWake: () => this.#hasPendingAsyncWake(),
 			getActiveToolNames: () => this.getActiveToolNames(),
 			getEnabledToolNames: () => this.getEnabledToolNames(),
-			toolRegistry: () => this.#tools.registry,
+			presentedWireName: name => this.#tools.presentedWireName(name),
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			prewalkWillHandoff: () => this.#prewalk.willHandoff,
 			consumeLastServedToolChoiceLabel: () => this.#toolChoiceQueue.consumeLastServedLabel(),
@@ -2419,7 +2433,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#memory = new SessionMemory(memoryHost, {
 			memoryEnabled: this.memoryEnabled,
 			memoryAgentDir: config.memoryAgentDir,
-			memoryTaskDepth: config.memoryTaskDepth,
+			memoryTaskDepth: config.taskDepth,
 			createMemoryTools: config.createMemoryTools,
 		});
 		// Resolve the wire service-tier per request so the Fireworks Priority
@@ -2604,6 +2618,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			queuedMessageCount: () => this.queuedMessageCount,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			model: () => this.model,
+			setCodeModeNamespacesInfo: info => {
+				this.#codeModeState.namespacesInfo = info;
+			},
 			memoryBackendSession: () => this,
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
@@ -2613,6 +2630,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			localProtocolOptions: () => this.#localProtocolOptions(),
 			evalPreludes: () => this.getEvalPreludes(),
 			sessionAgents: () => this.getSessionAgents(),
+			toolSession: () => this.#evalToolSession,
 			waitForUser: dialog => this.waitForUser(dialog),
 		};
 		this.#tools = new SessionTools(sessionToolsHost, {
@@ -2620,6 +2638,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			toolRegistry: config.toolRegistry,
 			createVibeTools: config.createVibeTools,
 			createThinkTool: config.createThinkTool,
+			createSidekickTool: config.createSidekickTool,
 			builtInToolNames: config.builtInToolNames,
 			mcpManagerToolNames: config.mcpManagerToolNames,
 			presentationPinnedToolNames: config.presentationPinnedToolNames,
@@ -2699,6 +2718,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#agentId = config.agentId;
 		this.#agentRegistry = config.agentRegistry;
 		this.#agentKind = config.agentKind ?? "main";
+		this.#fusionSession = { taskDepth: config.taskDepth, agentDefinition: config.agentDefinition };
 		// A subagent's streamed text reaches no output sink until the run settles
 		// (the parent sees only the yield), so a failed turn's partial prose is
 		// replay-safe and transient provider errors after it stay retryable —
@@ -2936,16 +2956,22 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// Transform the whole history as the live turn does, then cut it:
 				// provider transforms (inline imaging, image budgets) decide per
 				// request, so a separately transformed prefix can differ.
-				const prefixLength = (await this.convertMessagesToLlm(history, signal, model)).length;
-				const live = await this.agent.buildSideRequestContext(
-					await this.convertMessagesToLlm([...history, ...retained], signal, model),
-				);
-				// Date/cwd reminder controls are the only messages the transforms
-				// insert: count past them, and leave out any at the cut, so the kept
-				// turns follow the summarized range directly.
+				const full = await this.convertMessagesToLlm([...history, ...retained], signal, model);
+				const prefixLength = full.some(
+					message => isPerCallContextMessage(message) || getContextHistoryPosition(message) !== undefined,
+				)
+					? summarizedLengthAfterContextHooks(full, history.length)
+					: (await this.convertMessagesToLlm(history, signal, model)).length;
+				const live = await this.agent.buildSideRequestContext(full);
+				// Date/cwd reminder controls are the only messages the provider transforms
+				// insert: count past them and messages hooks added, and leave out any at
+				// the cut, so the kept turns follow the summarized range directly.
 				let cut = 0;
-				for (let counted = 0; cut < live.messages.length && counted < prefixLength; cut++) {
-					if (!isDateCwdReminderControl(live.messages[cut]!)) counted++;
+				let counted = 0;
+				for (const message of live.messages) {
+					if (counted >= prefixLength) break;
+					cut++;
+					if (!isDateCwdReminderControl(message) && !isAddedContextMessage(message)) counted++;
 				}
 				return { ...live, messages: live.messages.slice(0, cut) };
 			},
@@ -3063,6 +3089,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				armIdleCloseForOwner(ownerId, seconds * 1000);
 			}
 		});
+		cfgCodeModeInputs.listen(this, () =>
+			this.#tools.reconcileCodeMode().catch(error => {
+				logger.warn("Code Mode reconcile after setting change failed", { error: String(error) });
+			}),
+		);
+		// Immediate apply for `harness.mode`: re-apply tool presentation and the
+		// base prompt under the new effective profile without restarting the
+		// session or resetting provider state. The apply runs the same path a
+		// model switch takes (renames + facades + prompt rebuild).
+		cfgHarnessMode.listen(this, () =>
+			this.#tools.onEffectiveHarnessModeChange().catch(error => {
+				logger.warn("Harness mode reconcile after setting change failed", { error: String(error) });
+			}),
+		);
 
 		// Config-declared resolution done against the catalog as it stands at
 		// construction can be premature: background discovery is started
@@ -3081,6 +3121,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#watchWorkspaceAndPowerSettings();
 		this.#watchSessionSettings();
 		this.#watchModelAvailabilitySettings();
+		this.#recordSessionOpen();
 		// Last: makes the session addressable by its instance key (and, on a worker, published to main).
 		registerLocalSession(this);
 	}
@@ -3287,6 +3328,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#asyncJobManager;
 	}
 
+	get eventBus(): EventBus | undefined {
+		return this.#eventBus;
+	}
+
+	get subagentEventBus(): EventBus | undefined {
+		return this.#subagentEventBus;
+	}
+
 	getAgentId(): string | undefined {
 		return this.#agentId;
 	}
@@ -3398,20 +3447,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Re-anchor mode state to the session a branch or `/new` just minted. Both
-	 * mint a new session id/file, so without this the interactive-mode reconciler
-	 * keeps the previous session's transient mode: a stale vibe owner scope trips
-	 * the guard in `VibeRuntime.#persistModeExit` after a branch (issue #10468),
-	 * and plan/goal mode keeps running in a new session that records no mode
-	 * (issue #14653). Mirrors the reconcile step `switchSession` runs for the same
-	 * reason. Best-effort: a reconcile failure must not roll back an
-	 * otherwise-successful transition.
+	 * Re-anchor transient mode ownership after a branch or new session. A
+	 * reconciliation failure must not roll back an already committed transition.
 	 */
 	async #reconcileModeAfterTransition(): Promise<void> {
 		try {
 			await this.#sessionSwitchReconciler?.();
 		} catch (error) {
-			logger.warn("Failed to reconcile session mode after session transition", {
+			logger.warn("Failed to reconcile session mode after transition", {
 				sessionFile: this.sessionFile,
 				error: String(error),
 			});
@@ -3889,6 +3932,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
 	}
 
+	/** Mark where this process took over a session file with history; `/recover` splits processes at these. */
+	#recordSessionOpen(): void {
+		if (
+			!this.sessionManager.getEntries().some(entry => entry.type === "message" && entry.message.role === "assistant")
+		) {
+			return;
+		}
+		this.sessionManager.appendCustomEntry(SESSION_OPEN_CUSTOM_TYPE, createSessionOpenData());
+	}
+
 	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {
 		if (this.#exitRecorded) return;
 		this.#exitRecorded = true;
@@ -4274,7 +4327,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	): string {
 		const cache = this.#persistedMessageKeys;
 		const wasFresh = cache !== undefined && cache.anchor === this.#persistedMessageKeysAnchor();
-		// A digest entry carries no persistence key, so the memo stays valid across it.
+		// Digest entries carry no persistence key, so the memo stays valid across them.
 		if (message.role === "assistant") this.#tools.recordReplyPrompt(message);
 		const entryId = this.sessionManager.appendMessage(message);
 		if (message.role === "assistant") {
@@ -4575,7 +4628,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 		// This must happen before event fan-out awaits: streamed tool-call deltas
 		// can otherwise queue validation that a delayed turn-start reset erases.
-		if (event.type === "turn_start") this.#streamingEditGuard.reset();
+		if (event.type === "turn_start") {
+			this.#streamingEditGuard.reset();
+			this.#fusionEditReminderSent = false;
+		}
 		// Step the mid-run todo counter synchronously, BEFORE any await in this
 		// handler. The agent loop's next-turn `getAsideMessages` poll can run
 		// before queued microtasks drain, so `#takeMidRunTodoNudge` MUST see the
@@ -4908,6 +4964,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					const retry = this.#todoCallArguments(toolCallId);
 					if (retry) this.#dropSupersededTodoReminders(retry, details && stringProperty(details, "op"));
 				}
+				// A queued failure reminder exists only to force a corrected retry. Once a
+				// later todo mutation lands it is stale: its embedded failure-time list would
+				// resurface finished work as open on the next prompt (#16001).
+				if (toolName === "todo" && !isError && details?.op !== "view") {
+					this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(
+						message => message.customType !== "todo-error-reminder",
+					);
+				}
 				if (toolName === "todo" && isError) {
 					const errorText = content.find(part => part.type === "text")?.text;
 					const attemptedArgs = this.#todoCallArguments(toolCallId);
@@ -4936,6 +5000,26 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 									(details && stringProperty(details, "op")) ??
 									(attemptedArgs && stringProperty(attemptedArgs, "op")),
 							},
+						},
+						{ deliverAs: "nextTurn" },
+					);
+				}
+				if (
+					(toolName === "edit" || toolName === "write") &&
+					!isError &&
+					!this.#fusionEditReminderSent &&
+					writeDeviceDispatch(toolName, event.message) === undefined &&
+					this.#isFusionLead()
+				) {
+					this.#fusionEditReminderSent = true;
+					await this.sendCustomMessage(
+						{
+							customType: "fusion-direct-edit-reminder",
+							content: prompt.render(fusionDirectEditReminderTemplate, {
+								browserEnabled: this.getEvalPreludes().some(definition => definition.name === "browser"),
+							}),
+							display: false,
+							details: { toolName },
 						},
 						{ deliverAs: "nextTurn" },
 					);
@@ -5746,13 +5830,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
 		const runner = this.#extensionRunner;
-		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
+		// A harness facade is not wrapped itself: it runs through its target's
+		// wrapper, which consumes the loop marker under the target's name and
+		// emits `tool_call` with the target identity the session records, so
+		// the loop emits nothing for it.
+		const wrappedToolName = ctx.tool.persistAs ?? ctx.tool.name;
+		runner?.markLoopToolCall?.(ctx.toolCall.id, wrappedToolName);
 		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
 		if (ttsrResult) {
-			runner?.clearLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
+			runner?.clearLoopToolCall?.(ctx.toolCall.id, wrappedToolName);
 			return ttsrResult;
 		}
-		if (!runner?.hasHandlers("tool_call")) return undefined;
+		if (!runner?.hasHandlers("tool_call") || ctx.tool.persistAs !== undefined) return undefined;
 		const metadata = ctx.toolCall.providerMetadata;
 		const computer = metadata?.type === "computer" ? metadata : undefined;
 		// Parity with the wrapper's pre-emit short-circuit: an already-denied
@@ -7294,6 +7383,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#tools.getEnabledToolNames();
 	}
 
+	/**
+	 * Tool names for omp's own prompt templates (`toolRefs`): the tools this
+	 * session presents, keyed by native name. Native sessions get the literal
+	 * names; under Claude Code only what the wire carries (see `harnessToolRefs`).
+	 */
+	getToolRefs(): Readonly<Record<string, string>> {
+		return this.#tools.toolRefs();
+	}
+
 	/** Names of dynamic tools mounted under `xd://`. */
 	getMountedXdevToolNames(): string[] {
 		return this.#tools.getMountedXdevToolNames();
@@ -7322,6 +7420,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Eval tool names frozen into the provider-visible eval description (see {@link SessionTools.advertisedEvalToolNames}). */
 	getAdvertisedEvalToolNames(): readonly string[] {
 		return this.#tools.advertisedEvalToolNames;
+	}
+
+	/** Tools left directly model-visible by Code Mode; undefined when inactive. */
+	getCodeModeDirectToolNames(): readonly string[] | undefined {
+		return this.#tools.getCodeModeDirectToolNames();
 	}
 
 	/** Whether a registry entry came from a built-in factory. */
@@ -7460,6 +7563,29 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return refresh;
 	}
 
+	/**
+	 * Applies Code Mode at session startup: when the initial model activates
+	 * it (`codeMode` `on`, or `auto` matching a `code_mode_only` catalog flag),
+	 * the initial tool surface is routed through the Code Mode-aware path so
+	 * the restricted direct surface and namespaces snapshot exist before the
+	 * first provider turn instead of waiting for an unrelated reconciliation.
+	 *
+	 * Inactive sessions keep their initial surface untouched: re-applying an
+	 * unchanged set would seed the prompt-rebuild signature cache and suppress
+	 * the first late tool registration's rebuild (non-MCP `xd://` mounts are
+	 * deliberately not part of that signature).
+	 */
+	initializeCodeMode(): Promise<void> {
+		const model = this.model;
+		if (!model || !this.#tools.codeModeChangesBetween(undefined, model)) return Promise.resolve();
+		return this.#tools.reconcileCodeMode();
+	}
+
+	/** Current Code Mode `tool_namespaces_info` snapshot, or `undefined` when inactive. */
+	get codeModeNamespacesInfo(): unknown {
+		return this.#codeModeState.namespacesInfo;
+	}
+
 	/** Selects enabled tools, ignoring names absent from the registry. */
 	setActiveToolsByName(toolNames: string[]): Promise<void> {
 		return this.#tools.setActiveToolsByName(toolNames);
@@ -7527,6 +7653,38 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Resolves once every memory-setting edit so far, and the backend transitions it started, has settled. */
 	settleMemoryBackend(): Promise<void> {
 		return this.#memory.settle();
+	}
+
+	/** Reconciles the Fusion `sidekick` tool and lead prompt with current settings; true when mounted. */
+	applyFusionMode(): Promise<boolean> {
+		return this.#tools.applyFusionMode();
+	}
+
+	/** This session leads a Fusion sidekick (per `isFusionLead`) and has the `sidekick` tool mounted. */
+	#isFusionLead(): boolean {
+		return (
+			isFusionLead({ settings: this.settings, ...this.#fusionSession }) &&
+			this.getActiveToolNames().includes(SIDEKICK_TOOL_NAME)
+		);
+	}
+
+	/**
+	 * Fusion: a user message that lands while the sidekick is mid-handoff gets
+	 * the report-first guidance so the lead can re-brief for an
+	 * immediate report instead of waiting out the handoff.
+	 */
+	#createFusionReportFirstNotice(): CustomMessage | undefined {
+		if (!this.#isFusionLead() || findSidekickRef(this.#agentId ?? MAIN_AGENT_ID)?.status !== "running") {
+			return undefined;
+		}
+		return {
+			role: "custom",
+			customType: "fusion-report-first-guidance",
+			content: fusionReportFirstPrompt.trim(),
+			display: false,
+			attribution: "user",
+			timestamp: Date.now(),
+		};
 	}
 
 	/** Rebuilds the stable base prompt, optionally discarding a stale asynchronous rebuild. */
@@ -7621,8 +7779,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#inLogContext(() => this.#maintenance.shake(mode, opts));
 	}
 
-	/** Compact the active session history. */
-	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+	/**
+	 * Compact the active session history. Resolves without a result when a
+	 * `session_before_compact` handler compacted history in place instead of
+	 * writing a boundary.
+	 */
+	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult | undefined> {
 		return this.#inLogContext(() => this.#maintenance.compact(customInstructions, options));
 	}
 
@@ -7694,6 +7856,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	buildDisplaySessionContext(model = this.model): SessionContext {
 		return this.#withEvalStateContext(this.#providerBoundary.buildDisplaySessionContext(model));
+	}
+
+	/**
+	 * Persists the eval snapshot the next display rebuild would append, so a resumed
+	 * process sends it from the same slot (#15736). Startup defers it while the last
+	 * turn's calls lack results; /recover calls this once it has appended them.
+	 */
+	persistEvalStateContext(): void {
+		const message = this.#buildEvalStateContextMessage(
+			this.#providerBoundary.buildDisplaySessionContext(this.model).messages,
+		);
+		if (message) this.sessionManager.appendMessage(message);
 	}
 
 	#withEvalStateContext(context: SessionContext): SessionContext {
@@ -8191,7 +8365,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				: sessionPlanUrl;
 
 		const planExists = fs.existsSync(resolvedPlanPath);
-		// Capability gates, not the visible surface: `xd://`-mounted tools stay callable.
+		// Capability gates, not the visible surface: a Code Mode partition keeps
+		// `task` and `ask` callable through the eval bridge after demoting them.
 		const capableToolNames = this.getEnabledToolNames();
 		const content = prompt.render(planModeActivePrompt, {
 			planFilePath: displayPlanPath,
@@ -8364,6 +8539,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (!this.#magicKeywordEnabled(keyword.id) || !containsMagicKeyword(text, keyword.word)) continue;
 			context ??= {
 				tools: this.getEnabledToolNames(),
+				toolRefs: this.getToolRefs(),
 				taskBatch: cfgTaskBatch.get(this.settings),
 				scoutAvailable: this.#isScoutAvailable(),
 				evalTools: cfgEvalToolsEnabled.get(this.settings),
@@ -8551,6 +8727,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// user's message that steer this turn. User-authored prompts only — synthetic /
 		// agent-initiated turns never trigger them.
 		const keywordNotices = options?.synthetic ? [] : this.#createMagicKeywordNotices(expandedText);
+		const reportFirstNotice = options?.synthetic ? undefined : this.#createFusionReportFirstNotice();
 
 		// A `^` mention in a non-synthetic prompt mints a new alias. The hidden
 		// session-agent notice (which tells the model about the alias) must ride
@@ -8591,6 +8768,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (!queued && this.#promptGeneration !== queueGeneration && !options?.synthetic) {
 				this.#promptDropped?.({ text: typedText, images: options?.images });
 			}
+			// The report-first guidance refers to "the message above": it follows the user message.
+			if (queued && reportFirstNotice) await this.#queueCustomMessage(reportFirstNotice, streamingBehavior);
 			return true;
 		}
 
@@ -8654,7 +8833,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				outcome.sessionClaimed = this.agent.state.isStreaming;
 				throw new AgentBusyError();
 			}
-			await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
+			const queued = await this.#queueUserMessage(expandedText, options?.images, streamingBehavior, {
 				timestamp: submittedAt,
 				attribution: promptAttribution,
 				prependMessages: prependNotices,
@@ -8666,7 +8845,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				onPromptAdmitted: options?.onPromptAdmitted,
 				onPromptQueued: options?.onPromptQueued,
 			});
-			outcome.sessionClaimed = true;
+			// The abort race was decided by the generation check above; an aside can
+			// still be dropped by a session switch.
+			outcome.sessionClaimed = queued;
+			// The report-first guidance refers to "the message above": it follows the user message.
+			if (queued && reportFirstNotice) await this.#queueCustomMessage(reportFirstNotice, streamingBehavior);
 			return true;
 		}
 
@@ -8728,6 +8911,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 								...(imageDescriptionNotice ? [imageDescriptionNotice] : []),
 							]
 						: undefined,
+				appendMessages: reportFirstNotice ? [reportFirstNotice] : undefined,
 			});
 		} catch (error) {
 			turnError = error;
@@ -9122,6 +9306,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			"toolChoice" | "images" | "skipCompactionCheck" | "solutionSpace" | "onPromptAdmitted"
 		> & {
 			prependMessages?: AgentMessage[];
+			/** Hidden context that must read as following the user message (e.g. "the message above"). */
+			appendMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
 		},
@@ -9172,9 +9358,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				);
 			}
 
-			// Validate API key; a provider without one walks the retry fallback chain first.
-			const apiKey = await logger.time("prompt:apiKey", () => this.#modelRegistry.getApiKey(model, this.sessionId));
-			if (!apiKey && !(await this.#recovery.applyMissingCredentialFallback(setupAbort.signal))) {
+			// Credentials resolve on the request path, so a transient refresh failure retries there; a provider
+			// with none configured walks the retry fallback chain first.
+			if (
+				!this.#modelRegistry.hasConfiguredAuth(model) &&
+				!(await this.#recovery.applyMissingCredentialFallback(setupAbort.signal))
+			) {
 				if (setupAbort.signal.aborted) return false;
 				throw new PromptPreflightError(
 					`No API key found for ${model.provider}.\n\n` +
@@ -9233,6 +9422,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// it subsumes, avoiding a contradictory materialized notice.
 			const xdevMountNoticeIndex = messages.length;
 			messages.push(message);
+			if (options?.appendMessages) {
+				messages.push(...options.appendMessages);
+			}
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this.#pendingNextTurnMessages) {
 				messages.push(msg);
@@ -12347,8 +12539,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (this.agent.state.messages.length === 0) {
 			await this.refreshBaseSystemPrompt();
 		} else if (enabled) {
-			// Enabled covers top-level and xd://-mounted tools: every path through
-			// which the model can still reach a reader.
+			// Enabled covers top-level, xd://-mounted, and Code Mode bridge-demoted
+			// tools: every path through which the model can still reach a reader.
 			const hasSkillReader = this.getEnabledToolNames().some(name => toolReadsSkillUris(this.getToolByName(name)));
 			const renderedSkills = this.#skillDescriptions.render(
 				hasSkillReader ? this.skills.filter(skill => skill.hide !== true) : [],
@@ -12364,7 +12556,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				await this.sendCustomMessage(
 					{
 						customType: "skillful-notice",
-						content: prompt.render(skillfulNoticePrompt, { skills: renderedSkills }),
+						content: prompt.render(skillfulNoticePrompt, {
+							skills: renderedSkills,
+							toolRefs: this.getToolRefs(),
+						}),
 						display: false,
 					},
 					{ deliverAs: "nextTurn" },
@@ -12739,12 +12934,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#emit({ type: "model_changed" });
 		}
 
-		await this.#reconcileModelDependentState(model);
+		await this.#reconcileModelDependentState(currentModel, model);
 	}
 
-	async #reconcileModelDependentState(model: Model): Promise<void> {
+	async #reconcileModelDependentState(previousModel: Model | undefined, model: Model): Promise<void> {
 		// Re-evaluate append-only context mode — provider or setting may have changed
 		this.#syncAppendOnlyContext(model);
+
+		if (this.#tools.codeModeChangesBetween(previousModel, model) || this.#tools.codeModeDirectWireMetadataChanged()) {
+			try {
+				await this.#tools.reconcileCodeMode();
+			} catch (error) {
+				logger.warn("Code Mode reconcile after model change failed", { error: String(error) });
+			}
+		}
 
 		try {
 			await this.#maintenance.renderArchiveForModel();
@@ -12912,38 +13115,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// interrupt's auto-resume suppression the same way a typed prompt does.
 		if (didRetry) this.#advisors.autoResumeSuppressed = false;
 		return didRetry;
-	}
-
-	/**
-	 * Go on with the turn the previous process was in when it ended (`omp --restore`).
-	 *
-	 * A turn cut off without an exit record (a crash, SIGKILL or power loss records
-	 * none) is first closed the way exit recovery closes one whose exit was recorded:
-	 * its unfinished tool calls get "outcome unknown" results and an interrupted-turn
-	 * abort ends it. That turn is then retried as `/retry` does: a batch whose every
-	 * call was cut off runs again, otherwise the model answers from where the
-	 * transcript stops. A turn that finished, failed, or the user interrupted stays
-	 * as it is.
-	 *
-	 * @returns whether a continuation was scheduled; false while a turn runs, without
-	 * a model, or with nothing left unfinished.
-	 */
-	async restoreInterruptedTurn(): Promise<boolean> {
-		const branch = this.sessionManager.getBranch();
-		if (this.isStreaming || !hasRestorableTurn(branch)) return false;
-		const model = this.model;
-		if (!model) return false;
-		const abort = createInterruptedTurnAbortMessage(
-			branch,
-			{ api: model.api, provider: model.provider, model: model.id },
-			{ assumeExit: true },
-		);
-		if (abort) {
-			for (const result of createInterruptedToolResults(branch)) this.sessionManager.appendMessage(result);
-			this.sessionManager.appendMessage(abort);
-			this.agent.replaceMessages(this.buildDisplaySessionContext().messages);
-		}
-		return this.retry();
 	}
 
 	// =========================================================================
@@ -13222,7 +13393,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		);
 		const llmMessages = await this.convertMessagesToLlm(snapshot, args.signal);
 		assertEphemeralTurnReady();
-		const sideContext = await this.agent.buildSideRequestContext(llmMessages);
+		const sideContext = await this.agent.buildSideRequestContext(llmMessages, undefined, {
+			harnessProfile: effectiveHarnessProfile(this.settings, this.model) ?? null,
+		});
 		const toolHistory = sideContext.messages.some(
 			message =>
 				message.role === "toolResult" ||
@@ -13800,6 +13973,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#advisors.restoreCost(costs, providersBySlug);
 			}
 			this.#bash.finishSessionTransition(bashTransition, true);
+			if (switchingToDifferentSession) this.#recordSessionOpen();
 			// Keep the old reservations during rollback; the target is committed now,
 			// so the snapshotted old queues can no longer be restored.
 			this.#releaseTtsrReservations(previousSteeringMessages);
@@ -14358,8 +14532,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		let summaryDetails: unknown;
 		if (options.summarize && entriesToSummarize.length > 0 && !hookSummary) {
 			const model = this.model!;
-			const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
-			if (!apiKey) {
+			if (!this.#modelRegistry.hasConfiguredAuth(model)) {
 				throw new Error(`No API key for ${model.provider}`);
 			}
 			const result = await generateBranchSummary(entriesToSummarize, {
@@ -15655,7 +15828,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const refreshed = found && this.#modelRegistry.fitContextWindow(found, this.settings);
 		if (!refreshed || refreshed.contextWindow === current.contextWindow) return;
 		this.agent.setModel(refreshed);
-		await this.#reconcileModelDependentState(refreshed);
+		await this.#reconcileModelDependentState(current, refreshed);
 		if (this.#isDisposed) return;
 		this.#emit({ type: "model_changed" });
 	}

@@ -71,10 +71,11 @@ import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
 import { isRecord, logger, prompt, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { writeArtifact } from "./artifacts";
+import { candidateApiKey } from "../config/account-pools";
 import type { ModelRegistry } from "../config/model-registry";
 import { CHAT_MODEL_ROLE_IDS } from "../config/model-roles";
 import type { Settings } from "../config/settings";
-import type { ExtensionRunner, SessionBeforeCompactResult } from "../extensibility/extensions";
+import type { ExtensionRunner, SessionBeforeCompactResult, SessionHistoryRewrite } from "../extensibility/extensions";
 import type { CompactOptions, ContextUsage } from "../extensibility/extensions/types";
 import type { GoalModeState } from "../goals/state";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
@@ -109,7 +110,12 @@ import {
 	resolveRoleModelFull,
 } from "./role-models";
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
-import { buildSessionContext, getLatestCompactionEntry, getOpenAiRemoteCompactionPayload } from "./session-context";
+import {
+	buildSessionContext,
+	getLatestCompactionEntry,
+	getOpenAiRemoteCompactionPayload,
+	replaysInContext,
+} from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 import type { ShakeMode, ShakeResult } from "./shake-types";
@@ -268,6 +274,22 @@ function findUsageAnchorIndex(branchEntries: readonly SessionEntry[], compaction
 	return -1;
 }
 
+/**
+ * The latest usage anchor's index on `branchEntries` (`-1` when there is none)
+ * and which entries its provider-reported prompt carried, so a rewrite of one
+ * lowers that anchor: the entries before it that the model context replays
+ * ({@link replaysInContext}).
+ */
+function anchoredHistory(branchEntries: readonly SessionEntry[]): {
+	anchorIndex: number;
+	carries: (index: number) => boolean;
+} {
+	const compaction = getLatestCompactionEntry(branchEntries);
+	const anchorIndex = findUsageAnchorIndex(branchEntries, compaction ? branchEntries.lastIndexOf(compaction) : -1);
+	const replayed = replaysInContext(branchEntries);
+	return { anchorIndex, carries: index => index >= 0 && index < anchorIndex && replayed(index) };
+}
+
 /** A terminal payload rejection may be byte-sized history or irreducible media, not necessarily token overflow. */
 function payloadRejectionNotice(storedTokens: number, contextWindow: number): string {
 	const remedies =
@@ -397,6 +419,22 @@ class ManualCompactionNoOpError extends Error {
 		super(message);
 		this.name = "ManualCompactionNoOpError";
 	}
+}
+
+/**
+ * The frame byte budget `model` reads a snapcompact archive's no-reasoning view
+ * at, or `undefined` when it reads archives with their reasoning.
+ */
+function readerFrameBudget(model: Model): number | undefined {
+	return snapcompact.readerIncludesThinking(model) ? undefined : snapcompact.frameDataBytesBudget(model);
+}
+
+/** The file lists a snapcompact compaction entry recorded in `details`, when it has them. */
+function snapcompactDetails(details: unknown): snapcompact.CompactionDetails | undefined {
+	if (!isRecord(details) || !Array.isArray(details.readFiles) || !Array.isArray(details.modifiedFiles))
+		return undefined;
+	const isPath = (file: unknown): file is string => typeof file === "string";
+	return { readFiles: details.readFiles.filter(isPath), modifiedFiles: details.modifiedFiles.filter(isPath) };
 }
 
 /** Capabilities borrowed from the owning AgentSession. */
@@ -856,18 +894,13 @@ export class SessionMaintenance {
 	async dropImages(): Promise<{ removed: number; tokensFreed: number }> {
 		const branchEntries = this.#host.sessionManager.getBranch();
 		const countOptions = { excludeEncryptedReasoning: true } as const;
-		const latestCompaction = getLatestCompactionEntry(branchEntries);
-		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
-		const hasRemoteReplacementHistory = getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined;
-		const anchorIndex = findUsageAnchorIndex(branchEntries, compactionIndex);
+		// Only entries the anchor's provider-reported prompt already carried may be subtracted from it.
+		const history = anchoredHistory(branchEntries);
 		let removed = 0;
 		let tokensFreed = 0;
 		let anchoredTokensRemoved = 0;
 		for (const [index, entry] of branchEntries.entries()) {
-			// Only entries the anchor's provider-reported prompt already carried may
-			// be subtracted from it, and a remote compaction's replacement history
-			// hides everything before its cutoff from the wire.
-			const anchored = index < anchorIndex && (!hasRemoteReplacementHistory || index > compactionIndex);
+			const anchored = history.carries(index);
 			if (entry.type === "message") {
 				const before = this.#tokenizer.countMessage(entry.message, countOptions);
 				const dropped = stripImagesFromMessage(entry.message);
@@ -950,10 +983,7 @@ export class SessionMaintenance {
 
 		if (mode === "thinking") {
 			const branchEntries = this.#host.sessionManager.getBranch();
-			const latestCompaction = getLatestCompactionEntry(branchEntries);
-			const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
-			const hasRemoteReplacementHistory = getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined;
-			const anchorIndex = findUsageAnchorIndex(branchEntries, compactionIndex);
+			const anchored = anchoredHistory(branchEntries);
 			let removed = 0;
 			let tokensFreed = 0;
 			let anchoredTokensRemoved = 0;
@@ -974,9 +1004,7 @@ export class SessionMaintenance {
 				invalidateMessageCache(message);
 				const saved = Math.max(0, before - this.#tokenizer.countMessage(message, countOptions));
 				tokensFreed += saved;
-				if (index < anchorIndex && (!hasRemoteReplacementHistory || index > compactionIndex)) {
-					anchoredTokensRemoved += saved;
-				}
+				if (anchored.carries(index)) anchoredTokensRemoved += saved;
 				removed += dropped;
 			}
 			if (removed === 0) {
@@ -1055,9 +1083,7 @@ export class SessionMaintenance {
 		}
 
 		assertCurrent();
-		const hasRemoteReplacementHistory = getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined;
-		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
-		const anchorIndex = findUsageAnchorIndex(branchEntries, compactionIndex);
+		const anchored = anchoredHistory(branchEntries);
 		const entryIndexes = new Map(branchEntries.map((entry, index) => [entry, index]));
 
 		let toolResultsDropped = 0;
@@ -1073,11 +1099,7 @@ export class SessionMaintenance {
 			const replacementTokenCount = replacementTokenCounts[index] ?? 0;
 			replacementTokens += replacementTokenCount;
 			const entryIndex = entryIndexes.get(region.entry) ?? -1;
-			if (
-				entryIndex >= 0 &&
-				entryIndex < anchorIndex &&
-				(!hasRemoteReplacementHistory || entryIndex > compactionIndex)
-			) {
+			if (anchored.carries(entryIndex)) {
 				anchoredTokensRemoved += Math.max(0, region.tokens - replacementTokenCount);
 			}
 			return { region, replacement, replacementTokens: replacementTokenCount };
@@ -1087,7 +1109,7 @@ export class SessionMaintenance {
 		for (const { region } of items) {
 			if (!entrySnapshots.has(region.entry)) entrySnapshots.set(region.entry, structuredClone(region.entry));
 		}
-		const anchorEntry = anchorIndex >= 0 ? branchEntries[anchorIndex] : undefined;
+		const anchorEntry = anchored.anchorIndex >= 0 ? branchEntries[anchored.anchorIndex] : undefined;
 		if (anchorEntry && !entrySnapshots.has(anchorEntry))
 			entrySnapshots.set(anchorEntry, structuredClone(anchorEntry));
 		applyShakeRegions(items);
@@ -1112,6 +1134,66 @@ export class SessionMaintenance {
 			tokensFreed: Math.max(0, originalTokens - replacementTokens),
 			artifactId,
 		};
+	}
+
+	/**
+	 * Apply a `session_before_compact` handler's in-place history rewrite.
+	 *
+	 * Each rewrite swaps one kept entry's message body while the entry keeps its
+	 * id, role, and position, so the prefix stays a sequence of real messages
+	 * rather than collapsing into one summary. Entries the handler names that
+	 * are not messages on this branch, or would change a role, are ignored.
+	 * Commits exactly like a shake pass: persist, replay into the agent, reset
+	 * dependent state, and report the anchored tokens freed so the context
+	 * gauge moves with the rewrite. `applied` is zero when nothing changed, in
+	 * which case nothing was persisted either.
+	 */
+	async #applyHistoryRewrite(
+		rewrites: readonly SessionHistoryRewrite[],
+	): Promise<{ applied: number; tokensFreed: number }> {
+		const branchEntries = this.#host.sessionManager.getBranch();
+		const anchored = anchoredHistory(branchEntries);
+		const byId = new Map<string, number>();
+		branchEntries.forEach((entry, index) => byId.set(entry.id, index));
+
+		let tokensFreed = 0;
+		let anchoredTokensRemoved = 0;
+		let applied = 0;
+		for (const rewrite of rewrites) {
+			const index = byId.get(rewrite.entryId);
+			if (index === undefined) continue;
+			const entry = branchEntries[index];
+			if (entry.type !== "message" || rewrite.message.role !== entry.message.role) continue;
+			const before = this.#tokenizer.countMessage(entry.message);
+			let message = rewrite.message;
+			if (message.role === "assistant" && entry.message.role === "assistant") {
+				// As shake records it: `usage.output` keeps billing the visible output
+				// the rewrite removed, so a replayed turn's count takes the tally off.
+				const removed =
+					this.#tokenizer.countMessage(entry.message, { excludeEncryptedReasoning: true }) -
+					this.#tokenizer.countMessage(message, { excludeEncryptedReasoning: true });
+				message = {
+					...message,
+					elidedOutputTokens: (entry.message.elidedOutputTokens ?? 0) + Math.max(0, removed),
+				};
+			}
+			entry.message = message;
+			invalidateMessageCache(entry.message);
+			const freed = Math.max(0, before - this.#tokenizer.countMessage(entry.message));
+			tokensFreed += freed;
+			if (anchored.carries(index)) anchoredTokensRemoved += freed;
+			applied++;
+		}
+		if (applied === 0) return { applied, tokensFreed: 0 };
+
+		this.#host.recordAnchoredHistoryRewrite(anchoredTokensRemoved);
+		await this.#host.sessionManager.rewriteEntries();
+		const sessionContext = this.#host.buildDisplaySessionContext();
+		this.#host.agent.replaceMessages(sessionContext.messages);
+		this.#host.resetAdvisorRuntimes("history-rewrite");
+		this.#host.syncTodoPhasesFromBranch();
+		this.#host.closeCodexProviderSessionsForHistoryRewrite();
+		return { applied, tokensFreed };
 	}
 
 	/** One-shot, artifact-backed mechanical reduction for a pre-output Responses body-read timeout. */
@@ -1166,6 +1248,9 @@ export class SessionMaintenance {
 	 * Aborts current agent operation first.
 	 * @param customInstructions Optional instructions for the compaction summary
 	 * @param options Optional callbacks for completion/error handling
+	 * @returns The committed boundary, or `undefined` when a
+	 * `session_before_compact` handler compacted history in place and no
+	 * boundary was written; `options.onComplete` fires only for a boundary.
 	 * @param onCommitted Internal: nested fallback frames report their commit to
 	 * the owning frame the moment the entry lands, so a late rejection (a
 	 * `session_compact` hook or `onComplete` throwing after the append) still
@@ -1177,7 +1262,7 @@ export class SessionMaintenance {
 		methodOffset = 0,
 		retryController?: AbortController,
 		onCommitted?: () => void,
-	): Promise<CompactionResult> {
+	): Promise<CompactionResult | undefined> {
 		const ownsCompactionController = retryController === undefined;
 		if (
 			this.#handoffCleanup ||
@@ -1351,8 +1436,8 @@ export class SessionMaintenance {
 					),
 				);
 			}
-			const pathEntries = this.#host.sessionManager.getBranch();
-			const preparation = prepareCompaction(pathEntries, effectiveSettings, activeModel, this.#tokenizer);
+			let pathEntries = this.#host.sessionManager.getBranch();
+			let preparation = prepareCompaction(pathEntries, effectiveSettings, activeModel, this.#tokenizer);
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -1370,6 +1455,7 @@ export class SessionMaintenance {
 			if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
 				const result = (await this.#host.extensionRunner.emit({
 					type: "session_before_compact",
+					supportsRewrite: true,
 					preparation,
 					branchEntries: pathEntries,
 					customInstructions,
@@ -1380,9 +1466,22 @@ export class SessionMaintenance {
 					throw new CompactionCancelledError();
 				}
 
+				const rewrite =
+					result?.rewrite && result.rewrite.length > 0 && !compactionAbortController.signal.aborted
+						? await this.#applyHistoryRewrite(result.rewrite)
+						: undefined;
 				if (result?.compaction) {
 					hookCompaction = result.compaction;
 					fromExtension = true;
+				} else if (rewrite && rewrite.applied > 0) {
+					// The handler compacted in place. Inside the recovery band that
+					// completes the request with no boundary, exactly as an automatic
+					// pass settles there; otherwise the requested method runs over the
+					// rewritten branch, again exactly as an automatic pass escalates.
+					if (this.#compactionCreatedHeadroom()) return undefined;
+					pathEntries = this.#host.sessionManager.getBranch();
+					preparation = prepareCompaction(pathEntries, effectiveSettings, activeModel, this.#tokenizer);
+					if (!preparation) return undefined;
 				}
 			}
 
@@ -1730,6 +1829,7 @@ export class SessionMaintenance {
 		if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
 			const hookResult = (await this.#host.extensionRunner.emit({
 				type: "session_before_compact",
+				supportsRewrite: false,
 				preparation,
 				branchEntries: entries,
 				customInstructions: undefined,
@@ -1878,6 +1978,7 @@ export class SessionMaintenance {
 			if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
 				const hookResult = (await this.#host.extensionRunner.emit({
 					type: "session_before_compact",
+					supportsRewrite: false,
 					preparation,
 					branchEntries: this.#host.sessionManager.getBranch(),
 					customInstructions: undefined,
@@ -3637,7 +3738,7 @@ export class SessionMaintenance {
 		if (!candidate) return undefined;
 		if (modelsAreEqual(candidate, currentModel)) return undefined;
 		if (candidate.contextWindow == null || candidate.contextWindow <= contextWindow) return undefined;
-		const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId(), { signal });
+		const apiKey = await candidateApiKey(this.#host.modelRegistry, candidate, this.#host.sessionId(), { signal });
 		if (!apiKey) return undefined;
 		return candidate;
 	}
@@ -3718,7 +3819,7 @@ export class SessionMaintenance {
 		let nativeCompactionFailure: { error: NativeCompactionError; provider: string } | undefined;
 
 		for (const candidate of candidates) {
-			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+			const apiKey = await candidateApiKey(this.#host.modelRegistry, candidate, this.#host.sessionId());
 			if (!apiKey) continue;
 			if (
 				nativeCompactionFailure &&
@@ -4342,8 +4443,9 @@ export class SessionMaintenance {
 	}
 
 	/**
-	 * Whether the current stored context fits `model`'s usable window
-	 * (`contextWindow - reserve`), using the same reserve resolution as
+	 * Whether the current stored context fits `candidate`'s usable window
+	 * (`contextWindow - reserve`) once refitted to this session's window policy
+	 * ({@link ModelRegistry.fitContextWindow}), using the same reserve resolution as
 	 * compaction. This is deliberately independent of `compaction.enabled`: an
 	 * oversized request overflows the provider whether or not compaction would
 	 * have run, so a fit check must judge the raw budget.
@@ -4363,7 +4465,10 @@ export class SessionMaintenance {
 	 * cannot evaluate the budget, so we optimistically report a fit (preserving
 	 * prior behavior).
 	 */
-	contextFitsModel(model: Model, excludedMessage?: AssistantMessage): boolean {
+	contextFitsModel(candidate: Model, excludedMessage?: AssistantMessage): boolean {
+		// A registry row may carry another scope's extended-window opt-in; judge the
+		// window this session would run it with, the one a switch adopts.
+		const model = this.#host.modelRegistry.fitContextWindow(candidate, this.#host.settings);
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return true;
 		const messages = this.#host.messages();
@@ -4708,7 +4813,7 @@ export class SessionMaintenance {
 		model: Model,
 		maxFrames: number,
 	): Promise<snapcompact.CompactionResult> {
-		const details = entry.details as snapcompact.CompactionDetails | undefined;
+		const details = snapcompactDetails(entry.details);
 		const fileOps = snapcompact.createFileOps();
 		for (const file of details?.readFiles ?? []) fileOps.read.add(file);
 		for (const file of details?.modifiedFiles ?? []) fileOps.edited.add(file);
@@ -4761,7 +4866,7 @@ export class SessionMaintenance {
 		const lists = activeMessages
 			? [this.#host.agent.state.messages, activeMessages]
 			: [this.#host.agent.state.messages];
-		const scanned = lists.map(list => list.length);
+		const scanned = lists.map(list => ({ list, length: list.length }));
 		const replacements = await this.#summaryReplacements(
 			model,
 			...lists.map(list => list.slice(this.#summaryScanStart(list, scanKey))),
@@ -4774,12 +4879,12 @@ export class SessionMaintenance {
 			}
 			if (activeMessages) {
 				let changed = false;
-				for (let index = 0; index < activeMessages.length; index++) {
-					const replacement = replacements.get(activeMessages[index]!);
-					if (!replacement) continue;
+				activeMessages.forEach((message, index) => {
+					const replacement = replacements.get(message);
+					if (!replacement) return;
 					activeMessages[index] = replacement;
 					changed = true;
-				}
+				});
 				if (changed) invalidateConvertToLlmArrayCache(activeMessages);
 			}
 		}
@@ -5006,10 +5111,14 @@ export class SessionMaintenance {
 		return view ?? undefined;
 	}
 
-	#viewWithoutThinking(entry: CompactionEntry, model: Model): Promise<snapcompact.ArchiveView> {
+	#viewWithoutThinking(
+		entry: CompactionEntry,
+		archive: snapcompact.Archive,
+		model: Model,
+	): Promise<snapcompact.ArchiveView> {
 		let view = this.#withoutThinkingViews.get(entry);
 		if (!view) {
-			view = this.#renderViewWithoutThinking(entry, model);
+			view = this.#renderViewWithoutThinking(entry, archive, model);
 			this.#withoutThinkingViews.set(entry, view);
 		}
 		return view;
@@ -5022,19 +5131,15 @@ export class SessionMaintenance {
 	 * intact for readers that keep reasoning and for other branches. When the
 	 * render fails, the text-only form without frames is read instead.
 	 */
-	async #renderViewWithoutThinking(entry: CompactionEntry, model: Model): Promise<snapcompact.ArchiveView> {
-		const archive = snapcompact.getPreservedArchive(entry.preserveData)!;
-		const details = entry.details as Partial<snapcompact.CompactionDetails> | undefined;
+	async #renderViewWithoutThinking(
+		entry: CompactionEntry,
+		archive: snapcompact.Archive,
+		model: Model,
+	): Promise<snapcompact.ArchiveView> {
 		// The stored variant, the original when it carries no reasoning, else the
 		// text-only form without frames.
 		const readableView = () =>
-			snapcompact.viewWithoutThinking(
-				entry.summary,
-				archive,
-				Array.isArray(details?.readFiles) && Array.isArray(details?.modifiedFiles)
-					? { readFiles: details.readFiles, modifiedFiles: details.modifiedFiles }
-					: undefined,
-			);
+			snapcompact.viewWithoutThinking(entry.summary, archive, snapcompactDetails(entry.details));
 		const archiveText = snapcompact.archiveSourceText(archive);
 		if (archive.withoutThinking || !snapcompact.archiveIncludesThinking(entry.summary, archive) || !archiveText) {
 			return readableView();
@@ -5097,6 +5202,13 @@ export class SessionMaintenance {
 			methodIndex?: number;
 			/** A preceding shake already rewrote history before this fallback attempt. */
 			fallbackFromShake?: boolean;
+			/**
+			 * A `session_before_compact` rewrite already landed in this maintenance
+			 * round without reaching the recovery band. The handler has answered, so
+			 * the method now runs natively over the rewritten branch without
+			 * consulting the hook again.
+			 */
+			rewriteAttempted?: boolean;
 			/**
 			 * This call services an explicit model-requested rollover
 			 * (`new_context`): it bypasses the Auto-Compact toggle, and never
@@ -5469,9 +5581,10 @@ export class SessionMaintenance {
 			let codexCompaction: CodexCompactionContext | undefined;
 			let providerReplayThroughEntryId: string | undefined;
 
-			if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
+			if (options.rewriteAttempted !== true && this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
 				const hookResult = (await this.#host.extensionRunner.emit({
 					type: "session_before_compact",
+					supportsRewrite: true,
 					preparation,
 					branchEntries: pathEntriesForCompaction,
 					customInstructions: undefined,
@@ -5492,9 +5605,44 @@ export class SessionMaintenance {
 					return COMPACTION_CHECK_NONE;
 				}
 
+				// In-place edits land before any summary the same answer carries, so
+				// the kept tail is already reduced when the boundary is committed.
+				const rewrite =
+					hookResult?.rewrite && hookResult.rewrite.length > 0 && !autoCompactionSignal.aborted
+						? await this.#applyHistoryRewrite(hookResult.rewrite)
+						: undefined;
 				if (hookResult?.compaction) {
 					hookCompaction = hookResult.compaction;
 					fromExtension = true;
+				} else if (rewrite && rewrite.applied > 0) {
+					// The handler kept every entry and edited some in place instead of
+					// replacing the prefix with a summary. Settle exactly like shake:
+					// no compaction entry, chat rebuilt from messages. When the rewrite
+					// leaves context above the recovery band the handler has still had
+					// its say, so re-enter the same method natively over the rewritten
+					// branch.
+					const { tokensFreed } = rewrite;
+					const outcome = await this.#settleLocalRewrite({
+						action: "rewrite",
+						reason,
+						reclaimed: tokensFreed > 0,
+						tokensFreed,
+						willRetry,
+						generation,
+						autoContinue: shouldAutoContinue,
+						terminalTextAnswer,
+						triggerContextTokens: options.triggerContextTokens,
+						suppressContinuation,
+						detachPostCommit: options.detachPostCommit === true,
+						noProgressMessage: `Extension history rewrite freed nothing; continuing with ${method} compaction.`,
+						partialProgressMessage: `Extension history rewrite freed ~${tokensFreed} tokens but context is still above the threshold; continuing with ${method} compaction.`,
+					});
+					if (outcome !== "fallback") return outcome;
+					return await this.runAutoCompaction(reason, willRetry, {
+						...options,
+						methodIndex,
+						rewriteAttempted: true,
+					});
 				}
 			}
 
@@ -5802,7 +5950,7 @@ export class SessionMaintenance {
 				for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
 					const candidate = candidates[candidateIndex];
 					const hasMoreCandidates = candidateIndex < candidates.length - 1;
-					const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+					const apiKey = await candidateApiKey(this.#host.modelRegistry, candidate, this.#host.sessionId());
 					if (!apiKey) continue;
 					if (
 						nativeCompactionFailure &&
@@ -6357,6 +6505,131 @@ export class SessionMaintenance {
 	}
 
 	/**
+	 * Settle a local, in-place history rewrite (shake or an extension's
+	 * `rewrite`): decide whether it created real headroom, emit the end event,
+	 * and schedule the retry or continuation.
+	 *
+	 * Detect the dead-loop reported in issues #2119/#2275: the threshold check
+	 * fires, the rewrite runs, but residual context is still above the configured
+	 * threshold. The next agent_end would re-trigger the same pass, which has
+	 * nothing new to drop on the second round, so the loop spins until the user
+	 * kills it. Same hazard for "incomplete" (the retry would re-hit the length
+	 * cap) and for the existing "overflow + nothing reclaimed" case. In every
+	 * recovery reason we advance to the next preferred method so the situation
+	 * actually resolves; "idle" is exempt because its 60s+ timer re-checks usage
+	 * before re-firing and cannot dead-loop on its own.
+	 *
+	 * #2275: the post-rewrite check MUST stay provider-anchored when caller usage
+	 * and local estimates diverge. The local estimator undercounts
+	 * thinking-signature payloads, so thinking-heavy sessions can read well below
+	 * the provider usage that fired the threshold. Prefer the caller's context
+	 * figure when supplied, then subtract the rewrite's own savings and add
+	 * hysteresis (80% recovery band) so we don't oscillate at the boundary.
+	 * Threshold callers pass the provider-billed trigger after accounting for any
+	 * supersede/drop-useless pruning that already rewrote the next prompt; without
+	 * that pre-rewrite savings, the pass can advance to the next preference even
+	 * though the post-prune history is already inside the recovery band.
+	 */
+	async #settleLocalRewrite(args: {
+		action: "shake" | "rewrite";
+		reason: "overflow" | "threshold" | "idle" | "incomplete";
+		reclaimed: boolean;
+		tokensFreed: number;
+		willRetry: boolean;
+		generation: number;
+		autoContinue: boolean;
+		terminalTextAnswer: boolean;
+		triggerContextTokens: number | undefined;
+		suppressContinuation: boolean;
+		detachPostCommit: boolean;
+		noProgressMessage: string;
+		partialProgressMessage: string;
+	}): Promise<CompactionCheckResult | "fallback"> {
+		const { action, reason, reclaimed, willRetry, generation, detachPostCommit } = args;
+		const contextWindow = this.#model?.contextWindow ?? 0;
+		const compactionSettings = this.#compactionSettings;
+		let stillOverThreshold = false;
+		if (contextWindow > 0) {
+			if (typeof args.triggerContextTokens === "number" && Number.isFinite(args.triggerContextTokens)) {
+				const correctedTokens = Math.max(0, args.triggerContextTokens - args.tokensFreed);
+				const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
+				const recoveryBand = Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
+				stillOverThreshold = correctedTokens > recoveryBand;
+			} else {
+				const residualTokens = this.#host.getContextUsage({ contextWindow })?.tokens ?? 0;
+				stillOverThreshold = shouldCompact(residualTokens, contextWindow, compactionSettings);
+			}
+		}
+		const shouldFallBack = reason !== "idle" && ((reason === "overflow" && !reclaimed) || stillOverThreshold);
+		if (shouldFallBack) {
+			await this.#emitLifecycleEvent(
+				{
+					type: "auto_compaction_end",
+					action,
+					result: undefined,
+					aborted: false,
+					willRetry: false,
+					skipped: !reclaimed,
+					errorMessage: reclaimed ? args.partialProgressMessage : args.noProgressMessage,
+				},
+				detachPostCommit,
+			);
+			return "fallback";
+		}
+		await this.#emitLifecycleEvent(
+			{
+				type: "auto_compaction_end",
+				action,
+				result: undefined,
+				aborted: false,
+				willRetry,
+				skipped: !reclaimed,
+			},
+			detachPostCommit,
+		);
+
+		let continuationScheduled = false;
+		if (willRetry) {
+			// The rebuild replays every entry, so a trailing error/length assistant
+			// from the failed turn re-enters agent state — drop it before retrying,
+			// same as the context-full tail.
+			const messages = this.#host.agent.state.messages;
+			const lastMsg = messages[messages.length - 1];
+			if (lastMsg?.role === "assistant") {
+				const lastAssistant = lastMsg as AssistantMessage;
+				const shouldDrop =
+					lastAssistant.stopReason === "error" ||
+					(reason === "incomplete" && lastAssistant.stopReason === "length");
+				if (shouldDrop) this.#host.agent.replaceMessages(messages.slice(0, -1));
+			}
+			this.#host.scheduleAgentContinue({
+				source: `${action}-retry`,
+				delayMs: 100,
+				generation,
+			});
+			continuationScheduled = true;
+		} else {
+			continuationScheduled = this.#host.scheduleCompactionContinuation({
+				generation,
+				autoContinue: reason !== "idle" && args.autoContinue,
+				terminalTextAnswer: args.terminalTextAnswer,
+				suppressContinuation: args.suppressContinuation,
+			});
+		}
+		if (!reclaimed) {
+			return willRetry && continuationScheduled
+				? { ...COMPACTION_CHECK_CONTINUATION, historyRewritten: true }
+				: continuationScheduled
+					? COMPACTION_CHECK_CONTINUATION
+					: COMPACTION_CHECK_NONE;
+		}
+		return {
+			...(continuationScheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_NONE),
+			historyRewritten: true,
+		};
+	}
+
+	/**
 	 * Run a shake-method auto-maintenance pass. Emits the
 	 * `auto_compaction_start`/`auto_compaction_end` pair with a shake `action`,
 	 * runs {@link shake} inline against the protect-window config, and schedules
@@ -6396,111 +6669,22 @@ export class SessionMaintenance {
 				);
 				return COMPACTION_CHECK_NONE;
 			}
-			const reclaimed = result.toolResultsDropped + result.blocksDropped > 0;
-			// Detect the dead-loop reported in issues #2119/#2275: the threshold check
-			// fires, shake runs, but residual context is still above the configured
-			// threshold. The next agent_end would re-trigger shake, which has nothing
-			// new to drop on the second pass, so the loop spins until the user kills it.
-			// Same hazard for "incomplete" (the retry would re-hit the length cap) and
-			// for the existing "overflow + nothing reclaimed" case. In every recovery
-			// reason we advance to the next preferred method so the situation actually
-			// resolves; "idle" is exempt because its 60s+ timer re-checks usage before
-			// re-firing and cannot dead-loop on its own.
-			//
-			// #2275: the post-shake check MUST stay provider-anchored when caller
-			// usage and local estimates diverge. The local estimator undercounts
-			// thinking-signature payloads, so thinking-heavy sessions can read well
-			// below the provider usage that fired the threshold. Prefer the caller's
-			// context figure when supplied, then subtract shake's own savings and add
-			// hysteresis (80% recovery band) so we don't oscillate at the boundary.
-			// Threshold callers pass the provider-billed trigger after accounting for
-			// any supersede/drop-useless pruning that already rewrote the next prompt;
-			// without that pre-shake savings, shake can advance to the next preference
-			// even though the post-prune history is already inside the recovery band.
-			const contextWindow = this.#model?.contextWindow ?? 0;
-			const compactionSettings = this.#compactionSettings;
-			let stillOverThreshold = false;
-			if (contextWindow > 0) {
-				if (typeof triggerContextTokens === "number" && Number.isFinite(triggerContextTokens)) {
-					const correctedTokens = Math.max(0, triggerContextTokens - result.tokensFreed);
-					const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
-					const recoveryBand = Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
-					stillOverThreshold = correctedTokens > recoveryBand;
-				} else {
-					const postShakeTokens = this.#host.getContextUsage({ contextWindow })?.tokens ?? 0;
-					stillOverThreshold = shouldCompact(postShakeTokens, contextWindow, compactionSettings);
-				}
-			}
-			const shouldFallBack = reason !== "idle" && ((reason === "overflow" && !reclaimed) || stillOverThreshold);
-			if (shouldFallBack) {
-				const errorMessage = reclaimed
-					? `Auto-shake reclaimed ~${result.tokensFreed} tokens but context is still above the threshold; trying the next preferred compaction method.`
-					: "Auto-shake found nothing eligible to drop; trying the next preferred compaction method.";
-				await this.#emitLifecycleEvent(
-					{
-						type: "auto_compaction_end",
-						action,
-						result: undefined,
-						aborted: false,
-						willRetry: false,
-						skipped: !reclaimed,
-						errorMessage,
-					},
-					detachPostCommit,
-				);
-				return "fallback";
-			}
-			await this.#emitLifecycleEvent(
-				{
-					type: "auto_compaction_end",
-					action,
-					result: undefined,
-					aborted: false,
-					willRetry,
-					skipped: !reclaimed,
-				},
+			return await this.#settleLocalRewrite({
+				action,
+				reason,
+				reclaimed: result.toolResultsDropped + result.blocksDropped > 0,
+				tokensFreed: result.tokensFreed,
+				willRetry,
+				generation,
+				autoContinue,
+				terminalTextAnswer,
+				triggerContextTokens,
+				suppressContinuation,
 				detachPostCommit,
-			);
-
-			let continuationScheduled = false;
-			if (willRetry) {
-				// The shake rebuild replays every entry, so a trailing error/length
-				// assistant from the failed turn re-enters agent state — drop it before
-				// retrying, same as the context-full tail.
-				const messages = this.#host.agent.state.messages;
-				const lastMsg = messages[messages.length - 1];
-				if (lastMsg?.role === "assistant") {
-					const lastAssistant = lastMsg as AssistantMessage;
-					const shouldDrop =
-						lastAssistant.stopReason === "error" ||
-						(reason === "incomplete" && lastAssistant.stopReason === "length");
-					if (shouldDrop) this.#host.agent.replaceMessages(messages.slice(0, -1));
-				}
-				this.#host.scheduleAgentContinue({
-					source: "shake-retry",
-					delayMs: 100,
-					generation,
-				});
-				continuationScheduled = true;
-			} else {
-				continuationScheduled = this.#host.scheduleCompactionContinuation({
-					generation,
-					autoContinue: reason !== "idle" && autoContinue,
-					terminalTextAnswer,
-					suppressContinuation,
-				});
-			}
-			if (!reclaimed) {
-				return willRetry && continuationScheduled
-					? { ...COMPACTION_CHECK_CONTINUATION, historyRewritten: true }
-					: continuationScheduled
-						? COMPACTION_CHECK_CONTINUATION
-						: COMPACTION_CHECK_NONE;
-			}
-			return {
-				...(continuationScheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_NONE),
-				historyRewritten: true,
-			};
+				noProgressMessage:
+					"Auto-shake found nothing eligible to drop; trying the next preferred compaction method.",
+				partialProgressMessage: `Auto-shake reclaimed ~${result.tokensFreed} tokens but context is still above the threshold; trying the next preferred compaction method.`,
+			});
 		} catch (error) {
 			if (signal.aborted) {
 				await this.#emitLifecycleEvent(

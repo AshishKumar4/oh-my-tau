@@ -215,6 +215,82 @@ function snapcompactHistoryBlocksForContext(
 	return snapcompact.historyBlocks(archive, snapcompactHistoryBlockOptions(archive, options));
 }
 
+/**
+ * Where the kept tail of `compaction`, at `compactionIdx` on `path`, starts: its
+ * `firstKeptEntryId`, or, for a native Anthropic snapshot that kept no entry by
+ * id, the entry after its replay-through boundary. `-1` when it keeps no entry
+ * before itself. A remote replacement history replays its own items instead
+ * (see {@link getOpenAiRemoteCompactionPayload}).
+ */
+export function keptTailStart(
+	path: readonly SessionEntry[],
+	compaction: CompactionEntry,
+	compactionIdx: number,
+): number {
+	const firstKeptIdx = path.findIndex(
+		(entry, index) => index < compactionIdx && entry.id === compaction.firstKeptEntryId,
+	);
+	if (firstKeptIdx >= 0) return firstKeptIdx;
+	const replayThrough = compaction.providerReplayThroughEntryId;
+	if (
+		compaction.firstKeptEntryId !== "" ||
+		!replayThrough ||
+		getAnthropicCompactionPayload(compaction.preserveData) === undefined
+	) {
+		return -1;
+	}
+	const snapshotIdx = path.findIndex(entry => entry.id === replayThrough);
+	return snapshotIdx >= 0 && snapshotIdx + 1 < compactionIdx ? snapshotIdx + 1 : -1;
+}
+
+/**
+ * The request an experimental context rollover replays from before its kept
+ * tail: the latest authoritative request below `compactionIdx` and after
+ * `resetBoundaryIdx`, when it precedes `firstKeptEntryId`; `-1` otherwise
+ * (another compaction, or a request the kept tail already replays).
+ */
+export function rolloverRequestIndex(
+	path: readonly SessionEntry[],
+	compaction: CompactionEntry,
+	compactionIdx: number,
+	resetBoundaryIdx: number,
+): number {
+	if (!isRecord(compaction.details) || compaction.details.kind !== "experimental-context-rollover") return -1;
+	const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
+	for (let i = compactionIdx - 1; i > resetBoundaryIdx; i--) {
+		if (isRolloverRequestEntry(path[i])) return i < firstKeptIdx ? i : -1;
+	}
+	return -1;
+}
+
+/**
+ * Whether the model context {@link buildSessionContext} rebuilds from `path`
+ * replays the entry at an index: every entry after the latest `/clear`
+ * boundary or compaction, whichever is later, and what that compaction kept
+ * below itself. A remote replacement history replays its own items for the
+ * history it covers, and the entries after its replay-through boundary; any
+ * other compaction its kept tail ({@link keptTailStart}) and a rollover's
+ * restored request ({@link rolloverRequestIndex}). Entries between are not
+ * replayed, so this is membership, not a range.
+ */
+export function replaysInContext(path: readonly SessionEntry[]): (index: number) => boolean {
+	const resetBoundaryIdx = path.findLastIndex(entry => entry.type === "reset_boundary");
+	const compaction = getLatestCompactionEntry(path);
+	const compactionIdx = compaction ? path.lastIndexOf(compaction) : -1;
+	if (!compaction || resetBoundaryIdx > compactionIdx) return index => index > resetBoundaryIdx;
+	const request = rolloverRequestIndex(path, compaction, compactionIdx, resetBoundaryIdx);
+	let from = compactionIdx + 1;
+	if (getOpenAiRemoteCompactionPayload(compaction) !== undefined) {
+		const replayThrough = compaction.providerReplayThroughEntryId;
+		const throughIdx = replayThrough === undefined ? -1 : path.findIndex(entry => entry.id === replayThrough);
+		if (throughIdx >= 0 && throughIdx < compactionIdx) from = throughIdx + 1;
+	} else {
+		const kept = keptTailStart(path, compaction, compactionIdx);
+		if (kept >= 0) from = kept;
+	}
+	return index => index >= from || index === request;
+}
+
 /** Reads validated OpenAI Responses replacement history from a compaction entry. */
 export function getOpenAiRemoteCompactionPayload(
 	compaction: Pick<CompactionEntry, "preserveData"> | null | undefined,
@@ -521,15 +597,8 @@ export function buildSessionContext(
 		// still retires the tail's pre-compaction usage reports.
 		let historyRewriteAt: number | undefined;
 		if (anthropicPayload !== undefined) {
-			const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
-			const snapshotIdx =
-				compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId
-					? path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId)
-					: -1;
-			const firstRetained =
-				(firstKeptIdx >= 0 && firstKeptIdx < compactionIdx ? path[firstKeptIdx] : undefined) ??
-				(snapshotIdx >= 0 && snapshotIdx < compactionIdx - 1 ? path[snapshotIdx + 1] : undefined) ??
-				path[compactionIdx + 1];
+			const keptStart = keptTailStart(path, compaction, compactionIdx);
+			const firstRetained = path[keptStart >= 0 ? keptStart : compactionIdx + 1];
 			// The message's own time, not the entry's: an assistant message is
 			// stamped when its stream starts and saved after it ends, so a marker
 			// derived from the entry would postdate that turn and strip its thinking.
@@ -576,18 +645,9 @@ export function buildSessionContext(
 		// Attribution follows the shared turn-initiator semantics so a
 		// user-invoked skill or writable-collab request is retained like an
 		// ordinary one instead of being skipped for an older plain user message.
-		if (
-			!options?.transcript &&
-			isRecord(compaction.details) &&
-			compaction.details.kind === "experimental-context-rollover"
-		) {
-			const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
-			for (let i = compactionIdx - 1; i > resetBoundaryIdx; i--) {
-				const entry = path[i];
-				if (!isRolloverRequestEntry(entry)) continue;
-				if (i < firstKeptIdx) appendMessage(entry);
-				break;
-			}
+		if (!options?.transcript) {
+			const requestIdx = rolloverRequestIndex(path, compaction, compactionIdx, resetBoundaryIdx);
+			if (requestIdx >= 0) appendMessage(path[requestIdx]);
 		}
 
 		// The remote replacement payload (OpenAI remote compaction) carries the
@@ -597,15 +657,8 @@ export function buildSessionContext(
 		// turns visible instead of showing only the summary and post-compaction.
 		if (!remoteReplacementHistory || options?.transcript) {
 			// Emit kept messages (before compaction, starting from firstKeptEntryId).
-			const firstKeptIdx = path.findIndex(
-				(entry, index) => index < compactionIdx && entry.id === compaction.firstKeptEntryId,
-			);
-			const snapshotIdx =
-				anthropicPayload && compaction.firstKeptEntryId === "" && compaction.providerReplayThroughEntryId
-					? path.findIndex(entry => entry.id === compaction.providerReplayThroughEntryId)
-					: -1;
-			const retainedStart = firstKeptIdx >= 0 ? firstKeptIdx : snapshotIdx >= 0 ? snapshotIdx + 1 : -1;
-			if (retainedStart >= 0 && retainedStart < compactionIdx) {
+			const retainedStart = keptTailStart(path, compaction, compactionIdx);
+			if (retainedStart >= 0) {
 				let displayStartIdx = retainedStart;
 				if (options?.transcript) {
 					// `findCutPoint` may leave the collapsed display's kept region

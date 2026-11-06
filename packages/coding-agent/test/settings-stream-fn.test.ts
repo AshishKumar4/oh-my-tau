@@ -2,25 +2,32 @@
  * Contract: `createSettingsAwareStreamFn` layers session provider settings
  * (`providers.openrouterVariant`, `providers.antigravityEndpoint`,
  * `providers.stream*TimeoutSeconds`, `providers.maxInFlightRequests`,
- * `model.loopGuard.*`, `textVerbosity` for Responses-family requests)
+ * `model.loopGuard.*`, `textVerbosity` for Responses-family requests,
+ * `harness.mode` as the `harnessProfile` wire override, the served harness
+ * capture's `clientVersion` as `harnessClientVersion`)
  * options win — the same wiring the main agent and the advisor agent share so
  * OpenRouter sticky-routing / response caching behaves the same on advisor turns
  * (can1357/oh-my-pi#3639).
  */
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { StreamFn } from "@oh-my-pi/pi-agent-core";
-import { type Context, type Model, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
+import { type Context, type ImageContent, type Model, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
+import { claudeCodeSystemInstruction } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
 import { configureProviderStoreResponses } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { bindEffects } from "@oh-my-pi/pi-coding-agent/config/registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { HARNESS_CAPTURE_SCHEMA, loadHarnessPrompt } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import { cfgProvidersMuseCodeStoreResponses } from "@oh-my-pi/pi-coding-agent/session/settings";
 import {
 	createSettingsAwareStreamFn,
 	resolveWebsocketPreference,
 } from "@oh-my-pi/pi-coding-agent/session/settings-stream-fn";
+import { withHarnessCacheDir } from "./helpers/harness";
 
 /** Settings whose global (persisted) layer holds `storeResponses`; a runtime override would outrank the env var. */
 function persistedStore(value: boolean | undefined): Settings {
@@ -92,7 +99,7 @@ function replayedReasoningContext(producer: Model): Context {
 				timestamp: 1,
 			},
 		],
-	} as unknown as Context;
+	};
 }
 
 describe("createSettingsAwareStreamFn", () => {
@@ -139,6 +146,38 @@ describe("createSettingsAwareStreamFn", () => {
 		expect(options?.loopGuard).toEqual({ enabled: true, checkAssistantContent: true });
 		// caller's own option is preserved
 		expect(options?.apiKey).toBe("k");
+	});
+
+	it("threads native as null and forced profiles through, preserving caller pins", () => {
+		const profiled = {
+			api: "anthropic-messages",
+			provider: "anthropic",
+			id: "x",
+			identity: { class: "anthropic" },
+		} as unknown as Model;
+		for (const [mode, expected] of [
+			["native", null],
+			["claude-code", "claude-code"],
+			["codex", "codex"],
+		] as const) {
+			const settings = Settings.isolated({ "harness.mode": mode });
+			const { fn: base, calls } = captureBase();
+			createSettingsAwareStreamFn(settings, base)(profiled, stubContext, { apiKey: "k" });
+			expect(calls[0]?.options?.harnessProfile).toBe(expected);
+		}
+		// auto on an identity-less stub resolves no profile -> null (native wire).
+		const autoSettings = Settings.isolated({});
+		const { fn: base, calls } = captureBase();
+		createSettingsAwareStreamFn(autoSettings, base)(stubModel, stubContext, { apiKey: "k" });
+		expect(calls[0]?.options?.harnessProfile).toBeNull();
+		// Caller-supplied overrides win over the session mode.
+		const nativeSettings = Settings.isolated({ "harness.mode": "native" });
+		const { fn: base2, calls: calls2 } = captureBase();
+		createSettingsAwareStreamFn(nativeSettings, base2)(profiled, stubContext, {
+			apiKey: "k",
+			harnessProfile: "codex",
+		});
+		expect(calls2[0]?.options?.harnessProfile).toBe("codex");
 	});
 
 	it("forwards configured hidden thinking summaries", () => {
@@ -283,12 +322,64 @@ describe("createSettingsAwareStreamFn", () => {
 		expect(calls[1]?.options?.maxTokens).toBeUndefined();
 	});
 
+	it("refits after a same-id model replacement changes how its history is counted", () => {
+		// A models.yml override or registry refresh can swap the Model behind one
+		// provider, api and id. Bound to its conversation prefix, it bills another
+		// Claude model's signed reasoning from its deployment at the turn's output.
+		const vertex = getBundledModel<"anthropic-messages">("google-vertex", "claude-opus-5@default");
+		if (!vertex.thinking) throw new Error("Expected Claude Opus 5 on Vertex to think");
+		const sized = { ...vertex, contextWindow: 10_000, maxTokens: 8_000 };
+		const bound: Model = { ...sized, thinking: { ...vertex.thinking, prefixBinding: true } };
+		const unbound: Model = { ...sized, thinking: { ...vertex.thinking, prefixBinding: false } };
+		const context: Context = {
+			messages: [
+				// A rewrite marker newer than the turn makes its usage stale, so it is counted locally.
+				{ role: "user", content: "summary", historyRewriteAt: 10, timestamp: 10 },
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "Plan.", thinkingSignature: "s".repeat(400) },
+						{ type: "text", text: "Done." },
+					],
+					api: vertex.api,
+					provider: vertex.provider,
+					model: "claude-opus-4-7@default",
+					usage: {
+						input: 100,
+						output: 6_000,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 6_100,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 1,
+				},
+			],
+		};
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+		wrapped(bound, context, { apiKey: "k" });
+		wrapped(unbound, context, { apiKey: "k" });
+
+		// The bound model's prompt carries the 6,000 reasoning tokens, so its cap is fitted.
+		expect(calls[0]?.options?.maxTokens).toBeLessThan(8_000);
+		// The replacement drops that reasoning: its prompt is a few tokens.
+		expect(calls[1]?.options?.maxTokens).toBeUndefined();
+	});
+
 	it("fits the output cap at the called model's prices, not an earlier model's", () => {
 		// Gemini bills any image a flat 1,120 tokens; GPT-6.1 bills this one 4,763.
-		const gemini = getBundledModel("google", "gemini-3-pro-preview") as Model;
+		const gemini = getBundledModel("google", "gemini-3-pro-preview");
 		const codex: Model = { ...getBundledModel("openai-codex", "gpt-6.1-sol"), contextWindow: 10_000 };
-		const image = { type: "image", data: pngWithSize(2000, 2000), mimeType: "image/png", detail: "original" };
-		const context = { messages: [{ role: "user", content: [image], timestamp: 0 }] } as unknown as Context;
+		const image: ImageContent = {
+			type: "image",
+			data: pngWithSize(2000, 2000),
+			mimeType: "image/png",
+			detail: "original",
+		};
+		const context: Context = { messages: [{ role: "user", content: [image], timestamp: 0 }] };
 		const { fn: base, calls } = captureBase();
 		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
 		const fresh = captureBase();
@@ -338,6 +429,23 @@ describe("createSettingsAwareStreamFn", () => {
 
 		expect(calls[0]?.options?.maxTokens).toBeUndefined();
 		expect(calls[1]?.options?.maxTokens).toBeLessThan(9_000);
+	});
+
+	it("counts a cold request apart from an earlier replaying one", () => {
+		const copilot: Model = {
+			...getBundledModel("github-copilot", "gpt-5.4"),
+			contextWindow: 10_000,
+			maxTokens: 9_000,
+		};
+		const context = replayedReasoningContext(copilot);
+		const { fn: base, calls } = captureBase();
+		const wrapped = createSettingsAwareStreamFn(Settings.isolated({}), base);
+
+		wrapped(copilot, context, { apiKey: "k" });
+		wrapped(copilot, context, { apiKey: "k", providerSessionState: new Map() });
+
+		expect(calls[0]?.options?.maxTokens).toBeLessThan(9_000);
+		expect(calls[1]?.options?.maxTokens).toBeUndefined();
 	});
 
 	it("fits a cold request that may wait for a provider slot as replaying", () => {
@@ -625,5 +733,51 @@ describe("per-call server-side fallback switch", () => {
 			{ apiKey: "k", fallbacks: [{ model: "claude-opus-5" }] },
 		);
 		expect(base.calls[0]!.options?.fallbacks).toEqual(disabled ? undefined : [{ model: "claude-opus-5" }]);
+	});
+});
+
+describe("createSettingsAwareStreamFn served harness capture", () => {
+	const dirs = withHarnessCacheDir("omp-settings-stream-capture-");
+
+	it("threads the served capture's client version to the provider, and none without one", async () => {
+		const model = getBundledModel("anthropic", "claude-opus-5-5");
+		const forwardedVersion = (mode: "auto" | "claude-code" | "native", options: SimpleStreamOptions = {}) => {
+			const { fn: base, calls } = captureBase();
+			createSettingsAwareStreamFn(Settings.isolated({ "harness.mode": mode }), base)(model, stubContext, {
+				apiKey: "k",
+				...options,
+			});
+			return calls[0]?.options?.harnessClientVersion;
+		};
+		// Nothing served yet: the provider keeps the pinned wire version.
+		expect(forwardedVersion("claude-code")).toBeUndefined();
+
+		const profileDir = path.join(dirs.cache, "claude-code");
+		fs.mkdirSync(profileDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(profileDir, "2.1.284.b93-cli-claude-opus-5-5.json"),
+			JSON.stringify({
+				schema: HARNESS_CAPTURE_SCHEMA,
+				profile: "claude-code",
+				clientVersion: "2.1.284.b93",
+				entrypoint: "cli",
+				capturedAt: "2026-09-29T17:08:36.689Z",
+				model: "claude-opus-5-5",
+				instructions: [
+					"x-anthropic-billing-header: cc_version=2.1.284.b93; cc_entrypoint=cli;",
+					claudeCodeSystemInstruction,
+					"You are a coding CLI.",
+				],
+				tools: ["Bash", "Read"],
+			}),
+		);
+		expect(await loadHarnessPrompt("claude-code", model.id)).not.toBeNull();
+
+		expect(forwardedVersion("claude-code")).toBe("2.1.284.b93");
+		expect(forwardedVersion("auto")).toBe("2.1.284.b93");
+		// Native mode serves no capture, so its wire keeps the pinned version.
+		expect(forwardedVersion("native")).toBeUndefined();
+		// A caller-supplied version wins, like every other stream option.
+		expect(forwardedVersion("claude-code", { harnessClientVersion: "2.1.290.abc" })).toBe("2.1.290.abc");
 	});
 });

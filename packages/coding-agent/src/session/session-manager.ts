@@ -3582,8 +3582,14 @@ export class SessionManager {
 			| BashExecutionMessage
 			| PythonExecutionMessage
 			| FileMentionMessage,
+		options?: { inherited?: boolean },
 	): string {
-		const entry: SessionMessageEntry = { type: "message", ...this.#freshEntryFields(), message };
+		// Inherited turns (conversation forks) record the message clone with
+		// billing zeroed: the child must not pay for the parent's spend while
+		// token counts stay intact for context accounting.
+		const stored = options?.inherited === true ? structuredClone(message) : message;
+		const entry: SessionMessageEntry = { type: "message", ...this.#freshEntryFields(), message: stored };
+		if (options?.inherited === true) resetUsageCost(entryUsage(entry));
 		this.#recordEntry(entry);
 		return entry.id;
 	}
@@ -3962,10 +3968,16 @@ export class SessionManager {
 		});
 	}
 
-	/** Prompt blocks for a snapcompact archive, budgeted and resolved as {@link buildSessionContext} attaches them. */
-	snapcompactHistoryBlocks(archive: snapcompact.Archive): (TextContent | ImageContent)[] {
+	/**
+	 * Prompt blocks for a snapcompact archive, budgeted and resolved as {@link buildSessionContext} attaches them;
+	 * `maxFrameDataBytes` is the reading model's frame budget (unset: the default budget).
+	 */
+	snapcompactHistoryBlocks(archive: snapcompact.Archive, maxFrameDataBytes?: number): (TextContent | ImageContent)[] {
 		const resolveFrameData = (data: string) => this.resolveFrameData(data);
-		return snapcompact.historyBlocks(archive, snapcompactHistoryBlockOptions(archive, { resolveFrameData }));
+		return snapcompact.historyBlocks(
+			archive,
+			snapcompactHistoryBlockOptions(archive, { resolveFrameData, maxFrameDataBytes }),
+		);
 	}
 
 	/** A snapcompact frame's payload, read from the blob store when persistence externalized it. */

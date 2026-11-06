@@ -2,6 +2,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Message, Model, Usage, UserMessage } from "@oh-my-pi/pi-ai";
+import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -510,6 +512,56 @@ describe("AgentSession session stats", () => {
 		});
 
 		expect(session.getSessionStats().editRejections).toEqual({ unseen_lines: 2, stale_tag: 1 });
+
+	it("splits prompt-cache hit rate across harness profiles served in one session", () => {
+		const fable = getBundledModel("anthropic", "claude-fable-5-1");
+		const astra = getBundledModel("openai-codex", "gpt-6-astra");
+		expect(resolveHarnessProfile(fable)).toBe("claude-code");
+		expect(resolveHarnessProfile(astra)).toBe("codex");
+
+		const served = (target: Model, input: number, cacheRead: number, cacheWrite: number, timestamp: number) => ({
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: `turn ${timestamp}` }],
+			api: target.api,
+			provider: target.provider,
+			model: target.id,
+			usage: {
+				input,
+				output: 10,
+				cacheRead,
+				cacheWrite,
+				totalTokens: input + cacheRead + cacheWrite + 10,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop" as const,
+			timestamp,
+		});
+
+		const manager = SessionManager.inMemory();
+		appendUsage(manager, astra, 300, { cacheRead: 200, totalTokens: 500 });
+		const agent = new Agent({
+			initialState: {
+				model: model(),
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [served(fable, 100, 300, 100, 1), served(fable, 100, 900, 0, 2), served(astra, 100, 200, 200, 3)],
+			},
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: manager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+
+		const stats = session.getSessionStats();
+
+		expect(stats.promptCacheByHarness).toEqual({
+			"claude-code": { requests: 2, input: 200, cacheRead: 1200, cacheWrite: 100, hitPct: 80 },
+			codex: { requests: 2, input: 400, cacheRead: 400, cacheWrite: 200, hitPct: 40 },
+		});
+		expect(Object.keys(stats.promptCacheByHarness ?? {})).toEqual(["claude-code", "codex"]);
+		expect(stats.tokens.cacheRead).toBe(1600);
 	});
 
 	it("drops anchored tool schemas after switching to a model that defers them", () => {

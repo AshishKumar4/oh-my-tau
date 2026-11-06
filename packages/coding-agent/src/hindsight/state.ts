@@ -515,7 +515,10 @@ export class HindsightSessionState implements HindsightSessionStateApi {
 		const generation = ++this.#recallGeneration;
 		// Reuse this transcript's recall so a resumed session sends the same prompt. Hindsight
 		// memories cannot be looked up by id, so changes since are not reported.
-		const persisted = findPersistedRecall(this.session.sessionManager, this.#recallScope());
+		const persisted = findPersistedRecall(this.session.sessionManager, this.#recallScope(), {
+			backend: "hindsight",
+			cwd: this.session.sessionManager.getCwd(),
+		});
 		if (persisted !== undefined) {
 			return {
 				context: persisted.text || undefined,

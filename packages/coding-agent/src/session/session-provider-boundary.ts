@@ -8,6 +8,7 @@ import * as snapcompact from "@oh-my-pi/snapcompact";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelString } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { deobfuscateSessionContext, obfuscateMessages } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
@@ -241,6 +242,9 @@ export class SessionProviderBoundary {
 				checkAssistantContent: cfgModelLoopGuardCheckAssistantContent.get(this.#host.settings),
 				...options.loopGuard,
 			},
+			...("harnessProfile" in options
+				? {}
+				: { harnessProfile: effectiveHarnessProfile(this.#host.settings, this.#host.model()) ?? null }),
 		};
 
 		if (sessionMetadata && !options.metadata) {

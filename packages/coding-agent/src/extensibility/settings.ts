@@ -62,6 +62,12 @@ export const cfgSkillsEnableAgentsProject = register({
 	default: true,
 });
 
+export const cfgSkillsEnableManagedUser = register({
+	id: "skills.enableManagedUser",
+	type: "boolean",
+	default: true,
+});
+
 export const cfgSkillsCustomDirectories = register({
 	id: "skills.customDirectories",
 	type: "array",
@@ -97,6 +103,7 @@ export const cfgSkills = combine({
 	enablePiProject: cfgSkillsEnablePiProject,
 	enableAgentsUser: cfgSkillsEnableAgentsUser,
 	enableAgentsProject: cfgSkillsEnableAgentsProject,
+	enableManagedUser: cfgSkillsEnableManagedUser,
 	customDirectories: cfgSkillsCustomDirectories,
 	ignoredSkills: cfgSkillsIgnoredSkills,
 	manualSkills: cfgSkillsManualSkills,

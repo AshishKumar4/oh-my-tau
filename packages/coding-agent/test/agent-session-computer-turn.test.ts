@@ -17,6 +17,7 @@ import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
+import * as fileMentions from "@oh-my-pi/pi-coding-agent/utils/file-mentions";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
@@ -176,14 +177,16 @@ describe("AgentSession computer display hold per turn", () => {
 	it("releases at an interrupt while the prompt's setup is still unwinding", async () => {
 		const entered = Promise.withResolvers<void>();
 		const unblock = Promise.withResolvers<void>();
-		const getApiKey = spyOn(modelRegistry, "getApiKey").mockImplementation(async () => {
+		// Credentials resolve on the request path here, so the setup step held open
+		// is the prompt's @file mention read.
+		const mentionRead = spyOn(fileMentions, "generateFileMentionMessages").mockImplementation(async () => {
 			entered.resolve();
 			await unblock.promise;
-			return "test-key";
+			return [];
 		});
 		try {
 			const target = createSession([{ content: ["done"] }]);
-			const running = target.prompt("go").catch(() => undefined);
+			const running = target.prompt("go @notes.md").catch(() => undefined);
 			await entered.promise;
 			expect(computerTurnInFlight(owner)).toBe(1);
 			await target.abort();
@@ -193,7 +196,7 @@ describe("AgentSession computer display hold per turn", () => {
 			await running;
 			expect(releases).toEqual([1]);
 		} finally {
-			getApiKey.mockRestore();
+			mentionRead.mockRestore();
 		}
 	});
 

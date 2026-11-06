@@ -38,6 +38,7 @@ import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
 import type { CacheWarmer } from "./cache-warmer";
+import type { EventBus } from "../utils/event-bus";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
 import type { Skill, SkillWarning } from "../extensibility/skills";
@@ -48,6 +49,7 @@ import type { JobWidgetView } from "@oh-my-pi/pi-tui/tools/job-widget";
 import type { ToolSession } from "../tools";
 import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
+import type { HarnessCacheStats } from "./prompt-cache-stats";
 import type { SettingsGatedToolDelta } from "./session-tools";
 import type { CostGateApi } from "./cost-gate";
 import type { SessionManager } from "./session-manager";
@@ -171,6 +173,8 @@ export interface InitialRetryFallbackState {
 /** Dependencies and initial state used to construct an AgentSession. */
 export interface AgentSessionConfig {
 	agent: Agent;
+	/** Shared with the provider stream wrapper: current Codex Code Mode tool exposure snapshot for turn metadata. */
+	codeModeState?: { namespacesInfo?: unknown };
 	sessionManager: SessionManager;
 	settings: Settings;
 	/**
@@ -256,6 +260,10 @@ export interface AgentSessionConfig {
 	getEvalPreludes?: () => readonly EvalPreludeDefinition[];
 	/** Tool bridge context used by user-initiated Python cells to project enabled eval preludes. */
 	evalToolSession?: ToolSession;
+	/** Session event bus; subagent lifecycle and progress frames on it feed the UI's running-subagents list. */
+	eventBus?: EventBus;
+	/** Separate bus for subagent frames when the host splits them from {@link eventBus}. */
+	subagentEventBus?: EventBus;
 	/** Loaded skills already discovered by the SDK. */
 	skills?: Skill[];
 	/** Frozen routing hints shared with the system prompt and later skillful notices. */
@@ -271,12 +279,12 @@ export interface AgentSessionConfig {
 	memoryEnabled?: boolean;
 	/** Agent directory used when changing memory backends in a live session. */
 	memoryAgentDir?: string;
-	/** Recursion depth used to suppress live backend replacement in subagents. */
-	memoryTaskDepth?: number;
 	/** Creates built-in memory tools for the current backend. */
 	createMemoryTools?: () => Promise<AgentTool[]>;
 	/** Creates the private `think` scratchpad tool for runtime setting changes. */
 	createThinkTool?: () => Promise<AgentTool | null>;
+	/** Creates the Fusion `sidekick` tool for runtime setting changes; null when it cannot mount. */
+	createSidekickTool?: () => Promise<AgentTool | null>;
 	/** Model registry for API key resolution and model discovery. */
 	modelRegistry: ModelRegistry;
 	/**
@@ -377,6 +385,10 @@ export interface AgentSessionConfig {
 	agentKind?: "main" | "sub";
 	/** Registry whose awaits table records this agent blocked on the user while a dialog waits for their answer. */
 	agentRegistry?: AgentRegistryApi;
+	/** Task recursion depth (0 = top-level). Default: 0. Gates Fusion leadership and live memory-backend replacement. */
+	taskDepth?: number;
+	/** The agent definition a subagent session runs under; undefined for the top-level session. */
+	agentDefinition?: AgentDefinition;
 	/** Provider-facing session ID override. */
 	providerSessionId?: string;
 	/** OAuth account pools enforced on the session's key lookups; the session lifts them on dispose. */
@@ -610,6 +622,7 @@ export interface SessionStats {
 	routedModels?: Record<string, number>;
 	/** Failed edits by the engine's `errorKind`. */
 	editRejections?: Record<string, number>;
+	promptCacheByHarness?: Record<string, HarnessCacheStats>;
 	contextUsage?: ContextUsage;
 }
 

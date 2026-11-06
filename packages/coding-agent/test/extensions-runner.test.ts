@@ -7,12 +7,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "@oh-my-pi/omptype/typebox";
 import type { AgentMessage, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import type { MessageCreateParams } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
-import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { getContextHistoryPosition, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import { isCursorExecResolved, kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, stripImagesFromMessage, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -4874,6 +4876,330 @@ describe("ExtensionRunner", () => {
 				);
 			});
 			expect(cachedTexts).toEqual(["persisted user", "persisted assistant"]);
+		});
+
+		it("keeps a message a context handler caches unchanged across calls out of per-call context", async () => {
+			// The handler returns the first message object it saw on every later call. The
+			// history position published on it by one call must not read as a rewrite in the next.
+			await Bun.write(
+				path.join(extensionsDir, "cache-first.ts"),
+				`export default function(pi) {
+					let first;
+					pi.on("context", async event => {
+						first ??= event.messages[0];
+						return { messages: [first, ...event.messages.slice(1)] };
+					});
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const model = getBundledModel<"anthropic-messages">("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic model to exist");
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "persisted user", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "persisted assistant" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: model.id,
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 2,
+				},
+			];
+			const anchoredTexts = async (transformed: AgentMessage[]) => {
+				let body: MessageCreateParams | undefined;
+				const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+					body = JSON.parse(String(init?.body ?? "{}")) as MessageCreateParams;
+					return new Response(
+						JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
+						{ status: 400, headers: { "Content-Type": "application/json" } },
+					);
+				}) as typeof fetch;
+				await streamAnthropic(
+					model,
+					{ systemPrompt: ["system"], messages: convertToLlm(wrapSteeringForModel(transformed)) },
+					{ apiKey: "sk-ant-api-test", fetch: fetchMock },
+				)
+					.result()
+					.catch(() => undefined);
+				if (!body) throw new Error("Expected Anthropic wire body");
+				return body.messages.flatMap(message =>
+					Array.isArray(message.content)
+						? message.content.flatMap(block =>
+								"cache_control" in block && block.cache_control != null && block.type === "text"
+									? [block.text]
+									: [],
+							)
+						: [],
+				);
+			};
+
+			const first = await runner.emitContext(messages);
+			const second = await runner.emitContext(messages);
+			expect(second[0]).toBe(first[0]);
+			expect(await anchoredTexts(first)).toEqual(["persisted user", "persisted assistant"]);
+			expect(await anchoredTexts(second)).toEqual(["persisted user", "persisted assistant"]);
+		});
+
+		it("keeps rolling breakpoints on the tail when a context handler leaves freshly streamed messages untouched", async () => {
+			// A no-op context handler still routes every message through `structuredClone`,
+			// which cannot carry the symbol-keyed markers a live stream leaves on its
+			// blocks. Treating that loss as a rewrite marked each new assistant turn as
+			// per-call context and pinned the cacheable prefix to the last user turn, so
+			// every later tool round-trip in the turn re-sent the whole tail uncached.
+			await Bun.write(
+				path.join(extensionsDir, "passthrough.ts"),
+				`export default function(pi) { pi.on("context", async event => ({ messages: event.messages })); }`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const model = getBundledModel<"anthropic-messages">("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected bundled Anthropic model to exist");
+			const streamedToolCall = { type: "toolCall" as const, id: "call-1", name: "lookup", arguments: {} };
+			setStreamingPartialJson(streamedToolCall, "{}");
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "persisted user", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "streamed assistant" }, streamedToolCall],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: model.id,
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 2,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "lookup",
+					content: [{ type: "text", text: "tool output" }],
+					isError: false,
+					timestamp: 3,
+				},
+			];
+			const transformed = await runner.emitContext(messages);
+			let body: MessageCreateParams | undefined;
+			const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
+				body = JSON.parse(String(init?.body ?? "{}")) as MessageCreateParams;
+				return new Response(
+					JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
+					{ status: 400, headers: { "Content-Type": "application/json" } },
+				);
+			}) as typeof fetch;
+
+			await streamAnthropic(
+				model,
+				{
+					systemPrompt: ["system"],
+					messages: convertToLlm(wrapSteeringForModel(transformed)),
+					tools: [
+						{
+							name: "lookup",
+							description: "Lookup a value",
+							parameters: { type: "object", properties: {}, additionalProperties: false },
+						},
+					],
+				},
+				{ apiKey: "sk-ant-api-test", fetch: fetchMock },
+			)
+				.result()
+				.catch(() => undefined);
+			if (!body) throw new Error("Expected Anthropic wire body");
+
+			const anchored = body.messages.flatMap((message, index) =>
+				Array.isArray(message.content) &&
+				message.content.some(block => "cache_control" in block && block.cache_control != null)
+					? [index]
+					: [],
+			);
+			// The two newest messages carry the rolling breakpoints, so the next request
+			// reads the streamed turn instead of paying for it again.
+			expect(anchored).toEqual([body.messages.length - 2, body.messages.length - 1]);
+		});
+
+		it("keeps a file mention's image in an earlier call's output after its owner strips the session's images", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "append-note.ts"),
+				`export default function(pi) {
+					pi.on("context", async event => ({
+						messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+					}));
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const screenshot: ImageContent = { type: "image", data: "U0NSRUVOU0hPVA==", mimeType: "image/png" };
+			const mention: AgentMessage = {
+				role: "fileMention",
+				files: [{ path: "shot.png", content: "", image: screenshot }],
+				timestamp: 1,
+			};
+			const sent = await runner.emitContext([mention, { role: "user", content: "what is this?", timestamp: 2 }]);
+
+			// The owner strips the session's images in place, as an image shake does.
+			expect(stripImagesFromMessage(mention)).toBe(1);
+
+			expect(JSON.stringify(convertToLlm(sent))).toContain(screenshot.data);
+		});
+
+		it("converts a hooked call's history with the provider markers its messages carry", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "append-note.ts"),
+				`export default function(pi) {
+					pi.on("context", async event => ({
+						messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+					}));
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			// A Cursor turn whose tool call already ran on the provider's side.
+			const resolvedCall = {
+				type: "toolCall" as const,
+				id: "call-cursor",
+				name: "read",
+				arguments: { path: "x" },
+				[kCursorExecResolved]: true as const,
+			};
+			const turn: AgentMessage = { ...createAssistantMessage("reading"), content: [resolvedCall] };
+
+			const sent = convertToLlm(await runner.emitContext([{ role: "user", content: "read x", timestamp: 1 }, turn]));
+
+			const call = sent.find(message => message.role === "assistant")?.content[0];
+			expect(call).toMatchObject({ type: "toolCall", id: "call-cursor" });
+			expect(isCursorExecResolved(call)).toBe(true);
+		});
+
+		it("hands back one object per unchanged history message across calls, a new one once it moves or is rewritten", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "append-note.ts"),
+				`export default function(pi) {
+					pi.on("context", async event => ({
+						messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+					}));
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const question: AgentMessage = { role: "user", content: "question", timestamp: 1 };
+			const answer: AgentMessage = createAssistantMessage("answer");
+			const first = await runner.emitContext([question, answer]);
+			const second = await runner.emitContext([question, answer]);
+			// Caches keyed by message identity (conversion, estimates, the date/cwd reminder)
+			// see the same history message on every hooked call; the note is this call's own.
+			expect(second[0]).toBe(first[0]);
+			expect(second[1]).toBe(first[1]);
+			expect(second[2]).not.toBe(first[2]);
+			expect(second.slice(0, 2)).not.toContain(question);
+
+			// A history rebuilt ahead of the answer moves it; the earlier call keeps what it read.
+			const summary: AgentMessage = { role: "user", content: "summary", timestamp: 0 };
+			const moved = await runner.emitContext([summary, question, answer]);
+			expect(moved[2]).not.toBe(first[1]);
+			expect(moved.map(getContextHistoryPosition)).toEqual([0, 1, 2, undefined]);
+			expect(first.map(getContextHistoryPosition)).toEqual([0, 1, undefined]);
+
+			// An owner rewriting the answer in place gets a copy of the new content.
+			const items: Array<Record<string, unknown>> = [{ type: "message", role: "assistant" }];
+			const rewritten: AssistantMessage = {
+				...createAssistantMessage("answer"),
+				providerPayload: { type: "openaiResponsesHistory", provider: "openai", items },
+			};
+			const before = await runner.emitContext([question, rewritten]);
+			const sent = JSON.stringify(before[1]);
+			const text = rewritten.content[0];
+			if (text?.type !== "text") throw new Error("Expected a text block");
+			text.text = "[shaken]";
+			items.push({ type: "reasoning", summary: [] });
+			invalidateMessageCache(rewritten);
+			const after = await runner.emitContext([question, rewritten]);
+			expect(after[1]).not.toBe(before[1]);
+			expect(JSON.stringify(after[1])).toBe(JSON.stringify(rewritten));
+			// What an earlier call handed back stays as it was read, its content included.
+			expect(JSON.stringify(before[1])).toBe(sent);
+			expect(sent).toContain('"answer"');
+		});
+
+		it("publishes history positions on its own copies when the history cannot be cloned", async () => {
+			await Bun.write(
+				path.join(extensionsDir, "passthrough.ts"),
+				`export default function(pi) { pi.on("context", async event => ({ messages: event.messages })); }`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			// A function in a tool result's details makes `structuredClone` throw.
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "question", timestamp: 1 },
+				{
+					role: "toolResult",
+					toolCallId: "call-1",
+					toolName: "lookup",
+					content: [{ type: "text", text: "tool output" }],
+					details: { render: () => "rendered" },
+					isError: false,
+					timestamp: 2,
+				},
+			];
+			for (let call = 0; call < 2; call++) {
+				const transformed = await runner.emitContext(messages);
+				expect(transformed.map(getContextHistoryPosition)).toEqual([0, 1]);
+				expect(transformed.some((message, index) => message === messages[index])).toBe(false);
+				// The session's own messages stay free of one call's provenance.
+				expect(messages.map(getContextHistoryPosition)).toEqual([undefined, undefined]);
+			}
 		});
 	});
 });

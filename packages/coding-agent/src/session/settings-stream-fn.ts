@@ -10,11 +10,18 @@
  * OpenRouter never saw `providers.openrouterVariant`, breaking sticky routing
  * and OpenRouter response-cache hits across advisor calls.
  */
-import { fitOutputTokensToContextWindow, type StreamFn, Tokenizer } from "@oh-my-pi/pi-agent-core";
+import {
+	fitOutputTokensToContextWindow,
+	type StreamFn,
+	Tokenizer,
+	tokenizerAccountingKey,
+} from "@oh-my-pi/pi-agent-core";
 import { type Model, type SimpleStreamOptions, streamSimple } from "@oh-my-pi/pi-ai";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import { serverSideFallbackModels } from "@oh-my-pi/pi-catalog/compat/server-side-fallback";
 import type { Settings } from "../config/settings";
+import { servedHarnessPrompt } from "../harness/capture";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { type AnthropicSlowModeLanes, anthropicSlowModeLanes } from "./anthropic-slow-mode";
 
 import {
@@ -92,9 +99,9 @@ export function createSettingsAwareStreamFn(
 	base: StreamFn = streamSimple,
 	slowModeContext?: SettingsStreamSlowModeContext,
 ): StreamFn {
-	// One tokenizer per reading model and native-history replay state, so
-	// per-message counts are reused across requests: its prices (images,
-	// replayed thinking and reasoning) belong to that model and request state.
+	// One tokenizer per accounting policy (reading model and native-history
+	// replay state), so per-message counts are reused across requests and a
+	// model replaced under the same id gets its own.
 	const tokenizers = new Map<string, Tokenizer>();
 	return (model, context, streamOptions) => {
 		const openrouterRoutingPreset = cfgProvidersOpenrouterVariant.get(settings);
@@ -160,13 +167,27 @@ export function createSettingsAwareStreamFn(
 		const nativeHistoryReplay =
 			Object.hasOwn(maxInFlightRequests, model.provider) ||
 			openAIResponsesReplaysNativeHistory(model, streamOptions?.providerSessionState);
-		const tokenizerKey = `${model.provider}\0${model.api}\0${model.id}\0${nativeHistoryReplay}`;
-		let tokenizer = tokenizers.get(tokenizerKey);
+		const tokenizerOptions = { nativeHistoryReplay };
+		let tokenizer = tokenizers.get(tokenizerAccountingKey(model, tokenizerOptions));
 		if (!tokenizer) {
-			tokenizer = new Tokenizer(model, { nativeHistoryReplay });
-			tokenizers.set(tokenizerKey, tokenizer);
+			tokenizer = new Tokenizer(model, tokenizerOptions);
+			tokenizers.set(tokenizer.accountingKey, tokenizer);
 		}
 		const maxTokens = fitOutputTokensToContextWindow(model, context, streamOptions?.maxTokens, tokenizer);
+		// Session effective harness profile: `auto` resolves the catalog
+		// profile (byte-identical to omitting the override), `native` sends
+		// `null` (providers run native), and a forced profile threads through
+		// to wire naming, head caching, replay, and the Codex request shape.
+		// Caller-supplied overrides win so tests and embeddings can pin the wire.
+		const harnessOverride =
+			streamOptions !== undefined && "harnessProfile" in streamOptions
+				? (streamOptions.harnessProfile ?? null)
+				: (effectiveHarnessProfile(settings, model) ?? null);
+		// The capture serving this profile's prompt and tools names the client
+		// release the wire claims (Claude Code's User-Agent and billing header).
+		// Native sessions serve no capture, so their wire keeps the pinned version.
+		const harnessClientVersion =
+			streamOptions?.harnessClientVersion ?? servedHarnessPrompt(model, harnessOverride)?.clientVersion;
 		const merged: SimpleStreamOptions = {
 			...streamOptions,
 			maxTokens,
@@ -196,6 +217,8 @@ export function createSettingsAwareStreamFn(
 				: {}),
 			...(codexAccessPrograms !== undefined ? { codexAccessPrograms } : {}),
 			...(slowModeHooks !== undefined ? { anthropicSlowMode: slowModeHooks } : {}),
+			harnessProfile: harnessOverride,
+			...(harnessClientVersion !== undefined ? { harnessClientVersion } : {}),
 		};
 		return base(model, context, merged);
 	};

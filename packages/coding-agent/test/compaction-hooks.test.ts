@@ -210,6 +210,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Compaction hooks", () => {
 		await session.agent.waitForIdle();
 
 		const result = await session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBe(customSummary);
 
@@ -259,6 +260,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Compaction hooks", () => {
 		await session.agent.waitForIdle();
 
 		const result = await session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBeDefined();
 
@@ -359,6 +361,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Compaction hooks", () => {
 		await session.agent.waitForIdle();
 
 		const result = await session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBe(customSummary);
 		expect(result.tokensBefore).toBe(999);

@@ -16,6 +16,7 @@ import type { Settings } from "../config/settings";
 import { obfuscateProviderContext } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { HandoffResult, SessionHandoffOptions } from "./agent-session-types";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import type { SessionManager } from "./session-manager";
 
 import { cfgCompactionHandoffSaveToDisk } from "./context-settings";
@@ -157,6 +158,9 @@ export class SessionHandoff {
 			const handoffContext = await this.#host.agent.buildSideRequestContext(
 				handoffLlmMessages,
 				this.#host.baseSystemPrompt(),
+				{
+					harnessProfile: effectiveHarnessProfile(this.#host.settings, this.#host.model()) ?? null,
+				},
 			);
 			const handoffStreamOptions = this.#host.prepareSimpleStreamOptions(
 				{

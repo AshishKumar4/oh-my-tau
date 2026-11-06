@@ -128,6 +128,17 @@ interface ImageBudgetState {
 	fallbackTextBytes?: number;
 }
 
+/**
+ * How much of `total` to drop to fit `limit`, in steps of a quarter of the
+ * limit. Dropping exactly the excess moves the oldest kept image on every
+ * request that adds one, which rewrites the whole cached prompt each time;
+ * a stepped amount changes the dropped set, and the prompt, once per step.
+ */
+function steppedExcess(total: number, limit: number): number {
+	const step = Math.max(1, Math.floor(limit / 4));
+	return Math.ceil((total - limit) / step) * step;
+}
+
 function needsImageDrop(state: ImageBudgetState): boolean {
 	return state.remainingDrops > 0 || state.inlineBytes > state.byteBudget;
 }
@@ -158,13 +169,13 @@ function clampContent(
 function clampUserMessage(message: UserMessage, state: ImageBudgetState): UserMessage {
 	if (!Array.isArray(message.content) || !needsImageDrop(state)) return message;
 	const content = clampContent(message.content, state);
-	return content ? { ...message, content, providerPayload: undefined } : message;
+	return content ? inheritContextIdentity({ ...message, content, providerPayload: undefined }, message) : message;
 }
 
 function clampDeveloperMessage(message: DeveloperMessage, state: ImageBudgetState): DeveloperMessage {
 	if (!Array.isArray(message.content) || !needsImageDrop(state)) return message;
 	const content = clampContent(message.content, state);
-	return content ? { ...message, content, providerPayload: undefined } : message;
+	return content ? inheritContextIdentity({ ...message, content, providerPayload: undefined }, message) : message;
 }
 
 /**
@@ -185,7 +196,7 @@ function clampToolResultMessage(message: ToolResultMessage, state: ImageBudgetSt
 	const screenshot = sentScreenshotBytes(message, state.metadataWire);
 	if (screenshot === undefined) {
 		const content = clampContent(message.content, state);
-		return content ? { ...message, content } : message;
+		return content ? inheritContextIdentity({ ...message, content }, message) : message;
 	}
 	const bytes = state.byteBudget === Number.POSITIVE_INFINITY ? 0 : screenshot;
 	if (state.remainingDrops <= 0 && !(state.inlineBytes > state.byteBudget && bytes > 0)) return message;
@@ -200,7 +211,10 @@ function clampToolResultMessage(message: ToolResultMessage, state: ImageBudgetSt
 		// The note's prefix, call id and truncation marker.
 		state.fallbackTextBytes += Buffer.byteLength(JSON.stringify(sent)) + 256;
 	}
-	return { ...message, content: text.length > 0 ? text : [IMAGE_OMISSION], providerMetadata: undefined };
+	return inheritContextIdentity(
+		{ ...message, content: text.length > 0 ? text : [IMAGE_OMISSION], providerMetadata: undefined },
+		message,
+	);
 }
 
 function clampImages(context: Context, state: ImageBudgetState): Context {
@@ -232,10 +246,10 @@ export function clampProviderContextImages(context: Context, model: Model): Cont
 	if (!model.input.includes("image")) return context;
 	const metadataWire = sendsComputerScreenshotMetadata(model);
 	const totalImages = countImages(context, metadataWire);
-	const remainingDrops = totalImages - providerImageBudget(model);
-	if (remainingDrops <= 0) return context;
+	const limit = providerImageBudget(model);
+	if (totalImages <= limit) return context;
 	return clampImages(context, {
-		remainingDrops,
+		remainingDrops: steppedExcess(totalImages, limit),
 		inlineBytes: 0,
 		byteBudget: Number.POSITIVE_INFINITY,
 		model,
@@ -368,7 +382,8 @@ function otherRequestBytes(context: Context, model: Model, metadataWire: boolean
 
 /**
  * Drops oldest inline image blocks so their base64 fits the deployment's request-body budget: its inline-image byte
- * budget and, where the host sets a `request-body-byte-limit`, what the request's other bytes leave of that limit.
+ * budget and, where the host sets a `request-body-byte-limit`, what the request's other bytes leave of that limit,
+ * in the same steps as the image cap.
  * Runs after URL/provider-file decoration: blocks the provider receives as references carry no inline bytes.
  */
 export function clampProviderContextImageBytes(context: Context, model: Model): Context {
@@ -386,7 +401,13 @@ export function clampProviderContextImageBytes(context: Context, model: Model): 
 	const bodyLimit = resolveRequestBodyByteLimit(model, budgetedHost);
 	if (bodyLimit === undefined) {
 		if (inlineBytes <= byteBudget) return context;
-		return clampImages(context, { remainingDrops: 0, inlineBytes, byteBudget, model, metadataWire });
+		return clampImages(context, {
+			remainingDrops: 0,
+			inlineBytes,
+			byteBudget: inlineBytes - steppedExcess(inlineBytes, byteBudget),
+			model,
+			metadataWire,
+		});
 	}
 	// Only what the other bytes leave of the body limit may hold images, whatever the image budget allows.
 	let imageRoom = bodyLimit - REQUEST_ENVELOPE_BYTES - otherRequestBytes(context, model, metadataWire);
@@ -398,7 +419,8 @@ export function clampProviderContextImageBytes(context: Context, model: Model): 
 		const state: ImageBudgetState = {
 			remainingDrops: 0,
 			inlineBytes,
-			byteBudget: budget,
+			// Stepped against the tighter of the image budget and the body's room.
+			byteBudget: inlineBytes - steppedExcess(inlineBytes, budget),
 			model,
 			metadataWire,
 			kept,

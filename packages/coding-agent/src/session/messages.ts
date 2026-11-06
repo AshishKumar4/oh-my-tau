@@ -52,11 +52,16 @@ import {
 } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
 import { convertMessageToLlm } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type { AssistantMessage, ImageContent, Message, TextContent, UserMessage } from "@oh-my-pi/pi-ai";
-import { copyPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import {
+	getContextHistoryPosition,
+	isPerCallContextMessage,
+	withContextProvenance,
+} from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
 import { cleanTinyMessage, formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
+import { contextHistorySource } from "./context-history-source";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 
 export {
@@ -771,7 +776,6 @@ function wrapSteeringUserMessage(message: SteeringUserMessage): UserMessage {
 					attribution: "user",
 					timestamp: message.timestamp,
 				};
-	copyPerCallContextMessage(userMessage, message);
 	if (typeof message.content === "string") {
 		if (message.content.length === 0) return message.role === "user" ? message : userMessage;
 		return { ...userMessage, content: renderSteeringEnvelope(message.content) };
@@ -784,9 +788,8 @@ function wrapSteeringUserMessage(message: SteeringUserMessage): UserMessage {
 	return { ...userMessage, content };
 }
 
-// One wrapper per steering message. Per-request transforms key on identity (the
-// date/cwd reminder treats an unseen user turn as new), so a fresh wrapper each
-// request would read as a never-sent turn. Owner edits evict it below.
+// Per-request transforms track sent turns by identity. Owner edits invalidate
+// the wrapper through the same hook as the LLM conversion cache.
 const steeringWrapperCache = new WeakMap<AgentMessage, UserMessage>();
 
 export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
@@ -799,17 +802,19 @@ export function wrapSteeringForModel(messages: AgentMessage[]): AgentMessage[] {
 	let wrappedMessages: AgentMessage[] | undefined;
 	for (let i = 0; i < messages.length; i++) {
 		const message = messages[i];
-		if (!isSteeringUserMessage(message)) continue;
-		let wrappedMessage = steeringWrapperCache.get(message);
+		// A context hook call's copy wraps as its source, whatever its position.
+		const source = contextHistorySource(message);
+		if (!isSteeringUserMessage(source)) continue;
+		let wrappedMessage = steeringWrapperCache.get(source);
 		if (wrappedMessage === undefined) {
-			wrappedMessage = wrapSteeringUserMessage(message);
-			steeringWrapperCache.set(message, wrappedMessage);
+			wrappedMessage = wrapSteeringUserMessage(source);
+			steeringWrapperCache.set(source, wrappedMessage);
 		}
-		if (wrappedMessage === message) continue;
+		if (wrappedMessage === source) continue;
 		if (wrappedMessages === undefined) {
 			wrappedMessages = messages.slice();
 		}
-		wrappedMessages[i] = wrappedMessage;
+		wrappedMessages[i] = withContextProvenance(wrappedMessage, message);
 	}
 	return wrappedMessages ?? messages;
 }
@@ -1297,19 +1302,32 @@ export function convertMessagesForContextView(messages: AgentMessage[]): Context
 }
 
 /** Cached per-message conversion. Reuses the stored fragment while identity and
- *  `interruptedNext` neighbor state hold; recomputes on a neighbor flip. */
+ *  `interruptedNext` neighbor state hold; recomputes on a neighbor flip. A context
+ *  hook call's copy of a history message converts as its source, whatever its position. */
 function convertOneCached(m: AgentMessage, interruptedNext: boolean): Message[] {
-	const cached = convertCache.get(m);
-	if (cached !== undefined && cached.interruptedNext === interruptedNext) return cached.fragment;
-	const fragment = convertOne(m, interruptedNext);
-	for (const message of fragment) copyPerCallContextMessage(message, m);
-	convertCache.set(m, { interruptedNext, fragment });
-	return fragment;
+	const source = contextHistorySource(m);
+	const cached = convertCache.get(source);
+	let fragment: Message[];
+	if (cached !== undefined && cached.interruptedNext === interruptedNext) {
+		fragment = cached.fragment;
+	} else {
+		fragment = convertOne(source, interruptedNext);
+		convertCache.set(source, { interruptedNext, fragment });
+	}
+	return isPerCallContextMessage(m) || getContextHistoryPosition(m) !== undefined
+		? fragment.map(message => withContextProvenance(message, m))
+		: fragment;
 }
 
-/** A turn the user wrote: a user message, or a user-initiated custom prompt (`/skill:`, collab). */
+/**
+ * A turn the user wrote, selected before provider wire conversion: a user
+ * message not attributed to the agent, or a user-initiated custom prompt
+ * (`/skill:`, collab).
+ */
 export function isUserAuthoredMessage(message: AgentMessage): boolean {
-	return message.role === "user" || (message.role === "custom" && isUserTurnInitiator(message));
+	return message.role === "user"
+		? message.attribution !== "agent"
+		: message.role === "custom" && isUserTurnInitiator(message);
 }
 
 /**

@@ -31,6 +31,9 @@ import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { createInMemoryModelRegistry } from "./helpers/agent-session-setup";
+
+const registries: Array<ReturnType<typeof createInMemoryModelRegistry>> = [];
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -132,6 +135,39 @@ async function createSession(
 	return sess;
 }
 
+async function createSessionWithMockModel(
+	tools: AgentTool[],
+	bridge: ClientBridge,
+	responses: NonNullable<MockModelOptions["responses"]>,
+): Promise<AgentSession> {
+	const mock = createMockModel({ responses });
+	const settings = Settings.isolated({ "compaction.enabled": false });
+	const sessionManager = SessionManager.inMemory(tempDir.path());
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: {
+			model: mock.model,
+			systemPrompt: ["Test"],
+			tools,
+			messages: [],
+		},
+		convertToLlm,
+		streamFn: mock.stream,
+	});
+
+	const registry = createInMemoryModelRegistry(mock.model.provider);
+	registries.push(registry);
+	const sess = new AgentSession({
+		agent,
+		sessionManager,
+		settings,
+		modelRegistry: registry,
+		toolRegistry: new Map(tools.map(t => [t.name, t])),
+	});
+	sess.setClientBridge(bridge);
+	return sess;
+}
+
 beforeAll(() => {
 	tempDir = TempDir.createSync("@pi-acp-permission-test-");
 });
@@ -139,6 +175,7 @@ beforeAll(() => {
 afterEach(async () => {
 	await session?.dispose();
 	session = undefined;
+	for (const registry of registries.splice(0)) registry.authStorage.close();
 });
 
 afterAll(async () => {

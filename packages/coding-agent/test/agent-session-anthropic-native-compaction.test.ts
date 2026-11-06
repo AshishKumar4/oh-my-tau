@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { __resetProxyCache } from "@oh-my-pi/pi-ai/utils/proxy";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import { asGlobalFetch } from "./helpers/fetch-mock";
 
 interface MessagesRequest {
@@ -122,7 +125,13 @@ describe("AgentSession Anthropic native compaction", () => {
 		});
 
 	/** A real session whose Messages API requests are recorded and answered by `respond`. */
-	async function openSession(tempDir: TempDir, respond: (request: number) => Response) {
+	async function openSession(
+		tempDir: TempDir,
+		respond: (request: number) => Response,
+		extensions: ExtensionFactory[] = [],
+		seed?: (sessionManager: SessionManager) => Promise<void>,
+		keepRecentTokens = 1,
+	) {
 		const model = getBundledModel("anthropic", "claude-opus-5-5");
 		if (!model) throw new Error("Expected bundled claude-opus-5-5");
 		const requests: MessagesRequest[] = [];
@@ -138,14 +147,19 @@ describe("AgentSession Anthropic native compaction", () => {
 		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
 		authStorage.keys.setRuntime("anthropic", "sk-ant-test");
 		const sessionManager = SessionManager.inMemory(tempDir.path());
+		await seed?.(sessionManager);
 		const { session } = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
 			sessionManager,
 			authStorage,
 			modelRegistry: new ModelRegistry(authStorage, tempDir.join("models.yml")),
-			settings: Settings.isolated({ "compaction.methodOrder": ["remote"], "compaction.keepRecentTokens": 1 }),
+			settings: Settings.isolated({
+				"compaction.methodOrder": ["remote"],
+				"compaction.keepRecentTokens": keepRecentTokens,
+			}),
 			model,
+			extensions,
 			disableExtensionDiscovery: true,
 			skills: [],
 			contextFiles: [],
@@ -180,9 +194,8 @@ describe("AgentSession Anthropic native compaction", () => {
 
 		expect(requests).toHaveLength(3);
 		const [, live, compaction] = requests;
-		// The live turn carries the injected intent field and the first-turn
-		// date/cwd reminder; the compaction request must carry them too.
-		expect(JSON.stringify(live.tools)).toContain('"i"');
+		// The live turn carries the first-turn date/cwd reminder and the session's
+		// projected tools; the compaction request must carry them too.
 		expect(JSON.stringify(live.messages[0])).toContain("<system-reminder>");
 		expect(compaction.system).toEqual(live.system);
 		expect(compaction.tools).toEqual(live.tools);
@@ -190,6 +203,205 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(withoutCacheControl(compaction.messages)).toEqual(
 			withoutCacheControl(live.messages.slice(0, compaction.messages.length)),
 		);
+	});
+
+	it("cuts after the summarized range when a context hook appends messages to every request", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-hook-");
+		const appendNote: ExtensionFactory = pi => {
+			pi.on("context", event => {
+				const last = event.messages.at(-1);
+				// A fresh note, and one spread from the last history message: both are added, not history.
+				const notes: AgentMessage[] = [{ role: "user", content: "per-call note", timestamp: 0 }];
+				if (last?.role === "user") notes.push({ ...last, content: "spread per-call note" });
+				return { messages: [...event.messages, ...notes] };
+			});
+		};
+		const { session, requests, close } = await openSession(
+			tempDir,
+			request => (request <= 2 ? answer(request) : captured()),
+			[appendNote],
+		);
+		try {
+			await session.prompt("first question");
+			await session.prompt("second question");
+			await expect(session.compact()).rejects.toThrow("captured");
+		} finally {
+			await close();
+		}
+
+		expect(requests).toHaveLength(3);
+		const [, live, compaction] = requests;
+		// The notes ride at the end of each live request; they are not part of the history.
+		expect(JSON.stringify(live.messages.at(-1))).toContain("per-call note");
+		// One-token keep-recent keeps only the last answer: the compaction request is the
+		// history before it exactly as the live turn sent it, without the notes and
+		// without the kept answer.
+		expect(JSON.stringify(compaction.messages)).not.toContain("spread per-call note");
+		expect(withoutCacheControl(compaction.messages)).toEqual(
+			withoutCacheControl(live.messages.slice(0, compaction.messages.length)),
+		);
+		expect(JSON.stringify(compaction.messages)).not.toContain("answer 2");
+		expect(JSON.stringify(compaction.messages)).not.toContain("per-call note");
+	});
+
+	it("cuts by history position when a context hook drops turns by the context's size", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-window-");
+		// A window over the newest turns: the summarized history alone fits, the whole context does not.
+		const keepNewestExchange: ExtensionFactory = pi => {
+			pi.on("context", event => (event.messages.length > 3 ? { messages: event.messages.slice(-2) } : undefined));
+		};
+		const { session, requests, close } = await openSession(
+			tempDir,
+			request => (request <= 2 ? answer(request) : captured()),
+			[keepNewestExchange],
+		);
+		try {
+			await session.prompt("first question");
+			await session.prompt("second question");
+			await expect(session.compact()).rejects.toThrow("captured");
+		} finally {
+			await close();
+		}
+
+		expect(requests).toHaveLength(3);
+		const compaction = JSON.stringify(requests[2].messages);
+		// The whole context keeps the second exchange; its summarized part is the second question.
+		expect(compaction).toContain("second question");
+		expect(compaction).not.toContain("first question");
+		expect(compaction).not.toContain("answer 2");
+	});
+
+	it("keeps summarized messages a context hook rewrites for every request, by spread or by clone", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-rewrite-");
+		const hasText = (message: AgentMessage, text: string) =>
+			message.role === "user" &&
+			Array.isArray(message.content) &&
+			message.content.some(block => block.type === "text" && block.text === text);
+		const annotate: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: event.messages.map(message => {
+					if (message.role !== "user" || !Array.isArray(message.content)) return message;
+					if (hasText(message, "first question")) {
+						return { ...message, content: [{ type: "text" as const, text: "first question (annotated)" }] };
+					}
+					if (hasText(message, "second question")) {
+						// A fresh object: it carries no provenance of its own.
+						const clone = structuredClone(message);
+						clone.content = [{ type: "text", text: "second question (annotated)" }];
+						return clone;
+					}
+					return message;
+				}),
+			}));
+		};
+		const { session, requests, close } = await openSession(
+			tempDir,
+			request => (request <= 2 ? answer(request) : captured()),
+			[annotate],
+		);
+		try {
+			await session.prompt("first question");
+			await session.prompt("second question");
+			await expect(session.compact()).rejects.toThrow("captured");
+		} finally {
+			await close();
+		}
+
+		expect(requests).toHaveLength(3);
+		const [, live, compaction] = requests;
+		// The rewritten questions stay in the summarized range, the last one ending it:
+		// the compaction request carries both as the live turn sent them, and stops
+		// before the kept answer.
+		expect(JSON.stringify(live.messages)).toContain("first question (annotated)");
+		expect(JSON.stringify(live.messages.at(-1))).toContain("second question (annotated)");
+		expect(withoutCacheControl(compaction.messages)).toEqual(withoutCacheControl(live.messages));
+		expect(JSON.stringify(compaction.messages)).not.toContain("answer 2");
+	});
+
+	const note: AgentMessage = { role: "user", content: "per-call note", timestamp: 0 };
+	const restructuringHooks: Array<[string, ExtensionFactory]> = [
+		// Every message cloned (no provenance) and a note prepended: positions shift.
+		[
+			"prepends over clones",
+			pi => pi.on("context", event => ({ messages: [note, ...event.messages.map(m => structuredClone(m))] })),
+		],
+		// The opening exchange repeated ahead of the clones: the shift keeps roles aligned.
+		[
+			"repeats the opening exchange over clones",
+			pi =>
+				pi.on("context", event => ({
+					messages: [...event.messages.slice(0, 2), ...event.messages].map(m => structuredClone(m)),
+				})),
+		],
+		// One array the hook keeps and returns on every call, whatever the history.
+		[
+			"returns one array it keeps across calls",
+			pi => {
+				const kept: AgentMessage[] = [note];
+				pi.on("context", () => ({ messages: kept }));
+			},
+		],
+		// The same shift at an unchanged length: a note prepended and the last message dropped.
+		[
+			"shifts clones at the same length",
+			pi =>
+				pi.on("context", event => ({
+					messages: [note, ...event.messages.slice(0, -1).map(m => structuredClone(m))],
+				})),
+		],
+	];
+
+	for (const [label, hook] of restructuringHooks) {
+		it(`declines rather than guess when a context hook ${label}`, async () => {
+			using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-restructure-");
+			const { session, requests, close } = await openSession(
+				tempDir,
+				request => (request <= 2 ? answer(request) : captured()),
+				[hook],
+			);
+			try {
+				await session.prompt("first question");
+				await session.prompt("second question");
+				await expect(session.compact()).rejects.toThrow("cannot be located");
+			} finally {
+				await close();
+			}
+			// No native compaction request was sent with a guessed range.
+			expect(requests).toHaveLength(2);
+		});
+	}
+
+	it("locates the summarized range by each call's provenance when a hook reuses one note object", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-reused-");
+		// One object across calls: untraced while the hook restructures, added once it appends.
+		const reusedNote: AgentMessage = { role: "user", content: "reused per-call note", timestamp: 0 };
+		let restructure = true;
+		const hook: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: restructure
+					? [reusedNote, ...event.messages.map(m => structuredClone(m))]
+					: [...event.messages, reusedNote],
+			}));
+		};
+		const { session, requests, close } = await openSession(
+			tempDir,
+			request => (request <= 2 ? answer(request) : captured()),
+			[hook],
+		);
+		try {
+			await session.prompt("first question");
+			await session.prompt("second question");
+			restructure = false;
+			await expect(session.compact()).rejects.toThrow("captured");
+		} finally {
+			await close();
+		}
+
+		expect(requests).toHaveLength(3);
+		const compaction = requests[2];
+		expect(JSON.stringify(compaction.messages)).toContain("second question");
+		expect(JSON.stringify(compaction.messages)).not.toContain("reused per-call note");
+		expect(JSON.stringify(compaction.messages)).not.toContain("answer 2");
 	});
 
 	it("keeps every summarized message when a reminder change mid tool loop inserted a control turn", async () => {
@@ -224,6 +436,40 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(withoutCacheControl(compaction.messages)).toEqual(withoutCacheControl(live.messages));
 	});
 
+	it("cuts a later compaction behind the earlier summary when a context hook adds a note to every request", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-summary-hook-");
+		const appendNote: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+			}));
+		};
+		const { session, requests, close } = await openSession(
+			tempDir,
+			request => (request === 3 ? compactionAnswer() : request === 5 ? captured() : answer(request)),
+			[appendNote],
+		);
+		try {
+			await session.prompt("first question");
+			await session.prompt("second question");
+			await session.compact();
+			await session.prompt("third question");
+			await expect(session.compact()).rejects.toThrow("captured");
+		} finally {
+			await close();
+		}
+
+		expect(requests).toHaveLength(5);
+		const [live, compaction] = requests.slice(3);
+		// The earlier summary converts to a message of its own making; it still counts as history.
+		expect(JSON.stringify(compaction.messages[0])).toContain("sig-compact");
+		expect(withoutCacheControl(compaction.messages)).toEqual(
+			withoutCacheControl(live.messages.slice(0, compaction.messages.length)),
+		);
+		expect(JSON.stringify(compaction.messages)).toContain("third question");
+		expect(JSON.stringify(compaction.messages)).not.toContain("per-call note");
+		expect(JSON.stringify(compaction.messages)).not.toContain("answer 4");
+	});
+
 	it("replays a later compaction's prefix as sent, without disturbing the live reminder state", async () => {
 		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-second-");
 		const opened = await openSession(tempDir, request =>
@@ -253,5 +499,139 @@ describe("AgentSession Anthropic native compaction", () => {
 		expect(withoutCacheControl(next.messages.slice(0, live.messages.length))).toEqual(
 			withoutCacheControl(live.messages),
 		);
+	});
+
+	it("sends each request as the previous one plus new turns, over a snapcompacted archive and a context hook's note", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-cache-stability-");
+		const REASONING = "PRIVATE-REASONING";
+		const NOTE = "per-call note";
+		await Bun.write(tempDir.join("notes.txt"), "notes");
+		const appendNote: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: [...event.messages, { role: "user", content: NOTE, timestamp: 0 }],
+			}));
+		};
+		// A resumed session whose archive was rendered under GPT, reasoning included.
+		const seedGptArchive = async (sessionManager: SessionManager) => {
+			const gpt = getBundledModel("openai", "gpt-5.4");
+			const keptId = sessionManager.appendMessage({ role: "user", content: "Kept turn.", timestamp: 1 });
+			const archived = await snapcompact.compact(
+				{
+					firstKeptEntryId: keptId,
+					messagesToSummarize: [
+						{ role: "user", content: "Plan the migration.", timestamp: 0 },
+						{
+							role: "assistant",
+							content: [
+								{ type: "thinking", thinking: `${REASONING} about the migration.` },
+								{ type: "text", text: "Migrated." },
+							],
+							api: gpt.api,
+							provider: gpt.provider,
+							model: gpt.id,
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "stop",
+							timestamp: 0,
+						},
+					],
+					turnPrefixMessages: [],
+					tokensBefore: 10_000,
+					fileOps: snapcompact.createFileOps(),
+				},
+				{ model: gpt },
+			);
+			expect(archived.summary).toContain("¶think:");
+			sessionManager.appendCompaction(archived.summary, archived.shortSummary, keptId, archived.tokensBefore, {
+				details: archived.details,
+				preserveData: archived.preserveData,
+				method: "snapcompact",
+			});
+		};
+		const opened = await openSession(
+			tempDir,
+			request => answer(request, request === 2 ? "notes.txt" : undefined),
+			[appendNote],
+			seedGptArchive,
+		);
+		try {
+			await opened.session.prompt("first question");
+			// The second answer reads a file, so its tool loop makes one more request.
+			await opened.session.prompt("second question");
+			opened.moveCwd();
+			await opened.session.prompt("third question");
+			await opened.session.prompt("fourth question");
+		} finally {
+			await opened.close();
+		}
+
+		expect(opened.requests).toHaveLength(5);
+		// Every request ends with the hook's note, exactly as the hook wrote it; the rest is
+		// history. A breakpoint sends its message's text as a block, so text is compared as blocks.
+		const history = (request: MessagesRequest | undefined): unknown[] => {
+			const messages = request?.messages ?? [];
+			expect(messages.at(-1)).toEqual({ role: "user", content: NOTE });
+			return messages.slice(0, -1).map(message => {
+				const sent = withoutCacheControl(message);
+				return isRecord(sent) && typeof sent.content === "string"
+					? { ...sent, content: [{ type: "text", text: sent.content }] }
+					: sent;
+			});
+		};
+		// Claude reads the archive without its reasoning from the first request on.
+		expect(JSON.stringify(opened.requests[0]?.messages)).not.toContain(REASONING);
+		for (let index = 1; index < opened.requests.length; index++) {
+			const previous = history(opened.requests[index - 1]);
+			const next = history(opened.requests[index]);
+			expect({ index, sent: next.slice(0, previous.length) }).toEqual({ index, sent: previous });
+			expect(next.length).toBeGreaterThan(previous.length);
+		}
+		// The moved cwd rides on the turn that followed the move, and stays there.
+		const moved = JSON.stringify(history(opened.requests.at(-1)));
+		expect(moved).toContain(`${tempDir.join("moved")}`);
+	});
+
+	it("replays a kept turn's moved reminder unchanged after native compaction when a context hook adds a note to every request", async () => {
+		using tempDir = TempDir.createSync("@pi-anthropic-native-compaction-kept-reminder-");
+		const appendNote: ExtensionFactory = pi => {
+			pi.on("context", event => ({
+				messages: [...event.messages, { role: "user", content: "per-call note", timestamp: 0 }],
+			}));
+		};
+		// Keeps the last question and its answer, so the reminder-bearing turn moves to the front of the history.
+		const keepRecentTokens = 9;
+		const opened = await openSession(
+			tempDir,
+			request => (request === 4 ? compactionAnswer() : answer(request)),
+			[appendNote],
+			undefined,
+			keepRecentTokens,
+		);
+		try {
+			await opened.session.prompt("first question");
+			await opened.session.prompt("second question");
+			opened.moveCwd();
+			await opened.session.prompt("third question");
+			await opened.session.compact();
+			await opened.session.prompt("fourth question");
+		} finally {
+			await opened.close();
+		}
+
+		expect(opened.requests).toHaveLength(5);
+		const [, , live, compaction, next] = opened.requests;
+		const keptTurn = (request: MessagesRequest | undefined) =>
+			withoutCacheControl(request?.messages.find(message => JSON.stringify(message).includes("third question")));
+		expect(JSON.stringify(compaction?.messages)).toContain("second question");
+		expect(JSON.stringify(compaction?.messages)).not.toContain("third question");
+		// The turn after the cwd move carries the moved reminder, and replays with it.
+		expect(JSON.stringify(keptTurn(live))).toContain(tempDir.join("moved"));
+		expect(keptTurn(next)).toEqual(keptTurn(live));
 	});
 });

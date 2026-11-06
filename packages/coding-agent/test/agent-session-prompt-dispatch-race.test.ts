@@ -38,8 +38,10 @@ describe("AgentSession concurrent prompt dispatch", () => {
 	let modelRegistry: ModelRegistry;
 	let authStorage: AuthStorage | undefined;
 	let sessionDir: string | undefined;
+	let beforeAgentStart: (() => Promise<void>) | undefined;
 
 	beforeEach(async () => {
+		beforeAgentStart = undefined;
 		authStorage = await AuthStorage.create(":memory:");
 		authStorage.keys.setRuntime("anthropic", "test-key");
 		modelRegistry = new ModelRegistry(authStorage);
@@ -56,7 +58,27 @@ describe("AgentSession concurrent prompt dispatch", () => {
 		sessionDir = undefined;
 	});
 
-	function createSession(sessionManager = SessionManager.inMemory(), extensionRunner?: ExtensionRunner) {
+	async function createSession(sessionManager = SessionManager.inMemory(), extensionRunner?: ExtensionRunner) {
+		if (!extensionRunner) {
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				api =>
+					api.on("before_agent_start", async () => {
+						await beforeAgentStart?.();
+					}),
+				sessionManager.getCwd(),
+				new EventBus(),
+				runtime,
+				"prompt-admission-gate",
+			);
+			extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				sessionManager.getCwd(),
+				sessionManager,
+				modelRegistry,
+			);
+		}
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
 
@@ -89,15 +111,13 @@ describe("AgentSession concurrent prompt dispatch", () => {
 			const manager = SessionManager.create(sessionDir, sessionDir);
 			const retained = manager.appendMessage({ role: "user", content: "Retained", timestamp: 1 });
 			const abandoned = manager.appendMessage({ role: "user", content: "Abandoned", timestamp: 2 });
-			createSession(manager);
+			await createSession(manager);
 			const reached = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
-			const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
-			vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (...args) => {
+			beforeAgentStart = async () => {
 				reached.resolve();
 				await release.promise;
-				return getApiKey(...args);
-			});
+			};
 			const releaseFlush = Promise.withResolvers<void>();
 			let btwBranch: Promise<BtwBranchResult> | undefined;
 			if (transition === "branchFromBtw") {
@@ -151,21 +171,24 @@ describe("AgentSession concurrent prompt dispatch", () => {
 		const target = manager.appendMessage({ role: "user", content: "Original", timestamp: 1 });
 		const runtime = new ExtensionRuntime();
 		const extension = await loadExtensionFromFactory(
-			api => api.on("session_before_tree", async () => ({ cancel: true })),
+			api => {
+				api.on("session_before_tree", async () => ({ cancel: true }));
+				api.on("before_agent_start", async () => {
+					await beforeAgentStart?.();
+				});
+			},
 			manager.getCwd(),
 			new EventBus(),
 			runtime,
 			"cancel-tree",
 		);
-		createSession(manager, new ExtensionRunner([extension], runtime, manager.getCwd(), manager, modelRegistry));
+		await createSession(manager, new ExtensionRunner([extension], runtime, manager.getCwd(), manager, modelRegistry));
 		const reached = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
-		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (...args) => {
+		beforeAgentStart = async () => {
 			reached.resolve();
 			await release.promise;
-			return getApiKey(...args);
-		});
+		};
 		const pending = session.prompt("Still belongs here");
 		try {
 			await reached.promise;
@@ -189,7 +212,7 @@ describe("AgentSession concurrent prompt dispatch", () => {
 	});
 
 	it("queues a prompt that loses the pre-dispatch race instead of racing a second turn", async () => {
-		createSession();
+		await createSession();
 
 		// Neither call is awaited before the other starts: both pass the
 		// top-of-prompt isStreaming check because the pre-dispatch awaits
@@ -221,22 +244,20 @@ describe("AgentSession concurrent prompt dispatch", () => {
 
 	/**
 	 * Runs `start` (which must call `session.prompt()` and attach its handlers)
-	 * and lets a tree navigation drop that prompt while usage preflight awaits
-	 * the API key.
+	 * and lets a tree navigation drop that prompt while an extension awaits
+	 * admission before dispatch.
 	 */
 	async function dropPromptByTransition(start: () => void): Promise<void> {
 		const manager = SessionManager.inMemory();
 		const retained = manager.appendMessage({ role: "user", content: "Retained", timestamp: 1 });
 		manager.appendMessage({ role: "user", content: "Abandoned", timestamp: 2 });
-		createSession(manager);
+		await createSession(manager);
 		const reached = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
-		const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
-		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (...args) => {
+		beforeAgentStart = async () => {
 			reached.resolve();
 			await release.promise;
-			return getApiKey(...args);
-		});
+		};
 		start();
 		try {
 			await reached.promise;
@@ -297,7 +318,7 @@ describe("AgentSession concurrent prompt dispatch", () => {
 			runtime,
 			"deploy-command",
 		);
-		createSession(manager, new ExtensionRunner([extension], runtime, manager.getCwd(), manager, modelRegistry));
+		await createSession(manager, new ExtensionRunner([extension], runtime, manager.getCwd(), manager, modelRegistry));
 
 		expect(await session.prompt("/deploy staging", { attribution: "agent", runCommands: false })).toBe(true);
 		await session.waitForIdle();

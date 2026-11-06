@@ -896,6 +896,135 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.id).toBe(fallbackModel.id);
 	});
 
+	it("retries a Codex native-lane refusal on the same model despite a configured chain", async () => {
+		const primaryModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+		const fallbackModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled native-lane retry models");
+		}
+
+		const requestedModels: string[] = [];
+		const agent = createFallbackAgent(primaryModel, requestedModels, {
+			firstError:
+				"Codex error event: The experimental native turn lane cannot accept stateful WebSocket messages while a native turn is running. Start a new independent response.create turn instead. (code=unsupported_native_inflight_message)",
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		await session.prompt("Answer while the native lane is busy");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+		]);
+		expect(session.model?.provider).toBe(primaryModel.provider);
+		expect(session.model?.id).toBe(primaryModel.id);
+	});
+
+	it("adopts a fallback refitted to the session's own window settings", async () => {
+		// The registry's settings put the fallback on its extended window; the
+		// session's settings (a subagent with model thresholds off) keep it standard.
+		// The agent fits every model it adopts, so the swap lands on a refitted row.
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primaryModel) throw new Error("Expected bundled anthropic/claude-sonnet-4-5");
+		const registrySettings = Settings.isolated({
+			"compaction.modelThresholds": { "openai/gpt-5.6-terra": 400_000 },
+		});
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-window.yml"), {
+			settings: registrySettings,
+		});
+		const registryRow = modelRegistry.find("openai", "gpt-5.6-terra");
+		const tiers = modelRegistry.contextWindowTiers({ provider: "openai", id: "gpt-5.6-terra" });
+		if (!registryRow || !tiers) throw new Error("Expected openai/gpt-5.6-terra with two window tiers");
+		expect(registryRow.contextWindow).toBe(tiers.extended);
+
+		const requestedModels: string[] = [];
+		const agent = createFallbackAgent(primaryModel, requestedModels);
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"compaction.modelThresholdsEnabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": { default: ["openai/gpt-5.6-terra"] },
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		const registry = modelRegistry;
+		agent.setModelResolver(next => registry.fitContextWindow(next, settings));
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry });
+		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") fallbackAppliedEvents.push(event);
+		});
+
+		await session.prompt("Recover on the fallback");
+		await session.waitForIdle();
+
+		expect(fallbackAppliedEvents.map(event => event.to)).toEqual(["openai/gpt-5.6-terra"]);
+		expect(session.model?.id).toBe("gpt-5.6-terra");
+		expect(session.model?.contextWindow).toBe(tiers.standard);
+		expect(
+			sessionManager
+				.getEntries()
+				.some(entry => entry.type === "model_change" && entry.model === "openai/gpt-5.6-terra"),
+		).toBe(true);
+		expect(requestedModels.at(-1)).toBe("openai/gpt-5.6-terra");
+	});
+
+	it("skips a fallback whose window at the session's settings the context exceeds, though the registry's row fits it", async () => {
+		// Between the fallback's tiers: the registry's extended row fits this context,
+		// the standard window the session would run the fallback with does not.
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primaryModel) throw new Error("Expected bundled anthropic/claude-sonnet-4-5");
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-window.yml"), {
+			settings: Settings.isolated({ "compaction.modelThresholds": { "openai/gpt-5.6-terra": 400_000 } }),
+		});
+		const tiers = modelRegistry.contextWindowTiers({ provider: "openai", id: "gpt-5.6-terra" });
+		if (!tiers) throw new Error("Expected openai/gpt-5.6-terra with two window tiers");
+		// The standard window's worth of text: over its budget, well inside the extended one's.
+		const contextTokens = tiers.standard;
+
+		const requestedModels: string[] = [];
+		const agent = createFallbackAgent(primaryModel, requestedModels);
+		// About one token per repeat: the stored context the fallback would be sent.
+		agent.replaceMessages([{ role: "user", content: "lorem ".repeat(contextTokens), timestamp: 1 }]);
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"compaction.modelThresholdsEnabled": false,
+			"retry.baseDelayMs": 5,
+			// With the fallback skipped, the turn ends on the primary's wait instead of sleeping through it.
+			"retry.maxDelayMs": 1_000,
+			"retry.fallbackChains": { default: ["openai/gpt-5.6-terra"] },
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		const registry = modelRegistry;
+		agent.setModelResolver(next => registry.fitContextWindow(next, settings));
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") fallbackAppliedEvents.push(event);
+		});
+
+		await session.prompt("Recover without the undersized fallback");
+		await session.waitForIdle();
+
+		expect(fallbackAppliedEvents).toEqual([]);
+		expect(requestedModels).not.toContain("openai/gpt-5.6-terra");
+		expect(session.model?.id).toBe(primaryModel.id);
+	});
+
 	it("never falls back to a model of a provider that settings disable", async () => {
 		// A fallback candidate that availability-filtered resolution misses was
 		// looked up by name in the full catalog, so a chain naming a disabled
@@ -4947,6 +5076,10 @@ describe("AgentSession retry fallback", () => {
 					],
 				},
 				"retry.fallbackRevertPolicy": "cooldown-expiry",
+				// Auto mode serves Fable 5 the claude-code surface (replace edit mode) and
+				// Opus 4.8 the native one; a fallback that changes the edit mode withholds
+				// the credit, so keep both models on one surface.
+				"harness.mode": "native",
 			});
 			settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
 

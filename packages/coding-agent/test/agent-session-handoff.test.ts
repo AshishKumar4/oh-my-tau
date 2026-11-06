@@ -427,7 +427,8 @@ describe("AgentSession handoff", () => {
 		if (!preserve) throw new Error("Expected previousPreserveData");
 		// The archive plaintext that compact() migrates into the summary prompt is
 		// redacted, so the raw secret never reaches the provider.
-		const archive = snapcompact.getPreservedArchive(preserve)!;
+		const archive = snapcompact.getPreservedArchive(preserve);
+		if (!archive) throw new Error("Expected the snapcompact archive in previousPreserveData");
 		expect(archive.text).toBe(`archived ${placeholder}`);
 		expect(archive.textHead).toBe(`head ${placeholder}`);
 		// So is the no-reasoning variant a Claude summarizer reads instead.

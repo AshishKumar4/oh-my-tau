@@ -37,6 +37,15 @@ export interface PersistedRecall {
 	memories: RecalledMemory[];
 }
 
+/** A recall found in the transcript. */
+export interface FoundRecall extends PersistedRecall {
+	/**
+	 * The entry predates scopes and holds the whole recall, not the block as delivered:
+	 * the backend cut it to its injection budget on every send, and must again.
+	 */
+	uncut?: true;
+}
+
 /** Details of a {@link MEMORY_RECALL_CHANGES_MESSAGE_TYPE} message. */
 export interface MemoryRecallChangesDetails {
 	scope: string;
@@ -52,6 +61,34 @@ interface MemoryRecallEntryData extends PersistedRecall {
 	 * project's memories into another.
 	 */
 	scope: string;
+}
+
+/**
+ * Where a recall entry written before scopes applies: those entries name only the
+ * backend and cwd they were recalled for.
+ */
+export interface LegacyRecallScope {
+	backend: string;
+	cwd: string;
+}
+
+/** A recall entry from before scopes: the block as injected, without the memories it holds. */
+interface LegacyRecallEntryData extends LegacyRecallScope {
+	block: string;
+}
+
+function isLegacyRecallEntryData(data: unknown): data is LegacyRecallEntryData {
+	return (
+		typeof data === "object" &&
+		data !== null &&
+		!("version" in data) &&
+		"backend" in data &&
+		typeof data.backend === "string" &&
+		"cwd" in data &&
+		typeof data.cwd === "string" &&
+		"block" in data &&
+		typeof data.block === "string"
+	);
 }
 
 function isRecalledMemories(value: unknown): value is RecalledMemory[] {
@@ -101,12 +138,15 @@ function isMemoryRecallChangesDetails(details: unknown): details is MemoryRecall
  * memories still current per the latest change report delivered after it. Undefined
  * when the branch needs a fresh recall: none was recorded since the last context
  * reset, or no turn followed one (a branch that edits the first prompt asks a
- * different question).
+ * different question). An entry written before scopes is reused when it matches
+ * `legacy`, so a session recalled then still resumes with the prompt it was sent;
+ * it holds no memory ids, so changes since cannot be reported for it.
  */
 export function findPersistedRecall(
 	sessionManager: Pick<SessionManager, "getBranch">,
 	scope: string,
-): PersistedRecall | undefined {
+	legacy?: LegacyRecallScope,
+): FoundRecall | undefined {
 	const entries: SessionEntry[] = sessionManager.getBranch();
 	let turnFollowed = false;
 	let reported: RecalledMemory[] | undefined;
@@ -119,14 +159,18 @@ export function findPersistedRecall(
 			if (reported === undefined && isMemoryRecallChangesDetails(entry.details) && entry.details.scope === scope) {
 				reported = entry.details.memories;
 			}
-		} else if (
-			turnFollowed &&
-			entry.type === "custom" &&
-			entry.customType === MEMORY_RECALL_ENTRY_TYPE &&
-			isMemoryRecallEntryData(entry.data) &&
-			entry.data.scope === scope
-		) {
-			return { text: entry.data.text, memories: reported ?? entry.data.memories };
+		} else if (turnFollowed && entry.type === "custom" && entry.customType === MEMORY_RECALL_ENTRY_TYPE) {
+			const { data } = entry;
+			if (isMemoryRecallEntryData(data)) {
+				if (data.scope === scope) return { text: data.text, memories: reported ?? data.memories };
+			} else if (
+				legacy &&
+				isLegacyRecallEntryData(data) &&
+				data.backend === legacy.backend &&
+				data.cwd === legacy.cwd
+			) {
+				return { text: data.block, memories: [], uncut: true };
+			}
 		}
 	}
 	return undefined;

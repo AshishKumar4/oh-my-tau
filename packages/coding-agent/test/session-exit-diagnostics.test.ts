@@ -16,6 +16,7 @@ import {
 	describePendingToolCalls,
 	hasRestorableTurn,
 	SESSION_EXIT_CUSTOM_TYPE,
+	SESSION_OPEN_CUSTOM_TYPE,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 	type ToolExecutionStartData,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
@@ -243,6 +244,55 @@ describe("session exit diagnostics", () => {
 				.getEntries()
 				.some(entry => entry.type === "custom" && entry.customType === SESSION_EXIT_CUSTOM_TYPE),
 		).toBe(false);
+	});
+
+	it("marks where a live session takes over a file with history", async () => {
+		tempDir = TempDir.createSync("@pi-session-open-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const dir = tempDir.path();
+		const live = (sessionManager: SessionManager): AgentSession =>
+			new AgentSession({
+				agent: new Agent({
+					initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+					convertToLlm,
+				}),
+				sessionManager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry,
+			});
+		const openMarkers = (sessionManager: SessionManager) =>
+			sessionManager
+				.getEntries()
+				.flatMap(entry =>
+					entry.type === "custom" && entry.customType === SESSION_OPEN_CUSTOM_TYPE ? [entry.data] : [],
+				);
+		const withHistory = async (): Promise<string> => {
+			const manager = SessionManager.create(dir, dir);
+			manager.appendMessage({ ...pendingAssistant, content: [{ type: "text", text: "done" }], stopReason: "stop" });
+			await manager.flush();
+			const file = manager.getSessionFile();
+			await manager.close();
+			if (!file) throw new Error("Expected persistent session file path");
+			return file;
+		};
+		const thisProcess = { pid: process.pid, processStartedAt: performance.timeOrigin };
+
+		const empty = SessionManager.create(dir, dir);
+		session = live(empty);
+		expect(openMarkers(empty)).toEqual([]);
+
+		// The history's fixture model is not restorable here, and a switch refuses an
+		// unrestorable model; the takeover marker is what this checks.
+		expect(await session.switchSession(await withHistory(), { keepModel: true })).toBe(true);
+		expect(openMarkers(session.sessionManager)).toEqual([expect.objectContaining(thisProcess)]);
+		await session.dispose();
+
+		const resumed = await SessionManager.open(await withHistory(), dir);
+		session = live(resumed);
+		expect(openMarkers(resumed)).toEqual([expect.objectContaining(thisProcess)]);
 	});
 
 	it("treats assistant tool calls as pending even when stopReason is not toolUse", () => {

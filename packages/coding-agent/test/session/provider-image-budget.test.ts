@@ -8,9 +8,11 @@ import type {
 	ModelSpec,
 	TextContent,
 	Tool,
+	ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { streamFactoryDroid } from "@oh-my-pi/pi-ai/providers/factory-droid";
+import { contextIdentity } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { factoryDroidRegistry } from "@oh-my-pi/pi-catalog/compat/factory-droid";
 import { buildFactoryDroidModel } from "@oh-my-pi/pi-catalog/discovery";
@@ -252,10 +254,59 @@ describe("provider context image budgets", () => {
 
 		const clamped = clampProviderContextImages(context, UMANS_MODEL);
 
-		expect(imageData(clamped)).toEqual(Array.from({ length: 10 }, (_, index) => `image-${index + 21}`));
+		const kept = imageData(clamped);
+		expect(kept.length).toBeGreaterThan(0);
+		expect(kept.length).toBeLessThanOrEqual(10);
+		expect(kept).toEqual(imageData(context).slice(-kept.length));
 		expect(textData(clamped)).toEqual(Array.from({ length: 31 }, (_, index) => `text-${index}`));
 		expect(clamped).not.toBe(context);
 		expect(imageData(context)).toEqual(Array.from({ length: 31 }, (_, index) => `image-${index}`));
+	});
+
+	it("keeps the earlier request byte-identical while a growing conversation adds images past the cap", () => {
+		const model = ANTHROPIC_PROXY_MODEL;
+		const turn = (index: number): Context["messages"][number] => ({
+			role: "user",
+			content: [text(`look at screenshot ${index}`), image(`screenshot-${index}`)],
+			timestamp: index,
+		});
+		let previous: Context["messages"] = [];
+		let rewrites = 0;
+		const added = 120;
+		for (let total = 1; total <= 90 + added; total++) {
+			const messages = Array.from({ length: total }, (_, index) => turn(index));
+			const sent = clampProviderContextImages({ systemPrompt: ["system"], tools: [], messages }, model).messages;
+			expect(imageData({ systemPrompt: [], tools: [], messages: sent }).length).toBeLessThanOrEqual(90);
+			expect(JSON.stringify(sent.at(-1))).toContain(`screenshot-${total - 1}`);
+			if (JSON.stringify(sent.slice(0, previous.length)) !== JSON.stringify(previous)) rewrites++;
+			previous = sent;
+		}
+		// Each rewrite re-sends the whole cached prompt; it may happen once per batch of images, not per image.
+		expect(rewrites).toBeLessThanOrEqual(Math.ceil(added / 20));
+	});
+
+	it("clamps a tool result's current content after its owner rewrites it in place", () => {
+		// Shake replaces a tool result's content array, keeping its images, and marks it pruned.
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call-shots",
+			toolName: "bash",
+			content: [text("CAPTURE-LOG"), ...Array.from({ length: 12 }, (_, index) => image(`shot-${index}`))],
+			isError: false,
+			timestamp: 1,
+		};
+		const clamp = () => clampProviderContextImages({ systemPrompt: [], tools: [], messages: [result] }, UMANS_MODEL);
+		const first = clamp();
+		expect(textData(first)).toEqual(["CAPTURE-LOG"]);
+
+		result.content = [text("[shaken]"), ...result.content.filter(part => part.type === "image")];
+		result.prunedAt = 2;
+		const second = clamp();
+
+		// The same images drop, and what goes out is what the message holds now.
+		expect(imageData(second)).toEqual(imageData(first));
+		expect(textData(second)).toEqual(["[shaken]"]);
+		expect(second.messages[0]).toMatchObject({ prunedAt: 2 });
 	});
 
 	it.each([
@@ -273,19 +324,25 @@ describe("provider context image budgets", () => {
 		["the official DeepSeek API", DEEPSEEK_MODEL, 600],
 		["a DeepSeek proxy", DEEPSEEK_PROXY_MODEL, 5],
 	] as const)("keeps the newest images up to the count %s allows", (_label, model, budget) => {
-		const context: Context = {
+		const imaged = (count: number): Context => ({
 			systemPrompt: [],
 			tools: [],
-			messages: Array.from({ length: budget + 1 }, (_, index) => ({
+			messages: Array.from({ length: count }, (_, index) => ({
 				role: "user",
 				content: [image(`image-${index}`)],
 				timestamp: index,
 			})),
-		};
+		});
+		const full = imaged(budget);
+		expect(clampProviderContextImages(full, model)).toBe(full);
 
-		const clamped = clampProviderContextImages(context, model);
+		// One past the budget drops a quarter-budget step of the oldest images.
+		const step = Math.max(1, Math.floor(budget / 4));
+		const clamped = clampProviderContextImages(imaged(budget + 1), model);
 
-		expect(imageData(clamped)).toEqual(Array.from({ length: budget }, (_, index) => `image-${index + 1}`));
+		expect(imageData(clamped)).toEqual(
+			Array.from({ length: budget + 1 - step }, (_, index) => `image-${index + step}`),
+		);
 	});
 
 	it("drops the oldest images over DeepSeek's 40 MiB inline-image budget", () => {
@@ -355,7 +412,9 @@ describe("provider context image budgets", () => {
 		const clamped = clampProviderContextImages(context, UMANS_MODEL);
 		const firstMessage = clamped.messages[0];
 
-		expect(imageData(clamped)).toEqual(Array.from({ length: 10 }, (_, index) => `image-${index + 1}`));
+		const kept = imageData(clamped);
+		expect(kept.length).toBeLessThanOrEqual(10);
+		expect(kept).toEqual(imageData(context).slice(-kept.length));
 		expect(firstMessage?.role).toBe("toolResult");
 		expect(firstMessage?.content).toEqual([text("[image omitted: provider image limit]")]);
 	});
@@ -454,6 +513,38 @@ describe("provider context image budgets", () => {
 		expect(clamped.messages[2]).toBe(context.messages[2]);
 	});
 
+	it("keeps every screenshot when assistant images alone pass the cap", () => {
+		const model = ANTHROPIC_PROXY_MODEL;
+		const generated = Array.from({ length: 89 }, (_, index) => image(`generated-${index}`));
+		const context: Context = {
+			systemPrompt: [],
+			tools: [],
+			messages: [
+				{ role: "user", content: [text("first"), image("screenshot-0")], timestamp: 0 },
+				{
+					role: "assistant",
+					content: [text("generated"), ...generated],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 1,
+				},
+				{ role: "user", content: [text("second"), image("screenshot-1")], timestamp: 2 },
+			],
+		};
+
+		expect(clampProviderContextImages(context, model)).toBe(context);
+	});
+
 	it("still clamps user and tool result images that genuinely exceed the cap", () => {
 		const context: Context = {
 			systemPrompt: [],
@@ -469,7 +560,10 @@ describe("provider context image budgets", () => {
 
 		const clamped = clampProviderContextImages(context, OPENAI_RESPONSES_MODEL);
 
-		expect(imageData(clamped)).toEqual(Array.from({ length: 200 }, (_, index) => `input-${index + 2}`));
+		const kept = imageData(clamped);
+		expect(kept.length).toBeGreaterThan(0);
+		expect(kept.length).toBeLessThanOrEqual(200);
+		expect(kept).toEqual(imageData(context).slice(-kept.length));
 	});
 
 	it("retains exactly the configured inline byte budget, then drops oldest images without mutating the context", () => {
@@ -497,13 +591,53 @@ describe("provider context image budgets", () => {
 		};
 		const clamped = clampProviderContextImageBytes(overBudget, ANTHROPIC_MODEL);
 		expect(clamped).not.toBe(overBudget);
-		expect(clamped.messages[0]).toEqual({ role: "user", content: [text("old")], timestamp: 0 });
+		const oldTurn = clamped.messages[0];
+		expect(oldTurn).toMatchObject({ role: "user", content: [text("old")], timestamp: 0 });
+		expect(oldTurn?.role === "user" ? oldTurn.providerPayload : "not a user turn").toBeUndefined();
+		// The clamped turn stands for the one it was copied from.
+		expect(oldTurn && contextIdentity(oldTurn)).toBe(overBudget.messages[0]);
 		expect(clamped.messages[1]).toBe(overBudget.messages[1]);
 		expect(clamped.messages[2]).toBe(overBudget.messages[2]);
 		expect(imageData(clamped)).toEqual([HALF_ANTHROPIC_IMAGE_BUDGET, "AAAA"]);
 		expect(textData(clamped)).toEqual(["old", "middle", "new"]);
 		expect(imageData(overBudget)).toHaveLength(3);
 		expect(overBudget.messages[0]).toBe(context.messages[0]);
+	});
+
+	it("keeps the earlier request byte-identical while screenshots past the inline byte budget accumulate", () => {
+		// Distinct 534 KB screenshots, one per tool result; 46 of them fill 24 MB.
+		const shots = Array.from({ length: 120 }, (_, index) => `${index}:`.padEnd(534_000, "A"));
+		// The text and image payloads of each tool result, as sent.
+		const sentContent = (messages: Context["messages"]) =>
+			messages.map(message =>
+				message.role === "toolResult"
+					? message.content.map(part => (part.type === "image" ? part.data : part.text))
+					: [],
+			);
+		let previous: string[][] = [];
+		let rewrites = 0;
+		const added = shots.length - 46;
+		for (let total = 46; total <= shots.length; total++) {
+			const messages: Context["messages"] = shots.slice(0, total).map((shot, index) => ({
+				role: "toolResult",
+				toolCallId: `call-${index}`,
+				toolName: "screenshot",
+				content: [text(`result-${index}`), image(shot)],
+				isError: false,
+				timestamp: index,
+			}));
+			const sent = sentContent(
+				clampProviderContextImageBytes({ systemPrompt: [], tools: [], messages }, ANTHROPIC_MODEL).messages,
+			);
+			const kept = sent.flat().filter(part => part.length === 534_000);
+			expect(kept.reduce((bytes, data) => bytes + data.length, 0)).toBeLessThanOrEqual(24_000_000);
+			expect(kept.at(-1)).toBe(shots[total - 1]);
+			const prefix = sent.slice(0, previous.length);
+			if (prefix.some((parts, index) => !Bun.deepEquals(parts, previous[index]))) rewrites++;
+			previous = sent;
+		}
+		// Each rewrite re-sends the cached prompt; it happens once per 6 MB step, not per screenshot.
+		expect(rewrites).toBeLessThanOrEqual(Math.ceil((added * 534_000) / 6_000_000));
 	});
 
 	it("removes oldest live screenshots before Anthropic's 128 MB request cap", () => {
@@ -1462,7 +1596,8 @@ describe("provider context image budgets", () => {
 		};
 		const countClamped = clampProviderContextImages(countLimited, UMANS_MODEL);
 		expect(countClamped.messages[0]?.content).toEqual([text("ref-0")]);
-		expect(imageData(countClamped)).toHaveLength(10);
+		expect(countClamped.messages[1]?.content).toEqual([text("ref-1")]);
+		expect(imageData(countClamped)).toHaveLength(9);
 		expect(textData(countClamped)).toEqual(Array.from({ length: 11 }, (_, index) => `ref-${index}`));
 	});
 
@@ -1618,6 +1753,8 @@ describe("provider context image budgets", () => {
 		if (summary?.role !== "user" || !Array.isArray(summary.content)) throw new Error("Expected the summary message");
 		expect(summary.content.map(block => block.type)).toEqual(["text", "text", "image", "text"]);
 		expect(textData(capped)).toContainEqual(expect.stringContaining("2 archived image frames could not be included"));
+		// The capped summary stands for the one it was copied from.
+		expect(contextIdentity(summary)).toBe(context.messages[0]);
 		expect(capArchiveFrameBytes(context, ANTHROPIC_MODEL)).toBe(context);
 	});
 });

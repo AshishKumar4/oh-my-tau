@@ -8,6 +8,7 @@ import {
 	createInterruptedToolResults,
 	createInterruptedTurnAbortMessage,
 	describePendingToolCalls,
+	isInterruptedToolResult,
 	SESSION_EXIT_CUSTOM_TYPE,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
@@ -780,9 +781,8 @@ describe("SessionManager.forkFrom", () => {
 		expect(createInterruptedTurnAbortMessage(branch)?.stopReason).toBe("aborted");
 		const [result] = createInterruptedToolResults(branch);
 		expect(result?.toolCallId).toBe("toolu_crashed");
-		expect(
-			result?.content.some(block => block.type === "text" && block.text.includes("Previous OMP process exited")),
-		).toBe(true);
+		// Process-exit recovery records the `/recover` placeholder, not the fork's parent-may-still-run result.
+		expect(result !== undefined && isInterruptedToolResult(result)).toBe(true);
 	});
 
 	it("retains the length-stop guard only when a call has no start marker", async () => {

@@ -164,6 +164,7 @@ describe("compaction prefers the current session model over modelRoles.default",
 		});
 
 		const result = await session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBe("fallback summary");
 		expect(compactSpy).toHaveBeenCalledTimes(2);

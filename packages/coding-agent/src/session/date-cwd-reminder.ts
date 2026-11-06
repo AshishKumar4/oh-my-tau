@@ -152,7 +152,13 @@ const ORDINAL_SUFFIX = /#(\d+)$/;
 interface Injection {
 	reminder: string;
 	source: UserMessage;
+	/** `source`'s content when `injected` was built: an owner may replace it on the same message. */
+	content: UserMessage["content"];
 	injected: UserMessage;
+}
+
+function injectionOf(reminder: string, source: UserMessage): Injection {
+	return { reminder, source, content: source.content, injected: injectReminder(source, reminder) };
 }
 
 /** A developer reminder and the key of the turn it was placed after. */
@@ -368,18 +374,14 @@ export class DateCwdReminderInjector {
 		}
 		state.controls = state.controls.filter(control => present.has(control.anchor));
 		if (recreated) {
-			state.injections.set(root, {
-				reminder: previousFirst.reminder,
-				source: firstUser,
-				injected: injectReminder(firstUser, previousFirst.reminder),
-			});
+			state.injections.set(root, injectionOf(previousFirst.reminder, firstUser));
 			state.reminder = this.#carriedReminder(state, keys) ?? previousFirst.reminder;
 			// One conversation under a new first-turn key: the old key is never sent again.
 			this.#states.delete(predecessor.root);
 			return state;
 		}
 		if (!state.injections.has(root) && !messageStartsWithReminder(firstUser, reminder)) {
-			state.injections.set(root, { reminder, source: firstUser, injected: injectReminder(firstUser, reminder) });
+			state.injections.set(root, injectionOf(reminder, firstUser));
 		}
 		if (this.#journal) {
 			for (const [turn, injection] of state.injections) {
@@ -528,11 +530,7 @@ export class DateCwdReminderInjector {
 			const turnIndex = newUser ?? messages.length - 1;
 			if (newUser !== undefined) {
 				const message = messages[newUser] as UserMessage;
-				state.injections.set(keys[newUser]!, {
-					reminder,
-					source: message,
-					injected: injectReminder(message, reminder),
-				});
+				state.injections.set(keys[newUser]!, injectionOf(reminder, message));
 			} else {
 				state.controls.push({ anchor: keys[turnIndex]!, message: createReminderControl(reminder) });
 			}
@@ -557,13 +555,14 @@ export class DateCwdReminderInjector {
 		const out: Message[] = [];
 		for (const [index, message] of messages.entries()) {
 			const key = keys[index]!;
-			const injection = state.injections.get(key);
-			if (injection && message.role === "user") {
-				// A new copy of an injected turn gets the reminder that turn was first sent with.
-				if (injection.source !== message) {
-					injection.source = message;
-					injection.injected = injectReminder(message, injection.reminder);
-				}
+			const cached = state.injections.get(key);
+			if (cached && message.role === "user") {
+				// A new copy of an injected turn, or new content on it, gets the reminder that turn was first sent with.
+				const injection =
+					cached.source === message && cached.content === message.content
+						? cached
+						: injectionOf(cached.reminder, message);
+				if (injection !== cached) state.injections.set(key, injection);
 				out.push(injection.injected);
 				changed = true;
 			} else {

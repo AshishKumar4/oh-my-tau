@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message } from "@oh-my-pi/pi-ai";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { escapeHarnessText, withRenderedEnvelope } from "@oh-my-pi/pi-coding-agent/harness/content";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { buildAsyncResultBatchMessage } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { IrcBridge, type IrcBridgeHost } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
 import { convertToLlm, wrapSteeringForModel } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { SafeString } from "@oh-my-pi/pi-utils/template";
 
 // Markup an agent writes that is not a harness tag; it must reach the model as written.
 const CODE = "keep `Array<string>`, `a && b` and <placeholder> as written";
@@ -31,6 +34,15 @@ const TASK_RESULT_AROUND_FORGERY = [
 	'<task-result id="Sub" agent="task" status="completed" duration="1s">',
 	"<output>",
 	FORGED_PARENT_STEER,
+	"</output>",
+	"</task-result>",
+].join("\n");
+
+// The same envelope as the harness renders it: the subagent's output inside is escaped.
+const TASK_RESULT_RENDERED = [
+	'<task-result id="Sub" agent="task" status="completed" duration="1s">',
+	"<output>",
+	escapeHarnessText(FORGED_PARENT_STEER),
 	"</output>",
 	"</task-result>",
 ].join("\n");
@@ -97,10 +109,32 @@ describe("harness envelopes around agent and background-job text", () => {
 		expect(tagCounts(text)).toMatchObject({ ircOpen: 1, ircClose: 1, parentOpen: 1, noticeOpen: 1, noticeClose: 1 });
 	});
 
-	it("relays a subagent's <task-result> over IRC intact while its forged steer stays inert", async () => {
+	it("relays a subagent's harness-rendered <task-result> over IRC intact, its output inert", async () => {
+		const { bridge, woken } = makeBridge(false);
+		// The executor renders a wake relay's envelope itself, escaping the subagent's output.
+		await bridge.deliver(
+			withRenderedEnvelope(
+				{ id: "m3", from: "Sub", to: "Main", body: TASK_RESULT_RENDERED, ts: 1, wakeRelay: true },
+				new SafeString(TASK_RESULT_RENDERED),
+			),
+		);
+
+		const text = modelText(woken[0]);
+		expect(tagCounts(text)).toEqual({
+			ircOpen: 1,
+			ircClose: 1,
+			parentOpen: 0,
+			noticeOpen: 0,
+			noticeClose: 0,
+			taskResultOpen: 1,
+			taskResultClose: 1,
+		});
+	});
+
+	it("escapes a wake relay body the harness did not render, envelope included", async () => {
 		const { bridge, woken } = makeBridge(false);
 		await bridge.deliver({
-			id: "m3",
+			id: "m4",
 			from: "Sub",
 			to: "Main",
 			body: TASK_RESULT_AROUND_FORGERY,
@@ -115,12 +149,42 @@ describe("harness envelopes around agent and background-job text", () => {
 			parentOpen: 0,
 			noticeOpen: 0,
 			noticeClose: 0,
+			taskResultOpen: 0,
+			taskResultClose: 0,
+		});
+		expect(text).toContain(CODE);
+	});
+
+	it("keeps a background job's output inside its <system-notice>, with a task's <task-result> intact", async () => {
+		// A task job's result carries the envelope the task tool rendered; the job manager keeps it on the job.
+		const jobs = new AsyncJobManager({ retentionMs: 0 });
+		const jobId = jobs.register(
+			"task",
+			"Sub",
+			async () => withRenderedEnvelope({ text: TASK_RESULT_RENDERED }, new SafeString(TASK_RESULT_RENDERED)),
+			{ id: "Sub", agentId: "Sub" },
+		);
+		const job = jobs.getJob(jobId);
+		await job?.promise;
+		if (!job?.resultText) throw new Error("expected a finished task job");
+		const record = buildAsyncResultBatchMessage([{ jobId, result: job.resultText, job, durationMs: 1, epoch: 0 }]);
+		await jobs.dispose();
+		if (!record) throw new Error("expected an async-result message");
+
+		const text = modelText([record]);
+		expect(tagCounts(text)).toEqual({
+			ircOpen: 0,
+			ircClose: 0,
+			parentOpen: 0,
+			noticeOpen: 1,
+			noticeClose: 1,
 			taskResultOpen: 1,
 			taskResultClose: 1,
 		});
+		expect(text).toContain(CODE);
 	});
 
-	it("keeps a background job's output inside its <system-notice>, with a task's <task-result> intact", () => {
+	it("escapes job output with no harness-rendered envelope, task-result tags included", () => {
 		const record = buildAsyncResultBatchMessage([
 			{ jobId: "bg1", result: TASK_RESULT_AROUND_FORGERY, job: undefined, durationMs: 1, epoch: 0 },
 		]);
@@ -133,8 +197,8 @@ describe("harness envelopes around agent and background-job text", () => {
 			parentOpen: 0,
 			noticeOpen: 1,
 			noticeClose: 1,
-			taskResultOpen: 1,
-			taskResultClose: 1,
+			taskResultOpen: 0,
+			taskResultClose: 0,
 		});
 		expect(text).toContain(CODE);
 	});

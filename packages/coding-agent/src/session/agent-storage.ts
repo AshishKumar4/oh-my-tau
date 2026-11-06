@@ -9,6 +9,7 @@ import {
 	type ServiceTier,
 	type StoredAuthCredential,
 } from "@oh-my-pi/pi-ai";
+import { modelPerfKey } from "@oh-my-pi/pi-catalog/identity/metrics";
 import {
 	AsyncDrain,
 	checkpointWal,
@@ -123,18 +124,6 @@ const MODEL_PERF_BACKFILL_MAX_AGE_MS = 90 * 86_400_000;
 const MODEL_PERF_BACKFILL_CHUNK = 2048;
 /** Hard ceiling on rows scanned per backfill run, whatever the age cutoff admits — bounds total CPU on very high-volume databases (models only seen earlier than the newest N measurable rows get no backfill). */
 const MODEL_PERF_BACKFILL_MAX_ROWS = 250_000;
-
-/**
- * `model_perf` row key: the model, plus the service tier when the turn ran on a
- * non-default one (`provider/model@ultrafast`). Tier rows keep a fast serving
- * path's throughput from blending into the standard average — a 300 t/s
- * ultrafast turn and a 25 t/s standard turn are different measurements, not one
- * 160 t/s model. Readers that do not know the tier read the bare
- * `provider/model` row, which stays the standard/default-tier aggregate.
- */
-export function modelPerfKey(modelKey: string, serviceTier?: ServiceTier | null): string {
-	return serviceTier && serviceTier !== "auto" && serviceTier !== "default" ? `${modelKey}@${serviceTier}` : modelKey;
-}
 
 /**
  * Validates one request timing and shapes it for the model_perf upsert.
@@ -412,6 +401,7 @@ CREATE TABLE settings (
 			this.#db.run("DELETE FROM model_perf");
 			using clearBackfillStmt = this.#db.prepare("DELETE FROM meta WHERE key = ?");
 			clearBackfillStmt.run(MODEL_PERF_BACKFILL_KEY);
+			clearBackfillStmt.run(MODEL_PERF_BACKFILL_V1_KEY);
 		}
 	}
 
@@ -751,9 +741,10 @@ FROM model_usage_legacy
 			// Stats databases written before the served-tier column existed cannot
 			// separate a fast serving path's samples from standard ones; those rows
 			// import as standard-tier history.
-			const hasTier = (statsDb.prepare("PRAGMA table_info(messages)").all() as { name: string }[]).some(
-				column => column.name === "service_tier",
-			);
+			const hasTier = statsDb
+				.prepare<{ name: string }, []>("PRAGMA table_info(messages)")
+				.all()
+				.some(column => column.name === "service_tier");
 			using select = statsDb.prepare(
 				`SELECT rowid, timestamp, provider, model, output_tokens, duration, ttft${hasTier ? ", service_tier" : ""}
 FROM messages

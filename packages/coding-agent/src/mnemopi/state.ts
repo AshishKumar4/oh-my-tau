@@ -22,6 +22,7 @@ import {
 import { countUserTurns, extractMessages } from "../hindsight/transcript";
 import {
 	findPersistedRecall,
+	type LegacyRecallScope,
 	type MemoryRecallChangesDetails,
 	type PersistedRecall,
 	persistRecall,
@@ -736,8 +737,9 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 
 	/**
 	 * A fresh recall is cut by `budget` to the prefix the prompt carries next to the memory
-	 * instructions; a reused one is resent exactly as delivered. Memories the delivered block
-	 * shows, even in part, are tracked for change reports.
+	 * instructions; a reused one is resent exactly as delivered, and one recorded before
+	 * scopes is cut as every send of it was. Memories the delivered block shows, even in
+	 * part, are tracked for change reports.
 	 */
 	async beforeAgentStartPrompt(
 		promptText: string,
@@ -751,13 +753,13 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		// The transcript's recall is history: a resumed session sends it unchanged, so the
 		// prompt cache still matches, and reports what changed since as a new message.
 		const scope = getMnemopiRecallScope(this.config);
-		const persisted = findPersistedRecall(this.session.sessionManager, scope);
+		const persisted = findPersistedRecall(this.session.sessionManager, scope, this.#legacyRecallScope());
 		if (persisted !== undefined) {
 			// The note carries what it reports, so a turn that never delivers it leaves the
 			// change for the next resume to report.
 			const changes = this.#recallChanges(persisted.memories);
 			return {
-				context: persisted.text || undefined,
+				context: (persisted.uncut ? budget(persisted.text) : persisted.text) || undefined,
 				notice: changes && {
 					content: changes.content,
 					details: { scope, memories: changes.memories } satisfies MemoryRecallChangesDetails,
@@ -917,12 +919,21 @@ export class MnemopiSessionState implements MnemopiSessionStateApi {
 		});
 	}
 
+	/** Where this session's recall entries from before scopes apply. */
+	#legacyRecallScope(): LegacyRecallScope {
+		return { backend: "mnemopi", cwd: this.session.sessionManager.getCwd() };
+	}
+
 	async maybeRecallOnAgentStart(): Promise<void> {
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
 		const generation = this.#recallGeneration;
 		// No message can join a turn already started, so a reused recall's changes wait for
 		// the next resume to be reported.
-		const persisted = findPersistedRecall(this.session.sessionManager, getMnemopiRecallScope(this.config));
+		const persisted = findPersistedRecall(
+			this.session.sessionManager,
+			getMnemopiRecallScope(this.config),
+			this.#legacyRecallScope(),
+		);
 		let context = persisted?.text;
 		let record: PersistedRecall | undefined;
 		if (persisted === undefined) {

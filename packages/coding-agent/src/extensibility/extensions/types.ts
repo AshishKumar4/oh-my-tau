@@ -1767,6 +1767,7 @@ export type {
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
 	SessionCompactingResult,
+	SessionHistoryRewrite,
 } from "../shared-events";
 
 // ============================================================================

@@ -10,6 +10,8 @@ import {
 import type { ScopeLike } from "../config/registry";
 import type { AgentSession } from "./agent-session";
 import { resolveSpeculationMethod } from "./compaction-methods";
+import { servedHarnessPrompt } from "../harness/capture";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { estimateInlineSavings } from "./snapcompact-inline";
 import { resolveModelCompactionSettings } from "./model-compaction-threshold";
 import { resolveSpeculationLeadTokens } from "./speculation-lead";
@@ -37,6 +39,19 @@ export function getSessionCompactionBoundaries(
 	);
 }
 
+/**
+ * Vendor-prompt reference for skills-subtraction placement: when a harness
+ * profile serves the recorded vendor prompt as system-prompt block 0, omp's
+ * own template (carrying the skills listing) moves to block 1. The loaded
+ * prompt object is stable per profile, so identity comparison is cheap.
+ */
+export function sessionVendorPromptRef(session: {
+	model?: Model;
+	settings: ScopeLike;
+}): { readonly text: string } | undefined {
+	return servedHarnessPrompt(session.model, effectiveHarnessProfile(session.settings, session.model) ?? null);
+}
+
 /** Read host settings and optionally run the provider's inline-image planner. */
 export function computeSessionContextBreakdown(
 	session: AgentSession,
@@ -55,10 +70,29 @@ export function computeSessionContextBreakdown(
 			});
 		}
 	}
-	return computeContextBreakdown(session, {
-		compaction: resolveModelCompactionSettings(session.settings, session.model),
-		sourceRevision: session.settings.revision,
-		skillful: cfgSkillful.get(session.settings),
-		snapcompact,
-	});
+	// Read each member off the live session. Spreading it (`{ ...session }`)
+	// copies own enumerable properties only, so every class-body getter and
+	// method is dropped: `messages`, `systemPrompt` and `skills` arrive
+	// undefined and `getContextBreakdown` disappears, which silently demotes
+	// this to a local estimate over an empty conversation.
+	return computeContextBreakdown(
+		{
+			model: session.model,
+			vendorPromptRef: sessionVendorPromptRef(session),
+			agent: session.agent,
+			messages: session.messages,
+			systemPrompt: session.systemPrompt,
+			skills: session.skills,
+			// Bind rather than wrap: a duck-typed session without the method must
+			// stay absent here, or the local-estimate branch is never taken and
+			// the call throws instead.
+			getContextBreakdown: session.getContextBreakdown?.bind(session),
+		},
+		{
+			compaction: resolveModelCompactionSettings(session.settings, session.model),
+			sourceRevision: session.settings.revision,
+			skillful: cfgSkillful.get(session.settings),
+			snapcompact,
+		},
+	);
 }
