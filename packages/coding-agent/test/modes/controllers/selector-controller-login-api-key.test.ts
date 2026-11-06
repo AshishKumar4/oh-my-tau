@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import type { OAuthPrompt } from "@oh-my-pi/pi-ai/registry/oauth/types";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SelectorController } from "@oh-my-pi/pi-coding-agent/modes/controllers/selector-controller";
@@ -52,6 +53,8 @@ describe("/login API key entry", () => {
 	let ctx: InteractiveModeContext;
 	let controller: SelectorController;
 	let dialogShown: Promise<LoginDialogComponent>;
+	/** Runs after each prompt the dialog shows. */
+	let onPrompt: ((prompt: OAuthPrompt) => void) | undefined;
 	let presented: Component[];
 
 	beforeAll(async () => {
@@ -79,9 +82,18 @@ describe("/login API key entry", () => {
 		ctx = createInteractiveModeContext({ session: { modelRegistry, sessionId: "session-1" } });
 		const shown = Promise.withResolvers<LoginDialogComponent>();
 		dialogShown = shown.promise;
-		// The controller focuses the dialog once it is mounted and ready for input.
-		ctx.ui.setFocus = vi.fn((component: Component | null) => {
-			if (component instanceof LoginDialogComponent) shown.resolve(component);
+		// The dialog is ready for input once it shows its first prompt; it mounts
+		// (and takes focus) a load earlier.
+		const showPrompt = LoginDialogComponent.prototype.showPrompt;
+		onPrompt = undefined;
+		vi.spyOn(LoginDialogComponent.prototype, "showPrompt").mockImplementation(function (
+			this: LoginDialogComponent,
+			...args: Parameters<typeof showPrompt>
+		) {
+			const answer = showPrompt.apply(this, args);
+			shown.resolve(this);
+			onPrompt?.(args[0]);
+			return answer;
 		});
 		presented = [];
 		ctx.present = vi.fn((content: Component | readonly Component[]) => {
@@ -161,12 +173,9 @@ describe("/login API key entry", () => {
 		const login = controller.showOAuthSelector("login", "anthropic");
 		const dialog = await dialogShown;
 		const workspacePrompt = Promise.withResolvers<void>();
-		const showPrompt = dialog.showPrompt.bind(dialog);
-		vi.spyOn(dialog, "showPrompt").mockImplementation(prompt => {
-			const answer = showPrompt(prompt);
+		onPrompt = prompt => {
 			if (!prompt.secret) workspacePrompt.resolve();
-			return answer;
-		});
+		};
 		dialog.pasteText(CONSOLE_KEY);
 		dialog.handleInput("\r");
 		await workspacePrompt.promise;
