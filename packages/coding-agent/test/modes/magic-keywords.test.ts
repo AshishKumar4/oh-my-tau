@@ -88,7 +88,8 @@ describe("keyword notices under Claude Code", () => {
 		const workflow = renderWorkflowNotice({ ...WORKFLOW_BASE, toolRefs });
 		expect(workflow).toContain("call the `wait` tool");
 		expect(workflow).not.toContain("end your turn");
-		expect(workflow).not.toContain("undefined");
+		// An unrendered tool name shows as `undefined` in backticks; prose may say "undefined".
+		expect(workflow).not.toContain("`undefined`");
 	});
 
 	it("tell a session with no wait tool to end its turn", () => {

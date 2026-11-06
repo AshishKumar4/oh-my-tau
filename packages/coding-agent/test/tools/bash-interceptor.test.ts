@@ -386,6 +386,7 @@ describe("rule messages on the presented Bash", () => {
 				"bash.autoBackground.enabled": false,
 			}),
 			cwd: os.tmpdir(),
+			getSessionFile: () => null,
 			getActiveModel: () => getBundledModel("anthropic", "claude-opus-5"),
 			getToolRefs: () => CLAUDE_CODE_REFS,
 		} as unknown as ToolSession;

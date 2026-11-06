@@ -238,13 +238,13 @@ describe("eval wait guidance on the presented surface", () => {
 	it("names omp's wait natively", () => {
 		const text = docsOf({ waitTool: true });
 		expect(text).toContain("If blocked, leave `eval` and call `wait`.");
-		expect(text).toContain("`wait` blocks when you have nothing else to do");
+		expect(text).toContain("the `wait` tool (not kernel `wait()`) blocks when you have nothing else to do");
 	});
 
 	it("names TaskOutput where it stands in for wait under Claude Code", () => {
 		const text = docsOf({ waitTool: true, waitToolName: "TaskOutput" });
 		expect(text).toContain("If blocked, leave `eval` and call `TaskOutput`.");
-		expect(text).toContain("`TaskOutput` blocks when you have nothing else to do");
+		expect(text).toContain("the `TaskOutput` tool (not kernel `wait()`) blocks when you have nothing else to do");
 		expect(text).not.toContain("`wait`");
 	});
 
@@ -252,7 +252,8 @@ describe("eval wait guidance on the presented surface", () => {
 		const text = docsOf({ waitTool: false, waitToolName: null });
 		expect(text).not.toContain("`wait`");
 		expect(text).not.toContain("TaskOutput");
-		expect(text).not.toContain("undefined");
+		// An unrendered tool name shows as `undefined` in backticks; prose may say "undefined".
+		expect(text).not.toContain("`undefined`");
 		// The kernel's own wait(handles) is not a tool and stays documented.
 		expect(text).toContain("wait(handles");
 	});

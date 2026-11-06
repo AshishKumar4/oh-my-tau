@@ -187,7 +187,7 @@ describe("multi-agent templates under claude-code", () => {
 		for (const [name, text] of Object.entries(rendered)) {
 			expect({ name, leaks: leaks(text) }).toEqual({ name, leaks: [] });
 		}
-		expect(rendered.contract).toContain('`SendMessage` (`to: "<id>"`');
+		expect(rendered.contract).toContain("`SendMessage` messages a live agent.");
 		expect(rendered.contract).toContain('`TaskStop` (`task_id: "<id>"`) cancels/stops.');
 		expect(rendered.contract).toContain("`Read proc://` lists jobs/services");
 		expect(rendered.followUp).toContain('message it via `SendMessage` (`to: "ScanRepo"`) to follow up');
@@ -228,7 +228,8 @@ describe("multi-agent templates under claude-code", () => {
 					tool => text.includes(`\`${tool}\``) || (FACADE_ONLY_NAMES.includes(tool) && text.includes(tool)),
 				);
 				expect({ surface, name, leaks: leaks(text), named }).toEqual({ surface, name, leaks: [], named: [] });
-				expect(text).not.toContain("undefined");
+				// An unrendered tool name shows as `undefined` in backticks; prose may say "undefined".
+				expect(text).not.toContain("`undefined`");
 			}
 		}
 		// A subagent that cannot message has no peer section at all.
@@ -257,7 +258,7 @@ describe("multi-agent templates under claude-code", () => {
 			'reply via `write` (`path: "agent://Main"`, `content: "…"`), when available',
 		);
 		const contract = prompt.render(taskAsyncContractTemplate, { ...data, toolRefs: NATIVE });
-		expect(contract).toContain("Completely blocked? Call `wait` to receive the first settled job or peer message.");
+		expect(contract).toContain("Completely blocked? Call `wait` to receive the first settled job you started.");
 		expect(contract).toContain("`write proc://<id>/kill` cancels/stops; omit `content`.");
 	});
 
@@ -273,10 +274,10 @@ describe("multi-agent templates under claude-code", () => {
 		const claudeCode = composeSpawnAdvisory({ ...args, toolRefs: CLAUDE_CODE }) ?? "";
 		expect(leaks(claudeCode)).toEqual([]);
 		expect(claudeCode).toContain('`subagent_type: "scout"`');
-		expect(claudeCode).toContain('`SendMessage` (`to: "all"` broadcasts)');
+		expect(claudeCode).toContain("Give each file one owner via `SendMessage`");
 		const native = composeSpawnAdvisory(args) ?? "";
 		expect(native).toContain('`agent: "scout"`');
-		expect(native).toContain("`write agent://<id>` (`agent://all` broadcasts)");
+		expect(native).toContain("Give each file one owner via `write agent://<id>`");
 		expect(composeSpawnAdvisory({ ...args, toolRefs: NATIVE })).toBe(native);
 	});
 
