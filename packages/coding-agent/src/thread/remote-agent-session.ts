@@ -96,6 +96,7 @@ import {
 } from "../session/session-context";
 import type { CustomEntry, SessionEntry } from "../session/session-entries";
 import { conversationTip, lastModelChangeRole, SessionEntryIndex } from "../session/session-manager";
+import { harnessToolRefs } from "../harness/manifest";
 import type { AgentDefinition } from "../task/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import { type ApprovalGrantStore, getApprovalGrants } from "../tools/approval-cache";
@@ -165,6 +166,7 @@ export function emptyMirrorState(): SessionMirrorState {
 		},
 		advisorOverview: { configured: false, advisors: [] },
 		sessionAgents: [],
+		toolRefs: harnessToolRefs(undefined),
 		hindsightActive: false,
 		effectiveExtensionRoots: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
 	};
@@ -504,6 +506,10 @@ export class RemoteAgentSession implements AgentViewSession {
 
 	getSessionAgents(): AgentDefinition[] {
 		return this.#state.sessionAgents;
+	}
+
+	getToolRefs(): Readonly<Record<string, string>> {
+		return this.#state.toolRefs;
 	}
 
 	hasQueuedIrcFrom(from: string): boolean {

@@ -4,6 +4,7 @@
  * published output is the previous run's — see the same record.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import type { AgentSession } from "../session/agent-session";
 
 /**
@@ -26,6 +27,8 @@ export interface LaneRun {
 	handOver(): void;
 	/** Settles once the run has finalized and relayed its end. */
 	readonly released: Promise<void>;
+	/** The run's live progress record, which the widget of the job carrying its end reads. */
+	readonly progress: AgentProgress;
 }
 
 /** The open run of each kept-alive lane's session. */

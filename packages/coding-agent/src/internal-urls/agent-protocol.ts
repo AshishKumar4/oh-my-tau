@@ -30,7 +30,6 @@ import agentPromptDoc from "../prompts/internal-urls/agent.md" with { type: "tex
 import agentProgressTemplate from "../prompts/tools/agent-url-progress.md" with { type: "text" };
 import agentSupersededTemplate from "../prompts/tools/agent-url-superseded.md" with { type: "text" };
 import { loadSessionMessagesReadOnly } from "../session/session-loader";
-import { laneRuns } from "../task/lane-runs";
 import { artifactsDirsFromRegistry } from "./registry-helpers";
 import type {
 	InternalResource,
@@ -130,15 +129,17 @@ function lastAssistantText(messages: readonly AgentMessage[]): string | undefine
 }
 
 /**
- * Whether `<id>`'s published output predates a run the agent is in now: a turn
- * it is streaming, or a kept-alive lane's open run, which spans the gaps where
- * the lane waits on its own background work and rewrites the output only when
- * it ends.
+ * Whether `<id>`'s published output predates a run the agent is in now or is
+ * about to start: a turn it is streaming, or a kept-alive lane's open run,
+ * which spans the gaps where the lane waits on its own background work and
+ * rewrites the output only when it ends. An executor-driven run holds the
+ * session's IRC wakes, so `ircWakesPending` (mirrored for worker-homed
+ * sessions) reports it on any thread, as it does a wake still queued for a run.
  */
 function isSuperseded(registry: AgentRegistryApi, outputId: string): boolean {
 	const ref = registry.get(outputId);
 	if (ref === undefined || ref.kind === "advisor") return false;
-	return registry.isRunning(ref) || (ref.session !== null && laneRuns.has(ref.session));
+	return registry.isRunning(ref) || ref.session?.ircWakesPending === true;
 }
 
 /**

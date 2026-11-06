@@ -160,6 +160,10 @@ export class PeerAgentSession implements AgentSessionHandle {
 		return this.#field("sessionAgents");
 	}
 
+	getToolRefs(): Readonly<Record<string, string>> {
+		return this.#field("toolRefs");
+	}
+
 	hasQueuedIrcFrom(from: string): boolean {
 		return mainBridge().remote.callSync("hasQueuedIrcFrom", this, from);
 	}

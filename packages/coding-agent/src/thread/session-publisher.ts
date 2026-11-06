@@ -99,6 +99,7 @@ export function captureSessionState(session: AgentSession): SessionMirrorState {
 		sessionStats: read.sessionStats(session),
 		advisorOverview: read.advisorOverview(session),
 		sessionAgents: read.sessionAgents(session),
+		toolRefs: read.toolRefs(session),
 		hindsightActive: read.hindsightActive(session),
 		effectiveExtensionRoots: read.effectiveExtensionRoots(session),
 	};

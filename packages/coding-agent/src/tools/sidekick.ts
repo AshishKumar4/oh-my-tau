@@ -14,7 +14,7 @@ import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import { effectiveHarnessProfile, sessionToolRefs } from "../harness/effective-profile";
 import { formatDuration, prompt } from "@oh-my-pi/pi-utils";
-import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
+import type { AsyncJob, AsyncJobManagerApi } from "../async/job-manager";
 import {
 	buildFusionPromptData,
 	type FusionPromptData,
@@ -188,20 +188,16 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 					void reportProgress(describeProgress(progress));
 					forwardProgress(progress);
 				});
-				const job = manager.getJob(ownJobId);
-				if (job) job.agentId ??= result.id;
+				manager.setJobAgent(ownJobId, result.id);
 				return reportOf(result);
 			},
 			{ id: `${ref?.id ?? SIDEKICK_LABEL}-h${handoff}`, ownerId: leadId, agentId: ref?.id },
 		);
 		// A first-handoff job learns its agent id once the spawn registers it;
 		// the mid-handoff interrupt lookup keys on it.
-		const job = manager.getJob(jobId);
-		if (job && !job.agentId) {
+		if (!ref) {
 			void this.#spawning?.then(
-				spawned => {
-					job.agentId ??= spawned.id;
-				},
+				spawned => manager.setJobAgent(jobId, spawned.id),
 				() => {},
 			);
 		}
@@ -352,7 +348,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 	 * so the async path does not deliver the same report twice.
 	 */
 	async #awaitJob(
-		manager: AsyncJobManager,
+		manager: AsyncJobManagerApi,
 		jobId: string,
 		signal: AbortSignal | undefined,
 		mode: SidekickHandoffMode,
@@ -369,28 +365,30 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		// `#spawning`; the registry has the sidekick as soon as it registers.
 		const releaseAwait = this.#holdHandoffAwait(() => job.agentId ?? findSidekickRef(this.#leadId())?.id);
 		let outcome: "settled" | "timeout" | "aborted";
+		let settled: AsyncJob = job;
 		try {
 			outcome = await Promise.race([job.promise.then(() => "settled" as const), timeout.promise, aborted.promise]);
+			// A worker's row is a snapshot: look it up again while the watch keeps it.
+			// Retention may still have evicted it; then the captured row is the newest.
+			settled = manager.getJob(jobId) ?? job;
 		} finally {
 			releaseAwait();
 			manager.unwatchJobs([jobId]);
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", onAbort);
 		}
-		// Read the captured row, not a fresh lookup: retention may already have
-		// evicted a just-settled job from the manager's table.
-		if (job.status !== "running") {
+		if (settled.status !== "running") {
 			manager.consumeJobResults([jobId]);
-			if (job.status === "failed") throw new ToolError(job.errorText ?? "Sidekick handoff failed.");
-			if (job.status === "cancelled") throw new ToolError("Sidekick handoff was cancelled.");
-			return textResult(job.resultText ?? "", { agentId: job.agentId, jobId, mode, pending: false });
+			if (settled.status === "failed") throw new ToolError(settled.errorText ?? "Sidekick handoff failed.");
+			if (settled.status === "cancelled") throw new ToolError("Sidekick handoff was cancelled.");
+			return textResult(settled.resultText ?? "", { agentId: settled.agentId, jobId, mode, pending: false });
 		}
 		const reason =
 			outcome === "aborted"
 				? "The wait was interrupted"
 				: `No report within ${formatDuration(SIDEKICK_MAX_BLOCK_SECONDS * 1000)}`;
 		return textResult(`${reason}; the sidekick is still working on handoff job \`${jobId}\`. ${this.#waitHint()}`, {
-			agentId: job.agentId,
+			agentId: settled.agentId,
 			jobId,
 			mode,
 			pending: true,

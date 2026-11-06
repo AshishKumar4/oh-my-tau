@@ -139,6 +139,7 @@ export type AsyncJobManagerProtocol = {
 	getAllJobs: RpcMethod<[filter: AsyncJobFilter | undefined], AsyncJobWire[]>;
 	backgroundJob: RpcMethod<[jobId: string], boolean>;
 	releaseForegroundJob: RpcMethod<[jobId: string], void>;
+	setJobAgent: RpcMethod<[jobId: string, agentId: string], void>;
 	getDeliveryState: RpcMethod<[filter: AsyncJobFilter | undefined], AsyncJobDeliveryState>;
 	hasPendingDeliveries: RpcMethod<[filter: AsyncJobFilter | undefined], boolean>;
 	watchJobs: RpcMethod<[jobIds: string[]], number>;
@@ -154,6 +155,7 @@ export type AsyncJobManagerProtocol = {
 		[ownerId: string, options: { timeoutMs?: number; excludeSuppressed?: boolean } | undefined],
 		boolean
 	>;
+	cancelAndReapJobs: RpcMethod<[jobIds: readonly string[], deadlineAt: number], AsyncJobReapResult>;
 	cancelAndReapOwnerJobs: RpcMethod<[ownerId: string, deadlineAt: number], AsyncJobReapResult>;
 	drainDeliveries: RpcMethod<[options: { timeoutMs?: number; filter?: AsyncJobFilter } | undefined], boolean>;
 	isDeliverySuppressed: RpcMethod<[jobId: string], boolean>;

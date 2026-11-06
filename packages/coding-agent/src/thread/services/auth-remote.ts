@@ -12,6 +12,7 @@ import type {
 	AnthropicSlowModeFailure,
 	AnthropicSlowModeRetry,
 	AnthropicSlowModeSignal,
+	ApiKeyCredential,
 	ApiKeyResolver,
 	AuthAccountPolicy,
 	AuthAccountPolicyConfig,
@@ -33,6 +34,8 @@ import type {
 	ClientUsageSummary,
 	CredentialDisabledEvent,
 	CredentialHealthResult,
+	CredentialPoolSummary,
+	CredentialRequestScope,
 	CredentialRotation,
 	CredentialsApi,
 	DisabledCredentialSummary,
@@ -240,6 +243,12 @@ class RemoteCredentials implements CredentialsApi {
 	revalidate(): Promise<void> {
 		return this.#remote.call("credentials.revalidate");
 	}
+	addApiKey(provider: string, key: string, options?: { workspaceId?: string }): Promise<StoredAuthCredential> {
+		return this.#remote.call("credentials.addApiKey", provider, key, options);
+	}
+	pooledApiKeys(provider: string): Array<StoredAuthCredential & { credential: ApiKeyCredential }> {
+		return this.#remote.callSync("credentials.pooledApiKeys", provider);
+	}
 	get(provider: string): AuthCredential | undefined {
 		return this.#remote.callSync("credentials.get", provider);
 	}
@@ -298,6 +307,12 @@ class RemoteKeys implements KeysApi {
 
 	get(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
 		return this.#remote.call("keys.get", provider, sessionId, options);
+	}
+	isOAuthBearer(provider: string, bearer: string): boolean {
+		return this.#remote.callSync("keys.isOAuthBearer", provider, bearer);
+	}
+	requestScope(provider: string, bearer: string): CredentialRequestScope | undefined {
+		return this.#remote.callSync("keys.requestScope", provider, bearer);
 	}
 	prefetchUsage(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<void> {
 		return this.#remote.call("keys.prefetchUsage", provider, sessionId, options);
@@ -459,6 +474,9 @@ class RemoteSessions implements SessionsApi {
 	release(provider: string, sessionId: string): boolean {
 		return this.#remote.callSync("sessions.release", provider, sessionId);
 	}
+	isRestricted(provider: string, sessionId: string | undefined): boolean {
+		return this.#remote.callSync("sessions.isRestricted", provider, sessionId);
+	}
 }
 
 class RemoteUsage implements UsageApi {
@@ -575,6 +593,9 @@ class RemoteLimits implements LimitsApi {
 	): Promise<boolean> {
 		return this.#remote.call("limits.invalidateMatching", provider, apiKey, options);
 	}
+	pools(provider: string, modelId?: string, sessionId?: string): CredentialPoolSummary[] {
+		return this.#remote.callSync("limits.pools", provider, modelId, sessionId);
+	}
 }
 
 class RemoteResets implements ResetsApi {
@@ -658,6 +679,14 @@ export class RemoteAuthStorageBackend implements AuthStorageBackend {
 
 	setAccountPolicies(config: AuthAccountPolicyConfig): void {
 		this.#remote.callSync("setAccountPolicies", config);
+	}
+
+	holdCredential(provider: string, credentialId: number): void {
+		this.#remote.callSync("holdCredential", provider, credentialId);
+	}
+
+	releaseCredential(provider: string, credentialId: number): void {
+		this.#remote.callSync("releaseCredential", provider, credentialId);
 	}
 
 	async replaceStore(store: AuthCredentialStore): Promise<void> {

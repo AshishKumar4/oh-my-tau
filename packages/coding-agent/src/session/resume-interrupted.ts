@@ -19,7 +19,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentOutput, YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 import { isRecord } from "@oh-my-pi/pi-utils";
-import { AsyncJobError, type AsyncJobManager } from "../async";
+import { AsyncJobError, type AsyncJobManagerApi } from "../async";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { getBundledAgent, resolveRetiredAgentName } from "../task/agents";
@@ -825,7 +825,7 @@ async function resolveAgentDefinition(
 /** The part of an `AgentSession` `/recover` works through. */
 export interface RecoverHost {
 	readonly sessionManager: SessionManager;
-	readonly asyncJobManager: AsyncJobManager | undefined;
+	readonly asyncJobManager: AsyncJobManagerApi | undefined;
 	/** Buses a restarted subagent announces itself on, so it shows in the running-subagents list like a spawn. */
 	readonly eventBus: EventBus | undefined;
 	readonly subagentEventBus: EventBus | undefined;

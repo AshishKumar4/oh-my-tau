@@ -131,6 +131,8 @@ export interface AgentSessionHandle {
 	getAdvisorStatusOverview(): AgentSessionAdvisorOverview;
 	/** Session-local general-purpose agents pinned to user-tagged models. */
 	getSessionAgents(): AgentDefinition[];
+	/** Names the session's harness profile presents omp's tools under (`read` → `Read`). */
+	getToolRefs(): Readonly<Record<string, string>>;
 	/** Whether a message from `from` still waits for a turn of its own. */
 	hasQueuedIrcFrom(from: string): boolean;
 	/** Surface and consume every pending IRC record before automatic injection; with `ifAny`,

@@ -213,6 +213,9 @@ function serveAuthStorage(state: PeerAuthState): RpcServe<AuthStorage, AuthStora
 		"credentials.disable": (storage, id, cause) => storage.credentials.disable(id, cause),
 		"credentials.listDisabled": (storage, provider, signal) => storage.credentials.listDisabled(provider, signal),
 		"credentials.snapshot": storage => storage.credentials.snapshot(),
+		"credentials.addApiKey": (storage, provider, key, options) =>
+			storage.credentials.addApiKey(provider, key, options),
+		"credentials.pooledApiKeys": (storage, provider) => storage.credentials.pooledApiKeys(provider),
 
 		"keys.get": (storage, provider, sessionId, options) => storage.keys.get(provider, sessionId, options),
 		"keys.prefetchUsage": (storage, provider, sessionId, options) =>
@@ -224,6 +227,8 @@ function serveAuthStorage(state: PeerAuthState): RpcServe<AuthStorage, AuthStora
 		"keys.availability": (storage, providers) => authAvailability(storage, providers),
 		"keys.availabilityOf": (storage, provider) => providerAvailability(storage, provider),
 		"keys.describe": (storage, provider, sessionId) => storage.keys.describe(provider, sessionId),
+		"keys.isOAuthBearer": (storage, provider, bearer) => storage.keys.isOAuthBearer(provider, bearer),
+		"keys.requestScope": (storage, provider, bearer) => storage.keys.requestScope(provider, bearer),
 		"keys.setRuntime": (storage, provider, apiKey) => storage.keys.setRuntime(provider, apiKey),
 		"keys.removeRuntime": (storage, provider) => storage.keys.removeRuntime(provider),
 		"keys.setConfig": (storage, provider, config, options) => storage.keys.setConfig(provider, config, options),
@@ -266,6 +271,7 @@ function serveAuthStorage(state: PeerAuthState): RpcServe<AuthStorage, AuthStora
 		"sessions.permits": (storage, provider, sessionId, credentialId) =>
 			storage.sessions.permits(provider, sessionId, credentialId),
 		"sessions.release": (storage, provider, sessionId) => storage.sessions.release(provider, sessionId),
+		"sessions.isRestricted": (storage, provider, sessionId) => storage.sessions.isRestricted(provider, sessionId),
 
 		"usage.reports": (storage, options) =>
 			storage.usage.reports({
@@ -300,6 +306,7 @@ function serveAuthStorage(state: PeerAuthState): RpcServe<AuthStorage, AuthStora
 		"limits.markReached": (storage, provider, sessionId, options) =>
 			storage.limits.markReached(provider, sessionId, options),
 		"limits.rotate": (storage, provider, sessionId, options) => storage.limits.rotate(provider, sessionId, options),
+		"limits.pools": (storage, provider, modelId, sessionId) => storage.limits.pools(provider, modelId, sessionId),
 		"limits.invalidateMatching": (storage, provider, apiKey, options) =>
 			storage.limits.invalidateMatching(provider, apiKey, options),
 
@@ -320,6 +327,8 @@ function serveAuthStorage(state: PeerAuthState): RpcServe<AuthStorage, AuthStora
 		"blocks.deleteAll": (storage, credentialId) => storage.blocks.deleteAll(credentialId),
 
 		setAccountPolicies: (storage, config) => storage.setAccountPolicies(config),
+		holdCredential: (storage, provider, credentialId) => storage.holdCredential(provider, credentialId),
+		releaseCredential: (storage, provider, credentialId) => storage.releaseCredential(provider, credentialId),
 	};
 }
 

@@ -16,12 +16,7 @@ import { isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import { SafeString } from "@oh-my-pi/pi-utils/template";
 import { escapeHarnessText, withRenderedEnvelope } from "../harness/content";
-import {
-	ASYNC_JOB_MANAGER_SHUTDOWN_REASON,
-	AsyncJobError,
-	type AsyncJobManagerApi,
-	type AsyncJobRunResult,
-} from "../async";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, type AsyncJobManagerApi } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { ModelRegistry } from "../config/model-registry";
@@ -3353,6 +3348,8 @@ interface LaneRunStart {
 	firstTurn?: Promise<unknown>;
 	signal: AbortSignal | undefined;
 	onProgress?: (progress: AgentProgress) => void;
+	/** Each finished tool call of the run, for the tool tap of the job carrying its end. */
+	onToolResult?: (result: SubagentToolResult) => void;
 	sessionFile: string | undefined;
 	/** Whether to ask for completion estimates; a wake run, which answers a peer message, leaves it unset. */
 	completionProbe?: boolean;
@@ -3402,6 +3399,7 @@ async function runLane(session: AgentSession, options: LaneRunOptions, start: La
 		modelRole: options.modelRole,
 		signal: start.signal,
 		onProgress: start.onProgress,
+		onToolResult: start.onToolResult,
 		eventBus: options.eventBus,
 		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
@@ -3465,6 +3463,7 @@ async function runLane(session: AgentSession, options: LaneRunOptions, start: La
 			detach();
 		},
 		released: released.promise,
+		progress: monitor.progress,
 	};
 	laneRuns.set(session, run);
 	// A peer's message waits for a run of its own, whose relay answers it, and the
@@ -3691,11 +3690,14 @@ function openWakeRun(
 	const cancel = new AbortController();
 	const firstTurn = Promise.withResolvers<unknown>();
 	let jobOwnerId: string | undefined;
+	// The run's finished tool calls, which the job's widget reads like a first run's.
+	const tools = new TextTap(TOOLS_SOURCE_ID, TOOLS_SOURCE_LABEL);
 	const ended = runLane(session, options, {
 		task,
 		records,
 		firstTurn: firstTurn.promise,
 		signal: cancel.signal,
+		onToolResult: result => appendToolResult(tools, result),
 		sessionFile: AgentRegistry.global().get(id)?.sessionFile ?? options.sessionFile ?? undefined,
 		// The owner's message is an assignment it waits on; a peer's gets a short answer, too short to probe.
 		completionProbe: ownerWoken && options.completionProbe === true,
@@ -3711,6 +3713,8 @@ function openWakeRun(
 			() => {},
 		),
 	);
+	// runLane registers its run before its first await.
+	const lane = laneRuns.get(session);
 	/** Register the job that carries the run's end to the parent; returns its owner, or undefined when there is none. */
 	const routeToParent = (): string | undefined => {
 		if (!ownerId || !manager) return undefined;
@@ -3746,7 +3750,7 @@ function openWakeRun(
 					}
 					const text = formatTaskResultSummary(end.result, {
 						totalDurationMs: end.result.durationMs,
-						toolRefs: AgentRegistry.global().get(end.carrier)?.session?.getToolRefs?.(),
+						toolRefs: AgentRegistry.global().get(end.carrier)?.session?.getToolRefs(),
 					});
 					const structured = end.result.structuredOutput;
 					if (end.result.aborted || end.result.exitCode !== 0 || end.result.error !== undefined) {
@@ -3754,7 +3758,19 @@ function openWakeRun(
 					}
 					return withRenderedEnvelope({ text, structured }, new SafeString(text));
 				},
-				{ id, agentId: id, ownerId },
+				{
+					id,
+					agentId: id,
+					ownerId,
+					...(lane && {
+						widgetInputs: createTaskWidgetInputs({
+							manager,
+							agentId: id,
+							tools: () => tools,
+							progress: lane.progress,
+						}),
+					}),
+				},
 			);
 			return ownerId;
 		} catch (error) {

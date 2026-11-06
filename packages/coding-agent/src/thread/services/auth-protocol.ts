@@ -16,6 +16,7 @@ import type {
 	AnthropicSlowModeRetry,
 	AnthropicSlowModeSignal,
 	Api,
+	ApiKeyCredential,
 	ApiKeyResolver,
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -37,6 +38,8 @@ import type {
 	ClientUsageSummary,
 	CredentialDisabledEvent,
 	CredentialHealthResult,
+	CredentialPoolSummary,
+	CredentialRequestScope,
 	CredentialRotation,
 	DisabledCredentialSummary,
 	InvalidateCredentialMatchingOptions,
@@ -164,6 +167,14 @@ export type AuthStorageProtocol = {
 	"credentials.disable": RpcMethod<[id: number, disabledCause: string], boolean>;
 	"credentials.listDisabled": RpcMethod<[provider?: string, signal?: AbortSignal], DisabledCredentialSummary[]>;
 	"credentials.snapshot": RpcMethod<[], AuthCredentialSnapshot>;
+	"credentials.addApiKey": RpcMethod<
+		[provider: string, key: string, options?: { workspaceId?: string }],
+		StoredAuthCredential
+	>;
+	"credentials.pooledApiKeys": RpcMethod<
+		[provider: string],
+		Array<StoredAuthCredential & { credential: ApiKeyCredential }>
+	>;
 
 	"keys.get": RpcMethod<[provider: string, sessionId?: string, options?: AuthApiKeyOptions], string | undefined>;
 	"keys.prefetchUsage": RpcMethod<[provider: string, sessionId?: string, options?: AuthApiKeyOptions], void>;
@@ -182,6 +193,8 @@ export type AuthStorageProtocol = {
 	/** {@link ProviderAuthAvailability} of one provider the cached table lacks. */
 	"keys.availabilityOf": RpcMethod<[provider: string], ProviderAuthAvailability>;
 	"keys.describe": RpcMethod<[provider: string, sessionId?: string], string | undefined>;
+	"keys.isOAuthBearer": RpcMethod<[provider: string, bearer: string], boolean>;
+	"keys.requestScope": RpcMethod<[provider: string, bearer: string], CredentialRequestScope | undefined>;
 	"keys.setRuntime": RpcMethod<[provider: string, apiKey: string], void>;
 	"keys.removeRuntime": RpcMethod<[provider: string], void>;
 	"keys.setConfig": RpcMethod<[provider: string, apiKeyConfig: string, options?: { fallback?: boolean }], void>;
@@ -224,6 +237,7 @@ export type AuthStorageProtocol = {
 	"sessions.unrestrict": RpcMethod<[provider: string, sessionId: string, lease: number], void>;
 	"sessions.permits": RpcMethod<[provider: string, sessionId: string, credentialId: number], boolean>;
 	"sessions.release": RpcMethod<[provider: string, sessionId: string], boolean>;
+	"sessions.isRestricted": RpcMethod<[provider: string, sessionId: string | undefined], boolean>;
 
 	"usage.reports": RpcMethod<[options?: WireUsageReportsOptions], UsageReport[] | null>;
 	"usage.ingestHeaders": RpcMethod<
@@ -259,6 +273,7 @@ export type AuthStorageProtocol = {
 		[provider: string, sessionId: string | undefined, options?: RotateCredentialOptions],
 		CredentialRotation
 	>;
+	"limits.pools": RpcMethod<[provider: string, modelId?: string, sessionId?: string], CredentialPoolSummary[]>;
 	"limits.invalidateMatching": RpcMethod<
 		[provider: string, apiKey: string, options?: InvalidateCredentialMatchingOptions],
 		boolean
@@ -273,6 +288,8 @@ export type AuthStorageProtocol = {
 	"blocks.deleteAll": RpcMethod<[credentialId: number], void>;
 
 	setAccountPolicies: RpcMethod<[config: AuthAccountPolicyConfig], void>;
+	holdCredential: RpcMethod<[provider: string, credentialId: number], void>;
+	releaseCredential: RpcMethod<[provider: string, credentialId: number], void>;
 };
 
 /**

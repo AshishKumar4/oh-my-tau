@@ -313,6 +313,10 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		this.#remote.notify("releaseForegroundJob", jobId);
 	}
 
+	setJobAgent(jobId: string, agentId: string): void {
+		this.#remote.notify("setJobAgent", jobId, agentId);
+	}
+
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState {
 		return this.#remote.callSync("getDeliveryState", filter);
 	}
@@ -363,6 +367,10 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 
 	waitForOwnerJobs(ownerId: string, options?: { timeoutMs?: number; excludeSuppressed?: boolean }): Promise<boolean> {
 		return this.#remote.call("waitForOwnerJobs", ownerId, options);
+	}
+
+	cancelAndReapJobs(jobIds: readonly string[], deadlineAt: number): Promise<AsyncJobReapResult> {
+		return this.#remote.call("cancelAndReapJobs", jobIds, deadlineAt);
 	}
 
 	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
