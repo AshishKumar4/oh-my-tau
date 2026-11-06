@@ -19,9 +19,14 @@ export default class Update extends Command {
 	static description = commandHelp.description;
 	static flags = {
 		plugins: Flags.boolean({ char: "l", description: "Update installed plugins", default: false }),
+		check: Flags.boolean({
+			char: "c",
+			description: "With --plugins, report the upgrades without installing",
+			default: false,
+		}),
 	};
 
-	static examples = ["omp update", "omp update --plugins"];
+	static examples = ["omp update", "omp update --plugins", "omp update --plugins --check"];
 
 	async run(): Promise<void> {
 		const { flags } = await this.parse(Update);
@@ -30,6 +35,6 @@ export default class Update extends Command {
 			return;
 		}
 		await initTheme();
-		await pluginCli.runPluginCommand({ action: "upgrade", args: [], flags: {} });
+		await pluginCli.runPluginCommand({ action: "upgrade", args: [], flags: flags.check ? { dryRun: true } : {} });
 	}
 }

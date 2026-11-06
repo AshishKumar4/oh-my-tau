@@ -185,7 +185,7 @@ describe("model merge reuse", () => {
 					},
 				],
 				false,
-				fingerprintStaticModels(existing),
+				fingerprintStaticModels(existing, { additive: true }),
 				directory.join("models.db"),
 			);
 			const cached = readModelCache("openai", 60_000, Date.now, directory.join("models.db"));

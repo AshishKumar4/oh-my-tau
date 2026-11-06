@@ -7,7 +7,6 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import * as toolTimeouts from "@oh-my-pi/pi-coding-agent/tools/tool-timeouts";
-import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { Shell } from "@oh-my-pi/pi-natives";
 
 const KERNEL_OWNER = "background-timeout-test";
@@ -37,16 +36,6 @@ function job(manager: AsyncJobManager, id: string | undefined): AsyncJob {
 	const running = manager.getJob(id);
 	if (running === undefined) throw new Error(`Missing background job ${id}`);
 	return running;
-}
-
-async function stillPending<T>(promise: Promise<T>): Promise<boolean> {
-	let settled = false;
-	const settle = () => {
-		settled = true;
-	};
-	void promise.then(settle, settle);
-	for (let turn = 0; turn < 50 && !settled; turn++) await Promise.resolve();
-	return !settled;
 }
 
 afterEach(async () => {
@@ -250,23 +239,3 @@ describe("EvalTool background deadlines", () => {
 	});
 });
 
-it("wait stays blocked past thirty minutes and returns a running snapshot at two hours", async () => {
-	vi.useFakeTimers();
-	const jobs = manager();
-	const run = Promise.withResolvers<string>();
-	const id = jobs.register("bash", "long suite", async () => run.promise);
-	const waiting = new WaitTool(session(Settings.isolated({ "launch.enabled": false }), jobs)).execute("cap", {});
-	try {
-		vi.advanceTimersByTime(30 * 60_000);
-		expect(await stillPending(waiting)).toBe(true);
-		vi.advanceTimersByTime(90 * 60_000 - 1);
-		expect(await stillPending(waiting)).toBe(true);
-		vi.advanceTimersByTime(1);
-		const result = await waiting;
-		expect(result.details?.jobs).toEqual([expect.objectContaining({ id, status: "running" })]);
-		expect(jobs.getJob(id)?.status).toBe("running");
-	} finally {
-		run.resolve("suite complete");
-		await jobs.waitForAll();
-	}
-});

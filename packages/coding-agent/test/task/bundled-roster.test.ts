@@ -85,11 +85,11 @@ describe("bundled agent roster", () => {
 		removeSyncWithRetries(tempDir);
 	});
 
-	it("discovers only scout, reviewer and task as bundled agents", async () => {
+	it("discovers only scout, reviewer, seance and task as bundled agents", async () => {
 		const { agents } = await discoverAgents(projectDir, os.homedir(), NO_EXTENSIONS);
 
 		const bundledNames = agents.filter(agent => agent.source === "bundled").map(agent => agent.name);
-		expect(bundledNames.sort()).toEqual(["reviewer", "scout", "task"]);
+		expect(bundledNames.sort()).toEqual(["reviewer", "scout", "seance", "task"]);
 	});
 
 	it("gives the task agent's session no spawn allowance", async () => {
