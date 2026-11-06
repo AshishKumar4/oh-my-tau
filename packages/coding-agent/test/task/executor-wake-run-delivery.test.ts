@@ -21,6 +21,7 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { buildAsyncResultBatchMessage } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -906,10 +907,15 @@ describe("IRC wake run delivery", () => {
 
 		await lane.manager.drainDeliveries({ timeoutMs: 1000 });
 
-		// The result arrives as the parent's job result, as with room, not as a message.
+		// The result arrives as the parent's job result, as with room, not as a message,
+		// and its envelope stays trusted: the notice the parent reads is not escaped.
 		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
 		expect(lane.delivered).toHaveLength(1);
 		expect(lane.delivered[0]).toContain("answered directly");
+		const notice = buildAsyncResultBatchMessage([
+			{ jobId: LANE, result: lane.delivered[0], job: lane.manager.getJob(LANE), durationMs: undefined, epoch: 0 },
+		]);
+		expect(notice?.content).toContain(`<task-result id="${LANE}"`);
 		expect(relaysTo(REVIEWER)).toHaveLength(1);
 		filler.resolve("filler done");
 	});

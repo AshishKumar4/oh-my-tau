@@ -598,6 +598,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 			structured: result.structured,
 			agentOutputPublished: result.agentOutputPublished,
 		};
+		withRenderedEnvelope(job, getRenderedEnvelope(result, result.text));
 		this.#jobs.set(id, job);
 		this.#recordAgentReply(job);
 		this.#enqueueDelivery(id, result.text);
