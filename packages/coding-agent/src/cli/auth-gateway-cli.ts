@@ -24,7 +24,7 @@ import {
 	type CredentialCompletionResult,
 	completeSimple,
 	type Model,
-	type OAuthRequestIdentity,
+	type CredentialRequestScope,
 } from "@oh-my-pi/pi-ai";
 import {
 	AuthBrokerClient,
@@ -39,14 +39,16 @@ import {
 	parseAuthGatewayClients,
 	startAuthGateway,
 } from "@oh-my-pi/pi-ai/auth-gateway";
+import { isLoopbackBind, parseBind } from "@oh-my-pi/pi-ai/utils/parse-bind";
 import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import { buildModelProviderPriorityRank } from "@oh-my-pi/pi-catalog/identity";
 import { type GeneratedProvider, getBundledModels, getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
 import { type ModelKind, modelKind } from "@oh-my-pi/pi-catalog/types";
-import { getConfigRootDir, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, getHarnessCacheDir, logger, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { cfgDisabledProviders, cfgModelProviderOrder } from "../config/model-settings";
+import { recordHarnessRequest } from "../harness/record";
 import { resolveProviderModelReference } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import {
@@ -73,6 +75,7 @@ export interface AuthGatewayCommandArgs {
 		 * to wire token-paste plumbing into every local client.
 		 */
 		noAuth?: boolean;
+		recordHarness?: boolean;
 		/**
 		 * Strict mode for `check` — additionally exercise every credential
 		 * against its provider's chat-completion endpoint. The usage probe (run
@@ -307,6 +310,15 @@ export function indexModelsByRequestId(
 	return { models: served, qualified, bare };
 }
 
+export function assertHarnessRecordingConfined(flags: AuthGatewayCommandArgs["flags"]): void {
+	if (flags.recordHarness !== true || flags.noAuth !== true) return;
+	const bind = flags.bind ?? DEFAULT_AUTH_GATEWAY_BIND;
+	if (isLoopbackBind(parseBind(bind).hostname)) return;
+	throw new Error(
+		`\`--record-harness\` refuses to start on ${bind} with \`--no-auth\`: every capture written under ${path.join(getHarnessCacheDir(), "<profile>")} becomes the system prompt of later omp sessions on a profiled model, so any host that can reach this bind would author them. Bind loopback (e.g. \`--bind=${DEFAULT_AUTH_GATEWAY_BIND}\`) or drop \`--no-auth\`.`,
+	);
+}
+
 /**
  * Resolve a client-requested model id: the exact `provider/id`, else the bare
  * `id`'s best candidate — the first priority tier `options.accepts` admits any
@@ -369,6 +381,7 @@ export function createSerializedRebuilder(run: (force: boolean) => Promise<void>
 }
 
 async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
+	assertHarnessRecordingConfined(flags);
 	const brokerConfig = await resolveAuthBrokerConfig();
 	if (!brokerConfig) {
 		throw new Error(
@@ -399,7 +412,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// in sdk.ts. The gateway never touches local SQLite.
 	const accountPool = await loadAuthBrokerAccountPool();
 	const settings = await resolveEffectiveSettings();
-	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig({ settings });
+	const { accountPolicies, defaultReservePct, poolOrders } = await loadEffectiveAuthAccountPolicyConfig({ settings });
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
 	const store = new RemoteAuthCredentialStore({
@@ -415,6 +428,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		sourceLabel: `broker ${brokerConfig.url}`,
 		accountPolicies,
 		defaultReservePct,
+		poolOrders,
 	});
 	await storage.credentials.reload();
 
@@ -457,6 +471,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		version: VERSION,
 		resolveModel: (id, options) => resolveGatewayModel(id, index, options),
 		listModels: () => index.qualified.values(),
+		...(flags.recordHarness === true && { harnessRecorder: recordHarnessRequest }),
 		excludeProviders: new Set(cfgDisabledProviders.get(settings)),
 		clients,
 	});
@@ -472,6 +487,11 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		);
 	}
 	process.stdout.write(`upstream broker: ${brokerConfig.url}\n`);
+	if (flags.recordHarness === true) {
+		process.stdout.write(
+			`harness recording: on — point Claude Code (ANTHROPIC_BASE_URL) or Codex (model_provider base_url) here; captures land in ${path.join(getHarnessCacheDir(), "<profile>")}\n`,
+		);
+	}
 
 	// `serve` is long-lived: rebuild the catalog periodically so models
 	// discovered after boot (for providers we already hold credentials for)
@@ -762,7 +782,7 @@ async function probeOneModel(
 	model: Model<Api>,
 	apiKey: string,
 	outerSignal: AbortSignal,
-	oauthIdentity?: OAuthRequestIdentity,
+	credentialScope?: CredentialRequestScope,
 ): Promise<CredentialCompletionResult> {
 	const start = Date.now();
 	const attemptTimeoutSignal = AbortSignal.timeout(STRICT_PROBE_PER_ATTEMPT_TIMEOUT_MS);
@@ -779,7 +799,7 @@ async function probeOneModel(
 		},
 		{
 			apiKey,
-			oauthIdentity,
+			credentialScope,
 			maxTokens: 32,
 			signal: attemptSignal,
 		},
@@ -811,14 +831,6 @@ export function createStrictCompletionProbe(): CompletionProbe {
 			return { ok: null, reason: `no bearer-compatible probe model bundled for provider ${input.provider}` };
 		}
 		const apiKey = composeProbeApiKey(input.provider, input.credential);
-		const oauthIdentity =
-			input.credential.type === "oauth"
-				? {
-						orgId: input.credential.orgId,
-						region: input.credential.region,
-						inferenceRegion: input.credential.inferenceRegion,
-					}
-				: undefined;
 		let lastFailure: CredentialCompletionResult | undefined;
 		for (const model of candidates) {
 			if (input.signal.aborted) {
@@ -828,7 +840,7 @@ export function createStrictCompletionProbe(): CompletionProbe {
 					modelId: model.id,
 				};
 			}
-			const result = await probeOneModel(model, apiKey, input.signal, oauthIdentity);
+			const result = await probeOneModel(model, apiKey, input.signal, input.credentialScope);
 			if (result.ok === true) return result;
 			lastFailure = result;
 			if (!RETRYABLE_MODEL_ERROR_RE.test(result.reason ?? "")) {
@@ -875,7 +887,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 
 	const accountPool = await loadAuthBrokerAccountPool();
 	const settings = await resolveEffectiveSettings();
-	const { accountPolicies, defaultReservePct } = await loadEffectiveAuthAccountPolicyConfig({ settings });
+	const { accountPolicies, defaultReservePct, poolOrders } = await loadEffectiveAuthAccountPolicyConfig({ settings });
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
 	const store = new RemoteAuthCredentialStore({
@@ -887,6 +899,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		sourceLabel: `broker ${brokerConfig.url}`,
 		accountPolicies,
 		defaultReservePct,
+		poolOrders,
 	});
 	try {
 		await storage.credentials.reload();

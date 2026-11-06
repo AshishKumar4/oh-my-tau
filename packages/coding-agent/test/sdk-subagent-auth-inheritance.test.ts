@@ -68,9 +68,9 @@ function claudeUsage(accountId: string, usedFraction: number): UsageReport {
 	};
 }
 
-/** Account B is 70% used and inside its 50% reserve; A is 20% used, so only an explicit pin keeps B. */
-function reserveAuthStorage(): AuthStorage {
-	const usedFractionByAccount: Record<string, number> = { "account-a": 0.2, "account-b": 0.7 };
+/** With a reserve, B is 70% used; only an explicit pin keeps it over A's 20% usage. */
+function revivalAuthStorage(reserveB = false): AuthStorage {
+	const usedFractionByAccount: Record<string, number> = { "account-a": 0.2, "account-b": reserveB ? 0.7 : 0.2 };
 	return new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")), {
 		usageProviderResolver: provider =>
 			provider === "anthropic"
@@ -83,7 +83,7 @@ function reserveAuthStorage(): AuthStorage {
 						},
 					}
 				: undefined,
-		accountPolicies: [{ provider: "anthropic", account: { accountId: "account-b" }, reservePct: 50 }],
+		accountPolicies: reserveB ? [{ provider: "anthropic", account: { accountId: "account-b" }, reservePct: 50 }] : [],
 	});
 }
 
@@ -274,6 +274,7 @@ describe("task subagent OAuth pin inheritance", () => {
 		childAccount: string,
 		parentAccount: string,
 		parentPinOptions?: { restoredAtMs: number },
+		hold?: "child" | "parent",
 		oauthAccountPools?: Record<string, string[]>,
 	): Promise<string | undefined> {
 		const tempDir = TempDir.createSync("@pi-subagent-revive-pin-");
@@ -304,6 +305,15 @@ describe("task subagent OAuth pin inheritance", () => {
 				),
 			).toBe(true);
 
+			if (hold) {
+				const heldAccount = hold === "child" ? childAccount : parentAccount;
+				const held = authStorage.oauth
+					.accounts("anthropic")
+					.find(account => account.accountId === `account-${heldAccount}`);
+				if (!held) throw new Error("Expected held account");
+				authStorage.holdCredential("anthropic", held.credentialId);
+			}
+
 			({ session: child } = await createAgentSession({
 				cwd: tempDir.path(),
 				agentDir: tempDir.path(),
@@ -314,12 +324,19 @@ describe("task subagent OAuth pin inheritance", () => {
 				model,
 				credentialSourceSessionId: parentProviderSessionId,
 				oauthAccountPools,
+				taskDepth: 1,
+				parentTaskPrefix: "0-Revived",
+				agentId: "0-Revived",
 				toolNames: ["read"],
 				disableExtensionDiscovery: true,
 			}));
 			const childGetApiKey = child.agent.getApiKey;
 			if (!childGetApiKey) throw new Error("Expected child credential resolver");
-			return await resolveApiKeyOnce(await childGetApiKey(model));
+			const key = await resolveApiKeyOnce(await childGetApiKey(model));
+			expect(metadataUserId(child.agent.metadataForProvider("anthropic")).account_uuid).toBe(
+				key === "access-b" ? "account-b" : "account-a",
+			);
+			return key;
 		} finally {
 			await child?.dispose();
 			authStorage.close();
@@ -328,20 +345,30 @@ describe("task subagent OAuth pin inheritance", () => {
 	}
 
 	it("keeps a revived child's own warm transcript pin over the parent's automatic affinity", async () => {
-		const key = await reviveChildKey(createInMemoryAuthStorage(), "b", "a", { restoredAtMs: Date.now() });
+		const key = await reviveChildKey(revivalAuthStorage(), "b", "a", { restoredAtMs: Date.now() });
 		expect(key).toBe("access-b");
 	});
 
 	it("moves a revived child onto the parent's explicit pin over its transcript pin", async () => {
-		expect(await reviveChildKey(createInMemoryAuthStorage(), "b", "a")).toBe("access-a");
+		expect(await reviveChildKey(revivalAuthStorage(), "b", "a")).toBe("access-a");
+	});
+
+	it("does not revive onto a held transcript account", async () => {
+		expect(await reviveChildKey(revivalAuthStorage(), "b", "a", { restoredAtMs: Date.now() }, "child")).toBe(
+			"access-a",
+		);
+	});
+
+	it("does not inherit a held explicit parent pin", async () => {
+		expect(await reviveChildKey(revivalAuthStorage(), "b", "a", undefined, "parent")).toBe("access-b");
 	});
 
 	it("keeps the parent's explicit pin explicit in a revived child pinned to the same account", async () => {
-		expect(await reviveChildKey(reserveAuthStorage(), "b", "b")).toBe("access-b");
+		expect(await reviveChildKey(revivalAuthStorage(true), "b", "b")).toBe("access-b");
 	});
 
 	it("keeps a revived child inside its account pool over the parent's explicit pin", async () => {
-		const key = await reviveChildKey(createInMemoryAuthStorage(), "b", "a", undefined, {
+		const key = await reviveChildKey(createInMemoryAuthStorage(), "b", "a", undefined, undefined, {
 			anthropic: ["email:b@example.com"],
 		});
 		expect(key).toBe("access-b");
@@ -349,7 +376,7 @@ describe("task subagent OAuth pin inheritance", () => {
 
 	it("keeps a child explicit through revival when the parent's pin predates its first run", async () => {
 		const tempDir = TempDir.createSync("@pi-subagent-revive-pin-");
-		const authStorage = reserveAuthStorage();
+		const authStorage = revivalAuthStorage(true);
 		let child: AgentSession | undefined;
 		try {
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");

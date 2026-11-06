@@ -540,27 +540,40 @@ export async function requestXAIResponses(
 		throw new SearchProviderError("xai", `Selected model ${model.provider}/${model.id} is not an xAI model`, 400);
 	}
 	const customEndpoint = model.baseUrl.replace(/\/+$/, "") !== XAI_DEFAULT_BASE_URL;
-	const credentialOrigin = request.authStorage.keys.source(model.provider);
-	const hasCommandBackedKey = modelRegistry.hasCommandBackedApiKey(model.provider);
-	const officialOAuthCredential =
-		model.provider === "xai-oauth" &&
-		!hasCommandBackedKey &&
-		(credentialOrigin?.kind === "oauth" || credentialOrigin?.kind === "env");
-	if (customEndpoint && officialOAuthCredential) {
-		throw new SearchProviderError(
+	// The resolver and every provenance check must read the same storage;
+	// request.authStorage may be a divergent caller handle.
+	const authStorage = modelRegistry.authStorage;
+	const oauthProvider = model.provider === "xai-oauth";
+	const refuseOAuth = () =>
+		new SearchProviderError(
 			"xai",
 			`Refusing to send official xAI OAuth credentials to custom endpoint ${model.baseUrl}. Configure an API key for provider "xai-oauth".`,
 		);
-	}
+	// OAuth-first auth (stored OAuth or `XAI_OAUTH_TOKEN`) is refused up front; a
+	// configured command-backed key outranks it.
+	const credentialOrigin = authStorage.keys.source(model.provider);
+	const officialOAuthOrigin =
+		oauthProvider &&
+		!modelRegistry.hasCommandBackedApiKey(model.provider) &&
+		(credentialOrigin?.kind === "oauth" || credentialOrigin?.kind === "env");
+	if (customEndpoint && officialOAuthOrigin) throw refuseOAuth();
+	// The serving credential can still change per attempt: pooled API keys fall
+	// back to OAuth, and a failed OAuth refresh falls through to `XAI_OAUTH_TOKEN`.
+	// So the guard and authMode also follow each actual bearer.
+	let servedOAuth = false;
 	const response = await withAuth(
 		modelRegistry.resolver(model, request.sessionId),
 		async key => {
+			const oauthBearer = oauthProvider && authStorage.keys.isOAuthBearer(model.provider, key);
+			if (customEndpoint && oauthBearer) throw refuseOAuth();
+			servedOAuth = oauthBearer;
 			const transport: XAIHttpTransport = {
 				// XAI_BASE_URL never receives official OAuth credentials: neither an OAuth-origin
 				// credential nor an OAuth access-token bearer leaves the bundled endpoint.
-				baseURL: officialOAuthCredential
-					? model.baseUrl
-					: (resolveXaiBaseUrl(model.provider, model.baseUrl, key) ?? model.baseUrl),
+				baseURL:
+					officialOAuthOrigin || oauthBearer
+						? model.baseUrl
+						: (resolveXaiBaseUrl(model.provider, model.baseUrl, key) ?? model.baseUrl),
 				headers: await modelRegistry.resolveModelHeaders(model, request.signal),
 			};
 			return callXAIResponses(key, request, body, transport);
@@ -570,10 +583,7 @@ export async function requestXAIResponses(
 			missingKeyMessage: `xAI credentials not found for selected provider "${model.provider}".`,
 		},
 	);
-	const authMode =
-		model.provider === "xai-oauth" && (credentialOrigin?.kind === "oauth" || credentialOrigin?.kind === "env")
-			? "oauth"
-			: "api_key";
+	const authMode = servedOAuth ? "oauth" : "api_key";
 	return { response, authMode };
 }
 

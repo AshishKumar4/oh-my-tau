@@ -8,14 +8,15 @@ import type { AsyncJobManagerApi } from "../async/job-manager";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
 import type { ToolDefinition } from "../extensibility/extensions";
-import securityReviewerPrompt from "../prompts/agents/security-reviewer.md" with { type: "text" };
 import securityCoordinatorPrompt from "../prompts/security/scan-coordinator.md" with { type: "text" };
 import securityRequestPrompt from "../prompts/security/scan-request.md" with { type: "text" };
+import securityWorkerAgent from "../prompts/security/scan-worker.md" with { type: "text" };
 import securityPublishDescription from "../prompts/tools/security-publish.md" with { type: "text" };
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
+import { parseAgent } from "../task/agents";
 import { createSecurityAuthResolver, selectSecurityAuth } from "./auth";
 import type {
 	SecurityCoverage,
@@ -43,13 +44,18 @@ import { SecurityStore, writeSecurityBundleToDirectory } from "./store";
 
 import { cfgRetryFallbackChains, cfgRetryModelFallback, cfgRetryUsageAwareFallback } from "../session/settings";
 import { cfgSecurityEnabled } from "../tools/settings";
-import { cfgTaskAgentModelOverrides, cfgTaskAgentPrewalk } from "../task/settings";
+import {
+	cfgTaskAgentAdvisor,
+	cfgTaskAgentModelOverrides,
+	cfgTaskAgentPrewalk,
+	cfgTaskDisabledAgents,
+} from "../task/settings";
 
 const SECURITY_SESSION_TOOLS = ["read", "grep", "glob", "lsp", "ast_grep", "task", "security_publish"];
 const SECURITY_WORKFLOW_FINGERPRINT = createSecurityWorkflowFingerprint([
 	securityCoordinatorPrompt,
 	securityRequestPrompt,
-	securityReviewerPrompt,
+	securityWorkerAgent,
 	securityPublishDescription,
 ]);
 
@@ -235,16 +241,30 @@ function initialBundle(
 async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInput): Promise<AgentSession> {
 	const scanSettings = await input.host.settings.cloneForCwd(input.executionRoot);
 	const modelSelector = `${input.model.provider}/${input.model.id}`;
+	// Scans may cover untrusted code, so the worker only reads it. The definition
+	// is private and pinned: project or user agent files cannot replace it.
+	const worker = parseAgent("embedded:security/scan-worker.md", securityWorkerAgent, "bundled");
 	cfgRetryModelFallback.override(scanSettings, false);
 	cfgRetryUsageAwareFallback.override(scanSettings, false);
 	cfgRetryFallbackChains.override(scanSettings, {});
+	// `reviewer` settings meant for ordinary delegation must not disable the
+	// scan's workers or route them to other models: the scan pins one model and
+	// account.
+	cfgTaskDisabledAgents.override(
+		scanSettings,
+		cfgTaskDisabledAgents.get(scanSettings).filter(name => name !== worker.name),
+	);
 	cfgTaskAgentModelOverrides.override(scanSettings, {
 		...cfgTaskAgentModelOverrides.get(scanSettings),
-		"security-reviewer": modelSelector,
+		[worker.name]: modelSelector,
 	});
 	cfgTaskAgentPrewalk.override(scanSettings, {
 		...cfgTaskAgentPrewalk.get(scanSettings),
-		"security-reviewer": "off",
+		[worker.name]: "off",
+	});
+	cfgTaskAgentAdvisor.override(scanSettings, {
+		...cfgTaskAgentAdvisor.get(scanSettings),
+		[worker.name]: "off",
 	});
 	const providerSessionId = `security:${input.scanId}`;
 	const { session } = await createAgentSession({
@@ -264,7 +284,8 @@ async function createDefaultSecuritySession(input: SecurityScanSessionFactoryInp
 		toolNames: SECURITY_SESSION_TOOLS,
 		restrictToolNames: true,
 		allowRestrictedCustomTools: true,
-		spawns: "security-reviewer",
+		spawns: worker.name,
+		pinnedAgents: [worker],
 		appendSystemPrompt: securityCoordinatorPrompt.trim(),
 		disableExtensionDiscovery: true,
 		enableMCP: false,

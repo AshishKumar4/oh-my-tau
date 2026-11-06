@@ -9,6 +9,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { createApiKeyResolver } from "../src/config/api-key-resolver";
+import { getTestModel } from "./helpers/model-fixtures";
 
 describe("AuthStorage account rotation", () => {
 	let tempDir: string;
@@ -396,7 +397,57 @@ describe("AuthStorage account rotation", () => {
 		expect(Date.now() - startedAt).toBeLessThan(1_000);
 	});
 
-	test("provider login invalidates only that provider's persisted session stickiness", async () => {
+	test("withAuth reaches a fourth healthy Codex OAuth sibling through ModelRegistry", async () => {
+		await authStorage.credentials.set("openai-codex", [
+			{
+				type: "oauth",
+				access: "access-a",
+				refresh: "refresh-a",
+				expires: Date.now() + 60_000,
+				accountId: "acct-a",
+			},
+			{
+				type: "oauth",
+				access: "access-b",
+				refresh: "refresh-b",
+				expires: Date.now() + 60_000,
+				accountId: "acct-b",
+			},
+			{
+				type: "oauth",
+				access: "access-c",
+				refresh: "refresh-c",
+				expires: Date.now() + 60_000,
+				accountId: "acct-c",
+			},
+			{
+				type: "oauth",
+				access: "access-d",
+				refresh: "refresh-d",
+				expires: Date.now() + 60_000,
+				accountId: "acct-d",
+			},
+		]);
+
+		const model = getTestModel("openai-codex");
+
+		const modelRegistry = new ModelRegistry(authStorage, undefined, { ignoreLocalModelConfig: true });
+		const attemptedKeys: string[] = [];
+		const result = await withAuth(modelRegistry.resolver(model, "codex-four-oauth-session"), async key => {
+			attemptedKeys.push(key);
+			if (key !== "access-d") {
+				throw new Error("You have hit your ChatGPT usage limit (pro plan). Try again later.");
+			}
+			return key;
+		});
+
+		expect(result).toBe("access-d");
+		expect(attemptedKeys.at(-1)).toBe("access-d");
+		expect([...attemptedKeys].sort()).toEqual(["access-a", "access-b", "access-c", "access-d"]);
+		expect(new Set(attemptedKeys).size).toBe(4);
+	});
+
+	test("provider login leaves running sessions on their own accounts", async () => {
 		tempDir = path.join(os.tmpdir(), `pi-test-auth-rotation-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		authStorage.close();
@@ -468,9 +519,10 @@ describe("AuthStorage account rotation", () => {
 		authStorage = await createRotationStorage(path.join(tempDir, "testauth.db"));
 		await authStorage.credentials.reload();
 
+		// A new account ranks for new sessions; a running session keeps the account its cache is warm on.
 		const reloadedTargetKey = await authStorage.keys.get(targetProvider, sessionId);
-		expect(reloadedTargetKey).toBe(freshKey);
-		expect(reloadedTargetKey).not.toBe(stickyKey);
+		expect(reloadedTargetKey).toBe(stickyKey);
+		expect(reloadedTargetKey).not.toBe(freshKey);
 		expect(await authStorage.keys.get(unrelatedProvider, unrelatedSessionId)).toBe(unrelatedStickyKey);
 	});
 });

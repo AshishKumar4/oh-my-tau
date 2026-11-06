@@ -25,6 +25,7 @@ import {
 	resolveAnthropicApiVersion,
 } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import { $env } from "@oh-my-pi/pi-utils";
+import { SessionAccountPoolScope } from "../../../config/account-pools";
 import type { AnthropicApiResponse, AnthropicCitation } from "../../../web/search/types";
 import type { SearchCitation, SearchResponse, SearchSource } from "../types";
 import { SearchProviderError } from "../../../web/search/types";
@@ -322,21 +323,42 @@ function parseResponse(response: AnthropicApiResponse): SearchResponse {
  * @throws {Error} If no Anthropic credentials are configured
  */
 export async function searchAnthropic(params: SearchParams): Promise<SearchResponse> {
-	const registryResolver = params.modelRegistry.resolver(params.model, params.sessionId);
-	const searchApiKey = params.model.provider === "anthropic" ? $env.ANTHROPIC_SEARCH_API_KEY : undefined;
-	const keyOrResolver: ApiKey = searchApiKey
+	const provider = params.model.provider;
+	// The id the registry resolves credentials under: a pool-scoped registry
+	// supplies its session's when the caller passes none.
+	const credentialSessionId = SessionAccountPoolScope.credentialSessionId(
+		params.modelRegistry,
+		provider,
+		params.sessionId,
+	);
+	const registryResolver = params.modelRegistry.resolver(params.model, credentialSessionId);
+	// A session restricted to an account pool uses only its pooled OAuth accounts,
+	// never the dedicated search key: not first, and not as a fallback.
+	const searchApiKey =
+		provider === "anthropic" && !params.authStorage.sessions.isRestricted(provider, credentialSessionId)
+			? $env.ANTHROPIC_SEARCH_API_KEY
+			: undefined;
+	// A search key that is also a stored key carries that key's request scope (its workspace).
+	const searchKey = searchApiKey && {
+		apiKey: searchApiKey,
+		credentialScope: params.authStorage.keys.requestScope(provider, searchApiKey),
+	};
+	const keyOrResolver: ApiKey = searchKey
 		? async context => {
-				if (context.error === undefined && !context.lastChance) return searchApiKey;
-				return (await registryResolver(context)) ?? searchApiKey;
+				if (context.error === undefined && !context.lastChance) return searchKey;
+				return (await registryResolver(context)) ?? searchKey;
 			}
 		: registryResolver;
-	const accountId = params.authStorage.oauth.identity(params.model.provider, params.sessionId)?.accountId;
+	const accountId = params.authStorage.oauth.identity(provider, credentialSessionId)?.accountId;
 	const parsed = params.parsedQuery ?? parseSearchQuery(params.query);
 	const plan = planQuery(params.query, parsed);
 	const response = await withAuth(
 		keyOrResolver,
-		async key => {
-			const auth = buildAnthropicAuthConfig(key, params.model.baseUrl, { isOAuth: params.model.isOAuth });
+		async (key, scope) => {
+			const auth = buildAnthropicAuthConfig(key, params.model.baseUrl, {
+				isOAuth: params.model.isOAuth,
+				workspaceId: scope?.workspaceId,
+			});
 			const configuredHeaders = await params.modelRegistry.resolveModelHeaders(params.model, params.signal);
 			// Mirror the main Messages path: OAuth requests need a Claude-Code-shaped
 			// metadata.user_id (`{session_id, account_uuid?, device_id}`) so the
@@ -366,7 +388,7 @@ export async function searchAnthropic(params: SearchParams): Promise<SearchRespo
 		},
 		{
 			signal: params.signal,
-			missingKeyMessage: `Anthropic credentials not found for selected provider "${params.model.provider}".`,
+			missingKeyMessage: `Anthropic credentials not found for selected provider "${provider}".`,
 		},
 	);
 

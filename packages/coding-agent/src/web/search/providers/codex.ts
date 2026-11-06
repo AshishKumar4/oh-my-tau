@@ -594,10 +594,25 @@ export async function searchCodex(params: SearchParams): Promise<SearchResponse>
 		}
 
 		const keyOrResolver = params.modelRegistry.resolver(params.model, params.sessionId);
-		result = await withAuth(keyOrResolver, async accessToken => runSearch({ accessToken }), {
-			signal: params.signal,
-			missingKeyMessage: `Codex credentials not found for selected provider "${params.model.provider}".`,
-		});
+		result = await withAuth(
+			keyOrResolver,
+			async accessToken => {
+				// Whichever credential serves (pooled keys fall back to stored OAuth, and a
+				// command-backed key is only a fallback beneath it), refuse any attempt
+				// whose actual bearer is a stored subscription token.
+				if (params.modelRegistry.authStorage.keys.isOAuthBearer(params.model.provider, accessToken)) {
+					throw new SearchProviderError(
+						"codex",
+						`Refusing to send official Codex OAuth credentials to custom endpoint ${transport.baseUrl}. Configure an API key for provider "${params.model.provider}".`,
+					);
+				}
+				return runSearch({ accessToken });
+			},
+			{
+				signal: params.signal,
+				missingKeyMessage: `Codex credentials not found for selected provider "${params.model.provider}".`,
+			},
+		);
 	} else {
 		// `hasCodexSearch` admits this provider from `keys.source()`, which knows
 		// about env bearers; `oauth.access` below does not — it only reads stored
