@@ -37,6 +37,7 @@ function makeFakeSession(): FakeSession {
 	const delivered: IrcMessage[] = [];
 	const relayed: CustomMessage[] = [];
 	const session = {
+		...createSessionDefaults(),
 		isStreaming: true,
 		deliverIrcMessage: async (msg: IrcMessage) => {
 			if (nextError) {
@@ -581,6 +582,8 @@ describe("IRC", () => {
 					stopReason: "stop",
 				}),
 				deliverIrcMessage: (msg: IrcMessage) => bridge.deliver(msg),
+				// A lane returns `yield`'s result only when its session has `yield`.
+				getEnabledToolNames: () => (opts.yields ? ["yield"] : []),
 				asyncJobManager: opts.jobManager,
 			} as unknown as AgentSession;
 			registry.register({ id, displayName: "task", kind: "sub", status: "idle", session, parentId: opts.parentId });

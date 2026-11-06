@@ -3466,10 +3466,10 @@ async function runLane(session: AgentSession, options: LaneRunOptions, start: La
 		progress: monitor.progress,
 	};
 	laneRuns.set(session, run);
-	// A peer's message waits for a run of its own, whose relay answers it, and the
-	// held lane counts as busy, so the lifecycle does not park it mid-run (a run
-	// waiting on its own background work included). The parent's messages still
-	// join the run.
+	// As in a first run: the run's monitor would take a peer's answer as the run's
+	// result, so a non-parent message waits for a turn of its own after the run.
+	// The hold also keeps the lane busy across the run's gaps on its own background
+	// work, so the lifecycle does not park it mid-run, on any thread.
 	const releaseIrcWakes = session.holdIrcWakes();
 	const { onPromptBusy } = start;
 	// The lane keeps its spawn's result contract: a session without `yield`

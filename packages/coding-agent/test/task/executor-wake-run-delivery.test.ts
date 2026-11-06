@@ -479,40 +479,32 @@ describe("IRC wake run delivery", () => {
 		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
 	});
 
-	it("folds a wake that lands while the run waits on its job into that run", async () => {
-		const reviewerAnswered = Promise.withResolvers<void>();
+	it("answers a peer that messages a lane waiting on its job in a turn of its own once the run ends", async () => {
 		const lane = createLane([
 			toolCall("background", { label: "probe" }),
 			{ content: ["Waiting for the probe."] },
-			() => {
-				reviewerAnswered.resolve();
-				return { content: ["Still waiting on the probe."] };
-			},
 			toolCall("yield", { data: { report: "probe passed: 3 of 3" } }),
+			{ content: ["REVIEWER_ANSWER"] },
 		]);
 		const relaysTo = captureRelays();
 
 		await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Run the probe, then report." });
 		await lane.jobStarted;
 		await lane.session.waitForIdle();
-		const receipt = await IrcBus.global().send({ from: REVIEWER, to: LANE, body: "Status?" });
-		expect(receipt.outcome).toBe("woken");
-		await reviewerAnswered.promise;
-		await lane.session.waitForIdle();
+		// The run's result goes to whoever opened it: a peer's question waits for a turn of its own.
+		await IrcBus.global().send({ from: REVIEWER, to: LANE, body: "Status?" });
 		await drainEventLoop();
-		expect(lane.lifecycle).toEqual(["started"]);
-		expect(relaysTo(REVIEWER)).toEqual([]);
+		expect(lane.mock.calls.length).toBe(2);
 
 		lane.finishJob("3 of 3 passed");
 		await lane.runEnded;
+		expect(await until(() => relaysTo(REVIEWER).length === 1)).toBe(true);
 		await lane.settle();
 
-		expect(lane.lifecycle).toEqual(["started", "completed"]);
 		expect(lane.delivered).toHaveLength(1);
 		expect(lane.delivered[0]).toContain("probe passed: 3 of 3");
-		const reviewerRelays = relaysTo(REVIEWER);
-		expect(reviewerRelays).toHaveLength(1);
-		expect(reviewerRelays[0]).toContain("probe passed: 3 of 3");
+		expect(lane.delivered[0]).not.toContain("REVIEWER_ANSWER");
+		expect(relaysTo(REVIEWER)[0]).toContain("REVIEWER_ANSWER");
 		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
 	});
 
@@ -525,12 +517,13 @@ describe("IRC wake run delivery", () => {
 		]);
 		const relaysTo = captureRelays();
 		// The wake turn's loop has made its final aside poll when it ends; the
-		// session is still settling the turn, so the message waits as a tail.
+		// session is still settling the turn, so the parent's follow-up question
+		// waits as a tail, which the run (its parent's) takes in.
 		let tailSent = false;
 		lane.session.agent.subscribe(event => {
 			if (event.type !== "agent_end" || tailSent) return;
 			tailSent = true;
-			void IrcBus.global().send({ from: REVIEWER, to: LANE, body: "Is the probe still running?" });
+			void IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Is the probe still running?" });
 		});
 
 		await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Run the probe, then report." });
@@ -544,7 +537,7 @@ describe("IRC wake run delivery", () => {
 		await lane.settle();
 		expect(lane.delivered).toHaveLength(1);
 		expect(lane.delivered[0]).toContain("probe passed: 3 of 3");
-		expect(relaysTo(REVIEWER)).toHaveLength(1);
+		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
 	});
 
 	it("delivers a yield made inside the wake turn exactly once", async () => {
@@ -783,7 +776,7 @@ describe("IRC wake run delivery", () => {
 		const probeId = await lane.jobStartedAs("probe");
 		await lane.session.waitForIdle();
 		await drainEventLoop();
-		// Hold the killed run's session abort, so the reviewer's wake takes the
+		// Hold the killed run's session abort, so the parent's next wake takes the
 		// lane and starts work while that run's teardown is still ahead.
 		const abortGate = Promise.withResolvers<void>();
 		const abort = lane.session.abort.bind(lane.session);
@@ -795,7 +788,7 @@ describe("IRC wake run delivery", () => {
 		if (!wakeJob) throw new Error("the woken lane has no job for its parent");
 		expect(lane.manager.cancel(wakeJob.id, { ownerId: MAIN_AGENT_ID })).toBe(true);
 
-		await IrcBus.global().send({ from: REVIEWER, to: LANE, body: "Run the second probe." });
+		await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Run the second probe." });
 		const secondId = await lane.jobStartedAs("second");
 		expect(await until(() => lane.mock.calls.length >= 4)).toBe(true);
 		await lane.session.waitForIdle();
@@ -925,15 +918,10 @@ describe("IRC wake run delivery", () => {
 		filler.resolve("filler done");
 	});
 	it("does not relay a follow-up run's result to its job's owner when another agent spawned the lane", async () => {
-		const statusAnswered = Promise.withResolvers<void>();
 		const lane = createLane(
 			[
 				toolCall("background", { label: "probe" }),
 				{ content: ["Waiting for the probe."] },
-				() => {
-					statusAnswered.resolve();
-					return { content: ["The probe is still running."] };
-				},
 				toolCall("yield", { data: { report: "handoff: probe passed" } }),
 			],
 			{ parentId: LEAD },
@@ -950,14 +938,11 @@ describe("IRC wake run delivery", () => {
 		});
 		await lane.jobStarted;
 		await lane.session.waitForIdle();
-		await drainEventLoop();
-		await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body: "Status?" });
-		await statusAnswered.promise;
-		await lane.session.waitForIdle();
 
 		lane.finishJob("3 of 3 passed");
 		const result = await followUp;
 		expect(result.output).toContain("handoff: probe passed");
+		await drainEventLoop();
 		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
 	});
 

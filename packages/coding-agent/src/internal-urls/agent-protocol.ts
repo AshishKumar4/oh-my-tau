@@ -132,9 +132,9 @@ function lastAssistantText(messages: readonly AgentMessage[]): string | undefine
  * Whether `<id>`'s published output predates a run the agent is in now or is
  * about to start: a turn it is streaming, or a kept-alive lane's open run,
  * which spans the gaps where the lane waits on its own background work and
- * rewrites the output only when it ends. An executor-driven run holds the
- * session's IRC wakes, so `ircWakesPending` (mirrored for worker-homed
- * sessions) reports it on any thread, as it does a wake still queued for a run.
+ * rewrites the output only when it ends. Every lane run holds its session's
+ * IRC wakes, so `ircWakesPending` (mirrored for worker-homed sessions) reports
+ * it on any thread, as it does a wake still queued for a run.
  */
 function isSuperseded(registry: AgentRegistryApi, outputId: string): boolean {
 	const ref = registry.get(outputId);
