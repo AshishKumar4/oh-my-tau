@@ -70,7 +70,7 @@ import {
 	PERMISSION_REQUIRED_TOOLS,
 } from "./acp-permission-gate";
 import type { ClientBridge, ClientBridgePermissionOutcome } from "./client-bridge";
-import { buildToolNamespacesInfo, resolveCodeMode, type ToolNamespacesInfo } from "./code-mode";
+import { resolveCodeMode } from "./code-mode";
 import { toolReadsSkillUris } from "../system-prompt";
 
 import type { CustomMessage } from "./messages";
@@ -153,8 +153,6 @@ export interface SessionToolsHost {
 	evalPreludes(): readonly EvalPreludeDefinition[];
 	/** Live user-tagged model agents; candidates for the next base rebuild's advertised snapshot. */
 	sessionAgents(): readonly AgentDefinition[];
-	/** Publishes the current Codex Code Mode tool exposure snapshot for turn metadata; undefined clears it. */
-	setCodeModeNamespacesInfo?(info: unknown): void;
 	/** The tool context this session's tools run with; facades that post-process a call read it. */
 	toolSession?(): ToolSession | undefined;
 	/** Runs a wait for the user's answer, such as an ACP client's permission request. */
@@ -1627,31 +1625,12 @@ export class SessionTools {
 
 		let appliedTools = tools;
 		let appliedNames = validToolNames;
-		let nextCodeModeNamespacesInfo: ToolNamespacesInfo | undefined;
 		if (codeMode.active) {
 			// The write tool survives demotion only when plan mode or a deferrable
 			// tool still needs it as the staging transport.
 			if (transportNeeded && validToolNames.includes("write")) codeMode.directToolNames.add("write");
 			appliedTools = tools.filter(tool => codeMode.directToolNames.has(tool.name));
 			appliedNames = validToolNames.filter(name => codeMode.directToolNames.has(name));
-			nextCodeModeNamespacesInfo = buildToolNamespacesInfo({
-				tools: validToolNames.flatMap(name => {
-					const tool = presentedRegistry.get(name);
-					if (!tool) return [];
-					return [
-						{
-							name,
-							customWireName: tool.customWireName,
-							loadMode: "loadMode" in tool && typeof tool.loadMode === "string" ? tool.loadMode : undefined,
-							mcpServerName:
-								"mcpServerName" in tool && typeof tool.mcpServerName === "string"
-									? tool.mcpServerName
-									: undefined,
-						},
-					];
-				}),
-				directToolNames: codeMode.directToolNames,
-			});
 		}
 		const restrictDeviceOnlyWrite =
 			validToolNames.includes("write") &&
@@ -1797,7 +1776,6 @@ export class SessionTools {
 				this.#host.agent.setTools(presentedTools);
 			}
 
-			this.#host.setCodeModeNamespacesInfo?.(nextCodeModeNamespacesInfo);
 			this.#codeModeDirectWireSignature = codeMode.active
 				? this.#computeCodeModeDirectWireSignature(appliedNames)
 				: undefined;

@@ -140,10 +140,6 @@ const COMPLETED_EVENTS: Array<Record<string, unknown>> = [
 	},
 ];
 
-const NAMESPACES_INFO = {
-	functions: { name: "functions", functions: { eval: { name: "eval", direct: true } } },
-};
-
 function dataSse(events: Array<Record<string, unknown>>): Response {
 	return new Response(`${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\n`, {
 		status: 200,
@@ -185,7 +181,6 @@ async function captureRequest(
 	await streamOpenAICodexResponses(createCodexModel(modelId), createTestContext(tools), {
 		apiKey: createCodexTestToken(),
 		fetch: fetchMock,
-		toolNamespacesInfo: NAMESPACES_INFO,
 		...options,
 	}).result();
 
@@ -864,16 +859,6 @@ describe("codex harness wire surface", () => {
 		expect(items[3]?.role).toBe("user");
 	});
 
-	it("omits the omp-only tool_namespaces_info snapshot under the profile", async () => {
-		const profiled = await captureRequest("gpt-6-astra");
-		const unprofiled = await captureRequest("gpt-5.1-codex");
-		expect(Object.keys(profiled.turnMetadata).sort()).toEqual(
-			Object.keys(unprofiled.turnMetadata)
-				.filter(key => key !== "tool_namespaces_info")
-				.sort(),
-		);
-	});
-
 	it("keeps a forced tool choice inside its namespace under Responses Lite", async () => {
 		const { body } = await captureRequest("gpt-6-astra", {
 			responsesLite: true,
@@ -902,12 +887,11 @@ describe("codex harness wire surface", () => {
 	});
 
 	it("keeps omp's native surface on a codex model with no harness profile", async () => {
-		const { body, turnMetadata } = await captureRequest("gpt-5.1-codex");
+		const { body } = await captureRequest("gpt-5.1-codex");
 
 		expect(body.instructions).toBe("You are Codex, an agent based on GPT-6.");
 		expect(body.tools).toEqual([EXEC_DECLARATION, WAIT_DECLARATION, SPAWN_DECLARATION, LIST_DECLARATION]);
 		expect(inputItems(body).some(item => item.type === "additional_tools")).toBe(false);
-		expect(turnMetadata.tool_namespaces_info).toEqual(NAMESPACES_INFO);
 	});
 
 	it("declares a customWireName-only tool under omp's own name off the profile", async () => {

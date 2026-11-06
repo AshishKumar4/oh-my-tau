@@ -4989,7 +4989,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						getMode: () => cfgProvidersCacheWarming.get(settings),
 						decide: event => extensionRunner.emitCacheWarmingDecision(event),
 					});
-		const codeModeState: { namespacesInfo?: unknown } = {};
 		const transformToolCallArguments = (args: Record<string, unknown>): Record<string, unknown> => {
 			let result = args;
 			const maxTimeout = cfgToolsMaxTimeout.get(settings);
@@ -5089,18 +5088,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					cfgExternalThinking.get(settings) &&
 					agent.state.tools.some(tool => tool.name === "think") &&
 					supportsExternalThinking(streamModel);
-				// Codex Code Mode namespaces ride only on effective-codex turns;
-				// effective-native turns on a profiled model must not send them
-				// (the provider drops them there today via the profile check).
-				const namespacesInfo =
-					effectiveHarnessProfile(settings, streamModel) === "codex" ? codeModeState.namespacesInfo : undefined;
 				const fallbackCreditRedemption = session?.consumeActiveFallbackCreditRedemption(streamModel);
 				if (streamOptions?.promptCacheKey === undefined) session?.promoteTaskSiblingCandidate(streamModel);
 				const merged: SimpleStreamOptions = {
 					...streamOptions,
 					promptCacheKey: streamOptions?.promptCacheKey ?? session?.getPromptCacheKeyForModel(streamModel),
 					forceReasoningOff: externalThinking || streamOptions?.forceReasoningOff,
-					...(namespacesInfo === undefined ? {} : { toolNamespacesInfo: namespacesInfo }),
 				};
 				// The provider calls `onPayload` as it sends, past any wait for an in-flight
 				// slot: the prompt cache entry's lifetime starts there, not here.
@@ -5367,7 +5360,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// block createAgentSession for tens of seconds while the whole file is
 		// streamed and parsed on the main thread.
 		session = new AgentSession({
-			codeModeState,
 			cacheWarmer,
 			costGate: options.costGate,
 			advisorWatchdogPrompt,
@@ -6243,9 +6235,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// session starts directly on a Codex Code Mode model (`codeMode` `on`, or
 		// `auto` matching the model's `code_mode_only` flag): the Agent above was
 		// handed the unrestricted `initialTools`, so without this the first and all
-		// subsequent turns would expose the full direct tool surface and omit
-		// `tool_namespaces_info` until an unrelated model/setting/tool-selection
-		// change reconciled.
+		// subsequent turns would expose the full direct tool surface until an
+		// unrelated model/setting/tool-selection change reconciled.
 		try {
 			await session.initializeCodeMode();
 		} catch (error) {

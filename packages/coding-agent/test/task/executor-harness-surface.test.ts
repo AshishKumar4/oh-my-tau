@@ -16,7 +16,6 @@ import {
 } from "@oh-my-pi/pi-coding-agent/eval/handle-bridge";
 import { EVAL_WORKPOOL_BRIDGE_NAME } from "@oh-my-pi/pi-coding-agent/eval/workpool-bridge";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import type { ToolNamespacesInfo } from "@oh-my-pi/pi-coding-agent/session/code-mode";
 import { resolveCodeMode } from "@oh-my-pi/pi-coding-agent/session/code-mode";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -92,9 +91,7 @@ describe("subagent harness surface", () => {
 		expect(codex.getEnabledToolNames()).toContain("read");
 		expect(codex.getToolForEvalBridge("read")?.name).toBe("read");
 		expect(claudeCode.getActiveToolNames()).toContain("read");
-		expect(claudeCode.codeModeNamespacesInfo).toBeUndefined();
-		const codexNamespaces = codex.codeModeNamespacesInfo as ToolNamespacesInfo;
-		expect(codexNamespaces.functions.functions.read.direct).toBe(false);
+		expect(claudeCode.agent.state.tools.map(tool => tool.name)).toContain("read");
 	});
 
 	it("keeps the subagent orchestration protocol direct under an active harness profile", () => {

@@ -15,8 +15,7 @@ import { EVAL_COMPLETION_BRIDGE_NAME } from "../src/eval/completion-bridge";
 import { EVAL_CANCEL_BRIDGE_NAME, EVAL_STATUS_BRIDGE_NAME, EVAL_WAIT_BRIDGE_NAME } from "../src/eval/handle-bridge";
 import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
-import type { ToolNamespacesInfo } from "../src/session/code-mode";
-import { buildToolNamespacesInfo, resolveCodeMode } from "../src/session/code-mode";
+import { resolveCodeMode } from "../src/session/code-mode";
 import { SessionManager } from "../src/session/session-manager";
 import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
 
@@ -176,107 +175,6 @@ describe("resolveCodeMode", () => {
 	});
 });
 
-describe("buildToolNamespacesInfo", () => {
-	test("shape and flags", () => {
-		const info = buildToolNamespacesInfo({
-			tools: [
-				{ name: "eval", loadMode: "essential" },
-				{ name: "read", loadMode: "essential" },
-				{ name: "browser", loadMode: "discoverable" },
-				{ name: "mcp__gmail__search", mcpServerName: "gmail" },
-			],
-			directToolNames: new Set(["eval"]),
-		});
-		expect(info.functions.name).toBe("functions");
-		expect(info.functions.functions.eval).toEqual({
-			name: "eval",
-			direct: true,
-			code_mode_name: "eval",
-			deferred: false,
-			source: { kind: "harness" },
-		});
-		expect(info.functions.functions.read).toEqual({
-			name: "read",
-			direct: false,
-			code_mode_name: "read",
-			deferred: false,
-			source: { kind: "harness" },
-		});
-		expect(info.functions.functions.browser.deferred).toBe(true);
-		expect(info.functions.functions.mcp__gmail__search.source).toEqual({ kind: "mcp", server_name: "gmail" });
-	});
-	test("direct tools use wire names while retaining bridge names", () => {
-		const info = buildToolNamespacesInfo({
-			tools: [{ name: "edit", customWireName: "apply_patch" }],
-			directToolNames: new Set(["edit"]),
-		});
-
-		expect(info.functions.functions.apply_patch).toEqual({
-			name: "apply_patch",
-			direct: true,
-			code_mode_name: "edit",
-			deferred: false,
-			source: { kind: "harness" },
-		});
-		expect(info.functions.functions.edit).toBeUndefined();
-	});
-	test("a direct wire alias wins its name regardless of registry order", () => {
-		const tools = [{ name: "edit", customWireName: "apply_patch" }, { name: "apply_patch" }];
-		const direct = new Set(["edit"]);
-		const forward = buildToolNamespacesInfo({ tools, directToolNames: direct });
-		const reversed = buildToolNamespacesInfo({ tools: [...tools].reverse(), directToolNames: direct });
-
-		for (const info of [forward, reversed]) {
-			expect(info.functions.functions.apply_patch).toEqual({
-				name: "apply_patch",
-				direct: true,
-				code_mode_name: "edit",
-				deferred: false,
-				source: { kind: "harness" },
-			});
-		}
-	});
-
-	test("an exact direct name wins over a colliding direct alias", () => {
-		const tools = [{ name: "edit", customWireName: "apply_patch" }, { name: "apply_patch" }];
-		const direct = new Set(["edit", "apply_patch"]);
-
-		for (const ordered of [tools, [...tools].reverse()]) {
-			const info = buildToolNamespacesInfo({ tools: ordered, directToolNames: direct });
-			expect(info.functions.functions.apply_patch?.code_mode_name).toBe("apply_patch");
-		}
-	});
-
-	test("a tool losing its wire name stays reachable through the bridge", () => {
-		// The metadata advertises one callable per wire name, so the loser is
-		// unadvertised there - but the bridge resolves by real tool name, and the
-		// eval declarations are generated from the bridge names, so it stays
-		// callable as `tool.apply_patch()`.
-		const info = buildToolNamespacesInfo({
-			tools: [{ name: "edit", customWireName: "apply_patch" }, { name: "apply_patch" }],
-			directToolNames: new Set(["edit"]),
-		});
-		expect(Object.keys(info.functions.functions)).toEqual(["apply_patch"]);
-
-		const declarations = generateCodeModeDeclarations([{ name: "apply_patch", parameters: undefined }]);
-		expect(declarations).toContain("apply_patch(args: unknown): Promise<unknown>;");
-	});
-
-	test("prototype-named tools land as own entries", () => {
-		const info = buildToolNamespacesInfo({
-			tools: [{ name: "toString" }, { name: "__proto__" }],
-			directToolNames: new Set<string>(),
-		});
-
-		const wire = new Map<string, { code_mode_name: string }>(
-			Object.entries(JSON.parse(JSON.stringify(info)).functions.functions),
-		);
-		expect([...wire.keys()].sort()).toEqual(["__proto__", "toString"]);
-		expect(wire.get("toString")?.code_mode_name).toBe("toString");
-		expect(wire.get("__proto__")?.code_mode_name).toBe("__proto__");
-	});
-});
-
 describe("Code Mode session reconciliation", () => {
 	const sessions: AgentSession[] = [];
 
@@ -385,7 +283,6 @@ describe("Code Mode session reconciliation", () => {
 
 		expect(session.getEnabledToolNames()).toEqual(["read"]);
 		expect(session.getActiveToolNames()).toEqual(["read"]);
-		expect(session.codeModeNamespacesInfo).toBeUndefined();
 	});
 
 	test("retains the startup tools array when reconciliation keeps the exact roster", async () => {
@@ -420,10 +317,9 @@ describe("Code Mode session reconciliation", () => {
 		await session.setActiveToolsByName(["eval", "read"]);
 
 		expect(session.getActiveToolNames()).toEqual(["eval", "read"]);
-		expect(session.codeModeNamespacesInfo).toBeUndefined();
 	});
 
-	test("model switches refresh direct wire-name metadata", async () => {
+	test("a model switch that changes a direct tool's wire name renders the prompt again", async () => {
 		let wireName: string | undefined = "apply_patch";
 		const edit = {
 			...tool("edit"),
@@ -431,24 +327,31 @@ describe("Code Mode session reconciliation", () => {
 				return wireName;
 			},
 		};
+		const renderedWireNames: Array<string | undefined> = [];
 		const { session, codeModel } = createSession(
 			Settings.isolated({
 				"providers.openai-codex.codeMode": "auto",
 				"providers.openai-codex.codeModeDirectTools": ["edit"],
+				includeModelInPrompt: false,
 			}),
-			undefined,
+			async (names, tools) => {
+				renderedWireNames.push(tools?.get("edit")?.customWireName);
+				return { systemPrompt: [`tools:${names.join(",")}`] };
+			},
 			undefined,
 			[edit],
 		);
 		await session.setActiveToolsByName(["eval", "edit"]);
-		expect((session.codeModeNamespacesInfo as ToolNamespacesInfo).functions.functions.apply_patch).toBeDefined();
+		expect(renderedWireNames.at(-1)).toBe("apply_patch");
+		const rendered = renderedWireNames.length;
 
+		// Without the model line, the prompt's model key holds across the switch; only the wire name moved.
 		wireName = undefined;
 		await session.setModel({ ...codeModel, id: `${codeModel.id}-next` });
 
-		const info = session.codeModeNamespacesInfo as ToolNamespacesInfo;
-		expect(info.functions.functions.edit).toBeDefined();
-		expect(info.functions.functions.apply_patch).toBeUndefined();
+		expect(renderedWireNames.length).toBeGreaterThan(rendered);
+		expect(renderedWireNames.at(-1)).toBeUndefined();
+		expect(session.getActiveToolNames()).toEqual(["eval", "edit"]);
 	});
 
 	test("runtime setting changes immediately reconcile the Code Mode surface", async () => {
@@ -477,7 +380,6 @@ describe("Code Mode session reconciliation", () => {
 		await Promise.resolve();
 		await session.runToolRegistryMutation(async () => undefined);
 		expect(session.getActiveToolNames()).toEqual(["eval", "read"]);
-		expect(session.codeModeNamespacesInfo).toBeUndefined();
 
 		cfgEvalJs.set(settings, true);
 		await Promise.resolve();
@@ -546,14 +448,13 @@ describe("Code Mode session reconciliation", () => {
 		expect(predicateUpdates.at(-1)).toEqual(["eval", "read"]);
 	});
 
-	test("failed tool application leaves Code Mode namespace metadata unchanged", async () => {
+	test("failed tool application leaves the direct surface unchanged", async () => {
 		const { session } = createSession(Settings.isolated({ "providers.openai-codex.codeMode": "auto" }), async () => {
 			throw new Error("rebuild failed");
 		});
 
 		await expect(session.setActiveToolsByName(["eval", "read"])).rejects.toThrow("rebuild failed");
 
-		expect(session.codeModeNamespacesInfo).toBeUndefined();
 		expect(session.getActiveToolNames()).toEqual(["eval", "read"]);
 	});
 
@@ -597,7 +498,7 @@ describe("Code Mode session startup", () => {
 	let modelRegistry: ModelRegistry;
 	const sessions: AgentSession[] = [];
 
-	test("fresh session on a code_mode_only model starts restricted with namespaces info", async () => {
+	test("fresh session on a code_mode_only model starts restricted", async () => {
 		registryDir = path.join(os.tmpdir(), `pi-code-mode-startup-${Snowflake.next()}`);
 		fs.mkdirSync(registryDir, { recursive: true });
 		authStorage = await AuthStorage.create(path.join(registryDir, "auth.db"));
@@ -642,14 +543,9 @@ describe("Code Mode session startup", () => {
 		// Demoted tools stay enabled and bridge-reachable instead of vanishing.
 		expect(session.getEnabledToolNames()).toContain("read");
 		expect(session.getToolForEvalBridge("read")?.name).toBe("read");
-		// The namespaces snapshot feeding `tool_namespaces_info` exists before
-		const info = session.codeModeNamespacesInfo as ToolNamespacesInfo;
-		const entries = Object.values(info.functions.functions);
-		expect(entries.find(entry => entry.code_mode_name === "eval")?.direct).toBe(true);
-		expect(entries.find(entry => entry.code_mode_name === "read")?.direct).toBe(false);
 	});
 
-	test("fresh session with code mode off keeps the direct surface and no namespaces info", async () => {
+	test("fresh session with code mode off keeps the direct surface", async () => {
 		const { session } = await createAgentSession({
 			cwd: registryDir,
 			agentDir: registryDir,
@@ -682,7 +578,6 @@ describe("Code Mode session startup", () => {
 		const active = session.getActiveToolNames();
 		expect(active).toContain("read");
 		expect(active).toContain("bash");
-		expect(session.codeModeNamespacesInfo).toBeUndefined();
 	});
 
 	afterEach(async () => {

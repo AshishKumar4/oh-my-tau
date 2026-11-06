@@ -1823,7 +1823,6 @@ function mapOptionsForApi<TApi extends Api>(
 		liveSteering: options?.liveSteering,
 		maxInFlightRequests: options?.maxInFlightRequests,
 		beforeDispatch: options?.beforeDispatch,
-		toolNamespacesInfo: options?.toolNamespacesInfo,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		onSseEvent: options?.onSseEvent,

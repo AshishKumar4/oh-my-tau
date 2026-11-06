@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Removed
+
+- Removed the `toolNamespacesInfo` stream option and the Code Mode snapshot it carried: the session sent it only on codex-profile turns, which never carry it, and stock Codex sends it only behind an opt-in flag
+
 ## [18.17.0] - 2026-11-06
 
 ### Added
@@ -400,7 +404,7 @@
 
 ### Removed
 
-- Removed the `toolNamespacesInfo` stream option; Codex requests no longer send `tool_namespaces_info` turn metadata, and `code_mode_tool_names`/`tool_namespaces_info` are no longer reserved client metadata keys. (Upstream only: oh-my-tau keeps Codex Code Mode and this metadata.)
+- Removed the `toolNamespacesInfo` stream option; Codex requests no longer send `tool_namespaces_info` turn metadata, and `code_mode_tool_names`/`tool_namespaces_info` are no longer reserved client metadata keys. (oh-my-tau keeps Codex Code Mode and still reserves both keys, as codex-rs does.)
 
 ## [18.10.3] - 2026-10-12
 

@@ -2119,8 +2119,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return listPlanFiles({ localProtocolOptions: this.#localProtocolOptions() });
 	}
 
-	#codeModeState: { namespacesInfo?: unknown };
-
 	/** Live generation tok/s for the working row; fed by this session's own streamed deltas. */
 	readonly tokenRate: TokenRateMeter;
 
@@ -2132,7 +2130,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			(previous, next) =>
 				isHiddenUserCompanion(previous) && (isHiddenUserCompanion(next) || isUserQueuedMessage(next)),
 		);
-		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#ownsCostGate = config.costGate === undefined;
@@ -2618,9 +2615,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			queuedMessageCount: () => this.queuedMessageCount,
 			planModeEnabled: () => this.#planModeState?.enabled === true,
 			model: () => this.model,
-			setCodeModeNamespacesInfo: info => {
-				this.#codeModeState.namespacesInfo = info;
-			},
 			memoryBackendSession: () => this,
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
 			clearMemoryPromotionSnapshot: () => this.#memory.clearPromotionSnapshot(),
@@ -7571,11 +7565,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const model = this.model;
 		if (!model || !this.#tools.codeModeChangesBetween(undefined, model)) return Promise.resolve();
 		return this.#tools.reconcileCodeMode();
-	}
-
-	/** Current Code Mode `tool_namespaces_info` snapshot, or `undefined` when inactive. */
-	get codeModeNamespacesInfo(): unknown {
-		return this.#codeModeState.namespacesInfo;
 	}
 
 	/** Selects enabled tools, ignoring names absent from the registry. */

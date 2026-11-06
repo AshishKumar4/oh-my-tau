@@ -696,8 +696,6 @@ export interface StreamOptions {
 	 * providers; not invoked for compaction requests or failed turns.
 	 */
 	onCodexRequestSnapshot?: (snapshot: CodexRequestSnapshot) => void;
-	/** Codex Code Mode tool exposure snapshot emitted as `tool_namespaces_info` turn metadata; ignored by other providers. */
-	toolNamespacesInfo?: unknown;
 	/**
 	 * Optional per-provider concurrent request cap for LLM stream calls. Keys are
 	 * provider ids (`model.provider`); positive numeric values cap in-flight
