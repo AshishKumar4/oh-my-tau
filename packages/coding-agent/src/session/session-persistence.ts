@@ -170,30 +170,6 @@ function snapcompactArchiveNeedsRewrite(archive: Record<string, unknown>): boole
 }
 
 /**
- * The snapcompact archive under `preserveData[PRESERVE_KEY]`: its frames
- * externalize to the blob store, while `text`, `textHead` and `textTail` persist
- * verbatim. The next compaction re-renders the archive from `text`, so a cut
- * would drop the newest history uncounted and render {@link TRUNCATION_NOTICE}
- * into the frames.
- */
-function persistSnapcompactArchive(archive: Record<string, unknown>, blobStore: BlobStore): Record<string, unknown> {
-	const frames = truncateForPersistence(archive.frames, blobStore, SNAPCOMPACT_FRAMES_KEY);
-	const persisted = frames === archive.frames ? archive : { ...archive, frames };
-	const view = archive.withoutThinking;
-	if (!isRecord(view) || !isRecord(view.archive)) return persisted;
-	const viewArchive = persistSnapcompactArchive(view.archive, blobStore);
-	return viewArchive === view.archive
-		? persisted
-		: { ...persisted, withoutThinking: { ...view, archive: viewArchive } };
-}
-
-function snapcompactArchiveNeedsRewrite(archive: Record<string, unknown>): boolean {
-	if (persistenceNodeNeedsRewrite(archive.frames, SNAPCOMPACT_FRAMES_KEY)) return true;
-	const view = archive.withoutThinking;
-	return isRecord(view) && isRecord(view.archive) && snapcompactArchiveNeedsRewrite(view.archive);
-}
-
-/**
  * Recursively truncate large strings in an object for session persistence.
  * - Truncates oversized string fields (key-agnostic), except signed/encrypted
  *   blocks and signature keys, which persist verbatim

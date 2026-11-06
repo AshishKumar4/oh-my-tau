@@ -55,7 +55,7 @@ describe("task schema (single-spawn)", () => {
 	it.each([false, true])("advertises taskFile only while task.file is on (batch=%s)", batchEnabled => {
 		// Enabled first: the disabled schema must not reuse the enabled one from the cache.
 		for (const file of [true, false]) {
-			const schema = getTaskSchema({ batchEnabled, isolationEnabled: false, structured: false, file });
+			const schema = getTaskSchema({ batchEnabled, isolationEnabled: false, file });
 			const item = {
 				taskFile: "local://assignment.md",
 				model: "mock/file-worker",

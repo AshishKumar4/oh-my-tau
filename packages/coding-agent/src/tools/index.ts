@@ -364,7 +364,12 @@ export interface ToolSession {
 	 * changing advisor-local IDs.
 	 */
 	sessionManager?: Pick<SessionManager, "appendCustomEntry" | "ensureOnDisk" | "flush" | "getBranch" | "getEntries"> &
-		Partial<Pick<SessionManager, "getSessionId" | "getLeafId" | "appendModelUsage" | "getArtifactContent" | "buildSessionContext">>;
+		Partial<
+			Pick<
+				SessionManager,
+				"getSessionId" | "getLeafId" | "appendModelUsage" | "getArtifactContent" | "buildSessionContext"
+			>
+		>;
 	/** Latest Codex request snapshot captured by this session's main loop; a cloned copy so a queued fork never observes later mutation. */
 	getForkRequestSnapshot?: () => ForkRequestSnapshot | undefined;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */
@@ -397,6 +402,8 @@ export interface ToolSession {
 	getToolForEvalBridge?: (name: string) => AgentTool | undefined;
 	/** Current session context for eval-bridged tool execution. */
 	getToolContext?: () => AgentToolContext | undefined;
+	/** Names currently authorized for invocation through the eval bridge. */
+	getEvalBridgeToolNames?: () => readonly string[];
 	/** Tool names the eval description advertises as callable from cells; frozen with the cached prompt prefix. */
 	getAdvertisedEvalToolNames?: () => readonly string[];
 	/** Direct partition of the active Code Mode surface; undefined when Code Mode is inactive. */

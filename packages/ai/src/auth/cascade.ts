@@ -479,7 +479,12 @@ export class KeyCascade implements KeysApi {
 			pool: CredentialPoolKind,
 			strict: boolean,
 		): Promise<
-			| { apiKey: string | undefined; credentialId?: number; identity?: CredentialRequestScope; oauthAccess?: string }
+			| {
+					apiKey: string | undefined;
+					credentialId?: number;
+					identity?: CredentialRequestScope;
+					oauthAccess?: string;
+			  }
 			| undefined
 		> => {
 			if (pool === "api_key") {

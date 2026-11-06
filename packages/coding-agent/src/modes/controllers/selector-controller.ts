@@ -2,12 +2,9 @@ import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-p
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, UsageReport } from "@oh-my-pi/pi-ai";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
-import type {
-	ANTHROPIC_WORKSPACES_URL as AnthropicWorkspacesUrl,
-	resolveAnthropicKeyWorkspace as ResolveAnthropicKeyWorkspace,
-} from "@oh-my-pi/pi-ai/registry/api-key-validation";
 import { maskApiKey } from "@oh-my-pi/pi-ai/auth-storage";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import type { LoginDialogComponent } from "@oh-my-pi/pi-tui/overlays/login-dialog";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
 import { Loader, Spacer, Text } from "@oh-my-pi/pi-tui";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
@@ -2198,7 +2195,7 @@ export class SelectorController {
 	 * aborts `dialog.signal`, which rejects any pending prompt, and restores the
 	 * editor immediately; `restoreEditor` restores it when the flow ends.
 	 */
-	async #openLoginDialog(providerId: string): Promise<{ dialog: LoginDialogComponentType; restoreEditor: () => void }> {
+	async #openLoginDialog(providerId: string): Promise<{ dialog: LoginDialogComponent; restoreEditor: () => void }> {
 		const { LoginDialogComponent } = await loadProviderAuthUi();
 		let restored = false;
 		const restoreEditor = () => {

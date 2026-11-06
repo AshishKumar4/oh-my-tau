@@ -447,7 +447,6 @@ it("keeps a follow-up turn's report when a peer message arrives right after it",
 			id: AGENT_ID,
 			agent: { name: "task", description: "test", systemPrompt: "test", tools: ["read"], source: "bundled" },
 			message: "report again",
-			structured: false,
 			artifactsDir: child.artifactsDir,
 		});
 		expect(followUp.output).toBe("FOLLOW_UP_REPORT");

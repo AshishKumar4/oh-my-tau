@@ -163,6 +163,7 @@ describe("/recover", () => {
 			buildDisplaySessionContext: () => manager.buildSessionContext(),
 			persistEvalStateContext: () => {},
 			getAgentId: () => "Main",
+			settings: Settings.isolated(),
 			replaced,
 		};
 	}
@@ -628,7 +629,9 @@ describe("/recover", () => {
 			} else {
 				manager.appendMessage(toolTurn({ id: "wait", name: "wait", args: { jobs: [wakeJob] } }));
 				manager.appendMessage(
-					toolResult("wait", "wait", { jobs: snapshotJobs({ asyncJobManager: jobs } as ToolSession, [job]) }),
+					toolResult("wait", "wait", {
+						jobs: snapshotJobs({ asyncJobManager: jobs } as unknown as ToolSession, [job]),
+					}),
 				);
 			}
 			manager.appendMessage(createAssistantMessage("Both fixes are in."));
@@ -703,9 +706,7 @@ describe("/recover", () => {
 		expect(secondWake).toBe("Lane");
 		await tick();
 		// A full listing reports the older run completed (agent `Lane`) beside the running one.
-		const listed = snapshotJobs({ asyncJobManager: jobs } as unknown as ToolSession, jobs.getAllJobs(), {
-			includeResults: true,
-		});
+		const listed = snapshotJobs({ asyncJobManager: jobs } as unknown as ToolSession, jobs.getAllJobs());
 		expect(listed.map(row => [row.id, row.status, row.agentUrlId])).toEqual([
 			["Lane-2", "completed", "Lane"],
 			["Lane", "running", "Lane"],
@@ -784,9 +785,7 @@ describe("/recover", () => {
 		expect([firstRun, secondRun]).toEqual(["Lane", "Lane-2"]);
 		manager.appendMessage(wokeLaneReceipt("wake2"));
 		await executes("list", "read");
-		const listed = snapshotJobs({ asyncJobManager: jobs } as unknown as ToolSession, jobs.getAllJobs(), {
-			includeResults: true,
-		});
+		const listed = snapshotJobs({ asyncJobManager: jobs } as unknown as ToolSession, jobs.getAllJobs());
 		expect(listed.map(row => [row.id, row.status, row.agentUrlId])).toEqual([
 			["Lane", "completed", "Lane"],
 			["Lane-2", "running", "Lane"],

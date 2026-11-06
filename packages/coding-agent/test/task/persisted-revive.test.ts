@@ -4,7 +4,6 @@ import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponse, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
 import { SUBAGENT_CONTEXT_TAG } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
-import type { Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -614,6 +613,8 @@ describe("persisted subagent revival", () => {
 		await reviver(ref);
 
 		expect(capturedBudget).toBe(100);
+	});
+
 	it("revives transcripts of removed bundled agents from their recorded contract", async () => {
 		const contracts = [
 			{ agent: "security-reviewer", tools: ["read", "find", "grep", "glob", "lsp", "ast_grep", "yield"] },
@@ -1910,7 +1911,6 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.global().unregister("prompt-blocks");
 		AgentRegistry.global().unregister("Peer");
-		AgentRegistry.global().unregister("Peer");
 	});
 
 	function createTool(name: string): AgentTool {
@@ -2182,10 +2182,10 @@ describe("cold revival replays the system prompt the last request sent", () => {
 	});
 
 	/** The executor's own subagent prompt over a default block listing the active tools. */
-	function subagentPrompt(toolNames: string[], options?: CreateAgentSessionOptions): string[] {
+	function subagentPrompt(toolNames: string[], options?: CreateAgentSessionOptions, model?: Model): string[] {
 		const build = options?.systemPrompt;
 		if (typeof build !== "function") throw new Error("Expected a system prompt builder");
-		return [build([`default: ${toolNames.join(",")}`])].flat();
+		return [build([`default: ${toolNames.join(",")}`], model ? { model } : undefined)].flat();
 	}
 
 	function registerPeer(): void {
@@ -2203,6 +2203,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 	async function parkAndRevive(
 		whileParked: () => void,
 		hooks?: ExtensionHooks,
+		model?: Model,
 	): Promise<{ live: AgentSession; warm: RecordingSession }> {
 		const lifecycle = AgentLifecycleManager.global();
 		await lifecycle.park("prompt-blocks");
@@ -2211,7 +2212,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 		vi.spyOn(sdkModule, "createAgentSession").mockImplementationOnce(async options => {
 			warm = createRecordingSession(
 				options!.sessionManager!,
-				names => subagentPrompt(names, options),
+				names => subagentPrompt(names, options, model),
 				[{ content: ["next"] }],
 				hooks,
 			);
@@ -2262,6 +2263,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 
 		await spawned.session.setActiveToolsByName(["read"]);
 		expect(spawned.session.systemPrompt.join("\n")).toContain("`Peer` — Peer (sub, running): editing b.ts");
+	});
 
 	it("warm-revives a Claude Code subagent with the roster its wrapped per-spawn block held", async () => {
 		const cwd = makeTempDir("@pi-revive-wrapped-roster-");
@@ -2270,6 +2272,7 @@ describe("cold revival replays the system prompt the last request sent", () => {
 			cwd,
 			(names, options) => subagentPrompt(names, options, claudeCode),
 			spawnResponses(),
+			undefined,
 			undefined,
 			Settings.isolated({ "harness.mode": "claude-code" }),
 		);

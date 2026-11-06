@@ -13579,11 +13579,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					...streaming,
 					content: preservedBlocks,
 				};
-				markPerCallContextMessage(normalized);
 				const lastMessage = messages.at(-1);
 				if (lastMessage?.role === "assistant") {
+					markPerCallContextMessage(normalized, "rewritten");
 					messages[messages.length - 1] = normalized;
 				} else {
+					markPerCallContextMessage(normalized, "added");
 					messages.push(normalized);
 				}
 			}
@@ -13594,7 +13595,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		};
-		markPerCallContextMessage(reminder);
+		markPerCallContextMessage(reminder, "added");
 		messages.push(reminder);
 		// A regenerated vision description can change between keyed follow-ups.
 		// No breakpoint after it can be read by the next request.
@@ -13606,12 +13607,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				if (message.role === "custom" && message.customType === IMAGE_ATTACHMENT_DESCRIPTION_TYPE) {
 					volatileSuffix = true;
 				}
-				if (!conversationKey || volatileSuffix) markPerCallContextMessage(message);
+				if (!conversationKey || volatileSuffix) markPerCallContextMessage(message, "added");
 			}
 			messages.push(...detachedHistory);
 		}
 		if (imageDescriptionNotice) {
-			markPerCallContextMessage(imageDescriptionNotice);
+			markPerCallContextMessage(imageDescriptionNotice, "added");
 			messages.push(imageDescriptionNotice);
 			volatileSuffix = true;
 		}
@@ -13621,7 +13622,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		};
-		if (!conversationKey || volatileSuffix) markPerCallContextMessage(sidePrompt);
+		if (!conversationKey || volatileSuffix) markPerCallContextMessage(sidePrompt, "added");
 		messages.push(sidePrompt);
 		return messages;
 	}

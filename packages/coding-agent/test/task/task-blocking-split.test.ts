@@ -28,7 +28,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { SingleResult, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { type BlockedAwait, blockedAwaitsOf } from "@oh-my-pi/pi-coding-agent/tools/wait";
+import { type RecordedAwaitHold, recordAwaitHolds } from "../helpers/await-holds";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -289,10 +289,11 @@ describe("task per-item blocking split", () => {
 		const manager = createManager();
 		const session = createSession({ manager });
 		session.agentRegistry = registry;
-		const heldAtRefusal: BlockedAwait[][] = [];
+		const mainHolds = recordAwaitHolds(registry, "Main");
+		const heldAtRefusal: RecordedAwaitHold[][] = [];
 		session.emitBeforeSubagentSpawn = async event => {
 			if (event.agent !== "scout") return undefined;
-			heldAtRefusal.push(blockedAwaitsOf(registry, "Main"));
+			heldAtRefusal.push(mainHolds());
 			return { block: true, reason: "scout pool exhausted" };
 		};
 		const tool = await TaskTool.create(session);
@@ -306,9 +307,9 @@ describe("task per-item blocking split", () => {
 		} as TaskParams);
 
 		// The mixed call claims the scout's id up front, so its hold starts before the hook runs.
-		expect(heldAtRefusal).toEqual([[{ agents: ["ScoutFour"], inline: true }]]);
+		expect(heldAtRefusal).toEqual([[{ agents: ["ScoutFour"], interruptible: false }]]);
 		expect(firstText(result)).toContain("scout pool exhausted");
-		expect(blockedAwaitsOf(registry, "Main")).toEqual([]);
+		expect(mainHolds()).toEqual([]);
 		await manager.getJob("WorkerFour")?.promise;
 	});
 });

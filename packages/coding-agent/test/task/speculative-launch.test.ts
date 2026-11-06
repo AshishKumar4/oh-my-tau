@@ -30,8 +30,9 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { BatchArgsScanner, type TaskLaunchSession } from "@oh-my-pi/pi-coding-agent/task/speculative-launch";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { blockedAwaitsOf, WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
+import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import type { SingleResult, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
+import { recordAwaitHolds } from "../helpers/await-holds";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -157,6 +158,8 @@ describe("BatchArgsScanner", () => {
 				]);
 			}
 		}
+	});
+
 	it("reads the shared brief from a facade's key, never from an item's field of the same name", () => {
 		const raw =
 			'{"description":"Audit","prompt":"shared brief","tasks":[{"description":"A","prompt":"Do A."},{"description":"B","prompt":"Do B."}]}';
@@ -297,7 +300,8 @@ describe("task speculative launch", () => {
 			projectAgentsDir: null,
 		});
 		const registry = AgentRegistry.global();
-		const heldIds = () => blockedAwaitsOf(registry, "Main").flatMap(block => (block.inline ? block.agents : []));
+		const mainHolds = recordAwaitHolds(registry, "Main");
+		const heldIds = () => mainHolds().flatMap(hold => (hold.interruptible ? [] : hold.agents));
 		const scoutArgs = {
 			context: "ctx",
 			tasks: [

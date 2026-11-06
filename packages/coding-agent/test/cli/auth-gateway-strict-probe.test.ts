@@ -18,6 +18,7 @@ function oauthProbeInput(provider: Provider): CompletionProbeInput {
 			expiresAt: 1_900_000_000_000,
 			projectId: "project-1",
 		},
+		credentialScope: undefined,
 		signal: new AbortController().signal,
 	};
 }

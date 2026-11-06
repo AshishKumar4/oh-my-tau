@@ -449,11 +449,7 @@ export class DateCwdReminderInjector {
 			}
 			const source = messages[index]!;
 			if (source.role !== "user") continue;
-			state.injections.set(turn, {
-				reminder: placement.reminder,
-				source,
-				injected: injectReminder(source, placement.reminder),
-			});
+			state.injections.set(turn, injectionOf(placement.reminder, source));
 		}
 		for (let index = 0; index <= lastSent; index++) state.seen.add(keys[index]!);
 		state.reminder = this.#carriedReminder(state, keys);

@@ -512,6 +512,7 @@ describe("AgentSession session stats", () => {
 		});
 
 		expect(session.getSessionStats().editRejections).toEqual({ unseen_lines: 2, stale_tag: 1 });
+	});
 
 	it("splits prompt-cache hit rate across harness profiles served in one session", () => {
 		const fable = getBundledModel("anthropic", "claude-fable-5-1");

@@ -219,6 +219,7 @@ export interface EvalToolDescriptionOptions {
 	 */
 	waitToolName?: string | null;
 	/** Enabled preludes; each becomes an `xd://eval/<name>` doc topic, inlined when it asks to be. */
+	preludes?: readonly Pick<EvalPreludeDefinition, "name" | "documentation" | "inlineDocumentation">[];
 	/**
 	 * Inline every doc topic instead of linking `xd://eval/<topic>`. Required
 	 * when the session cannot `read` (the only transport for topic docs).
@@ -614,18 +615,19 @@ export class EvalTool implements AgentTool<EvalToolInput> {
 
 	async execute(
 		toolCallId: string,
-		params: typeof evalSchema.infer,
+		params: EvalToolParams | CodexExecParams,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<EvalToolDetails | undefined>> {
 		const result = await this.#execute(toolCallId, params, signal, onUpdate, ctx);
 		if (!this.session) return result;
+		const { code } = evalCellOf(params);
 		// Output shaped by the session's Spotlight experiment no longer matches the sink's line ranges.
 		return shapeToolResult(
 			this.session,
 			toolCallId,
-			{ tool: "eval", command: params.code, source: params.code, exitCode: result.isError ? 1 : 0 },
+			{ tool: "eval", command: code, source: code, exitCode: result.isError ? 1 : 0 },
 			result,
 			signal,
 			{ dropTruncation: true },

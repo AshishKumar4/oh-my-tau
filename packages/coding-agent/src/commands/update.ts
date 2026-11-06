@@ -2,7 +2,6 @@
  * Say how to update this build, or update installed plugins.
  */
 
-import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { updateHelp as commandHelp } from "../cli/command-help";
 import * as pluginCli from "../cli/plugin-cli";

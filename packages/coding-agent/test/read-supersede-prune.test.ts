@@ -33,7 +33,7 @@ beforeAll(async () => {
 	);
 	// A macOS `sample` report: a bare read shows a generated summary, a range reads the file.
 	await Bun.write(
-		path.join(cwd, "demo.sample.txt"),
+		directory.join("demo.sample.txt"),
 		[
 			"Analysis of sampling demo (pid 42) every 1 millisecond",
 			"Process:         demo [42]",

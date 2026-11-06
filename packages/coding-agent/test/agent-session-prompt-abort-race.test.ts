@@ -168,6 +168,7 @@ describe("AgentSession prompt admission racing abort", () => {
 		});
 		const entered = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
 		const release = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		if (!authStorage) throw new Error("createSession did not create the auth storage");
 		const health = authStorage.health;
 		const modelHealth = health.model.bind(health);
 		let calls = 0;

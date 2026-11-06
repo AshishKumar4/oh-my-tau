@@ -6,7 +6,6 @@ import { getEditStore } from "../edit/store";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
 import {
 	formatHashlineHeader,
-	formatNumberedLine,
 	formatNumberedLines,
 	splitAddressableFileLines,
 } from "@oh-my-pi/pi-tui/tools/hashline-format";
@@ -505,7 +504,13 @@ export async function buildInMemoryTextResult(
 			lineNumbers: Array.from({ length: lineCount }, (_, i) => startNum + i),
 		};
 		if (shouldAddHashLines) seenLines = contiguousLineNumbers(startNum, lineCount);
-		const formatted = formatTextWithMode(content, startNum, shouldAddHashLines, shouldAddLineNumbers, displayMode.numbering);
+		const formatted = formatTextWithMode(
+			content,
+			startNum,
+			shouldAddHashLines,
+			shouldAddLineNumbers,
+			displayMode.numbering,
+		);
 		if (!hashContext || emittedHashlineHeader) return formatted;
 		emittedHashlineHeader = true;
 		return prependHashlineHeader(formatted, hashContext);

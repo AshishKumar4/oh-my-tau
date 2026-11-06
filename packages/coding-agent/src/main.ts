@@ -2787,7 +2787,6 @@ export async function runRootCommand(
 					input: rpcInput,
 				});
 			} else if (isInteractive) {
-
 				const modelScopeNotification = buildModelScopeNotification(
 					scopedModels,
 					cfgStartupQuiet.get(settingsInstance),

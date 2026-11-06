@@ -110,12 +110,7 @@ import {
 	resolveRoleModelFull,
 } from "./role-models";
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
-import {
-	buildSessionContext,
-	getLatestCompactionEntry,
-	getOpenAiRemoteCompactionPayload,
-	replaysInContext,
-} from "./session-context";
+import { buildSessionContext, getLatestCompactionEntry, replaysInContext } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 import type { ShakeMode, ShakeResult } from "./shake-types";
@@ -419,14 +414,6 @@ class ManualCompactionNoOpError extends Error {
 		super(message);
 		this.name = "ManualCompactionNoOpError";
 	}
-}
-
-/**
- * The frame byte budget `model` reads a snapcompact archive's no-reasoning view
- * at, or `undefined` when it reads archives with their reasoning.
- */
-function readerFrameBudget(model: Model): number | undefined {
-	return snapcompact.readerIncludesThinking(model) ? undefined : snapcompact.frameDataBytesBudget(model);
 }
 
 /** The file lists a snapcompact compaction entry recorded in `details`, when it has them. */
@@ -1312,7 +1299,7 @@ export class SessionMaintenance {
 		let manualCompactionStarted = false;
 		let manualCompactionResult: CompactionResult | undefined;
 		let manualCompactionError: unknown;
-		const finish = (result: CompactionResult): CompactionResult => {
+		const finish = (result: CompactionResult | undefined): CompactionResult | undefined => {
 			manualCompactionResult = result;
 			return result;
 		};
@@ -4866,7 +4853,7 @@ export class SessionMaintenance {
 		const lists = activeMessages
 			? [this.#host.agent.state.messages, activeMessages]
 			: [this.#host.agent.state.messages];
-		const scanned = lists.map(list => ({ list, length: list.length }));
+		const scanned = lists.map(list => list.length);
 		const replacements = await this.#summaryReplacements(
 			model,
 			...lists.map(list => list.slice(this.#summaryScanStart(list, scanKey))),
@@ -4879,12 +4866,12 @@ export class SessionMaintenance {
 			}
 			if (activeMessages) {
 				let changed = false;
-				activeMessages.forEach((message, index) => {
-					const replacement = replacements.get(message);
-					if (!replacement) return;
+				for (let index = 0; index < activeMessages.length; index++) {
+					const replacement = replacements.get(activeMessages[index]!);
+					if (!replacement) continue;
 					activeMessages[index] = replacement;
 					changed = true;
-				});
+				}
 				if (changed) invalidateConvertToLlmArrayCache(activeMessages);
 			}
 		}
@@ -5111,14 +5098,10 @@ export class SessionMaintenance {
 		return view ?? undefined;
 	}
 
-	#viewWithoutThinking(
-		entry: CompactionEntry,
-		archive: snapcompact.Archive,
-		model: Model,
-	): Promise<snapcompact.ArchiveView> {
+	#viewWithoutThinking(entry: CompactionEntry, model: Model): Promise<snapcompact.ArchiveView> {
 		let view = this.#withoutThinkingViews.get(entry);
 		if (!view) {
-			view = this.#renderViewWithoutThinking(entry, archive, model);
+			view = this.#renderViewWithoutThinking(entry, model);
 			this.#withoutThinkingViews.set(entry, view);
 		}
 		return view;
@@ -5131,11 +5114,8 @@ export class SessionMaintenance {
 	 * intact for readers that keep reasoning and for other branches. When the
 	 * render fails, the text-only form without frames is read instead.
 	 */
-	async #renderViewWithoutThinking(
-		entry: CompactionEntry,
-		archive: snapcompact.Archive,
-		model: Model,
-	): Promise<snapcompact.ArchiveView> {
+	async #renderViewWithoutThinking(entry: CompactionEntry, model: Model): Promise<snapcompact.ArchiveView> {
+		const archive = snapcompact.getPreservedArchive(entry.preserveData)!;
 		// The stored variant, the original when it carries no reasoning, else the
 		// text-only form without frames.
 		const readableView = () =>

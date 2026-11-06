@@ -10,7 +10,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
-import { Effort } from "@oh-my-pi/pi-ai";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -85,6 +84,8 @@ it("revives a subagent a crash cut off mid tool call, does not run the call agai
 	const notes = path.join(cwd, "notes.txt");
 	await Bun.write(notes, "the answer is 42\n");
 
+	// The main session and its subagent's transcript, as the process left them when it died
+	// inside the subagent's `read` call: no tool result, no exit record.
 	const main = SessionManager.create(cwd, path.join(root, "sessions"));
 	const mainFile = main.getSessionFile();
 	if (!mainFile) throw new Error("Expected a persisted session file");
@@ -118,21 +119,15 @@ it("revives a subagent a crash cut off mid tool call, does not run the call agai
 		task: "report what notes.txt says",
 		tools: ["read"],
 		agent: "task",
-		resolvedModel: `mock/${SPAWN_MODEL}`,
+		resolvedModel: "mock/mock-model",
 	});
 	child.appendMessage({ role: "user", content: "report what notes.txt says", timestamp: Date.now() });
-	if (options.transcript) {
-		child.appendModelChange(`mock/${HANDOFF_MODEL}`, "prewalk");
-		child.appendThinkingLevelChange(Effort.High, Effort.High);
-	}
-	if (options.transcript === "fallback") child.appendModelChange(`mock/${SPAWN_MODEL}`, "fallback");
-	const servingModel = options.transcript === "handoff" ? HANDOFF_MODEL : SPAWN_MODEL;
 	child.appendMessage({
 		role: "assistant",
 		content: [{ type: "toolCall", id: "call_read", name: "read", arguments: { path: notes } }],
 		api: "mock",
 		provider: "mock",
-		model: servingModel,
+		model: "mock-model",
 		usage: {
 			input: 0,
 			output: 0,
@@ -173,7 +168,7 @@ it("revives a subagent a crash cut off mid tool call, does not run the call agai
 		},
 	});
 	const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
-	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [...mocks, ...catalogAvailable(kind)]);
+	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [mock, ...catalogAvailable(kind)]);
 	const settings = Settings.isolated({
 		"task.agentIdleTtlMs": 0,
 		"compaction.enabled": false,
@@ -181,8 +176,7 @@ it("revives a subagent a crash cut off mid tool call, does not run the call agai
 		"todo.enabled": false,
 		"todo.reminders": false,
 		"advisor.enabled": false,
-		modelRoles: { default: `mock/${SPAWN_MODEL}` },
-		defaultThinkingLevel: Effort.Medium,
+		modelRoles: { default: "mock/mock-model" },
 	});
 	const bus = new EventBus();
 	const session = {
@@ -220,29 +214,4 @@ it("revives a subagent a crash cut off mid tool call, does not run the call agai
 		authStorage.close();
 		await main.close();
 	}
-}
-
-it("revives a subagent a crash cut off mid tool call, runs the call again, and delivers its answer to the parent", async () => {
-	const { delivered, readResults } = await restoreInterruptedChild();
-
-	expect(delivered).toContain(`restored: 42 (${SPAWN_MODEL})`);
-	expect(readResults[SPAWN_MODEL]).toHaveLength(1);
-	expect(readResults[SPAWN_MODEL]![0]).toContain("the answer is 42");
-}, 20_000);
-
-it("revives a subagent on the model and effort a prewalk handoff switched it to, not its spawn model", async () => {
-	const { delivered, readResults, readEfforts } = await restoreInterruptedChild({ transcript: "handoff" });
-
-	expect(delivered).toContain(`restored: 42 (${HANDOFF_MODEL})`);
-	expect(readResults[HANDOFF_MODEL]).toHaveLength(1);
-	expect(readResults[SPAWN_MODEL]).toEqual([]);
-	expect(readEfforts[HANDOFF_MODEL]).toEqual([Effort.High]);
-}, 20_000);
-
-it("revives a subagent whose handoff target failed over on the spawn model, not the failed target", async () => {
-	const { delivered, readResults } = await restoreInterruptedChild({ transcript: "fallback" });
-
-	expect(delivered).toContain(`restored: 42 (${SPAWN_MODEL})`);
-	expect(readResults[SPAWN_MODEL]).toHaveLength(1);
-	expect(readResults[HANDOFF_MODEL]).toEqual([]);
 }, 20_000);

@@ -17,10 +17,11 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { BUILTIN_TOOLS, createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { SidekickTool } from "@oh-my-pi/pi-coding-agent/tools/sidekick";
-import { blockedAwaitsOf, WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
+import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
+import { recordAwaitHolds } from "../helpers/await-holds";
 
 const SIDEKICK_ID = "Sidekick";
 const SIDEKICK_TOOL = "sidekick";
@@ -436,6 +437,7 @@ describe("fusion sidekick tool", () => {
 		 */
 		async function sidekickWaitText(overrides: Partial<ToolSession>): Promise<string> {
 			const registry = AgentRegistry.global();
+			const mainHolds = recordAwaitHolds(registry, "Main");
 			registry.register({ id: "Main", displayName: "Main", kind: "main", session: streaming, status: "running" });
 			registry.register({
 				id: "Lane",
@@ -472,7 +474,7 @@ describe("fusion sidekick tool", () => {
 				const result = await tool.execute("c1", { message: "Implement X" });
 				expect(result.content[0]).toEqual({ type: "text", text: "report" });
 				// The lead's hold ends with the handoff.
-				expect(blockedAwaitsOf(registry, "Main")).toEqual([]);
+				expect(mainHolds()).toEqual([]);
 				return waitText;
 			} finally {
 				registry.unregister("Main");

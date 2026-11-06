@@ -215,7 +215,7 @@ export function createModelJobWidgetAuthor(options: ModelJobWidgetAuthorOptions)
 		};
 		// The system prompt and schema are the reusable prefix (cached by the provider). The job's
 		// samples never repeat, so a cache breakpoint on them would only bill a cache write.
-		markPerCallContextMessage(message);
+		markPerCallContextMessage(message, "added");
 		const response = await instrumentedCompleteSimple(
 			model,
 			{

@@ -147,15 +147,15 @@ describe("estimateToolSchemaTokens", () => {
 			parameters: {},
 		};
 		const tools = [tool];
-		estimateToolSchemaTokens(tools, tokenizer, 1);
-		estimateToolSchemaTokens(tools, tokenizer, 1);
+		estimateToolSchemaTokens(tools, tokenizer, { sourceRevision: 1 });
+		estimateToolSchemaTokens(tools, tokenizer, { sourceRevision: 1 });
 		expect(reads).toBe(1);
 
-		estimateToolSchemaTokens(tools, tokenizer, 2);
+		estimateToolSchemaTokens(tools, tokenizer, { sourceRevision: 2 });
 		expect(reads).toBe(2);
-		estimateToolSchemaTokens([...tools], tokenizer, 2);
+		estimateToolSchemaTokens([...tools], tokenizer, { sourceRevision: 2 });
 		expect(reads).toBe(3);
-		estimateToolSchemaTokens(tools, new Tokenizer(), 2);
+		estimateToolSchemaTokens(tools, new Tokenizer(), { sourceRevision: 2 });
 		expect(reads).toBe(4);
 	});
 });

@@ -358,6 +358,7 @@ function validateSpawnParams(
 	// rejected combination, never silently ignored.
 	if (tasks !== undefined && params.fork !== undefined) {
 		return "`fork` inherits this conversation and only applies to a single spawn. Remove `tasks[]` or drop `fork`.";
+	}
 	if (
 		!fileEnabled &&
 		(params.taskFile !== undefined || (Array.isArray(tasks) && tasks.some(item => item?.taskFile !== undefined)))

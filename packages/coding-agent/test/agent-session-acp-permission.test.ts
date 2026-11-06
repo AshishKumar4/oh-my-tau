@@ -139,12 +139,22 @@ async function createSessionWithMockModel(
 	tools: AgentTool[],
 	bridge: ClientBridge,
 	responses: NonNullable<MockModelOptions["responses"]>,
+	options?: { getApiKey?: () => Promise<string> | string; loopSteeringSignal?: AbortSignal },
 ): Promise<AgentSession> {
 	const mock = createMockModel({ responses });
 	const settings = Settings.isolated({ "compaction.enabled": false });
 	const sessionManager = SessionManager.inMemory(tempDir.path());
 	const agent = new Agent({
-		getApiKey: () => "test-key",
+		getApiKey: options?.getApiKey ?? (() => "test-key"),
+		// With a loop steering signal the tool calls run under a ctx
+		// (`ctx.toolCall.steeringSignal`), the path the production loop
+		// wires; the test aborts it on command to simulate the loop's
+		// any-source steering abort.
+		...(options?.loopSteeringSignal
+			? {
+					getToolContext: (() => ({ toolCall: { steeringSignal: options.loopSteeringSignal } }) as never) as never,
+				}
+			: {}),
 		initialState: {
 			model: mock.model,
 			systemPrompt: ["Test"],
@@ -1521,47 +1531,6 @@ it("refuses a steer into an agent-initiated turn whose output has no client forw
 		),
 	).toBe(false);
 });
-
-async function createSessionWithMockModel(
-	tools: AgentTool[],
-	bridge: ClientBridge,
-	responses: NonNullable<MockModelOptions["responses"]>,
-	options?: { getApiKey?: () => Promise<string> | string; loopSteeringSignal?: AbortSignal },
-): Promise<AgentSession> {
-	const mock = createMockModel({ responses });
-	const settings = Settings.isolated({ "compaction.enabled": false });
-	const sessionManager = SessionManager.inMemory(tempDir.path());
-	const getApiKey = options?.getApiKey ?? (() => "test-key");
-	const agent = new Agent({
-		getApiKey,
-		// With a loop steering signal the tool calls run under a ctx
-		// (`ctx.toolCall.steeringSignal`), the path the production loop
-		// wires; the test aborts it on command to simulate the loop's
-		// any-source steering abort.
-		...(options?.loopSteeringSignal
-			? {
-					getToolContext: (() => ({ toolCall: { steeringSignal: options.loopSteeringSignal } }) as never) as never,
-				}
-			: {}),
-		initialState: {
-			model: mock.model,
-			systemPrompt: ["Test"],
-			tools,
-			messages: [],
-		},
-		convertToLlm,
-		streamFn: mock.stream,
-	});
-	const sess = new AgentSession({
-		agent,
-		sessionManager,
-		settings,
-		modelRegistry: { getApiKey } as never,
-		toolRegistry: new Map(tools.map(t => [t.name, t])),
-	});
-	sess.setClientBridge(bridge);
-	return sess;
-}
 
 it("delivers two steers admitted in one dialog window first-arrival-first", async () => {
 	// Two admissions can land while one permission dialog is open, before

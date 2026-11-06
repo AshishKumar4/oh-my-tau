@@ -1770,6 +1770,8 @@ const CAPTURE_ADVERTISED_KEYS = [
 	"deferrable",
 	"delegationGuidance",
 	"lenientArgValidation",
+	"namespace",
+	"persistAs",
 ] as const satisfies readonly (keyof AgentTool)[];
 
 /** `AgentTool` keys that run code or let a call reach an effect; a refused copy has none of them. */
@@ -1791,6 +1793,7 @@ const CAPTURE_DROPPED_KEYS = [
 	"approvalRestrictionPaths",
 	"renderCall",
 	"renderResult",
+	"toNativeArgs",
 ] as const satisfies readonly (keyof AgentTool)[];
 
 // A new `AgentTool` key must be sorted into one of the lists above before this compiles.
@@ -2772,6 +2775,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			getToolByName: name => session?.getToolByName(name),
 			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
+			getEvalBridgeToolNames: () => session?.getEvalBridgeToolNames() ?? [],
 			getAdvertisedEvalToolNames: () => session?.getAdvertisedEvalToolNames() ?? [],
 			getCodeModeDirectToolNames: () => session?.getCodeModeDirectToolNames(),
 			agentRegistry,

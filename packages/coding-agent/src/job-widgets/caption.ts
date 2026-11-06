@@ -88,7 +88,7 @@ export function createModelJobCaptionWriter(options: ModelJobWidgetAuthorOptions
 			timestamp: Date.now(),
 		};
 		// The system prompt is the reusable prefix; the command never repeats.
-		markPerCallContextMessage(message);
+		markPerCallContextMessage(message, "added");
 		const response = await instrumentedCompleteSimple(
 			model,
 			{ systemPrompt: [systemPrompt], messages: [message] },

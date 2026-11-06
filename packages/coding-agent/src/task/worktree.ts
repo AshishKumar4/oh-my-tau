@@ -294,18 +294,6 @@ export async function captureBaseline(
 	budgetBytes: number = ISOLATION_BASELINE_MAX_CONTENT_BYTES,
 	ownRepos: readonly string[] = [repoRoot],
 ): Promise<WorktreeBaseline> {
-	return captureTreeBaseline(repoRoot, budgetBytes, [repoRoot]);
-}
-
-/**
- * {@link captureBaseline}, skipping linked worktrees of any repo in `ownRepos`
- * (see {@link discoverNestedRepos}).
- */
-async function captureTreeBaseline(
-	repoRoot: string,
-	budgetBytes: number,
-	ownRepos: readonly string[],
-): Promise<WorktreeBaseline> {
 	const [root, nestedPaths] = await Promise.all([
 		captureRepoBaseline(repoRoot, budgetBytes),
 		discoverNestedRepos(repoRoot, ownRepos),

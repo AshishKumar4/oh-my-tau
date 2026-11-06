@@ -72,14 +72,14 @@ interface SessionHarness {
 	emitTerminalYield: (data: unknown) => void;
 	/** End an assistant message carrying `text` and no tool calls. */
 	emitAssistantText: (text: string) => void;
-	/** Emit a session event, e.g. the `irc_message` an incoming IRC message publishes. */
-	emit: (event: AgentSessionEvent) => void;
 	/** End an assistant message carrying `content`, tool calls included. */
 	emitAssistantContent: (content: AssistantMessage["content"]) => void;
 	/** End the agent loop with every assistant message emitted so far. */
 	emitAgentEnd: () => void;
 	/** Finish a `toolName` call whose result is `text`. */
 	emitToolResult: (toolName: string, text: string) => void;
+	/** Emit a session event, e.g. the `irc_message` an incoming IRC message publishes. */
+	emit: (event: AgentSessionEvent) => void;
 	/** The observer factory installed by {@link attachIrcWakeTurnMonitor}, if any. */
 	wakeObserver: () =>
 		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
@@ -192,10 +192,10 @@ function createHarness(options?: {
 		promptEntered: promptEntered.promise,
 		emitTerminalYield,
 		emitAssistantText,
-		emit,
 		emitAssistantContent,
 		emitAgentEnd,
 		emitToolResult,
+		emit,
 		wakeObserver: () => wakeObserver,
 	};
 }
@@ -526,7 +526,7 @@ describe("runSubprocess result acceptance", () => {
 		manager.registerDeliverySink("Parent", (_jobId, text) => {
 			delivered.push(text);
 		});
-		const harness = createHarness({ asyncJobManager: manager });
+		const harness = createHarness({ asyncJobManager: manager, tools: ["read"] });
 		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
 		AgentRegistry.global().register({
 			id: AGENT_ID,
@@ -536,7 +536,7 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, artifactsDir });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -571,8 +571,6 @@ describe("runSubprocess result acceptance", () => {
 		}
 	});
 
-	it("keeps the accepted artifact and sidecar when the parent cancels its wake job before finalization", async () => {
-		const tempDir = TempDir.createSync("@omp-cancelled-wake-result-");
 	it("publishes and delivers a message result once when the user resumes a failed agent directly", async () => {
 		const tempDir = TempDir.createSync("@omp-user-resumed-result-");
 		const artifactsDir = tempDir.path();
@@ -674,7 +672,7 @@ describe("runSubprocess result acceptance", () => {
 		const tempDir = TempDir.createSync("@omp-wake-job-widget-");
 		const artifactsDir = tempDir.path();
 		const manager = new AsyncJobManager({});
-		const harness = createHarness({ asyncJobManager: manager });
+		const harness = createHarness({ asyncJobManager: manager, tools: ["read"] });
 		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
 		AgentRegistry.global().register({
 			id: AGENT_ID,
@@ -684,7 +682,7 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, structured: false, artifactsDir });
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, artifactsDir });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 
@@ -989,6 +987,8 @@ describe("runSubprocess result acceptance", () => {
 		});
 		expect(body).not.toContain("Running the tests.");
 		expect(body).toContain("produced no output");
+	});
+
 	it("answers the parent through its job when the parent steers a plain lane a peer woke", async () => {
 		const manager = new AsyncJobManager({});
 		const harness = createHarness({ asyncJobManager: manager, tools: ["read"] });

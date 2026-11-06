@@ -224,7 +224,6 @@ const CLAUDE_CODE_SKILL: HarnessFacadeSpec<typeof claudeCodeSkillSchema> = {
 	},
 };
 
-
 /**
  * `agent://` URL for a facade's recipient string. A `?query` (`?progress` for a
  * quiet note) stays on the URL; the vendor's `main` names omp's main agent.

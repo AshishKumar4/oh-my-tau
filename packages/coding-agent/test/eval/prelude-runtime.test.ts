@@ -205,7 +205,7 @@ describe("eval prelude runtime", () => {
 				"text('alpha')",
 				"store('k', 41)",
 				"const keys = Object.keys(tools)",
-				"display({",
+				"print({",
 				"  allTools: ALL_TOOLS.length,",
 				"  keys: keys.filter(k => ['exec_command', 'apply_patch'].includes(k)).sort(),",
 				"  str: String(tools),",
@@ -218,8 +218,8 @@ describe("eval prelude runtime", () => {
 		expect(first.exitCode).toBe(0);
 		expect(first.output).toContain("alpha");
 		expect(first.output).not.toContain("unreachable");
-		const jsonOut = first.displayOutputs.find(o => o.type === "json");
-		expect(jsonOut?.type === "json" ? jsonOut.data : undefined).toMatchObject({
+		const view = first.displayOutputs.find(o => o.type === "view");
+		expect(view?.type === "view" && view.view.kind === "json" ? view.view.value : undefined).toMatchObject({
 			allTools: codexExecToolCatalog(toolSession).length,
 			keys: ["apply_patch", "exec_command"],
 			str: "[object tools]",

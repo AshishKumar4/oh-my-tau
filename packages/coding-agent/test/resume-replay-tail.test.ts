@@ -88,7 +88,6 @@ describe("resuming a long session", () => {
 		mode = new InteractiveMode(
 			session,
 			"test",
-			undefined,
 			() => {},
 			undefined,
 			undefined,

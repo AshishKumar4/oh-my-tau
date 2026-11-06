@@ -5,6 +5,17 @@ import {
 	renderWorkflowNotice,
 } from "@oh-my-pi/pi-coding-agent/modes/magic-keywords";
 
+/** Workflow-notice inputs with every eval backend on and no per-call models. */
+const WORKFLOW_BASE = {
+	taskBatch: true,
+	scoutAvailable: true,
+	evalTools: true,
+	py: true,
+	js: true,
+	freshAgents: false,
+	perCallModel: false,
+};
+
 describe("magic keyword registry", () => {
 	it("keeps ids and words unique so notice types and settings keys cannot collide", () => {
 		expect(new Set(MAGIC_KEYWORDS.map(keyword => keyword.id)).size).toBe(MAGIC_KEYWORDS.length);
@@ -74,8 +85,8 @@ describe("keyword notices under Claude Code", () => {
 		expect(orchestrate).toContain("10. Right-size offload: `Agent` only for substantial");
 		expect(orchestrate).toContain("- `Agent` Target/Change/Acceptance scaffolding");
 		expect(orchestrate).not.toContain("`task`");
-		const workflow = renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true, toolRefs });
-		expect(workflow).toContain("call `wait`");
+		const workflow = renderWorkflowNotice({ ...WORKFLOW_BASE, toolRefs });
+		expect(workflow).toContain("call the `wait` tool");
 		expect(workflow).not.toContain("end your turn");
 		expect(workflow).not.toContain("undefined");
 	});
@@ -84,12 +95,7 @@ describe("keyword notices under Claude Code", () => {
 		const noWait = { task: "Agent", read: "Read", write: "Write", edit: "Edit", bash: "Bash", eval: "eval" };
 		const orchestrate = renderOrchestrateNotice({ tools: tools.filter(tool => tool !== "wait"), toolRefs: noWait });
 		expect(orchestrate).not.toContain("`wait`");
-		const workflow = renderWorkflowNotice({
-			taskBatch: true,
-			scoutAvailable: true,
-			evalTools: true,
-			toolRefs: noWait,
-		});
+		const workflow = renderWorkflowNotice({ ...WORKFLOW_BASE, toolRefs: noWait });
 		expect(workflow).toContain("end your turn: results arrive as notifications");
 		expect(workflow).not.toContain("`wait`");
 	});
@@ -98,13 +104,8 @@ describe("keyword notices under Claude Code", () => {
 		const withTaskOutput = { ...toolRefs, wait: "TaskOutput" };
 		const orchestrate = renderOrchestrateNotice({ tools, toolRefs: withTaskOutput });
 		expect(orchestrate).toContain("Blocked with nothing else to do? Use `TaskOutput`.");
-		const workflow = renderWorkflowNotice({
-			taskBatch: true,
-			scoutAvailable: true,
-			evalTools: true,
-			toolRefs: withTaskOutput,
-		});
-		expect(workflow).toContain("call `TaskOutput`");
+		const workflow = renderWorkflowNotice({ ...WORKFLOW_BASE, toolRefs: withTaskOutput });
+		expect(workflow).toContain("call the `TaskOutput` tool");
 	});
 
 	it("keep the native text when no refs are given", () => {
@@ -113,22 +114,12 @@ describe("keyword notices under Claude Code", () => {
 		expect(orchestrate).toContain("`task` subagents");
 		expect(orchestrate).toContain("10. Right-size offload: `task` only for substantial");
 		expect(orchestrate).toContain("- `task` Target/Change/Acceptance scaffolding");
-		expect(renderWorkflowNotice({ taskBatch: true, scoutAvailable: true, evalTools: true })).toContain(
-			"Leave `eval` and call `wait`",
-		);
+		expect(renderWorkflowNotice(WORKFLOW_BASE)).toContain("Leave `eval` and call the `wait` tool");
 	});
 });
 
 describe("workflow notice", () => {
-	const base = {
-		taskBatch: true,
-		scoutAvailable: true,
-		evalTools: true,
-		py: true,
-		js: true,
-		freshAgents: false,
-		perCallModel: false,
-	};
+	const base = WORKFLOW_BASE;
 
 	it("defaults to workpools and hides eval-defined tools when disabled", () => {
 		const enabled = renderWorkflowNotice(base);

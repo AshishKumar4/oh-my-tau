@@ -559,7 +559,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 */
 	#interception(rawCommand: string, command: string, managed: boolean, toolNames: string[]): string | undefined {
 		if (!cfgBashInterceptorEnabled.get(this.session.settings)) return undefined;
-		const rules = cfgBashInterceptorPatterns.get(this.session.settings).filter(rule => !managed || rule.tool !== "bash");
+		const rules = cfgBashInterceptorPatterns
+			.get(this.session.settings)
+			.filter(rule => !managed || rule.tool !== "bash");
 		const nativeBash = this.parameters !== claudeCodeBashSchema;
 		const messageData = {
 			toolRefs: sessionToolRefs(this.session),

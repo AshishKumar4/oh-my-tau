@@ -557,7 +557,6 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		eventBus: spec.eventBus,
 		subagentEventBus: spec.subagentEventBus,
 		sessionFile,
-		structured,
 		outputSchema: init.outputSchema,
 		outputSchemaMode: init.outputSchemaMode,
 		// Anchor artifacts to the revived ref's own dir (its parent's children

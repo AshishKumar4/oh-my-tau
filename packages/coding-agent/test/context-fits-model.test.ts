@@ -71,7 +71,14 @@ const codexTurn = (text: string, timestamp: number) => responsesTurn(active, tex
 /** The host members `contextFitsModel` reads; a missing session state replays native history. */
 type ContextFitHost = Pick<
 	SessionMaintenanceHost,
-	"agent" | "settings" | "model" | "messages" | "nonMessageTokenSource" | "getContextUsage" | "modelRegistry"
+	| "agent"
+	| "settings"
+	| "sessionManager"
+	| "model"
+	| "messages"
+	| "nonMessageTokenSource"
+	| "getContextUsage"
+	| "modelRegistry"
 > & { providerSessionState?: SessionMaintenanceHost["providerSessionState"] };
 
 /**

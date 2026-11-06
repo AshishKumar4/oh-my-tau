@@ -47,7 +47,6 @@ import type {
 	AuthApiKeyOptions,
 	AuthCredential,
 	AuthStorageOptions,
-	CredentialPoolOrders,
 	BlocksApi,
 	CredentialsApi,
 	HealthApi,

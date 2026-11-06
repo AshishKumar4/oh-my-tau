@@ -101,7 +101,12 @@ const FORMAT_ROUTES: Record<string, FormatRoute> = {
 		api: "anthropic-messages",
 		harness: "anthropic-messages",
 	},
-	"/v1/responses": { module: openaiResponses, label: "openai-responses", api: "openai-responses", harness: "openai-responses" },
+	"/v1/responses": {
+		module: openaiResponses,
+		label: "openai-responses",
+		api: "openai-responses",
+		harness: "openai-responses",
+	},
 };
 
 // (passthrough fast-path removed — it bypassed pi-ai provider logic, in
