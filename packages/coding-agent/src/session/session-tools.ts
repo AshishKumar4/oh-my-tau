@@ -485,6 +485,8 @@ export class SessionTools {
 	#promptModelKey: string | undefined;
 	/** Inline-descriptor decision of the model the base prompt was rendered for. */
 	#promptInlineDescriptors: boolean | undefined;
+	/** Harness profile the base prompt and the presented tools were rendered for. */
+	#promptHarness: HarnessProfile | undefined;
 	#rebuildSystemPrompt: SessionToolsOptions["rebuildSystemPrompt"];
 	#getMcpServerInstructions: SessionToolsOptions["getMcpServerInstructions"];
 	/**
@@ -592,6 +594,7 @@ export class SessionTools {
 		this.#basePromptRoutedXdevNames = this.#routedSummaryXdevNames();
 		this.#promptModelKey = this.#currentPromptModelKey();
 		this.#promptInlineDescriptors = this.#currentInlineDescriptors();
+		this.#promptHarness = this.#harnessProfile();
 		// The construction slate carries the profile's wire identities AND its
 		// facades, so a session that never applies a selection (headless `-p`)
 		// still presents the full surface on its first request. The live slate is
@@ -1103,11 +1106,12 @@ export class SessionTools {
 	 * when the hop changes what the request must carry for the new model: the edit-mode policy
 	 * (#11983), or the inline-descriptor decision, which also turns provider-side description pruning
 	 * on or off (#14200). The kept key makes a later switch back to the rendered model a no-op, and a
-	 * deliberate switch (`/model`, `setModel`) compares against the model the prompt describes.
+	 * deliberate switch (`/model`, `setModel`) compares against the model the prompt describes. A
+	 * hop across harness profiles is a full switch: the new model sees its own harness.
 	 */
 	async syncAfterModelChange(previousEditMode: EditModeSetting, options?: { retryFallback?: boolean }): Promise<void> {
 		const currentEditMode = this.resolveActiveEditMode();
-		if (options?.retryFallback) {
+		if (options?.retryFallback && this.#harnessProfile() === this.#promptHarness) {
 			const inlineDescriptorsChanged = this.#currentInlineDescriptors() !== this.#promptInlineDescriptors;
 			if (previousEditMode !== currentEditMode || inlineDescriptorsChanged) await this.refreshBaseSystemPrompt();
 			return;
@@ -1824,6 +1828,7 @@ export class SessionTools {
 				this.#lastAppliedToolSignature = rebuiltSignature;
 				this.#promptModelKey = this.#currentPromptModelKey();
 				this.#promptInlineDescriptors = this.#currentInlineDescriptors();
+				this.#promptHarness = this.#harnessProfile();
 				this.#setBasePromptXdevNames(rebuiltXdevCatalogNames);
 				// The rebuilt prompt is a fresh roster snapshot. Keep the complete
 				// pending delta for a turn override that hides it, while separately
@@ -2716,6 +2721,7 @@ export class SessionTools {
 				this.#pendingToolRosterDeltaAfterBase = undefined;
 				this.#promptModelKey = this.#currentPromptModelKey();
 				this.#promptInlineDescriptors = this.#currentInlineDescriptors();
+				this.#promptHarness = this.#harnessProfile();
 				this.#lastAppliedToolSignature = signature;
 				return true;
 			},
