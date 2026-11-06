@@ -1,5 +1,5 @@
 One cell per call; top-level state persists, including across compaction.{{#if spawns}} Subagents have separate kernels.{{/if}}
-{{#if spawns}}{{#if eagerDelegation}}For 2+ independent items, use a named `workpool()`; results auto-deliver.{{#if waitTool}} If blocked, leave `eval` and call `wait`.{{/if}}{{/if}}{{/if}}
+{{#if spawns}}{{#if eagerDelegation}}For 2+ independent items, use a named `workpool()`; results auto-deliver.{{#if waitTool}} If blocked, leave `eval` and call `{{waitToolName}}`.{{/if}}{{/if}}{{/if}}
 {{#if py}}Python: plain Python subprocess, not IPython (no `get_ipython()`, `obj?`, or `%matplotlib`). Magics like `%pip`, `%load`, `%time` and `!cmd` are rewritten to Python. Top-level `await` works; `asyncio.run(…)` fails.{{/if}}
 {{#if js}}JS: Bun (`Bun.file`, `Bun.write`, `Bun.$`); top-level `await`/`return` work.{{/if}}
 On error, retry only the failed step; earlier steps may have taken effect.
@@ -67,4 +67,4 @@ Global `{{name}}`, documented here in full (no `read` needed):
 NEVER repeat successful setup. Kernel-loss notice means reload setup.
 </critical>
 
-{{#if autoBackgroundEnabled}}Long cells may auto-background and deliver later; the kernel stays busy. `timeout: 0` disables the cell deadline, not the foreground wait.{{/if}}
+{{#if autoBackgroundEnabled}}Long cells may auto-background and deliver later; the kernel stays busy. Without an explicit timeout, these runs have no cell deadline; explicit limits still apply. `timeout: 0` disables the cell deadline, not the foreground wait.{{/if}}

@@ -1,5 +1,7 @@
+import { effectiveHarnessProfile } from "../../harness/effective-profile";
 import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import type { ToolSession } from "../../tools";
+import { codexExecToolCatalog } from "../../harness/codex-nested";
 import {
 	resolveOutputMaxColumns,
 	resolveOutputSinkArtifactMaxBytes,
@@ -176,6 +178,12 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			code,
 			filename: options.filename ?? `js-cell-${crypto.randomUUID()}.js`,
 			timeoutMs: runtimeTimeoutMs ?? options.idleTimeoutMs,
+			codex: (() => {
+				const model = options.session.getActiveModel?.();
+				return model && effectiveHarnessProfile(options.session.settings, model) === "codex"
+					? { tools: codexExecToolCatalog(options.session) }
+					: undefined;
+			})(),
 			runState: {
 				signal,
 				onReply: options.onReply,

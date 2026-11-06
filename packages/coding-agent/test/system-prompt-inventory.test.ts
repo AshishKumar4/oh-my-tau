@@ -612,7 +612,8 @@ describe("system prompt tool inventory", () => {
 			contextFiles: [],
 			skills: [],
 			rules: [],
-			toolNames: ["eval"],
+			toolNames: ["eval", "read"],
+			directToolNames: ["eval"],
 			tools,
 			evalPreludes: [{ name: "computer", guidance: "COMPUTER-GUIDANCE" }],
 			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
@@ -620,8 +621,9 @@ describe("system prompt tool inventory", () => {
 			inlineToolDescriptors: true,
 		});
 		const text = systemPrompt.join("\n\n");
-		expect(text).toContain("type eval = (");
-		expect(text).not.toContain("type computer = (");
+		// Only the direct keep-set renders as provider-callable functions.
+		expect(text).toContain("Runs code cells.");
+		expect(text).not.toContain("Reads files from disk.");
 		// Guidance still ships for enabled Eval preludes.
 		expect(text).toContain("COMPUTER-GUIDANCE");
 	});

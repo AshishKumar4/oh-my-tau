@@ -168,6 +168,7 @@ export async function executeInVmContext(options: {
 	code: string;
 	filename: string;
 	timeoutMs?: number;
+	codex?: SessionSnapshot["codex"];
 	runState: VmRunState;
 }): Promise<{ value: unknown }> {
 	const { sessionKey } = options;
@@ -508,6 +509,7 @@ async function runOnce(
 		packageRoot?: string;
 		packageEnvironment?: string;
 		code: string;
+		codex?: SessionSnapshot["codex"];
 		filename: string;
 		runState: VmRunState;
 		expectedRevision?: number;
@@ -564,6 +566,7 @@ async function runOnce(
 			cwd: options.cwd,
 			sessionId: options.sessionId,
 			localRoots: options.localRoots,
+			codex: options.codex,
 			preludes: javascriptPreludeSources(options.session),
 			packageRoot: session.packageRoot,
 			packageEnvironment: session.packageEnvironment,

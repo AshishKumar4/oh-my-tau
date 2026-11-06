@@ -1,0 +1,1 @@
+Send a message to an existing agent. `target` is an agent id from spawn_agent or list_agents, or `all` to broadcast to every live peer; `message` is plain text. Delivery is immediate and wakes an idle or parked recipient; the reply confirms delivery or names why it failed.

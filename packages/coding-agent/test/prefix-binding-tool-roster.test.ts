@@ -10,6 +10,10 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionMaintenance } from "@oh-my-pi/pi-coding-agent/session/session-maintenance";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryModelRegistry } from "./helpers/agent-session-setup";
+
+const registries: Array<ReturnType<typeof createInMemoryModelRegistry>> = [];
 
 function createPrefixBindingModel(): Model<"anthropic-messages"> {
 	return buildModel({
@@ -71,6 +75,7 @@ function newSession(
 		beforeRequest?: () => Promise<void>;
 		/** Prompt-cache key inherited from the session a fork was taken from. */
 		forkPromptCacheKey?: string;
+		responseDelayMs?: number;
 	} = {},
 ): TestSession {
 	const read = createTool("read");
@@ -79,7 +84,9 @@ function newSession(
 		[read.name, read],
 		[bash.name, bash],
 	]);
-	const mock = createMockModel({ responses: [{ content: ["ok"] }, { content: ["ok"] }] });
+	const mock = createMockModel({
+		responses: [{ content: ["ok"] }, { content: ["ok"], delayMs: options.responseDelayMs }],
+	});
 	const contexts: Message[][] = [];
 	const systemPrompts: string[][] = [];
 	const promptCacheKeys: (string | undefined)[] = [];
@@ -108,11 +115,13 @@ function newSession(
 			return mock.stream(requestModel, context, streamOptions);
 		},
 	});
+	const registry = createInMemoryModelRegistry(model.provider);
+	registries.push(registry);
 	const session = new AgentSession({
 		agent,
 		sessionManager: options.sessionManager ?? SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: { getApiKey: async () => "test-key" } as never,
+		modelRegistry: registry,
 		toolRegistry,
 		builtInToolNames: ["read", "bash"],
 		providerPromptCacheKeySource: options.forkPromptCacheKey ? "fork" : undefined,
@@ -126,6 +135,8 @@ function newSession(
 			systemPrompt: [await rebuilder.rebuildSystemPrompt(toolNames)],
 		}),
 	});
+	// Recorded provider contexts share the loop's message array and can retain replies after disposal.
+	session.addDisposer(() => mock.reset());
 	return { session, contexts, systemPrompts, promptCacheKeys, rebuild };
 }
 
@@ -144,6 +155,7 @@ describe("prefix-bound tool roster changes", () => {
 
 	afterEach(async () => {
 		for (const session of sessions.splice(0)) await session.dispose();
+		for (const registry of registries.splice(0)) registry.authStorage.close();
 		vi.restoreAllMocks();
 	});
 
@@ -216,7 +228,9 @@ describe("prefix-bound tool roster changes", () => {
 				.getEntries()
 				.findLast(entry => entry.type === "message" && entry.message.role === "assistant");
 			if (!reply) throw new Error("live turn persisted no reply");
-			return { sessionManager, replyEntryId: reply.id, systemPrompt: live.systemPrompts[0]! };
+			const systemPrompt = live.systemPrompts[0];
+			if (!systemPrompt) throw new Error("live turn captured no prompt");
+			return { sessionManager, replyEntryId: reply.id, systemPrompt };
 		}
 
 		it("sends the first request with the prompt the transcript was sent with when a tool registers late", async () => {
@@ -249,6 +263,52 @@ describe("prefix-bound tool roster changes", () => {
 
 			expect(resumed.systemPrompts[0]).toEqual(transcript.systemPrompt);
 			expect(resumed.promptCacheKeys[0]).toBe("parent-cache-key");
+		});
+
+		it("restores the prompt after reopening the journal in a new session", async () => {
+			using tempDir = TempDir.createSync("@pi-prefix-binding-resume-");
+			const sessionManager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+			const live = newSession(createPrefixBindingModel(), { sessionManager });
+			sessions.push(live.session);
+			await live.session.setActiveToolPresentation(["read", "bash"], []);
+			await live.session.prompt("first");
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persisted session");
+			await live.session.dispose();
+			const reopened = await SessionManager.open(sessionFile);
+			const resumed = newSession(createPrefixBindingModel(), { sessionManager: reopened });
+			sessions.push(resumed.session);
+			await resumed.session.setActiveToolPresentation(["read"], []);
+			await resumed.session.setActiveToolPresentation(["read", "bash"], []);
+
+			await resumed.session.prompt("second");
+
+			expect(resumed.systemPrompts[0]).toEqual(live.systemPrompts[0]);
+			expect(providerText(resumed.contexts[0])).not.toContain("Tool availability changed.");
+		});
+
+		it("records the base behind a per-turn override for a late-tool resume", async () => {
+			const sessionManager = SessionManager.inMemory();
+			const override = ["per-turn replacement"];
+			const live = newSession(createPrefixBindingModel(), {
+				sessionManager,
+				beforeAgentStartSystemPrompt: override,
+			});
+			sessions.push(live.session);
+			await live.session.setActiveToolPresentation(["read", "bash"], []);
+			await live.session.prompt("first");
+			const resumed = newSession(createPrefixBindingModel(), {
+				sessionManager,
+				beforeAgentStartSystemPrompt: override,
+			});
+			sessions.push(resumed.session);
+			await resumed.session.setActiveToolPresentation(["read"], []);
+			await resumed.session.setActiveToolPresentation(["read", "bash"], []);
+
+			await resumed.session.prompt("second");
+
+			expect(resumed.systemPrompts[0]).toEqual(override);
+			expect(providerText(resumed.contexts[0])).not.toContain("Tool availability changed.");
 		});
 
 		it("keeps the prompt frozen after a resumed request when /tree returns to the restored reply", async () => {
@@ -385,6 +445,33 @@ describe("prefix-bound tool roster changes", () => {
 			},
 		);
 
+		it("does not replace the recorded prompt when a provider call aborts before its first event", async () => {
+			const sessionManager = SessionManager.inMemory();
+			let calls = 0;
+			const live = newSession(createPrefixBindingModel(), {
+				sessionManager,
+				responseDelayMs: 1,
+				beforeRequest: async () => {
+					if (++calls === 2) live.session.agent.abort();
+				},
+			});
+			sessions.push(live.session);
+			await live.session.setActiveToolPresentation(["read"], []);
+			await live.session.prompt("first");
+			await live.session.setActiveToolPresentation(["read", "bash"], []);
+			await live.session.refreshBaseSystemPrompt();
+			await live.session.prompt("second");
+			const resumed = newSession(createPrefixBindingModel(), { sessionManager });
+			sessions.push(resumed.session);
+			await resumed.session.setActiveToolPresentation(["read"], []);
+			await resumed.session.setActiveToolPresentation(["read", "bash"], []);
+
+			await resumed.session.prompt("third");
+
+			expect(resumed.systemPrompts[0]).toEqual(["tools:read"]);
+			expect(providerText(resumed.contexts[0])).toContain("Now available: bash.");
+		});
+
 		it("keeps the startup prompt for a transcript recorded without a prompt digest", async () => {
 			const transcript = await liveTranscript();
 			// Transcripts written before prompt digests were recorded hold only the messages.
@@ -403,6 +490,74 @@ describe("prefix-bound tool roster changes", () => {
 
 			expect(resumed.systemPrompts[0]).toEqual(["tools:read"]);
 			expect(providerText(resumed.contexts[0])).toContain("Now available: bash.");
+		});
+
+		it("freezes a restored transcript with a malformed digest attached to its latest reply", async () => {
+			const transcript = await liveTranscript();
+			transcript.sessionManager.appendCustomEntry("system-prompt-digest", { malformed: true });
+			const previous = transcript.sessionManager
+				.getEntries()
+				.findLast(entry => entry.type === "message" && entry.message.role === "assistant");
+			if (previous?.type !== "message" || previous.message.role !== "assistant") throw new Error("Expected a reply");
+			transcript.sessionManager.appendMessage({
+				...previous.message,
+				content: [{ type: "text", text: "Reply after the malformed record" }],
+				timestamp: Date.now(),
+			});
+			const resumed = newSession(createPrefixBindingModel(), { sessionManager: transcript.sessionManager });
+			sessions.push(resumed.session);
+			await resumed.session.setActiveToolPresentation(["read"], []);
+			await resumed.session.setActiveToolPresentation(["read", "bash"], []);
+
+			await resumed.session.prompt("second");
+
+			expect(resumed.systemPrompts[0]).toEqual(["tools:read"]);
+			expect(providerText(resumed.contexts[0])).toContain("Now available: bash.");
+		});
+
+		it("ignores a prompt digest left orphaned by interrupted reply persistence on cold reopen", async () => {
+			using tempDir = TempDir.createSync("@pi-prefix-binding-interrupted-");
+			const sessionManager = SessionManager.create(tempDir.path(), tempDir.join("sessions"));
+			const live = newSession(createPrefixBindingModel(), { sessionManager });
+			sessions.push(live.session);
+			await live.session.setActiveToolPresentation(["read"], []);
+			await live.session.prompt("first");
+			await live.session.setActiveToolPresentation(["read", "bash"], []);
+			await live.session.refreshBaseSystemPrompt();
+			await live.session.prompt("second");
+			const entries = sessionManager.getEntries();
+			const orphanIndex = entries.findLastIndex(
+				entry => entry.type === "custom" && entry.customType === "system-prompt-digest",
+			);
+			const header = sessionManager.getHeader();
+			const sessionFile = sessionManager.getSessionFile();
+			if (orphanIndex < 0 || !header || !sessionFile) throw new Error("Expected a durable second prompt digest");
+			await live.session.dispose();
+			// A crash can leave the digest append durable while losing its following reply.
+			await Bun.write(
+				sessionFile,
+				`${[header, ...entries.slice(0, orphanIndex + 1)].map(entry => JSON.stringify(entry)).join("\n")}\n`,
+			);
+			const reopened = await SessionManager.open(sessionFile);
+			const resumed = newSession(createPrefixBindingModel(), { sessionManager: reopened });
+			sessions.push(resumed.session);
+			await resumed.session.setActiveToolPresentation(["read"], []);
+			await resumed.session.setActiveToolPresentation(["read", "bash"], []);
+
+			await resumed.session.prompt("third");
+
+			expect(resumed.systemPrompts[0]).toEqual(["tools:read"]);
+			expect(providerText(resumed.contexts[0])).toContain("Now available: bash.");
+			await resumed.session.dispose();
+			const again = newSession(createPrefixBindingModel(), {
+				sessionManager: await SessionManager.open(sessionFile),
+			});
+			sessions.push(again.session);
+			await again.session.setActiveToolPresentation(["read"], []);
+			await again.session.setActiveToolPresentation(["read", "bash"], []);
+			await again.session.prompt("fourth");
+			expect(again.systemPrompts[0]).toEqual(["tools:read"]);
+			expect(providerText(again.contexts[0])).toContain("Now available: bash.");
 		});
 
 		/** Kept out of the test body so no strong local binding outlives the capture. */

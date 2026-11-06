@@ -51,7 +51,7 @@ function createSession(tools: AgentTool[]): ToolSession {
 }
 
 describe("callSessionTool", () => {
-	it("summarizes text results into the bridge value and status event", async () => {
+	it("summarizes bridged results without injecting harness-only arguments", async () => {
 		const execute = vi.fn().mockResolvedValue({
 			content: [{ type: "text", text: "hello" }],
 		});
@@ -70,6 +70,13 @@ describe("callSessionTool", () => {
 		);
 
 		expect(result).toBe("hello");
+		expect(execute).toHaveBeenCalledWith(
+			expect.stringMatching(/^js-read-/),
+			{ path: "/tmp/demo.txt" },
+			undefined,
+			undefined,
+			undefined,
+		);
 		expect(statuses).toEqual([expect.objectContaining({ op: "read", path: "/tmp/demo.txt", chars: 5 })]);
 	});
 
@@ -158,6 +165,26 @@ describe("callSessionTool", () => {
 			"Validation failed",
 		);
 		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("removes harness intent before a strict tool executes through the eval bridge", async () => {
+		const schema = type({ "value?": "string" }).onUndeclaredKey("reject");
+		const tool: AgentTool<typeof schema> = {
+			name: "intent",
+			label: "intent",
+			description: "intent tool",
+			parameters: schema,
+			concurrency: "shared",
+			execute: async (_id, args) => ({
+				content: [{ type: "text", text: JSON.stringify(schema.assert(args)) }],
+			}),
+		};
+		const result = await callSessionTool(
+			"intent",
+			{ value: "x", [INTENT_FIELD]: "caller intent" },
+			{ session: createSession([tool]) },
+		);
+		expect(result).toBe('{"value":"x"}');
 	});
 
 	it("executes a closed-schema tool with schema-shaped args whether or not the caller supplies harness intent", async () => {

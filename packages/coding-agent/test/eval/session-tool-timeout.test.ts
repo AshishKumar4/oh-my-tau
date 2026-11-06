@@ -121,4 +121,58 @@ describe("eval delegated session tools", () => {
 			15_000,
 		);
 	}
+	// Delegated work pauses the cell budget; the cell's own work does not.
+	for (const name of ["task", "wait"] as const) {
+		it(`js: returns tool.${name} work that outlasts a one-second cell budget`, async () => {
+			const delegated = slowTool(name);
+			const evalTool = new EvalTool(makeSession(delegated.tool));
+			await warmEval(evalTool, "js");
+			const pending = evalTool.execute("slow-delegated-work", {
+				language: "js",
+				code: `print(await tool.${name}({}))`,
+				timeout: 1,
+			});
+			await delegated.started;
+			await Bun.sleep(1_500);
+			delegated.release();
+			const result = await pending;
+			expect(delegated.aborted()).toBe(false);
+			expect(result.details?.cells?.[0]).toMatchObject({
+				status: "complete",
+				output: expect.stringContaining("review complete"),
+			});
+		}, 15_000);
+	}
+
+	it("js: still charges an ordinary tool call to the cell budget", async () => {
+		const ordinary = slowTool("read");
+		const evalTool = new EvalTool(makeSession(ordinary.tool));
+		await warmEval(evalTool, "js");
+		const result = await evalTool.execute("slow-read", {
+			language: "js",
+			code: "print(await tool.read({}))",
+			timeout: 1,
+		});
+		expect(ordinary.aborted()).toBe(true);
+		expect(result.details?.cells?.[0]?.output).toContain("timed out");
+		expect(result.details?.cells?.[0]?.output).not.toContain("review complete");
+	}, 15_000);
+
+	it("js: interrupts a CPU loop that follows a delegated tool.task", async () => {
+		const delegated = slowTool("task");
+		const evalTool = new EvalTool(makeSession(delegated.tool));
+		await warmEval(evalTool, "js");
+		const pending = evalTool.execute("compute-after-delegated-work", {
+			language: "js",
+			code: "print(await tool.task({}));\nwhile (true) {}",
+			timeout: 1,
+		});
+		await delegated.started;
+		await Bun.sleep(1_500);
+		delegated.release();
+		const result = await pending;
+		expect(delegated.aborted()).toBe(false);
+		expect(result.details?.cells?.[0]?.output).toContain("review complete");
+		expect(result.details?.cells?.[0]?.output).toContain("timed out");
+	}, 15_000);
 });

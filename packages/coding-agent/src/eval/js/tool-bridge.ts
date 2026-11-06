@@ -7,6 +7,8 @@ import {
 import { type ImageContent, toolWireSchema } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { type CodexNestedValue, codexNestedAliasForModel, codexNestedTargetEnabled } from "../../harness/codex-nested";
+import { effectiveHarnessProfile } from "../../harness/effective-profile";
 import type { ToolSession } from "../../tools";
 import { committedTodoPhases } from "../../tools/todo";
 import { isReplyWrite, toolResultReplies } from "@oh-my-pi/pi-tui/chat/reply-write";
@@ -78,7 +80,8 @@ type ToolValue =
 			details?: unknown;
 			images?: Omit<ImageContent, "type">[];
 			hasError?: boolean;
-	  };
+	  }
+	| CodexNestedValue;
 function toolResultHasError(result: AgentToolResult): boolean {
 	if (isRecord(result) && result.isError === true) return true;
 	return isRecord(result.details) && result.details.isError === true;
@@ -278,6 +281,27 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 	}
 	if (name === EVAL_WORKPOOL_BRIDGE_NAME) {
 		return await runEvalWorkpool(args, options);
+	}
+	const codexAlias = codexNestedAliasForModel(
+		name,
+		options.session.getActiveModel?.(),
+		effectiveHarnessProfile(options.session.settings, options.session.getActiveModel?.()),
+	);
+	if (codexAlias) {
+		if (!codexNestedTargetEnabled(options.session, codexAlias)) {
+			throw new ToolError(`Unknown tool from js runtime: ${name}`);
+		}
+		const startedAt = Date.now();
+		const invoke = async (toolName: string, params: Record<string, unknown>): Promise<ToolValue> =>
+			callSessionTool(toolName, params, options);
+		const ctx = { session: options.session, invoke, elapsedSeconds: () => (Date.now() - startedAt) / 1000 };
+		const argsRecord = isRecord(args) ? args : typeof args === "string" ? { input: args } : {};
+		if (codexAlias.call) {
+			return await codexAlias.call(argsRecord, ctx);
+		}
+		const mapped = codexAlias.toParams ? codexAlias.toParams(argsRecord) : argsRecord;
+		const inner = await invoke(codexAlias.target, mapped);
+		return codexAlias.fromResult ? codexAlias.fromResult(inner, ctx.elapsedSeconds()) : inner;
 	}
 	const tool = getTool(options.session, name);
 	// Wire aliases share every guard, status and bookkeeping path with the canonical tool.

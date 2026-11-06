@@ -171,6 +171,50 @@ describe.skipIf(!pythonPath)("Python runner quoted-source transformation", () =>
 		expectSuccess(await executeCell(code), "shell-quotes-isolated");
 	});
 
+	it("preserves raw generated text, interpolated strings and quoted closing delimiters", async () => {
+		const payload = "%.o: %.c\n![image](plot.png)\n!literal\n%pwd\n%%bash\nvalue = %pwd";
+		const code = [
+			`source = r"""${payload}"""`,
+			`assert source == ${JSON.stringify(payload)}`,
+			"value = 7",
+			'source = f"""first {value}\n%pwd\n!literal\n"""',
+			'assert source == "first 7\\n%pwd\\n!literal\\n"',
+			"import io",
+			"output = io.StringIO()",
+			'output.write("""\nbool ok;\nok = !done;""")',
+			'assert output.getvalue() == "\\nbool ok;\\nok = !done;"',
+			'print("preserved")',
+		].join("\n");
+		expectSuccess(await executeCell(code), "preserved");
+	});
+
+	it("executes real indented and assigned magics without scanning shell quotes as Python", async () => {
+		const code = [
+			"import os",
+			"!echo \"'''\"",
+			'source = """%pwd\n!literal\n"""',
+			'assert source == "%pwd\\n!literal\\n"',
+			"cwd = %pwd",
+			"assert cwd == os.getcwd()",
+			"out = !echo assigned",
+			'assert out == ["assigned"]',
+			"if True:",
+			"    %pwd",
+			"    !echo indented",
+			'print("completed")',
+			"%%bash",
+			"printf cell-completed",
+		].join("\n");
+		const frames = await executeCell(code);
+		expectSuccess(frames, "completed");
+		const output = frames
+			.filter(frame => frame.type === "stdout")
+			.map(frame => frame.data ?? "")
+			.join("");
+		expect(output).toContain("indented");
+		expect(output).toContain("cell-completed");
+	});
+
 	it("reports unterminated quoted source without executing its apparent shell commands", async () => {
 		const frames = await executeCell('source = """\n!echo must-not-run\n');
 		expect(frames.find(frame => frame.type === "done")?.status).toBe("error");

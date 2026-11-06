@@ -126,6 +126,23 @@ const PRELUDE_GLOBAL_KEYS = [
 	"read",
 	"write",
 	"env",
+	// Codex exec surface (installed/uninstalled per run by the worker when the
+	// session profile is codex); tracked so stacked runtimes restore correctly.
+	"tools",
+	"__omp_install_codex_exec__",
+	"__omp_uninstall_codex_exec__",
+	"__omp_tool_catalog__",
+	"__omp_codex_store__",
+	"text",
+	"notify",
+	"exit",
+	"image",
+	"audio",
+	"generatedImage",
+	"store",
+	"load",
+	"yield_control",
+	"ALL_TOOLS",
 ];
 
 /**
@@ -445,6 +462,20 @@ export class JsRuntime {
 		}
 	}
 
+	/**
+	 * Take ownership of globals a caller already wrote through the realm
+	 * (e.g. the codex exec-surface install/uninstall hooks in the prelude, which
+	 * run as plain globalThis assignments) so save/restore across stacked
+	 * runtimes keeps their values. Caller must have this runtime's globals
+	 * active (e.g. right after getGlobal-driven install) — activating here
+	 * would restore the pre-install values before they could be recorded.
+	 */
+	recordGlobals(keys: readonly string[]): void {
+		for (const key of keys) {
+			this.#ownGlobal(key);
+			recordGlobalValue(key, this.#globalOwner);
+		}
+	}
 	/**
 	 * Synchronize enabled capability snippets before an ordinary eval cell.
 	 * Unchanged sources retain their objects; removed or replaced definitions

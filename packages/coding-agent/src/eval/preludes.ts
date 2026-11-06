@@ -51,6 +51,8 @@ export interface EvalPreludeDefinition {
 	 * mid-session, since the cached system prompt is not rebuilt for the toggle.
 	 */
 	guidance?: string;
+	/** Optional declarations appended to code-mode TypeScript context while enabled. */
+	codeModeDeclarations?: string;
 	/** Approval tier or argument-dependent approval decision for host calls. */
 	approval?: ToolApproval;
 	/** Live availability predicate. Omission means enabled. */

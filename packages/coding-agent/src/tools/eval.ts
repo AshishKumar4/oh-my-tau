@@ -7,6 +7,7 @@ import type {
 	ToolSpeculationPolicy,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, ToolExample } from "@oh-my-pi/pi-ai";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
 import {
 	replaceTabs,
@@ -34,10 +35,13 @@ import type {
 	EvalToolDetails,
 	EvalViewEntry,
 } from "@oh-my-pi/pi-tui/tools/eval";
+import { codexExecNestedDeclarations } from "../harness/codex-nested";
+import { effectiveHarnessProfile, sessionToolRefs } from "../harness/effective-profile";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import evalAgentsTopic from "../prompts/tools/eval-agents.md" with { type: "text" };
 import evalJudgeTopic from "../prompts/tools/eval-judge.md" with { type: "text" };
 import evalHelpersTopic from "../prompts/tools/eval-helpers.md" with { type: "text" };
+import evalCodeModeDescription from "../prompts/tools/eval-code-mode.md" with { type: "text" };
 import {
 	DEFAULT_MAX_BYTES,
 	findColumnCapped,
@@ -53,6 +57,9 @@ import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import { type EvalBackendsAllowance, resolveAdvertisedEvalBackends, resolveEvalBackends } from "./eval-backends";
+import { generateCodeModeDeclarations } from "@oh-my-pi/pi-tui/tools/eval-format/code-mode-declarations";
+import { buildCodexExecDescription } from "./eval-format/codex-exec-description";
+import codexExecGrammar from "./eval-format/codex-exec.lark" with { type: "text" };
 import { recordStatusEvent, type StatusEventLog } from "@oh-my-pi/pi-tui/tools/eval";
 import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { resolveOutputMaxColumns, resolveOutputSinkArtifactMaxBytes, resolveOutputSinkHeadBytes } from "./output-meta";
@@ -145,6 +152,20 @@ export const evalSchema = type({
 export type EvalToolParams = typeof evalSchema.infer;
 export type EvalCellInput = EvalToolParams;
 
+export const codexExecSchema = type({ input: "string" });
+export type CodexExecParams = typeof codexExecSchema.infer;
+type EvalToolInput = typeof evalSchema | typeof codexExecSchema;
+
+const CODEX_EXEC_FORMAT = { syntax: "lark", definition: codexExecGrammar } as const;
+const NO_EXAMPLES: readonly ToolExample<EvalToolParams>[] = [];
+
+function evalCellOf(params: EvalToolParams | CodexExecParams): EvalToolParams;
+function evalCellOf(params: Partial<EvalToolParams> | Partial<CodexExecParams>): Partial<EvalToolParams>;
+function evalCellOf(params: Partial<EvalToolParams> | Partial<CodexExecParams>): Partial<EvalToolParams> {
+	if ("input" in params) return { language: "js", code: params.input };
+	return params as Partial<EvalToolParams>;
+}
+
 /**
  * Build a session-scoped copy of the eval schema whose `language` enum and field
  * descriptions advertise only the runtimes enabled for this session. Disabled
@@ -191,8 +212,13 @@ export interface EvalToolDescriptionOptions {
 	eagerDelegation?: boolean;
 	/** Point blocked callers at the `wait` tool; false when the session lacks it (subagents). Default: true. */
 	waitTool?: boolean;
+	/**
+	 * Name the session presents omp's wait tool under (Claude Code's TaskOutput);
+	 * `null` when nothing on the wire waits (Claude Code without TaskOutput).
+	 * Default: `wait`.
+	 */
+	waitToolName?: string | null;
 	/** Enabled preludes; each becomes an `xd://eval/<name>` doc topic, inlined when it asks to be. */
-	preludes?: readonly Pick<EvalPreludeDefinition, "name" | "documentation" | "inlineDocumentation">[];
 	/**
 	 * Inline every doc topic instead of linking `xd://eval/<topic>`. Required
 	 * when the session cannot `read` (the only transport for topic docs).
@@ -218,6 +244,7 @@ function evalTemplateContext(options: EvalToolDescriptionOptions) {
 		evalTools: options.evalTools ?? true,
 		eagerDelegation: options.eagerDelegation ?? true,
 		waitTool: options.waitTool ?? true,
+		waitToolName: options.waitToolName === null ? undefined : (options.waitToolName ?? "wait"),
 		autoBackgroundEnabled: options.autoBackgroundEnabled ?? false,
 		spawns: spawnPolicy.enabled,
 		spawnDefaultAgent: spawnPolicy.defaultAgent,
@@ -349,11 +376,11 @@ function formatEvalInputLanguage(value: string): string {
 	return value;
 }
 
-export class EvalTool implements AgentTool<typeof evalSchema> {
+export class EvalTool implements AgentTool<EvalToolInput> {
 	readonly name = "eval";
 	readonly approval = "exec" as const;
 	readonly formatApprovalDetails = (args: unknown): string[] => {
-		const params = isRecord(args) ? args : {};
+		const params = evalCellOf(isRecord(args) ? (args as Partial<EvalToolParams> | Partial<CodexExecParams>) : {});
 		const language =
 			typeof params.language === "string" ? formatEvalInputLanguage(params.language) : "javascript (default)";
 		const code = typeof params.code === "string" ? params.code : "";
@@ -363,10 +390,14 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		return summarizeEvalLanguages(this.#enabledLanguages());
 	}
 
+	supportsCodeModeTransport(): boolean {
+		return this.#enabledLanguages().includes("js");
+	}
 	readonly loadMode = "essential";
 	readonly label = "Eval";
 	get description(): string {
-		return getEvalToolDescription(this.#descriptionOptions());
+		const base = getEvalToolDescription(this.#descriptionOptions());
+		return this.#codeModeDescription(base) ?? base;
 	}
 
 	/**
@@ -388,6 +419,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		const session = this.session;
 		if (!session) return {};
 		const backends = resolveAdvertisedEvalBackends(session);
+		const toolRefs = sessionToolRefs(session);
 		const depthAllowsSpawning = canSpawnAtDepth(
 			cfgTaskMaxRecursionDepth.get(session.settings),
 			session.taskDepth ?? 0,
@@ -400,7 +432,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			autoBackgroundEnabled: cfgEvalAutoBackgroundEnabled.get(session.settings),
 			evalTools: cfgEvalToolsEnabled.get(session.settings),
 			eagerDelegation: sessionDelegationBias(session) === "eager",
-			waitTool: hasWaitTool(session),
+			// Named as presented: TaskOutput stands in for `wait` where a Claude Code capture declares it.
+			waitTool: hasWaitTool(session) && toolRefs.wait !== undefined,
+			waitToolName: toolRefs.wait ?? null,
 			preludes: this.#advertisedPreludes(session),
 			inlineTopics: session.isToolActive?.("read") === false,
 			autoProvision: cfgEvalAutoProvision.get(session.settings),
@@ -418,6 +452,47 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		return session.getAdvertisedEvalPreludes?.() ?? getEnabledEvalPreludes(session.getEvalPreludes?.() ?? []);
 	}
 
+	/**
+	 * Codex Code Mode advertisement, pulled from the session's applied direct
+	 * partition on every read so the declarations can never advertise a tool the
+	 * model can already call directly (a plan-mode transport `write`), nor drift
+	 * from the active model or tool registry.
+	 */
+	#codeModeDescription(baseDescription: string): string | undefined {
+		const session = this.session;
+		const directToolNames = session?.getCodeModeDirectToolNames?.();
+		if (!session || !directToolNames) return undefined;
+		const direct = new Set(directToolNames);
+		const bridged = (session.getEvalBridgeToolNames?.() ?? [...(session.toolRegistry?.keys() ?? [])]).flatMap(
+			name => {
+				if (direct.has(name)) return [];
+				const tool = session.toolRegistry?.get(name);
+				if (!tool) return [];
+				const parameters: unknown = tool.parameters;
+				return [{ name, parameters }];
+			},
+		);
+		const preludeDeclarations = this.#advertisedPreludes(session)
+			.map(definition => definition.codeModeDeclarations?.trim())
+			.filter((declaration): declaration is string => Boolean(declaration))
+			.join("\n\n");
+		const profile = this.#harnessProfile();
+		if (profile === "codex") {
+			return buildCodexExecDescription({
+				tools: bridged.map(entry => {
+					const summary = session.toolRegistry?.get(entry.name)?.summary;
+					return typeof summary === "string" ? { ...entry, summary } : entry;
+				}),
+				preludeDeclarations,
+				nestedDeclarations: codexExecNestedDeclarations(this.session?.getActiveModel?.(), this.#harnessProfile()),
+			});
+		}
+		return prompt.render(evalCodeModeDescription, {
+			baseDescription,
+			declarations: generateCodeModeDeclarations(bridged),
+			preludeDeclarations,
+		});
+	}
 	/** Only syntax not obvious from the field schema; filtered by enabled language. */
 	static readonly #examples: readonly ToolExample<typeof evalSchema.infer>[] = [
 		{
@@ -425,11 +500,16 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			call: { language: "py", code: '%load "scripts/my setup.py"' },
 		},
 	];
-	get examples(): readonly ToolExample<typeof evalSchema.infer>[] {
+	get examples(): readonly ToolExample<EvalToolParams>[] {
+		if (this.#presentsCodexExec()) return NO_EXAMPLES;
 		const langs = new Set(this.#enabledLanguages());
 		return EvalTool.#examples.filter(ex => "call" in ex && langs.has(ex.call.language));
 	}
-	get parameters(): typeof evalSchema {
+	get customFormat(): { syntax: "lark"; definition: string } | undefined {
+		return this.#presentsCodexExec() ? CODEX_EXEC_FORMAT : undefined;
+	}
+	get parameters(): EvalToolInput {
+		if (this.#presentsCodexExec()) return codexExecSchema;
 		const langs = this.#enabledLanguages();
 		const maxTimeout = this.session ? cfgToolsMaxTimeout.get(this.session.settings) : undefined;
 		if (langs.length === EVAL_LANGUAGE_ORDER.length && !maxTimeout) return evalSchema;
@@ -442,9 +522,10 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	}
 	readonly concurrency = "exclusive";
 	readonly strict = true;
-	readonly intent = (args: Partial<typeof evalSchema.infer>): string | undefined => {
-		const title = typeof args.title === "string" ? args.title : undefined;
-		const language = typeof args.language === "string" ? formatEvalInputLanguage(args.language) : "javascript";
+	readonly intent = (args: Partial<EvalToolParams> | Partial<CodexExecParams>): string | undefined => {
+		const cell = evalCellOf(args);
+		const title = typeof cell.title === "string" ? cell.title : undefined;
+		const language = typeof cell.language === "string" ? formatEvalInputLanguage(cell.language) : "javascript";
 		return title || `running ${language}`;
 	};
 
@@ -489,6 +570,41 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		return this.session ? enabledEvalLanguages(resolveAdvertisedEvalBackends(this.session)) : ["py", "js"];
 	}
 
+	#harnessProfile(): HarnessProfile | undefined {
+		const session = this.session;
+		const model = session?.getActiveModel?.();
+		if (session === null || model === undefined) return undefined;
+		return effectiveHarnessProfile(session.settings, model);
+	}
+
+	#presentsCodexExec(): boolean {
+		return this.#harnessProfile() === "codex" && this.supportsCodeModeTransport();
+	}
+
+	/**
+	 * The vendor's first-line `// @exec: {"yield_time_ms": N, ...}` pragma under
+	 * the codex profile: strip the line and apply `yield_time_ms` as the cell
+	 * timeout (seconds). `max_output_tokens` stays inert — omp's eval owns its
+	 * output budget. The lark grammar already guarantees the pragma shape.
+	 */
+	#stripCodexExecPragma(params: EvalToolParams): EvalToolParams {
+		const match = /^[ \t]*\/\/ @exec:([^\r\n]*)(\r?\n|$)/.exec(params.code);
+		if (!match) return params;
+		const code = params.code.slice(match[0].length);
+		let yieldMs: number | undefined;
+		try {
+			const pragma: unknown = JSON.parse(match[1].trim());
+			if (pragma !== null && typeof pragma === "object" && !Array.isArray(pragma)) {
+				const value = (pragma as Record<string, unknown>).yield_time_ms;
+				if (typeof value === "number" && Number.isFinite(value) && value > 0) yieldMs = value;
+			}
+		} catch {
+			// Malformed pragma JSON: strip the line and keep the caller's timeout.
+		}
+		const timeout = yieldMs === undefined ? params.timeout : Math.max(1, Math.ceil(yieldMs / 1000));
+		return { ...params, code, timeout };
+	}
+
 	constructor(
 		private readonly session: ToolSession | null,
 		options?: EvalToolOptions,
@@ -518,11 +634,13 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 	async #execute(
 		_toolCallId: string,
-		params: typeof evalSchema.infer,
+		input: EvalToolParams | CodexExecParams,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<EvalToolDetails | undefined>> {
+		let params = evalCellOf(input);
+		if (this.#presentsCodexExec()) params = this.#stripCodexExecPragma(params);
 		const validated = evalSchema(params);
 		if (validated instanceof type.errors) {
 			throw new ToolError(`Validation failed for tool "eval": ${validated.summary}`);
@@ -564,6 +682,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		if (shadowCell && (source.filename || source.packages?.length || source.environment)) {
 			await shadowCell.discard("file-backed or environment-changing eval requires authoritative execution");
 		}
+		const autoBgManager = session.asyncJobManager;
+		const autoBackgroundEligible =
+			cfgEvalAutoBackgroundEnabled.get(session.settings) && autoBgManager !== undefined && !autoBgManager.atCapacity;
 		const cells: ResolvedEvalCell[] = [
 			{
 				index: 0,
@@ -573,7 +694,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				environmentChange: source.environment !== undefined,
 				environment:
 					source.environment ?? (this.#environmentModes[cellLanguage] === "project" ? "project" : undefined),
-				timeoutMs: cellTimeoutMs,
+				timeoutMs: params.timeout === undefined && autoBackgroundEligible ? 0 : cellTimeoutMs,
 				reset: params.reset ?? false,
 				resolved,
 			},
@@ -625,10 +746,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			return session.trackEvalExecution?.(execution, sessionAbortController) ?? execution;
 		};
 
-		const autoBgManager = session.asyncJobManager;
 		// At the running-job cap, fall through to direct foreground execution
 		// instead of failing every eval call until a slot frees up.
-		if (!cfgEvalAutoBackgroundEnabled.get(session.settings) || !autoBgManager || autoBgManager.atCapacity) {
+		if (!autoBackgroundEligible || !autoBgManager) {
 			return await run(signal, emitToolUpdate, () => true);
 		}
 
@@ -808,7 +928,11 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		if (extraNotice) {
 			lines.push(extraNotice, "");
 		}
-		lines.push(formatBackgroundNotice(jobId, timeoutSec));
+		lines.push(
+			this.#presentsCodexExec()
+				? `Script running with cell ID ${jobId}; call wait with this cell_id for its result.`
+				: formatBackgroundNotice(jobId, timeoutSec),
+		);
 		return { content: [{ type: "text", text: lines.join("\n") }], details };
 	}
 

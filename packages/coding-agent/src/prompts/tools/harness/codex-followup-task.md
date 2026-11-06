@@ -1,0 +1,1 @@
+Send a follow-up task to an existing agent and trigger a turn if it is idle. `target` is an agent id from spawn_agent or list_agents; `message` is the plain-text task. A running target receives it at its next message boundary; an idle or parked target is woken to work on it.
