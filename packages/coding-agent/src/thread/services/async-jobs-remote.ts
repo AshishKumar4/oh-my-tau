@@ -34,6 +34,7 @@ import type {
 	AsyncJobRunResult,
 	AsyncJobType,
 } from "../../async/job-manager";
+import { getRenderedEnvelope } from "../../harness/content";
 import type { JobTextSource, JobWidgetInputs, JobWidgetRegistry } from "../../job-widgets/types";
 import type { RemoteObject } from "../rpc";
 import {
@@ -46,6 +47,7 @@ import {
 	type WireJobFeed,
 	type WireJobRun,
 	type WireRegisterOptions,
+	WIRE_RENDERED_ERROR_FIELD,
 } from "./async-jobs-protocol";
 import { ignoreSettle, localUnsubscribe } from "./support";
 
@@ -243,12 +245,19 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		const feed = local ? new WorkerJobFeed(local) : undefined;
 		const wired: WireJobRun = async ctx => {
 			try {
-				return await run({
+				const outcome = await run({
 					jobId: ctx.jobId,
 					signal: fromWireSignal(ctx.signal),
 					reportProgress: ctx.reportProgress,
 					markRunning: () => ignoreSettle(ctx.markRunning()),
 				});
+				if (typeof outcome === "string" || !getRenderedEnvelope(outcome, outcome.text)) return outcome;
+				return { ...outcome, rendered: true };
+			} catch (error) {
+				if (error instanceof Error && getRenderedEnvelope(error, error.message)) {
+					Object.defineProperty(error, WIRE_RENDERED_ERROR_FIELD, { value: true, configurable: true });
+				}
+				throw error;
 			} finally {
 				// Sent ahead of the result, so main's final widget read sees the job's last output.
 				if (feed && ctx.pushFeed) ignoreSettle(ctx.pushFeed(feed.delta()));

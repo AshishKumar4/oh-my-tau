@@ -17,6 +17,7 @@
  *
  * Worker side: see `./async-jobs-remote`.
  */
+import { SafeString } from "@oh-my-pi/pi-utils/template";
 import {
 	type AsyncJob,
 	AsyncJobError,
@@ -24,6 +25,7 @@ import {
 	type AsyncJobProcess,
 	type AsyncJobRegisterOptions,
 } from "../../async/job-manager";
+import { withRenderedEnvelope } from "../../harness/content";
 import { TextTap } from "../../job-widgets/text-tap";
 import type { JobTextSource, JobWidgetBrief, JobWidgetInputs } from "../../job-widgets/types";
 import type { ThreadId } from "../identity";
@@ -39,6 +41,7 @@ import {
 	type WireJobFeed,
 	type WireRegisterOptions,
 	type WireRunContext,
+	WIRE_RENDERED_ERROR_FIELD,
 } from "./async-jobs-protocol";
 import { RemoteAsyncJobManager } from "./async-jobs-remote";
 import { ignoreSettle, PeerCleanups } from "./support";
@@ -215,7 +218,19 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 						markRunning: ctx.markRunning,
 						pushFeed: feed ? delta => feed.apply(delta, true) : undefined,
 					};
-					return run(wire);
+					return run(wire).then(
+						outcome => {
+							if (typeof outcome === "string" || !outcome.rendered) return outcome;
+							const { rendered: _, ...result } = outcome;
+							return withRenderedEnvelope(result, new SafeString(result.text));
+						},
+						(error: unknown) => {
+							if (error instanceof Error && Reflect.get(error, WIRE_RENDERED_ERROR_FIELD) === true) {
+								withRenderedEnvelope(error, new SafeString(error.message));
+							}
+							throw error;
+						},
+					);
 				},
 				mainRegisterOptions(options, feed),
 			);
