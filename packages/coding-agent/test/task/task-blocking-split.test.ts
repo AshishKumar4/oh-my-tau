@@ -280,7 +280,7 @@ describe("task per-item blocking split", () => {
 		expect(manager.getJob("WorkerThree")).toBeUndefined();
 	});
 
-	it("holds the turn on a pre-claimed inline spawn and releases it when the spawn hook refuses", async () => {
+	it("never holds the turn on an inline spawn its spawn hook refuses", async () => {
 		mockDiscovery();
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options =>
 			makeResult(options.id ?? "?", options.agent.name),
@@ -306,8 +306,8 @@ describe("task per-item blocking split", () => {
 			],
 		} as TaskParams);
 
-		// The mixed call claims the scout's id up front, so its hold starts before the hook runs.
-		expect(heldAtRefusal).toEqual([[{ agents: ["ScoutFour"], interruptible: false }]]);
+		// The hold starts with the child's run, after the hook allowed it: a refused spawn never had one.
+		expect(heldAtRefusal).toEqual([[]]);
 		expect(firstText(result)).toContain("scout pool exhausted");
 		expect(mainHolds()).toEqual([]);
 		await manager.getJob("WorkerFour")?.promise;

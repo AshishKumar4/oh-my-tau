@@ -19,6 +19,7 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { harnessFacade } from "@oh-my-pi/pi-coding-agent/harness/facade";
 import { harnessFacadeSpecs } from "@oh-my-pi/pi-coding-agent/harness/facades";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { ForkRequestSnapshot } from "@oh-my-pi/pi-coding-agent/session/fork-context";
@@ -33,6 +34,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import type { SingleResult, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { recordAwaitHolds } from "../helpers/await-holds";
+import { until } from "../helpers/fake-clock";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -294,7 +296,7 @@ describe("task speculative launch", () => {
 		expect([...startedIds]).toEqual(["Alpha"]);
 	});
 
-	it("holds the turn on an inline speculative run only once dispatch adopts it", async () => {
+	it("holds the turn on an inline run while it runs; a discarded run releases its hold", async () => {
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: [taskAgent, scoutAgent],
 			projectAgentsDir: null,
@@ -312,18 +314,18 @@ describe("task speculative launch", () => {
 		const scoutJson = JSON.stringify(scoutArgs);
 		const scoutAlphaClosed = scoutJson.slice(0, scoutJson.indexOf('{"name":"Beta"') + 10);
 
-		// A run discarded before adoption never held the turn, which was still streaming.
+		// An inline run holds the turn from its start; discarding it releases the hold.
 		const discarded = await openSession({ agentRegistry: registry });
 		discarded.session.update(toolCall, scoutAlphaClosed);
 		await spawn("Alpha").started.promise;
-		expect(heldIds()).toEqual([]);
+		expect(heldIds()).toEqual(["Alpha"]);
 		discarded.session.finalize({ toolCall, args: { ...scoutArgs, tasks: [scoutArgs.tasks[1]] } });
 		await spawn("Alpha").aborted.promise;
-		expect(heldIds()).toEqual([]);
+		await until(() => heldIds().length === 0, "the discarded run releases its hold");
 		spawns.clear();
 
-		// Adopted inline runs hold the turn by their pre-claimed ids until they
-		// settle: each child's message-only `wait` returns once its hold lands.
+		// Adopted inline runs hold the turn until they settle: a child waiting on a
+		// reply from its parent is told the parent cannot answer before it finishes.
 		const adopted = await openSession({ agentRegistry: registry });
 		adopted.session.update(toolCall, scoutAlphaClosed);
 		await spawn("Alpha").started.promise;
@@ -335,22 +337,29 @@ describe("task speculative launch", () => {
 				displayName: id,
 				kind: id === "Main" ? "main" : "sub",
 				parentId: id === "Main" ? undefined : "Main",
-				session: { isStreaming: true } as never,
+				session: {
+					isStreaming: true,
+					deliverIrcMessage: async () => {},
+					hasQueuedIrcFrom: () => false,
+				} as never,
 				status: "running",
 			});
 		}
-		const childWait = (id: string) =>
-			new WaitTool({
+		// Each child asks its parent a question, then waits for the reply it is owed.
+		const childWait = async (id: string) => {
+			await IrcBus.global().send({ from: id, to: "Main", body: "Which file?" });
+			return new WaitTool({
 				cwd: "/tmp",
 				settings: Settings.isolated({ "launch.enabled": false }),
 				agentRegistry: registry,
 				getAgentId: () => id,
 			} as unknown as ToolSession).execute(`${id}-wait`, {});
+		};
 		const waits = [childWait("Alpha"), childWait("Beta")];
 		const executing = adopted.tool.execute(toolCall.id, scoutArgs);
 		for (const result of await Promise.all(waits)) {
 			expect(result.content[0]).toMatchObject({
-				text: expect.stringContaining("`Main` is blocked waiting on your result"),
+				text: expect.stringContaining("`Main` cannot reply before you finish: it is waiting on your result."),
 			});
 		}
 		expect(heldIds().sort()).toEqual(["Alpha", "Beta"]);

@@ -1144,36 +1144,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	}
 
 	/**
-	 * Attach this turn to an inline run it is about to await. The turn stays
-	 * parked on the child until the returned release runs, reading no message
-	 * meanwhile: publish that, so the child's message-only `wait` returns instead
-	 * of blocking on an owner that cannot answer. Only a pre-claimed id is known
-	 * up front; otherwise the hold starts with the first progress naming the
-	 * child, which precedes any tool call the child makes.
-	 */
-	#attachInline(run: SpawnRun, owner: SpawnRunOwner): () => void {
-		const registry = this.session.agentRegistry;
-		let release: (() => void) | undefined;
-		let released = false;
-		const hold = (id: string | undefined): void => {
-			if (!registry || !id || release || released) return;
-			release = registry.awaits.hold(this.session.getAgentId?.() ?? MAIN_AGENT_ID, [id], { interruptible: false });
-		};
-		hold(run.identity.agentId);
-		run.attach({
-			...owner,
-			onUpdate: update => {
-				hold(update.details?.progress?.[0]?.id);
-				return owner.onUpdate?.(update);
-			},
-		});
-		return () => {
-			released = true;
-			release?.();
-		};
-	}
-
-	/**
 	 * Start a streamed item's run ahead of dispatch. Preflight and execution
 	 * mode mirror dispatch exactly; refuses (undefined) whenever dispatch would
 	 * reject the item, so a refusal halts further speculation for the call.
@@ -1950,12 +1920,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					detached: false,
 					fork,
 				});
-			const release = this.#attachInline(run, { signal, onUpdate });
-			try {
-				return await run.result;
-			} finally {
-				release();
-			}
+			run.attach({ signal, onUpdate });
+			return await run.result;
 		}
 
 		const startTime = Date.now();
@@ -2036,7 +2002,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						agentId: spawn.preAllocatedId,
 						detached: false,
 					});
-				const release = this.#attachInline(run, {
+				run.attach({
 					signal: workerSignal,
 					onUpdate: onItemProgress
 						? update => {
@@ -2046,16 +2012,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						: undefined,
 				});
 				try {
-					try {
-						await run.started;
-					} catch (error) {
-						if (workerSignal.aborted) return undefined;
-						throw error;
-					}
-					return await run.result;
-				} finally {
-					release();
+					await run.started;
+				} catch (error) {
+					if (workerSignal.aborted) return undefined;
+					throw error;
 				}
+				return await run.result;
 			},
 			signal,
 		);

@@ -869,8 +869,10 @@ describe("structured subagent primitive", () => {
 		const find = modelRegistry.find.bind(modelRegistry);
 		modelRegistry.find = (provider, id) => (provider === "mock" && id === model.id ? model : find(provider, id));
 		modelRegistry.getAvailable = () => [model];
+		// An agent with no result contract of its own: neither `output` nor `structured: true`.
 		mockDiscovery({
 			...AGENT,
+			output: undefined,
 			tools: ["read", "yield"],
 			model: [`mock/${model.id}`],
 		});
