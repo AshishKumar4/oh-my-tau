@@ -149,7 +149,6 @@ it.each([true, false])(
 				const card = ctx.pendingTools.get(block.id);
 				if (!(card instanceof ToolExecutionComponent)) throw new Error("Expected tool-specific card");
 				expect(card.toolName).toBe(block.name);
-				expect(card.describe().p?.key).toBe(block.id);
 				await controller.handleEvent({
 					type: "tool_execution_end",
 					toolCallId: block.id,

@@ -705,7 +705,6 @@ export class EventController {
 		if (pending && !this.ctx.pendingTools.has(newId)) {
 			this.ctx.pendingTools.delete(oldId);
 			this.ctx.pendingTools.set(newId, pending);
-			if (pending instanceof ToolExecutionComponent) pending.renameToolCall(newId);
 		}
 		const timeline = this.#toolTimelineComponents.get(oldId);
 		if (timeline && !this.#toolTimelineComponents.has(newId)) {

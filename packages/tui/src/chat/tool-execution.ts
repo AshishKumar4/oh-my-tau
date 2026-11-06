@@ -756,11 +756,6 @@ export class ToolExecutionComponent extends Container {
 		this.#ui.requestRender();
 	}
 
-	renameToolCall(id: string): void {
-		this.#toolCallId = id;
-		this.invalidate();
-	}
-
 	get toolName(): string {
 		return this.#toolName;
 	}
@@ -1321,7 +1316,6 @@ export class ToolExecutionComponent extends Container {
 		};
 		const presentation = this.#presentation.draw();
 		const key = [
-			this.#toolCallId,
 			dataFirst,
 			this.#resultVersion,
 			this.#toolCallId,
