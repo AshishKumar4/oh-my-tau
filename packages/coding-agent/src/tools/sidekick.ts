@@ -32,7 +32,11 @@ import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-r
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { getSidekickAgent } from "../task/agents";
 import { runSubagentFollowUpTurn } from "../task/executor";
-import { runStructuredSubagent, StructuredSubagentError } from "../task/structured-subagent";
+import {
+	reserveStructuredSubagentId,
+	runStructuredSubagent,
+	StructuredSubagentError,
+} from "../task/structured-subagent";
 import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { cfgFusionSidekickThinking } from "../fusion/settings";
 import { cfgTaskEnableLsp } from "../task/settings";
@@ -153,6 +157,10 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 
 		const handoff = ++this.#handoffs;
 		const mode: SidekickHandoffMode = ref === undefined ? "spawn" : "rebrief";
+		// A first handoff reserves the sidekick's id up front, so its job, this
+		// call's result and the lead's journal name the sidekick from the start
+		// (a worker starts the job's body only after `register` returns).
+		const agentId = ref?.id ?? (await reserveStructuredSubagentId(this.session, { label: SIDEKICK_LABEL }));
 		const message = prompt.render(sidekickHandoffTemplate, { first: ref === undefined, message: brief });
 		// Progress streams into this call only while it is still waiting; a
 		// handoff that outlives the call (non-blocking, timeout) reports through
@@ -162,22 +170,22 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			if (!waiting) return;
 			onUpdate?.({
 				content: [{ type: "text", text: describeProgress(progress) }],
-				details: { agentId: progress.id, mode, pending: true },
+				details: { agentId, mode, pending: true },
 			});
 		};
 		const run = (runSignal: AbortSignal, onProgress: (progress: AgentProgress) => void): Promise<SingleResult> =>
 			ref === undefined
-				? this.#spawn(message, runSignal, onProgress)
+				? this.#spawn(agentId, message, runSignal, onProgress)
 				: this.#followUp(ref, message, runSignal, onProgress);
 
 		if (!manager) {
 			// Async jobs are off: every handoff blocks inside this call.
 			const inline = run(signal ?? new AbortController().signal, forwardProgress);
 			this.#inlineHandoff = inline;
-			const releaseAwait = this.#holdHandoffAwait(() => ref?.id ?? findSidekickRef(leadId)?.id);
+			const releaseAwait = this.#holdHandoffAwait(agentId);
 			try {
 				const result = await inline;
-				return textResult(reportOf(result), { agentId: result.id, mode, pending: false });
+				return textResult(reportOf(result), { agentId, mode, pending: false });
 			} finally {
 				this.#inlineHandoff = undefined;
 				releaseAwait();
@@ -187,31 +195,19 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		const jobId = manager.register(
 			"task",
 			`${SIDEKICK_LABEL} handoff ${handoff}`,
-			async ({ jobId: ownJobId, signal: runSignal, reportProgress }) => {
-				const running = run(runSignal, progress => {
-					void reportProgress(describeProgress(progress));
-					forwardProgress(progress);
-				});
-				// A first handoff's job learns its agent id once the spawn registers the
-				// sidekick, long before the run ends: a second call looks the running job
-				// up by that id to steer it. A worker's job manager starts the body only
-				// after `register` returns, so the spawn is known only in here.
-				if (!ref) {
-					void this.#spawning?.then(
-						spawned => manager.setJobAgent(ownJobId, spawned.id),
-						() => {},
-					);
-				}
-				const result = await running;
-				manager.setJobAgent(ownJobId, result.id);
-				return reportOf(result);
-			},
-			{ id: `${ref?.id ?? SIDEKICK_LABEL}-h${handoff}`, ownerId: leadId, agentId: ref?.id },
+			async ({ signal: runSignal, reportProgress }) =>
+				reportOf(
+					await run(runSignal, progress => {
+						void reportProgress(describeProgress(progress));
+						forwardProgress(progress);
+					}),
+				),
+			{ id: `${agentId}-h${handoff}`, ownerId: leadId, agentId },
 		);
 
 		if (!block) {
 			return textResult(`Handoff ${handoff} dispatched to the sidekick (job \`${jobId}\`). ${this.#waitHint()}`, {
-				agentId: ref?.id,
+				agentId,
 				jobId,
 				mode,
 				pending: true,
@@ -231,27 +227,12 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 	/**
 	 * Publish that the lead's turn is blocked on its sidekick, reading no message,
 	 * until the returned release runs: a sidekick waiting on a reply from the lead
-	 * then returns instead of waiting on a lead that cannot answer. A first
-	 * handoff learns the sidekick's id only once the spawn registers, so the hold
-	 * starts with that registration.
+	 * then returns instead of waiting on a lead that cannot answer.
 	 */
-	#holdHandoffAwait(sidekickId: () => string | undefined): () => void {
-		const registry = this.session.agentRegistry;
-		if (!registry) return () => {};
-		const waiter = this.#leadId();
-		let held: { id: string; release: () => void } | undefined;
-		const sync = (): void => {
-			const id = sidekickId();
-			if (id === undefined || id === held?.id) return;
-			held?.release();
-			held = { id, release: registry.awaits.hold(waiter, [id], { interruptible: false }) };
-		};
-		sync();
-		const unsubscribe = held ? undefined : registry.onChange(sync);
-		return () => {
-			unsubscribe?.();
-			held?.release();
-		};
+	#holdHandoffAwait(sidekickId: string): () => void {
+		return (
+			this.session.agentRegistry?.awaits.hold(this.#leadId(), [sidekickId], { interruptible: false }) ?? (() => {})
+		);
 	}
 
 	/** Steer the update into the running handoff; the sidekick folds it in rather than restarting. */
@@ -274,6 +255,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 	}
 
 	async #spawn(
+		agentId: string,
 		message: string,
 		signal: AbortSignal,
 		onProgress: (progress: AgentProgress) => void,
@@ -304,7 +286,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 					systemPrompt: renderSidekickPrompt(sidekick.systemPrompt, model.model, thinkingLevel),
 				},
 				model: `${model.model.provider}/${model.model.id}`,
-				identity: { label: SIDEKICK_LABEL },
+				identity: { id: agentId },
 				keepAlive: true,
 				retainArtifacts: true,
 				enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(settings),
@@ -368,9 +350,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		const onAbort = (): void => aborted.resolve("aborted");
 		signal?.addEventListener("abort", onAbort, { once: true });
 		manager.watchJobs([jobId]);
-		// A first handoff's job learns its agent id only after the spawn settles
-		// `#spawning`; the registry has the sidekick as soon as it registers.
-		const releaseAwait = this.#holdHandoffAwait(() => job.agentId ?? findSidekickRef(this.#leadId())?.id);
+		const releaseAwait = job.agentId ? this.#holdHandoffAwait(job.agentId) : () => {};
 		let outcome: "settled" | "timeout" | "aborted";
 		let settled: AsyncJob = job;
 		try {

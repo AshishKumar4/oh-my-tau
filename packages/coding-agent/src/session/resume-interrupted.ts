@@ -20,6 +20,8 @@ import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type { StructuredSubagentOutput, YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { AsyncJobError, type AsyncJobManagerApi } from "../async";
+import type { Settings } from "../config/settings";
+import { SIDEKICK_TOOL_NAME } from "../fusion/config";
 import { AgentRegistry } from "../registry/agent-registry";
 import { ensurePersistedRoster } from "../registry/persisted-agents";
 import { getBundledAgent, resolveRetiredAgentName } from "../task/agents";
@@ -28,7 +30,6 @@ import { finalizeSubprocessOutput, runSubagentFollowUpTurn, softRequestBudgetFor
 import { cfgTaskMaxRuntimeMs } from "../task/settings";
 import { type SubprocessToolEvent, subprocessToolRegistry } from "../task/subprocess-tool-registry";
 import type { AgentDefinition } from "../task/types";
-import type { Settings } from "../config/settings";
 import type { EventBus } from "../utils/event-bus";
 import type { AgentSession } from "./agent-session";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "./async-job-delivery";
@@ -385,6 +386,16 @@ function scanWork(
 					start({ jobId: item.id, type: "task", label: truncate(label), startedAt, requestedAt });
 				}
 			}
+		}
+		// A sidekick handoff still running when the call returned (non-blocking, or past
+		// its block) is the sidekick's run: its job delivers the report like a task's.
+		if (
+			message.toolName === SIDEKICK_TOOL_NAME &&
+			details?.pending === true &&
+			typeof details.agentId === "string" &&
+			typeof details.jobId === "string"
+		) {
+			start({ jobId: details.agentId, type: "task", label: details.agentId, startedAt, requestedAt });
 		}
 		// Messaging a parked agent revives it, and messaging an idle one wakes it, for a new
 		// run that delivers its result like a spawn.

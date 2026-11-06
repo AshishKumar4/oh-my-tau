@@ -9,6 +9,7 @@ import { findSidekickRef, listSidekickRefs } from "@oh-my-pi/pi-coding-agent/fus
 import type { VendorTool } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import { harnessSurface } from "@oh-my-pi/pi-coding-agent/harness/facades";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { AgentOutputManager } from "@oh-my-pi/pi-coding-agent/task/output-manager";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { getSidekickAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
@@ -57,9 +58,14 @@ function singleResult(output: string, overrides: Partial<SingleResult> = {}): Si
 }
 
 /** Mirrors the executor: the spawned agent lands in the registry under the lead that dispatched it. */
-function registerSidekick(status: "idle" | "running", session: AgentSession | null = null, parentId = "Main"): void {
+function registerSidekick(
+	status: "idle" | "running",
+	session: AgentSession | null = null,
+	parentId = "Main",
+	id = SIDEKICK_ID,
+): void {
 	AgentRegistry.global().register({
-		id: parentId === "Main" ? SIDEKICK_ID : `${parentId}:${SIDEKICK_ID}`,
+		id,
 		displayName: "sidekick",
 		kind: "sub",
 		parentId,
@@ -119,8 +125,9 @@ describe("fusion sidekick tool", () => {
 	function spawnSpy(output = "spawn report") {
 		return vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
 			// The executor registers the child under `session.getAgentId()`.
+			// The executor registers the child under `session.getAgentId()`, with the id the tool reserved.
 			const leadId = request.session.getAgentId?.() ?? "Main";
-			registerSidekick("idle", null, leadId);
+			registerSidekick("idle", null, leadId, request.identity?.id);
 			return {
 				result: singleResult(output, { id: findSidekickRef(leadId)?.id }),
 				policy: {} as structured.EffectiveSubagentPolicy,
@@ -200,6 +207,8 @@ describe("fusion sidekick tool", () => {
 								taskDepth: 1,
 								getAgentId: () => id,
 								agentDefinition: expertAgent({ sidekick: true }),
+								// A subagent's ids nest under its own, as the executor scopes them.
+								agentOutputManager: new AgentOutputManager(() => null, { parentPrefix: id }),
 							});
 				const tool = SidekickTool.createIf(session);
 				if (!tool) throw new Error(`sidekick tool should mount for ${id}`);

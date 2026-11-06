@@ -333,8 +333,6 @@ export interface AsyncJobManagerApi {
 	backgroundJob(jobId: string): boolean;
 	/** Drop a foreground-backed job whose result the foreground call already returned. */
 	releaseForegroundJob(jobId: string): void;
-	/** Record the subagent a job runs once its spawn registers it; the first id wins. */
-	setJobAgent(jobId: string, agentId: string): void;
 	getDeliveryState(filter?: AsyncJobFilter): AsyncJobDeliveryState;
 	hasPendingDeliveries(filter?: AsyncJobFilter): boolean;
 	watchJobs(jobIds: string[]): number;
@@ -668,11 +666,6 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
 		}
 		return true;
-	}
-
-	setJobAgent(jobId: string, agentId: string): void {
-		const job = this.#jobs.get(jobId);
-		if (job && job.agentId === undefined) job.agentId = agentId;
 	}
 
 	/**

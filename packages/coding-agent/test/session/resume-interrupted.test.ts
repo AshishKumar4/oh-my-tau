@@ -932,6 +932,28 @@ describe("/recover", () => {
 		expect(!scan.handled && scan.agents.map(agent => agent.jobId)).toEqual(["Lane", "Idle"]);
 	});
 
+	it("tracks a sidekick handoff still running when its call returned until its report arrives", () => {
+		const handoff = (id: string, agentId: string, jobId: string | undefined, pending: boolean) => {
+			manager.appendMessage(toolTurn({ id, name: "sidekick", args: { message: "Review the patch" } }));
+			manager.appendMessage(toolResult(id, "sidekick", { agentId, jobId, mode: "spawn", pending }));
+		};
+		// Non-blocking (or past its block): the handoff job still runs.
+		handoff("a", "Sidekick", "Sidekick-h1", true);
+		// Blocked to the end: the report came back with the call.
+		handoff("b", "Sidekick-2", undefined, false);
+		// Delivered later through its job.
+		handoff("c", "Sidekick-3", "Sidekick-3-h1", true);
+		manager.appendCustomMessageEntry("async-result", "done", true, {
+			jobs: [{ jobId: "Sidekick-3-h1", type: "task", agentId: "Sidekick-3" }],
+		});
+		manager.appendMessage(createAssistantMessage("pairing"));
+		openedBy(manager, "this");
+
+		const scan = findInterruptedWork(manager.getBranch());
+
+		expect(!scan.handled && scan.agents.map(agent => agent.jobId)).toEqual(["Sidekick"]);
+	});
+
 	it("steps past a process that opened the file and did nothing", () => {
 		manager.appendMessage(toolTurn({ id: "a", name: "bash", args: { command: "sleep 100" } }));
 		manager.appendMessage(toolResult("a", "bash", { async: { state: "running", jobId: "bg_1", type: "bash" } }));
