@@ -18,6 +18,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { restoreSession } from "@oh-my-pi/pi-coding-agent/task/restore";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "../helpers/agent-session-setup";
@@ -89,6 +90,7 @@ describe("restoreSession (omp --restore)", () => {
 			agent: { replaceMessages: () => {} },
 			buildDisplaySessionContext: () => main.buildSessionContext(),
 			getAgentId: () => "Main",
+			settings: Settings.isolated(),
 			sendCustomMessage: async (message: { customType: string; content: unknown }) => {
 				notices.push(message);
 				return true;
