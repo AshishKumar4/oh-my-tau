@@ -24,9 +24,10 @@ export type ImageDetail = ImageContent["detail"];
 
 export type { ImageSize };
 
-// Larger than every detail level's pixel limit, so an unknown size charges
-// the level's full patch budget.
-const UNKNOWN_SIZE: ImageSize = { width: 65_535, height: 65_535 };
+// The largest image the OpenAI wire's rule sizes: an unknown size charges a
+// detail level's full patch budget, and a level that keeps any size (GPT-5.6+
+// `original`) a 6000px square rather than an unbounded one.
+const UNKNOWN_SIZE: ImageSize = { width: 6_000, height: 6_000 };
 
 let wireRule: ImageTokenization | undefined;
 
@@ -42,7 +43,7 @@ function openAiWireRule(): ImageTokenization {
 /**
  * Estimated input tokens for one image under `rule`, the OpenAI Responses
  * wire's by default. Unknown dimensions (undecodable data, remote URLs,
- * provider file ids) charge the rule's most expensive size.
+ * provider file ids) charge the rule's most expensive size up to 6000px square.
  */
 export function estimateImageTokens(
 	size: ImageSize | null | undefined,

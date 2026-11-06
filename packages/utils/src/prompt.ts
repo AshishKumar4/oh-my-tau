@@ -534,9 +534,7 @@ export function compile(template: string): (context: TemplateContext) => string 
 	// Keyed on the raw template so repeat renders skip parsing.
 	const cached = compiledTemplateCache.get(template);
 	if (cached) return cached;
-	const compiled = handlebars.compile(template, { noEscape: true, strict: false }) as (
-		context: TemplateContext,
-	) => string;
+	const compiled = handlebars.compile<TemplateContext>(template, { noEscape: true, strict: false });
 	compiledTemplateCache.set(template, compiled);
 	return compiled;
 }

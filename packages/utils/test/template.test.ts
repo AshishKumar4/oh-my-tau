@@ -7,6 +7,20 @@ import identifierTask from "./fixtures/template/identifier-task.md" with { type:
 import sessionUser from "./fixtures/template/session-user.md" with { type: "text" };
 import structuralTask from "./fixtures/template/structural-task.md" with { type: "text" };
 
+it("renders nested else-if chains with the opening block's close and preserves following output", () => {
+	const template = create().compile(
+		"{{#each rows}}{{#if ready}}ready:{{value}}{{else if pending}}{{#if retry}}retry{{else}}wait{{/if}}{{else}}closed{{/if}};{{/each}}after",
+	);
+	expect(
+		template({ rows: [{ ready: true, value: "one" }, { pending: true, retry: true }, { pending: true }, {}] }),
+	).toBe("ready:one;retry;wait;closed;after");
+	expect(template({ rows: [] })).toBe("after");
+	const alternative = create().compile("{{#unless first}}first{{else if second}}second{{else}}third{{/unless}}!");
+	expect(alternative({ first: false })).toBe("first!");
+	expect(alternative({ first: true, second: true })).toBe("second!");
+	expect(alternative({ first: true, second: false })).toBe("third!");
+});
+
 const GOLDENS: { source: string; context: Record<string, unknown>; expected: string }[] = [
 	{
 		source: sessionUser,

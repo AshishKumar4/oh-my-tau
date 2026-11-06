@@ -1666,8 +1666,8 @@ describe("Responses Lite remote compaction", () => {
 		overrides: Partial<ModelSpec<"openai-codex-responses">> = {},
 	): Model<"openai-codex-responses"> {
 		return buildModel({
-			id: "gpt-5.6-terra",
-			name: "GPT-5.6 Terra",
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
 			api: "openai-codex-responses",
 			provider: "openai-codex",
 			baseUrl: "https://chatgpt.example/backend-api",
@@ -1883,107 +1883,145 @@ describe("Responses Lite remote compaction", () => {
 		},
 	);
 
-	test("V2 compaction isolates its Lite WebSocket from the full Responses session", async () => {
-		const providerSessionState = new Map<string, ProviderSessionState>();
-		const webSocket = installCodexCompactionWebSocket({
-			respond: (socket, outbound) => {
-				const input = outbound.input;
-				const isCompaction =
-					Array.isArray(input) && input.some(item => isRecord(item) && item.type === "compaction_trigger");
-				const events = isCompaction
-					? compactionV2Events("enc-websocket")
-					: [
-							{
-								type: "response.output_item.done",
-								item: {
-									type: "message",
-									id: "message-live-turn",
-									role: "assistant",
-									status: "completed",
-									content: [{ type: "output_text", text: "live response" }],
-								},
-							},
-							{
-								type: "response.done",
-								response: {
-									id: "response-live-turn",
-									status: "completed",
-									usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
-								},
-							},
-						];
-				for (const event of events) socket.emit(event);
+	// gpt-6-astra carries the codex harness profile in the catalog. The native
+	// surface keeps upstream's full Responses turn: top-level instructions and no
+	// parallel_tool_calls, so independent tools can run in one turn. A profiled
+	// turn sends codex-cli's envelope instead: the base prompt as the leading
+	// developer message, tool_choice "auto" and parallel_tool_calls false
+	// (ai/test/fixtures/harness/codex-0.159.2.golden.json, vendorFraming.envelope).
+	test.each([
+		[
+			"native surface",
+			null,
+			{
+				instructions: "You are a helpful assistant.",
+				firstInput: { role: "user", content: [{ type: "input_text", text: "Start the turn" }] },
+				toolChoice: undefined,
+				parallelToolCalls: undefined,
 			},
-		});
-		try {
-			const model = makeCodexLiteModel({ preferWebsockets: true });
-			const sessionId = "codex-websocket-compaction";
-			const fetchMock = vi.fn(async () => {
-				throw new Error("WebSocket-first V2 compaction unexpectedly used SSE");
+		],
+		[
+			"codex harness profile",
+			undefined,
+			{
+				instructions: undefined,
+				firstInput: {
+					type: "message",
+					role: "developer",
+					content: [{ type: "input_text", text: "You are a helpful assistant." }],
+				},
+				toolChoice: "auto",
+				parallelToolCalls: false,
+			},
+		],
+	] as const)(
+		"V2 compaction isolates its Lite WebSocket from the full Responses session (%s)",
+		async (_surface, harnessProfile, expectedLive) => {
+			const providerSessionState = new Map<string, ProviderSessionState>();
+			const webSocket = installCodexCompactionWebSocket({
+				respond: (socket, outbound) => {
+					const input = outbound.input;
+					const isCompaction =
+						Array.isArray(input) && input.some(item => isRecord(item) && item.type === "compaction_trigger");
+					const events = isCompaction
+						? compactionV2Events("enc-websocket")
+						: [
+								{
+									type: "response.output_item.done",
+									item: {
+										type: "message",
+										id: "message-live-turn",
+										role: "assistant",
+										status: "completed",
+										content: [{ type: "output_text", text: "live response" }],
+									},
+								},
+								{
+									type: "response.done",
+									response: {
+										id: "response-live-turn",
+										status: "completed",
+										usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
+									},
+								},
+							];
+					for (const event of events) socket.emit(event);
+				},
 			});
-			const liveTurn = await ai
-				.streamSimple(
+			try {
+				const model = makeCodexLiteModel({ preferWebsockets: true });
+				const sessionId = "codex-websocket-compaction";
+				const fetchMock = vi.fn(async () => {
+					throw new Error("WebSocket-first V2 compaction unexpectedly used SSE");
+				});
+				const liveTurn = await ai
+					.streamSimple(
+						model,
+						{
+							systemPrompt: ["You are a helpful assistant."],
+							messages: [{ role: "user", content: "Start the turn", timestamp: Date.now() }],
+						},
+						{
+							apiKey: "test-key",
+							fetch: fetchMock,
+							sessionId,
+							preferWebsockets: true,
+							providerSessionState,
+							...(harnessProfile !== undefined ? { harnessProfile } : {}),
+						},
+					)
+					.result();
+				expect(liveTurn.stopReason).toBe("stop");
+
+				const request = buildCompactionV2Request(
 					model,
-					{
-						systemPrompt: ["You are a helpful assistant."],
-						messages: [{ role: "user", content: "Start the turn", timestamp: Date.now() }],
-					},
-					{
-						apiKey: "test-key",
-						fetch: fetchMock,
-						sessionId,
-						preferWebsockets: true,
-						providerSessionState,
-					},
-				)
-				.result();
-			expect(liveTurn.stopReason).toBe("stop");
-
-			const request = buildCompactionV2Request(
-				model,
-				[{ type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] }],
-				"compact instructions",
-				{ sessionId },
-			);
-			const result = await requestCompactionV2Streaming(model, "test-key", request, undefined, {
-				fetch: fetchMock,
-				preferWebsockets: true,
-				providerSessionState,
-				codexCompaction: TEST_CODEX_COMPACTION,
-			});
-
-			const liveRequest = webSocket.sockets[0]?.sent[0];
-			const compactionRequest = webSocket.sockets[1]?.sent[0];
-			const compactionInput = compactionRequest?.input;
-			expect(fetchMock).not.toHaveBeenCalled();
-			expect(webSocket.sockets).toHaveLength(2);
-			expect(webSocket.sockets[0]?.sent).toHaveLength(1);
-			expect(webSocket.sockets[1]?.sent).toHaveLength(1);
-			expect(liveRequest?.instructions).toBe("You are a helpful assistant.");
-			expect(liveRequest?.parallel_tool_calls).toBeUndefined();
-			expect(compactionRequest?.type).toBe("response.create");
-			expect(compactionRequest?.instructions).toBeUndefined();
-			expect(compactionRequest?.parallel_tool_calls).toBe(false);
-			expect(Array.isArray(compactionInput) ? compactionInput.at(-1) : undefined).toEqual({
-				type: "compaction_trigger",
-			});
-			expect(result.compactionItem).toEqual({ type: "compaction", encrypted_content: "enc-websocket" });
-			expect(
-				getOpenAICodexTransportDetails(model, {
-					sessionId,
+					[{ type: "message", role: "user", content: [{ type: "input_text", text: "real user" }] }],
+					"compact instructions",
+					{ sessionId },
+				);
+				const result = await requestCompactionV2Streaming(model, "test-key", request, undefined, {
+					fetch: fetchMock,
+					preferWebsockets: true,
 					providerSessionState,
-				}),
-			).toMatchObject({
-				lastTransport: "websocket",
-				websocketConnected: true,
-				canAppend: false,
-			});
-		} finally {
-			for (const state of providerSessionState.values()) state.close();
-			providerSessionState.clear();
-			webSocket.restore();
-		}
-	});
+					codexCompaction: TEST_CODEX_COMPACTION,
+				});
+
+				const liveRequest = webSocket.sockets[0]?.sent[0];
+				const compactionRequest = webSocket.sockets[1]?.sent[0];
+				const compactionInput = compactionRequest?.input;
+				const liveInput = liveRequest?.input;
+				expect(fetchMock).not.toHaveBeenCalled();
+				expect(webSocket.sockets).toHaveLength(2);
+				expect(webSocket.sockets[0]?.sent).toHaveLength(1);
+				expect(webSocket.sockets[1]?.sent).toHaveLength(1);
+				expect(liveRequest?.instructions).toBe(expectedLive.instructions);
+				expect(Array.isArray(liveInput) ? liveInput[0] : undefined).toEqual(expectedLive.firstInput);
+				expect(liveRequest?.tool_choice).toBe(expectedLive.toolChoice);
+				expect(liveRequest?.parallel_tool_calls).toBe(expectedLive.parallelToolCalls);
+				expect(compactionRequest?.type).toBe("response.create");
+				expect(compactionRequest?.instructions).toBeUndefined();
+				expect(compactionRequest?.parallel_tool_calls).toBe(false);
+				expect(Array.isArray(compactionInput) ? compactionInput.at(-1) : undefined).toEqual({
+					type: "compaction_trigger",
+				});
+				expect(result.compactionItem).toEqual({ type: "compaction", encrypted_content: "enc-websocket" });
+				expect(
+					getOpenAICodexTransportDetails(model, {
+						sessionId,
+						providerSessionState,
+					}),
+				).toMatchObject({
+					lastTransport: "websocket",
+					websocketConnected: true,
+					canAppend: false,
+				});
+			} finally {
+				for (const state of providerSessionState.values()) state.close();
+				providerSessionState.clear();
+				webSocket.restore();
+			}
+		},
+	);
 
 	test("V2 compaction discards partial WebSocket output before SSE replay", async () => {
 		const providerSessionState = new Map<string, ProviderSessionState>();
@@ -2598,50 +2636,89 @@ describe("compact() remote compaction failure handling", () => {
 		};
 	}
 
-	test("V1 compact drops mixed-provider Anthropic state and keeps unrelated preserve data", async () => {
-		const compactionItem = { type: "compaction", encrypted_content: "enc-current-v1" };
-		const compactPaths: string[] = [];
+	test("V1 compaction keeps cleaned preserve data rather than restoring foreign native state", async () => {
+		const preparation = makePreparation();
+		preparation.previousPreserveData = {
+			anthropicCompaction: { provider: "anthropic", content: "old summary" },
+			sessionHint: "retain",
+			openaiRemoteCompaction: {
+				provider: "openai",
+				replacementHistory: [{ type: "compaction", encrypted_content: "old" }],
+				compactionItem: { type: "compaction", encrypted_content: "old" },
+			},
+		};
+		const item = { type: "compaction", encrypted_content: "fresh" };
+		const paths: string[] = [];
 		const server = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
-			fetch(req) {
-				const url = new URL(req.url);
-				compactPaths.push(`${req.method} ${url.pathname}`);
-				if (req.method === "POST" && url.pathname.endsWith("/responses/compact")) {
-					return Response.json({ output: [compactionItem] });
-				}
-				return new Response("unexpected", { status: 404 });
+			fetch(request) {
+				paths.push(`${request.method} ${new URL(request.url).pathname}`);
+				return Response.json({ output: [item] });
 			},
 		});
 		try {
-			const preparation = makePreparation();
-			preparation.previousPreserveData = {
-				anthropicCompaction: { provider: "anthropic", content: "prior anthropic summary" },
-				openaiRemoteCompaction: {
-					provider: "openai",
-					replacementHistory: [{ type: "compaction", encrypted_content: "stale-enc" }],
-					compactionItem: { type: "compaction", encrypted_content: "stale-enc" },
-				},
-				sessionHint: "keep-me",
-			};
 			const model = makeOpenAiModel({
 				baseUrl: `http://127.0.0.1:${server.port}/v1`,
 				remoteCompaction: { enabled: true, v2StreamingEnabled: false },
 			});
-
-			const result = await compact(preparation, model, "test-key");
-
-			expect(compactPaths).toEqual(["POST /v1/responses/compact"]);
+			const result = await compact(preparation, model, "fixture");
+			expect(paths).toEqual(["POST /v1/responses/compact"]);
 			expect(result.preserveData?.anthropicCompaction).toBeUndefined();
-			expect(result.preserveData?.sessionHint).toBe("keep-me");
+			expect(result.preserveData?.sessionHint).toBe("retain");
 			expect(result.preserveData?.openaiRemoteCompaction).toEqual({
 				provider: "openai",
-				replacementHistory: [compactionItem],
-				compactionItem,
+				replacementHistory: [item],
+				compactionItem: item,
 			});
 		} finally {
-			server.stop(true);
+			await server.stop(true);
 		}
+	});
+
+	test("V2 retains operator text and prior retained turns without treating wire-role context as authorship", async () => {
+		const preparation = makePreparation();
+		preparation.settings = { ...preparation.settings, remoteStreamingV2Enabled: true };
+		preparation.previousSummary = "previous generated summary";
+		preparation.messagesToSummarize = [
+			{ role: "user", content: "<environment_context>Operator quoting a literal example", timestamp: 1 },
+			{ role: "user", content: "generated continuation", attribution: "agent", timestamp: 2 },
+			{ role: "user", content: "release skill request", timestamp: 3 },
+		];
+		const model = makeOpenAiModel({ remoteCompaction: { enabled: true, v2StreamingEnabled: true } });
+		let attempt = 0;
+		const fetch: FetchImpl = async () =>
+			sseResponse([
+				{
+					type: "response.output_item.done",
+					output_index: 0,
+					item: { type: "compaction", encrypted_content: `compact-${++attempt}` },
+				},
+				{
+					type: "response.completed",
+					response: { usage: { input_tokens: 12, output_tokens: 2, total_tokens: 14 } },
+				},
+			]);
+		const first = await compact(preparation, model, "fixture", undefined, undefined, { fetch });
+		const firstHistory = getCompactionV2PreserveData(first.preserveData)?.replacementHistory;
+		if (!firstHistory) throw new Error("Expected V2 replacement history");
+		const retained = JSON.stringify(firstHistory);
+		expect(retained).toContain("Operator quoting a literal example");
+		expect(retained).toContain("release skill request");
+		expect(retained).not.toContain("generated continuation");
+		expect(retained).not.toContain("previous generated summary");
+		preparation.previousPreserveData = first.preserveData;
+		preparation.previousSummary = first.summary;
+		preparation.messagesToSummarize = [{ role: "user", content: "next operator request", timestamp: 4 }];
+		preparation.recentMessages = [];
+		const next = await compact(preparation, model, "fixture", undefined, undefined, { fetch });
+		const nextHistory = getCompactionV2PreserveData(next.preserveData)?.replacementHistory;
+		if (!nextHistory) throw new Error("Expected successive replacement history");
+		expect(nextHistory.slice(0, firstHistory.length - 1)).toEqual(firstHistory.slice(0, -1));
+		expect(JSON.stringify(nextHistory)).toContain("next operator request");
+		expect(nextHistory.filter(item => item.type === "compaction")).toEqual([
+			{ type: "compaction", encrypted_content: "compact-2" },
+		]);
 	});
 
 	test.each(["v1", "v2", "codex-v2"])(

@@ -900,6 +900,12 @@ export function getFastembedCacheDir(): string {
 	return dirs.rootSubdir(path.join("cache", "fastembed"), "cache");
 }
 
+export function getHarnessCacheDir(): string {
+	const override = process.env.OMP_HARNESS_CACHE_DIR;
+	if (override) return override;
+	return dirs.rootSubdir(path.join("cache", "harness"), "cache");
+}
+
 /** Get the on-demand fastembed runtime install root (~/.omp/cache/fastembed-runtime). */
 export function getFastembedRuntimeDir(): string {
 	return dirs.rootSubdir(path.join("cache", "fastembed-runtime"), "cache");

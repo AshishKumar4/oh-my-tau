@@ -76,7 +76,11 @@ export interface CompactionV2Usage {
 export interface CompactionV2Request {
 	body: OpenAICodexCompactionBody;
 	input: unknown[];
-	/** Serialized user-written turns to keep next to the compaction item; defaults to `input`. */
+	/**
+	 * Serialized user-written turns to keep next to the compaction item. An
+	 * explicit selection is authoritative: an operator turn quoting a contextual
+	 * prefix stays. Defaults to `input` without its contextual user messages.
+	 */
 	retainedUserItems: unknown[];
 	retainedMessageBudget: number;
 	sessionId?: string;
@@ -250,7 +254,8 @@ export function buildCompactionV2RequestFromBody(
 	return {
 		body: { ...body, model: resolveCompactionV2Model(model), input },
 		input,
-		retainedUserItems: options?.retainedUserItems ?? input,
+		retainedUserItems:
+			options?.retainedUserItems ?? input.filter(item => !isRecord(item) || !isContextualUserMessage(item)),
 		retainedMessageBudget: resolveCompactionV2RetainedMessageBudget(options?.retainedMessageBudget),
 		sessionId: options?.sessionId,
 		promptCacheKey: options?.promptCacheKey,
@@ -736,7 +741,7 @@ function isRetainedUserMessageForCompactionV2(item: Record<string, unknown>): bo
 	// Responses input messages may omit `type`: omp serializes turns as
 	// `{ role, content }`, which the API reads as `type: "message"`.
 	const isMessage = item.type === "message" || (item.type === undefined && typeof item.role === "string");
-	return isMessage && item.role === "user" && !isContextualUserMessage(item);
+	return isMessage && item.role === "user";
 }
 
 function isContextualUserMessage(item: Record<string, unknown>): boolean {

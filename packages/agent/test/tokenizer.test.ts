@@ -444,7 +444,7 @@ describe("countMessage replayed thinking", () => {
 	function reader(provider: "anthropic" | "openrouter" | "amazon-bedrock" | "google", id: string): Model {
 		const model = getBundledModel(provider, id);
 		if (!model) throw new Error(`missing bundled model ${provider}/${id}`);
-		return model as Model;
+		return model;
 	}
 
 	function signedTurn(
@@ -637,6 +637,23 @@ describe("countMessage replayed thinking", () => {
 		expect(new Tokenizer(model).countMessage(turn)).toBe(VISIBLE_TOKENS + (kept ? 1000 : 0));
 		expect(new Tokenizer(model).countMessage(turn, { excludeEncryptedReasoning: true })).toBe(VISIBLE_TOKENS);
 	});
+
+	test("an Agent recounts another Claude model's turn when only the deployment's signature policy changes", () => {
+		// The same model behind Claude's own API and behind an endpoint that is not:
+		// only the former keeps another model's signature from its deployment.
+		const claude = getBundledModel<"anthropic-messages">("anthropic", "claude-opus-5-5");
+		if (!claude.thinking) throw new Error("Expected Claude Opus 5.5 to think");
+		const thinking = { ...claude.thinking, prefixBinding: false };
+		const official: Model = { ...claude, thinking, compat: { ...claude.compat, officialEndpoint: true } };
+		const proxied: Model = { ...claude, thinking, compat: { ...claude.compat, officialEndpoint: false } };
+		const turn = signedTurn(reader("anthropic", "claude-opus-5"), VISIBLE, SIGNATURE);
+		const agent = new Agent({ initialState: { model: official, systemPrompt: [], tools: [], messages: [] } });
+		expect(agent.tokenizer.countMessage(turn)).toBe(OUTPUT_TOKENS);
+
+		agent.setModel(proxied);
+
+		expect(agent.tokenizer.countMessage(turn)).toBe(VISIBLE_TOKENS);
+	});
 });
 
 // Contract: an assistant turn's native Responses history replays its reasoning
@@ -782,15 +799,18 @@ describe("replayed Responses reasoning", () => {
 		expect(agent.tokenizer.countMessage(turn, floored)).toBe(visibleTokens(agent.tokenizer));
 	});
 
-	test("prices a replayed turn whose backend reported no reasoning tokens at its signature", () => {
+	test("prices a replayed turn whose backend reported no reasoning tokens at the ciphertext it replays", () => {
 		const unreported = codexTurn(replayed());
 		delete unreported.usage.reasoningTokens;
 		// The reasoning item still goes on the wire, so the turn is not free.
-		expect(wireReasoning(unreported)).toBe(1);
+		const sent = convertCodexResponsesMessages(sol, { messages: [unreported] }).filter(
+			item => item.type === "reasoning",
+		);
+		expect(sent).toHaveLength(1);
 		const tokenizer = new Tokenizer(sol);
-		// Its only price is the ciphertext, counted as text.
+		// Its only price is the ciphertext the request carries; the stored-context floor leaves that guess out.
 		expect(tokenizer.countMessage(unreported)).toBe(
-			visibleTokens(tokenizer) + tokenizer.countTokens(JSON.stringify(reasoningItem)),
+			visibleTokens(tokenizer) + tokenizer.countTokens(sent.map(item => JSON.stringify(item))),
 		);
 		expect(tokenizer.countMessage(unreported, floored)).toBe(visibleTokens(tokenizer));
 		// Another model re-encodes the turn without its reasoning: neither price applies.

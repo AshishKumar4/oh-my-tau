@@ -90,9 +90,9 @@ export const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE = prompt.render(contextWind
 const REMOTE_COMPACTION_REQUEST_OVERHEAD_TOKENS = 256;
 /**
  * Per-`input_image` record estimates, tagged with the pricing tokenizer's
- * billing key; trim re-probes share untouched items by reference.
+ * accounting key; trim re-probes share untouched items by reference.
  */
-const remoteImageTokenCache = new WeakMap<Record<string, unknown>, { billingKey: string; tokens: number }>();
+const remoteImageTokenCache = new WeakMap<Record<string, unknown>, { accountingKey: string; tokens: number }>();
 const TOOL_RESULT_IMAGE_ATTACHMENT_TEXT = "Attached image(s) from tool result:";
 
 /**
@@ -122,10 +122,10 @@ function collectRemoteCompactionEstimate(value: unknown, tokenizer: Tokenizer, p
 	const record = value as Record<string, unknown>;
 	if (record.type === "input_image") {
 		let cached = remoteImageTokenCache.get(record);
-		if (cached?.billingKey !== tokenizer.frameBillingKey) {
+		if (cached?.accountingKey !== tokenizer.accountingKey) {
 			const detail = record.detail;
 			cached = {
-				billingKey: tokenizer.frameBillingKey,
+				accountingKey: tokenizer.accountingKey,
 				tokens: tokenizer.imageTokens(
 					typeof record.image_url === "string" ? dataUrlImageSize(record.image_url) : null,
 					detail === "low" || detail === "high" || detail === "original" || detail === "auto" ? detail : undefined,
@@ -771,6 +771,7 @@ export function buildOpenAiNativeHistory(
 							call_id: normalized.callId,
 							name: block.customWireName,
 							input: rawInput,
+							...(block.namespace ? { namespace: block.namespace } : {}),
 						});
 						continue;
 					}
@@ -778,8 +779,9 @@ export function buildOpenAiNativeHistory(
 						type: "function_call",
 						id: itemId,
 						call_id: normalized.callId,
-						name: block.name,
+						name: block.wireName ?? block.name,
 						arguments: stringifyJson(block.arguments) ?? "null",
+						...(block.namespace ? { namespace: block.namespace } : {}),
 					});
 				}
 			}

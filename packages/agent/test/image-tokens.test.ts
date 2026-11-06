@@ -40,7 +40,7 @@ describe("image pricing by the reading model", () => {
 	function reader(provider: "anthropic" | "google" | "openai-codex", id: string): Model {
 		const model = getBundledModel(provider, id);
 		if (!model) throw new Error(`missing bundled model ${provider}/${id}`);
-		return model as Model;
+		return model;
 	}
 	const image = { type: "image" as const, data: pngWithSize(1000, 1000), mimeType: "image/png" };
 

@@ -711,7 +711,8 @@ export interface SummaryOptions {
 	) => Promise<Context>;
 	/**
 	 * Whether a message is a turn the user wrote. Remote Compaction V2 keeps these
-	 * next to the compaction item. Defaults to `role === "user"`; hosts whose
+	 * next to the compaction item, selected before wire conversion erases their
+	 * origin. Defaults to a user message not attributed to the agent; hosts whose
 	 * user-initiated turns also arrive as custom messages (e.g. skill invocations)
 	 * widen it.
 	 */
@@ -1881,7 +1882,9 @@ export async function compact(
 		// migrations, and custom/hook messages can serialize as user-role items
 		// too, so pick the user's own messages before serialization erases that,
 		// then serialize each one exactly as the request does.
-		const isUserAuthored = summaryOptions.isUserAuthored ?? ((message: AgentMessage) => message.role === "user");
+		const isUserAuthored =
+			summaryOptions.isUserAuthored ??
+			((message: AgentMessage) => message.role === "user" && message.attribution !== "agent");
 		const remoteSystemPrompt = summaryOptions.remoteSystemPrompt ?? [SUMMARIZATION_SYSTEM_PROMPT];
 		const buildV2Input = async (includeTail: boolean): Promise<RemoteCompactionV2Input> => {
 			const messages = convertToLlm(includeTail ? remoteMessages : remotePrefixMessages);

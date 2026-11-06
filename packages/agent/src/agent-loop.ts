@@ -3,6 +3,7 @@
  * Transforms to Message[] only at the LLM call boundary.
  */
 import {
+	type Api,
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type ApiKeyResolution,
@@ -17,6 +18,7 @@ import {
 	streamSimple,
 	stripSchemaDescriptions,
 	type ToolCallProviderMetadata,
+	type ToolCall,
 	type ToolChoice,
 	type ToolResultMessage,
 	type ToolResultProviderMetadata,
@@ -33,12 +35,20 @@ import {
 	wrapInbandToolStream,
 } from "@oh-my-pi/pi-ai/dialect";
 import * as AIError from "@oh-my-pi/pi-ai/error";
-import { appendDuplicateSuffix, MAX_TOOL_CALL_ID_LENGTH } from "@oh-my-pi/pi-ai/providers/transform-messages";
+import {
+	appendDuplicateSuffix,
+	isResponsesFamilyApi,
+	MAX_TOOL_CALL_ID_LENGTH,
+	responsesCallComponent,
+} from "@oh-my-pi/pi-ai/providers/transform-messages";
+import { repairResponsesHistoryCallIds } from "@oh-my-pi/pi-ai/utils";
 import {
 	type CursorExecResolvedCarrier,
 	copyCursorExecResolved,
 	getStreamingPartialJson,
+	isCursorExecResolved,
 	kCursorExecResolved,
+	type ResponsesReplayItemCarrier,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { schemaDefinesProperty } from "@oh-my-pi/pi-ai/utils/schema/json-schema-validator";
 import { stamp } from "@oh-my-pi/pi-ai/utils/schema/stamps";
@@ -53,7 +63,8 @@ import {
 	signalListLabel,
 } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { isDsmlLeakRecoveryTarget, removeDsmlToolMarkupLeak } from "@oh-my-pi/pi-ai/utils/dsml-leak";
-import { cloneJsonTree, logger, sanitizeText, structuredCloneJSON, toError } from "@oh-my-pi/pi-utils";
+import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { cloneJsonTree, isRecord, logger, sanitizeText, structuredCloneJSON, toError } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { LiveSteeringChannel } from "./live-steering";
 import { agentPauseGate } from "./pause";
@@ -649,6 +660,7 @@ export function agentLoop(
 				...context,
 				messages: [...context.messages, ...prompts],
 			};
+			initializeToolCallIds(currentContext);
 			for (const prompt of prompts) {
 				(prompt as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
 			}
@@ -715,6 +727,7 @@ export function agentLoopContinue(
 		try {
 			const newMessages: AgentMessage[] = [];
 			const currentContext: AgentContext = { ...context, messages: [...context.messages] };
+			initializeToolCallIds(currentContext, unpairedToolCallTail(currentContext.messages));
 
 			const resumeTail = unpairedToolCallTail(currentContext.messages);
 			stream.push(
@@ -1038,6 +1051,15 @@ export interface NormalizeToolsOptions {
 	intentDescription?: string;
 	/** Strip descriptions from the wire specs when the catalog rides in the system prompt. */
 	pruneDescriptions?: boolean;
+}
+
+export function injectsIntent(
+	intentTracing: boolean | undefined,
+	model: Model,
+	override?: import("@oh-my-pi/pi-catalog/compat/harness").HarnessProfile | null,
+): boolean {
+	const effective = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
+	return !!intentTracing && effective === undefined;
 }
 
 export function normalizeTools(tools: AgentContext["tools"], options: NormalizeToolsOptions): Context["tools"] {
@@ -1568,14 +1590,10 @@ async function runLoopBody(
 				}
 				if (recovered) {
 					// Mint/repair ids before any snapshot: the recovered message skipped
-					// the streamed prepare (the leak interruption landed first), and the
-					// `message_start`/`message_end` copies below are what persistence and
-					// every consumer retain. Repairing only at executeToolCalls would
-					// leave those copies under a never-materialized id while the result
-					// carries the minted one. The later prepare stays idempotent — the
-					// repaired mark rides the snapshot (object spread), and the minted
-					// ids are already claimed at run scope.
-					ensureUniqueToolCallIds(message, toolCallIdsDispatchedUnder(currentContext));
+					// the streamed prepare, and the `message_start`/`message_end` copies
+					// below are what persistence and every consumer retain. The later
+					// prepare is idempotent (the repaired mark rides the snapshot).
+					ensureUniqueToolCallIds(message, currentContext);
 					message = snapshotAssistantMessage(message);
 					currentContext.messages.push(message);
 					stream.push({ type: "message_start", message: snapshotAssistantMessage(message) });
@@ -1612,7 +1630,14 @@ async function runLoopBody(
 					const toolResults: ToolResultMessage[] = [];
 					for (const toolCall of toolCalls) {
 						const errorMessage = toolCallAbortMessages?.[toolCall.id] ?? message.errorMessage;
-						const result = createAbortedToolResult(toolCall, stream, message.stopReason, errorMessage);
+						const result = createAbortedToolResult(
+							toolCall,
+							stream,
+							message.stopReason,
+							errorMessage,
+							currentContext.tools,
+							config.resolveFallbackTool,
+						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
 						toolResults.push(result);
@@ -1699,6 +1724,8 @@ async function runLoopBody(
 							stream,
 							"skipped",
 							`Not executed: call the \`${softRequiredTool}\` tool to resolve the pending action before using other tools.`,
+							currentContext.tools,
+							config.resolveFallbackTool,
 						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
@@ -1747,7 +1774,14 @@ async function runLoopBody(
 					const skipReason = deadlinePassed ? "aborted" : message.stopReason === "length" ? "length" : "skipped";
 					const skipErrMsg = deadlinePassed ? "Deadline exceeded" : undefined;
 					for (const toolCall of toolCalls) {
-						const result = createAbortedToolResult(toolCall, stream, skipReason, skipErrMsg);
+						const result = createAbortedToolResult(
+							toolCall,
+							stream,
+							skipReason,
+							skipErrMsg,
+							currentContext.tools,
+							config.resolveFallbackTool,
+						);
 						currentContext.messages.push(result);
 						newMessages.push(result);
 						toolResults.push(result);
@@ -2001,11 +2035,12 @@ async function prepareProviderCall(
 	const ownedDialect: Dialect | undefined =
 		(config.getDialect ? config.getDialect(model) : config.dialect) ?? resolveOwnedDialectFromEnv(Bun.env.PI_DIALECT);
 	const pruneToolDescriptions = !!config.pruneToolDescriptions && !ownedDialect;
+	const intentTracing = injectsIntent(config.intentTracing, model, config.harnessProfile);
 	let llmContext: Context;
 	if (config.appendOnlyContext) {
 		config.appendOnlyContext.syncMessages(normalizedMessages);
 		llmContext = config.appendOnlyContext.build(context, {
-			intentTracing: !!config.intentTracing,
+			intentTracing,
 			intentDescription: config.intentDescription,
 			pruneToolDescriptions,
 		});
@@ -2014,7 +2049,7 @@ async function prepareProviderCall(
 			systemPrompt: context.systemPrompt,
 			messages: normalizedMessages,
 			tools: normalizeTools(context.tools, {
-				injectIntent: !!config.intentTracing,
+				injectIntent: intentTracing,
 				intentDescription: config.intentDescription,
 				pruneDescriptions: pruneToolDescriptions,
 			}),
@@ -2931,15 +2966,54 @@ function resolveToolForCall(
 	// come back under their wire-level name, which may differ from the
 	// harness-internal `name`. Match on either, preferring `name` for
 	// determinism if both somehow collide.
+	const dispatchName = toolCall.wireName ?? toolCall.name;
 	return (
-		tools?.find(t => t.name === toolCall.name) ??
-		tools?.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name) ??
+		tools?.find(t => t.name === dispatchName) ??
+		tools?.find(t => t.customWireName !== undefined && t.customWireName === dispatchName) ??
 		// Not in the advertised set: let the host route side-transport tools
 		// (e.g. xd:// device mounts) called by their top-level name. It receives
 		// the snapshot searched above, never the agent's live tools, so a
 		// mid-stream roster change cannot widen what this request can reach.
-		resolveFallbackTool?.(toolCall.name, tools ?? [])
+		resolveFallbackTool?.(dispatchName, tools ?? [])
 	);
+}
+
+function nativeArgsForToolCall(
+	tool: Pick<AgentTool, "toNativeArgs">,
+	args: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+	try {
+		const projected = tool.toNativeArgs?.(args);
+		return isRecord(projected) ? projected : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function eventArgsForToolCall(
+	tool: Pick<AgentTool, "persistAs" | "toNativeArgs"> | undefined,
+	toolCallName: string,
+	args: Record<string, unknown>,
+): Record<string, unknown> {
+	if (tool?.persistAs === undefined || toolCallName !== tool.persistAs) return args;
+	return nativeArgsForToolCall(tool, args) ?? args;
+}
+
+/**
+ * Persist the omp-shaped payload beside the wire-shaped one on a call made
+ * through a `persistAs` tool. Provider replay picks one pair by whether the
+ * dispatching tool is still declared; a call whose projection failed has no
+ * omp payload and replays as it did before this field existed.
+ */
+function recordNativeArgs(
+	toolCall: AgentToolCall,
+	tool: Pick<AgentTool, "persistAs" | "toNativeArgs"> | undefined,
+	args: Record<string, unknown>,
+): void {
+	if (tool?.persistAs === undefined || toolCall.name !== tool.persistAs) return;
+	const native = nativeArgsForToolCall(tool, args);
+	if (native === undefined) delete toolCall.nativeArguments;
+	else toolCall.nativeArguments = native;
 }
 
 /** Shortest suggestable segment; below this the match is noise (`id`, `to`). */
@@ -3016,111 +3090,65 @@ function formatToolNotFoundMessage(
 	return `Tool ${name} not found. Closest available: ${suggestions.slice(0, MAX_TOOL_NAME_SUGGESTIONS).join(", ")}`;
 }
 
-/**
- * Enforce the invariant every downstream matcher keys on: `toolCall.id` is
- * unique and non-empty across the whole run — not just within one assistant
- * message. Providers can deliver a reused id (wire length truncation, Responses
- * `callId|itemId` composite collapse) or an id that never materialized (`""`) —
- * the same occurrences the replay pipeline repairs or drops
- * (`deduplicateToolCallIds` / `sanitizeMalformedToolCalls`). Id-keyed per-call
- * state — the prepare map below, every UI and persistence matcher — would
- * otherwise merge sibling calls: the later call's prepared entry overwrites the
- * earlier's, both calls execute the sibling's payload, and colliding result ids
- * merge or drop one sibling's output in every consumer. Message-scope
- * uniqueness is not enough for the session-wide consumers
- * (`formatSessionHistoryMarkdown`'s last-entry-wins map, the advisor delta
- * split, `EventController.#toolTimelineComponents`, persistence keys): a second
- * assistant turn whose ids never materialized used to re-mint `call_1`,
- * `call_2`, … and re-derive the same `_dup` suffixes, so those consumers merged
- * the cross-turn collisions. Every id kept or minted here is therefore claimed
- * in the run-scoped registry (`toolCallIdsDispatchedUnder`) and every candidate
- * is generated until unused at run scope. Never-materialized is the sanitizer's
- * trim test (`isMalformedToolCallId`): a whitespace-only id is minted like an
- * empty one, never kept — it would be dropped from provider replay together
- * with its result, the live/replay divergence this repair exists to close.
- * Cursor server-resolved blocks are never re-keyed (the provider correlates
- * their results out-of-band under its own ids) but their ids still join the
- * registry so no minted candidate collides with one. Idempotent: the message is
- * marked repaired and re-entry is a no-op, so the Harmony path can repair
- * before its snapshots while the dispatch-time prepare sees the already-minted
- * ids and leaves them alone.
- */
 const kToolCallIdsRepaired = Symbol("agent-loop.toolCallIdsRepaired");
+type RepairedCallsMessage = AssistantMessage & { [kToolCallIdsRepaired]?: true };
+const dispatchedIdsByContext = new WeakMap<AgentContext, Set<string>>();
 
-/** Assistant message optionally carrying the {@link kToolCallIdsRepaired} mark. */
-type ToolCallIdsRepairedCarrier = AssistantMessage & { [kToolCallIdsRepaired]?: true };
-
-/**
- * Run-scoped registry of every tool-call id {@link ensureUniqueToolCallIds} has
- * kept, minted, or seen on a server-resolved block under one
- * {@link AgentContext}. Keyed by the dispatch context (the same object every
- * `prepareToolCallDispatch` receives) so the uniqueness window spans every
- * assistant turn of the run rather than resetting per message. Each run gets a
- * fresh loop context, so minted ids use the process-unique `mintToolCallId`.
- */
-const dispatchedToolCallIdsByContext = new WeakMap<AgentContext, Set<string>>();
-
-function toolCallIdsDispatchedUnder(context: AgentContext): Set<string> {
-	let dispatched = dispatchedToolCallIdsByContext.get(context);
-	if (!dispatched) {
-		dispatched = new Set();
-		dispatchedToolCallIdsByContext.set(context, dispatched);
-	}
-	return dispatched;
+function callIdentity(id: string, api: Api): string {
+	return isResponsesFamilyApi(api) ? responsesCallComponent(id) : id;
 }
 
-function ensureUniqueToolCallIds(message: ToolCallIdsRepairedCarrier, dispatchedIds: Set<string>): void {
-	if (message[kToolCallIdsRepaired] === true) return;
-	const content = message.content;
-	const reserved = new Set<string>();
-	for (const block of content) {
-		if (block.type === "toolCall" && block.id) reserved.add(block.id);
+function initializeToolCallIds(context: AgentContext, resumeTail?: AssistantMessage): void {
+	const ids = new Set<string>();
+	for (const message of context.messages) {
+		if (message.role !== "assistant" || message === resumeTail) continue;
+		for (const block of message.content)
+			if (block.type === "toolCall" && block.id.trim()) ids.add(callIdentity(block.id, message.api));
 	}
-	const seen = new Set<string>();
-	for (const block of content) {
-		if (block.type !== "toolCall") continue;
-		if ((block as CursorExecResolvedCarrier)[kCursorExecResolved] === true) {
-			if (block.id?.trim()) dispatchedIds.add(block.id);
+	dispatchedIdsByContext.set(context, ids);
+}
+
+/** Dispatch and native replay must agree before any finalized message is persisted. */
+function ensureUniqueToolCallIds(message: RepairedCallsMessage, context: AgentContext): void {
+	const used = dispatchedIdsByContext.get(context);
+	if (!used) throw new Error("Tool-call identity registry was not initialized for this run");
+	const calls = message.content.filter(block => block.type === "toolCall");
+	if (message[kToolCallIdsRepaired]) {
+		for (const call of calls) used.add(callIdentity(call.id, message.api));
+		return;
+	}
+	for (const call of calls) if (isCursorExecResolved(call)) used.add(callIdentity(call.id, message.api));
+	const reserved = new Set(calls.map(call => callIdentity(call.id, message.api)));
+	const repairs: Array<{ call: ToolCall & ResponsesReplayItemCarrier; id: string }> = [];
+	const claimed = new Set<string>();
+	for (const call of calls) {
+		const key = callIdentity(call.id, message.api);
+		if (isCursorExecResolved(call)) {
+			claimed.add(key);
 			continue;
 		}
-		if (block.id?.trim() && !seen.has(block.id) && !dispatchedIds.has(block.id)) {
-			seen.add(block.id);
-			dispatchedIds.add(block.id);
+		const malformed = !call.id.trim() || (isResponsesFamilyApi(message.api) && call.id.startsWith("|"));
+		if (!malformed && !used.has(key) && !claimed.has(key)) {
+			claimed.add(key);
 			continue;
 		}
-		let candidate: string;
-		if (block.id?.trim()) {
-			let suffix = 1;
-			candidate = appendDuplicateSuffix(block.id, `_dup${suffix}`, MAX_TOOL_CALL_ID_LENGTH);
-			while (seen.has(candidate) || reserved.has(candidate) || dispatchedIds.has(candidate)) {
-				suffix += 1;
-				candidate = appendDuplicateSuffix(block.id, `_dup${suffix}`, MAX_TOOL_CALL_ID_LENGTH);
-			}
-		} else {
-			// Process-unique minter: a per-run counter would re-mint `call_1` in
-			// every run and collide with earlier runs' calls in session history.
-			do {
-				candidate = mintToolCallId();
-			} while (seen.has(candidate) || reserved.has(candidate) || dispatchedIds.has(candidate));
-		}
-		block.id = candidate;
-		seen.add(candidate);
-		dispatchedIds.add(candidate);
+		let suffix = 0;
+		let id: string;
+		let identity: string;
+		do {
+			id = malformed ? mintToolCallId() : appendDuplicateSuffix(call.id, `_dup${++suffix}`, MAX_TOOL_CALL_ID_LENGTH);
+			identity = callIdentity(id, message.api);
+		} while (used.has(identity) || claimed.has(identity) || reserved.has(identity));
+		repairs.push({ call, id });
+		claimed.add(identity);
 	}
+	repairResponsesHistoryCallIds(message, repairs);
+	for (const repair of repairs) repair.call.id = repair.id;
+	for (const id of claimed) used.add(id);
 	message[kToolCallIdsRepaired] = true;
 }
 
-/**
- * Pre-dispatch phase for every pending tool call on `assistantMessage`, run in
- * call order: tool-call id repair, intent extraction, argument validation, and
- * the `beforeToolCall` hook. A hook `args` revision is revalidated against the
- * tool schema and written back to `toolCall.arguments`; run before
- * `message_start`/`message_end` (the streamed path) that makes the revision the
- * single source of truth — history, execution events, persistence, provider
- * replay, concurrency scheduling, and `tool.execute` all agree. Id repair in
- * {@link ensureUniqueToolCallIds} follows the same rule. Failures are recorded
- * per call and surfaced by `executeToolCalls` at the record's scheduled slot.
- */
+/** Resolve IDs, tool arguments and hook revisions before persisting or executing a finalized call. */
 async function prepareToolCallDispatch(
 	assistantMessage: AssistantMessage,
 	context: AgentContext,
@@ -3128,9 +3156,7 @@ async function prepareToolCallDispatch(
 	signal: AbortSignal | undefined,
 ): Promise<Map<string, PreparedToolCall>> {
 	const { resolveFallbackTool, suggestFallbackToolNames, intentTracing, beforeToolCall } = config;
-	// Unique, non-empty ids first: everything below and every consumer of this
-	// message keys per-call state on `toolCall.id`.
-	ensureUniqueToolCallIds(assistantMessage, toolCallIdsDispatchedUnder(context));
+	ensureUniqueToolCallIds(assistantMessage, context);
 	const prepared = new Map<string, PreparedToolCall>();
 	for (const toolCall of assistantMessage.content) {
 		if (toolCall.type !== "toolCall") continue;
@@ -3139,13 +3165,26 @@ async function prepareToolCallDispatch(
 		// A host fallback accepts aliases (`xd://recall`, a mis-separated MCP
 		// name) that providers reject when replayed as a function-call name.
 		// Record the call under the resolved tool's canonical name so history,
-		// persistence, and replay agree; custom-wire calls keep their wire name.
-		if (tool && toolCall.name !== tool.name && toolCall.name !== tool.customWireName) {
+		// persistence, and replay agree; custom-wire calls keep their wire name,
+		// and a facade call already recorded under its target stays there.
+		if (
+			tool &&
+			toolCall.name !== tool.name &&
+			toolCall.name !== tool.customWireName &&
+			toolCall.name !== tool.persistAs
+		) {
 			toolCall.name = tool.name;
 		}
-		const entry: PreparedToolCall = { tool, args: toolCall.arguments as Record<string, unknown> };
+		// A harness facade persists under its target's omp name and keeps its own
+		// canonical name (never a fallback alias) as the wire name it dispatches
+		// and replays by.
+		if (tool?.persistAs !== undefined && toolCall.name !== tool.persistAs) {
+			toolCall.wireName = toolCall.name;
+			toolCall.name = tool.persistAs;
+		}
+		const entry: PreparedToolCall = { tool, args: toolCall.arguments };
 		prepared.set(toolCall.id, entry);
-		let argsForExecution = toolCall.arguments as Record<string, unknown>;
+		let argsForExecution = toolCall.arguments;
 		if (intentTracing) {
 			// A schema-owned `i` is a tool argument, never a harness intent.
 			const ownsIntent = tool !== undefined && schemaDefinesProperty(toolWireSchema(tool), INTENT_FIELD);
@@ -3183,6 +3222,7 @@ async function prepareToolCallDispatch(
 		const effectiveArgs = validate(argsForExecution);
 		if (effectiveArgs === undefined) continue;
 		entry.args = effectiveArgs;
+		recordNativeArgs(toolCall, tool, effectiveArgs);
 		if (!beforeToolCall || !tool) continue;
 		let beforeResult: BeforeToolCallResult | undefined;
 		try {
@@ -3213,6 +3253,7 @@ async function prepareToolCallDispatch(
 			// the call anywhere downstream.
 			toolCall.arguments = beforeResult.args;
 			entry.args = revised;
+			recordNativeArgs(toolCall, tool, revised);
 		}
 	}
 	return prepared;
@@ -3520,7 +3561,7 @@ async function executeToolCalls(
 				type: "tool_execution_start",
 				toolCallId: toolCall.id,
 				toolName: toolCall.name,
-				args: record.args,
+				args: eventArgsForToolCall(record.tool, toolCall.name, record.args),
 				intent: toolCall.intent,
 			});
 		}
@@ -3611,7 +3652,7 @@ async function executeToolCalls(
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
-			args: effectiveArgs,
+			args: eventArgsForToolCall(tool, toolCall.name, effectiveArgs),
 			intent: toolCall.intent,
 		});
 
@@ -3713,7 +3754,7 @@ async function executeToolCalls(
 									type: "tool_execution_update",
 									toolCallId: toolCall.id,
 									toolName: toolCall.name,
-									args: executionArgs,
+									args: eventArgsForToolCall(tool, toolCall.name, executionArgs),
 									partialResult: coerceToolResult(partialResult).result,
 								};
 								if (stream.done) config.onDetachedToolUpdate?.(event);
@@ -4094,18 +4135,21 @@ function createAbortedToolResult(
 	stream: EventStream<AgentEvent, AgentMessage[]>,
 	reason: "aborted" | "error" | "skipped" | "length",
 	errorMessage?: string,
+	tools?: AgentTool<any>[] | undefined,
+	resolveFallbackTool?: AgentLoopConfig["resolveFallbackTool"],
 ): ToolResultMessage {
 	const toolResultMessage = createSyntheticToolResultMessage(toolCall, reason, errorMessage);
 	const result: AgentToolResult<SyntheticToolResultDetails> = {
 		content: toolResultMessage.content,
 		details: toolResultMessage.details,
 	};
+	const tool = tools === undefined ? undefined : resolveToolForCall(tools, toolCall, resolveFallbackTool);
 
 	stream.push({
 		type: "tool_execution_start",
 		toolCallId: toolCall.id,
 		toolName: toolCall.name,
-		args: toolCall.arguments,
+		args: eventArgsForToolCall(tool, toolCall.name, toolCall.arguments),
 		intent: toolCall.intent,
 	});
 	stream.push({
