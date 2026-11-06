@@ -14,6 +14,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import type { AsyncJob } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { withRenderedEnvelope } from "@oh-my-pi/pi-coding-agent/harness/content";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
@@ -21,6 +22,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent/extensibility/exten
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { buildAsyncResultBlock } from "@oh-my-pi/pi-tui/chat/transcript-render-helpers";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { SafeString } from "@oh-my-pi/pi-utils/template";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { ArtifactManager } from "@oh-my-pi/pi-coding-agent/session/artifacts";
 import {
@@ -287,7 +289,16 @@ describe("AgentSession owner-routed async delivery", () => {
 			{ totalDurationMs: 1000 },
 		);
 		expect(envelope).toContain("<output>");
-		manager.register("task", "review", async () => envelope, { id: "Reviewer", ownerId: "Lead" });
+		// The task job hands over its envelope as rendered, the way `task` does.
+		manager.register(
+			"task",
+			"review",
+			async () => withRenderedEnvelope({ text: envelope }, new SafeString(envelope)),
+			{
+				id: "Reviewer",
+				ownerId: "Lead",
+			},
+		);
 		await session.settleAsyncWork();
 
 		const delivered = mock.calls

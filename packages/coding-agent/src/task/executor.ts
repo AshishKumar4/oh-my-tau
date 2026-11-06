@@ -3667,7 +3667,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
  * result, or, when the owner asked and no result came, what a relay would have
  * carried. Throws for a failed run, as a failed job.
  */
-function laneJobOutcome(end: LaneRunEnd, carrier: string): string | AsyncJobRunResult {
+function laneJobOutcome(end: LaneRunEnd, carrier: string): AsyncJobRunResult {
 	if (!end.yielded) {
 		const body = buildWakeRelayBody({
 			...end,
@@ -3696,10 +3696,12 @@ function laneJobOutcome(end: LaneRunEnd, carrier: string): string | AsyncJobRunR
  * turn's settle callback, which returns at once so the session's settle drain
  * is never held up by the run.
  *
- * The run's owner-routed job opens with it, so the parent's `wait` and job
- * list see the lane working; the job's body settles with the run, and
- * cancelling the job cancels the run. A parent manager with no room at the
- * open gets the job at the run's end, else the result as a message. A result
+ * The parent's job for the run opens when the run is one the parent asked
+ * for (its message woke the run, or a steer from it entered a turn) or when
+ * the run yields, so the parent's `wait` and job list see the lane working;
+ * the job's body settles with the run, and cancelling the job cancels the
+ * run. A parent manager with no room then gets the job at the run's end,
+ * else the result as a message. A result
  * ({@link LaneRunOutcome.yielded}), and any end of a run the owner asked for
  * (its message started or joined the run), is delivered through the job, so
  * the owner hears it once; any other run settles the job quietly, its answer
@@ -3767,8 +3769,7 @@ function openWakeRun(
 	void ended.then(end => {
 		if (!publishAtEnd || !manager || !ownerId) return;
 		try {
-			const outcome = laneJobOutcome(end, ownerId);
-			manager.publishCompleted("task", id, typeof outcome === "string" ? { text: outcome } : outcome, {
+			manager.publishCompleted("task", id, laneJobOutcome(end, ownerId), {
 				id,
 				agentId: id,
 				ownerId,
@@ -3839,8 +3840,8 @@ function openWakeRun(
 		}
 	};
 	// The parent hears about a run it asked for: one it woke opens its job now; a
-	// peer's run gets one only once a parent message steered into it is
-	// consumed (a message_end proves it entered a turn; receipt alone does not).
+	// peer's run gets one once a parent message steered into it is consumed (a
+	// message_end proves it entered a turn; receipt alone does not) or it yields.
 	if (ownerWoken) jobOwnerId = routeToParent();
 	else {
 		const stopParentSteers = session.subscribe(event => {
