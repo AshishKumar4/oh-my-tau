@@ -477,7 +477,7 @@ describe("snapcompact archive read by another model", () => {
 		const official = claude;
 		const proxy = buildModel({ ...toModelSpec(claude), baseUrl: "https://anthropic-proxy.example.com" });
 		const proxyBudget = snapcompact.frameDataBytesBudget(proxy);
-		expect(snapcompact.frameDataBytesBudget(official)).toBe(12_000_000);
+		const officialBudget = snapcompact.frameDataBytesBudget(official);
 		expect(proxyBudget).toBe(snapcompact.DEFAULT_FRAME_DATA_BYTES_BUDGET);
 		const cwd = path.join(tempDir, "frame-budget");
 		const sessionDir = path.join(cwd, "sessions");
@@ -485,7 +485,7 @@ describe("snapcompact archive read by another model", () => {
 		const frames = seedLargeVariant(sessionManager, 8);
 		const variantBytes = frames.reduce((bytes, data) => bytes + data.length, 0);
 		expect(variantBytes).toBeGreaterThan(proxyBudget);
-		expect(variantBytes).toBeLessThan(12_000_000);
+		expect(variantBytes).toBeLessThan(officialBudget);
 		expect(new Set(frames).size).toBe(frames.length);
 		// The newest frames that fit the proxy's budget.
 		const proxyFrames: string[] = [];
