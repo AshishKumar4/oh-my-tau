@@ -184,7 +184,9 @@ function createHarness(options?: {
 		trackIrcReply: () => {},
 		holdIrcWakes: () => () => {},
 		subscribeRunState: () => () => {},
-		isParentIrcSteer: () => false,
+		// A steered message the agent loop consumed carries the parent's flag, as IrcBridge marks it.
+		isParentIrcSteer: (message: AgentMessage) =>
+			message.role === "custom" && isRecord(message.details) && message.details.fromParent === true,
 		asyncJobManager: options?.asyncJobManager,
 	};
 	return {
@@ -1027,19 +1029,19 @@ describe("runSubprocess result acceptance", () => {
 				} as unknown as AgentMessage,
 			]);
 			// The parent's message arrives mid-turn: IrcBridge steers it in and
-			// publishes it as an `irc_message`; no wake observer sees it.
-			harness.emit({
-				type: "irc_message",
-				message: {
-					role: "custom",
-					customType: "irc:incoming",
-					content: "and the mask path?",
-					display: true,
-					details: { id: "msg-parent", from: "Parent", message: "and the mask path?", fromParent: true },
-					attribution: "agent",
-					timestamp: Date.now(),
-				},
-			} as AgentSessionEvent);
+			// publishes it as an `irc_message`; no wake observer sees it. The agent
+			// loop then consumes it (message_end), which is what makes it the parent's run.
+			const steer = {
+				role: "custom",
+				customType: "irc:incoming",
+				content: "and the mask path?",
+				display: true,
+				details: { id: "msg-parent", from: "Parent", message: "and the mask path?", fromParent: true },
+				attribution: "agent",
+				timestamp: Date.now(),
+			} as const;
+			harness.emit({ type: "irc_message", message: steer } as AgentSessionEvent);
+			harness.emit({ type: "message_end", message: steer } as unknown as AgentSessionEvent);
 			const waiting = new WaitTool(parent).execute("parent-wait", {});
 			harness.emitAssistantText("line 42 is fine; mask path fixed");
 			await finish?.(undefined);

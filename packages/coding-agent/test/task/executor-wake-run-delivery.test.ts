@@ -733,7 +733,7 @@ describe("IRC wake run delivery", () => {
 		expect(result.output).toContain("handoff: summary written");
 		expect(result.output).not.toContain("probe passed");
 	});
-	it("returns the parent's wait with the quiet settle when a run a peer started only answers", async () => {
+	it("gives the parent no job for a run a peer started, so its wait does not block on it", async () => {
 		const lane = createLane([
 			toolCall("background", { label: "probe" }),
 			{ content: ["Waiting for the probe."] },
@@ -744,19 +744,13 @@ describe("IRC wake run delivery", () => {
 		await IrcBus.global().send({ from: REVIEWER, to: LANE, body: "Does the probe pass?" });
 		await lane.jobStarted;
 		await lane.session.waitForIdle();
-		let returned = false;
-		const waiting = parentWait(lane)
-			.execute("wait-1", {})
-			.finally(() => {
-				returned = true;
-			});
-		await drainEventLoop();
-		expect(returned).toBe(false);
+		// The run is the reviewer's: the parent owns nothing to wait on.
+		expect(parentJobs(lane)).not.toContain(LANE);
+		const waited = await parentWait(lane).execute("wait-1", {});
+		expect(waited.details).toMatchObject({ jobs: [] });
 
 		lane.finishJob("3 of 3 passed");
-		const result = await waiting;
-		const text = result.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
-		expect(text).toContain(`${LANE} answered by message and recorded no result.`);
+		await lane.runEnded;
 		await lane.settle();
 		expect(lane.delivered).toEqual([]);
 		expect(relaysTo(REVIEWER)).toEqual(["The probe passed; nothing to record."]);

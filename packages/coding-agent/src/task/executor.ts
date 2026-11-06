@@ -3828,7 +3828,17 @@ function openWakeRun(
 			return undefined;
 		}
 	};
-	jobOwnerId = routeToParent();
+	// The parent hears about a run it asked for: one it woke opens its job now; a
+	// peer's run gets one only once a parent message steered into it is
+	// consumed (a message_end proves it entered a turn; receipt alone does not).
+	if (ownerWoken) jobOwnerId = routeToParent();
+	else {
+		const stopParentSteers = session.subscribe(event => {
+			if (event.type !== "message_end" || !session.isParentIrcSteer(event.message)) return;
+			jobOwnerId ??= routeToParent();
+		});
+		void ended.finally(stopParentSteers);
+	}
 	return turnError => firstTurn.resolve(turnError);
 }
 
