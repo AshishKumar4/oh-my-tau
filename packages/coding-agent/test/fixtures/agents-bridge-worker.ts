@@ -48,6 +48,8 @@ export interface AgentsProbe {
 	rewriteInterior(id: string, text: string): Promise<void>;
 	/** Custom message types of the local session's transcript. */
 	localCustomTypes(id: string): Promise<string[]>;
+	/** Text of the local session's last custom message of `customType`. */
+	localCustomText(id: string, customType: string): Promise<string>;
 	/** Keep the current ref object for `id`. */
 	grab(id: string): Promise<number>;
 	/** CAS `setStatus` with the grabbed ref, then with a fresh one. */
@@ -153,6 +155,15 @@ const probe: AgentsProbe = {
 	},
 	localCustomTypes: async id =>
 		local(id).messages.flatMap(message => (message.role === "custom" ? [message.customType] : [])),
+	localCustomText: async (id, customType) => {
+		const message = local(id).messages.findLast(
+			candidate => candidate.role === "custom" && candidate.customType === customType,
+		);
+		if (message?.role !== "custom") throw new Error(`no ${customType} message on ${id}`);
+		return typeof message.content === "string"
+			? message.content
+			: message.content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("");
+	},
 	grab: async id => {
 		const ref = AgentRegistry.global().get(id);
 		if (!ref) throw new Error(`no ref ${id}`);

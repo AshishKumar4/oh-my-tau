@@ -25,7 +25,7 @@ import {
 	type AsyncJobProcess,
 	type AsyncJobRegisterOptions,
 } from "../../async/job-manager";
-import { withRenderedEnvelope } from "../../harness/content";
+import { carryRenderedEnvelope, withRenderedEnvelope } from "../../harness/content";
 import { TextTap } from "../../job-widgets/text-tap";
 import type { JobTextSource, JobWidgetBrief, JobWidgetInputs } from "../../job-widgets/types";
 import type { ThreadId } from "../identity";
@@ -138,7 +138,7 @@ class JobFeedMirror implements JobWidgetInputs {
 /** Cloneable projection of a main job row. */
 export function toJobWire(job: AsyncJob): AsyncJobWire {
 	const process = job.process;
-	return {
+	return carryRenderedEnvelope(job, {
 		id: job.id,
 		type: job.type,
 		status: job.status,
@@ -170,7 +170,7 @@ export function toJobWire(job: AsyncJob): AsyncJobWire {
 				}
 			: undefined,
 		hasWidgetInputs: job.widgetInputs !== undefined,
-	};
+	});
 }
 
 function toJobWires(jobs: readonly AsyncJob[]): AsyncJobWire[] {
@@ -218,19 +218,14 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 						markRunning: ctx.markRunning,
 						pushFeed: feed ? delta => feed.apply(delta, true) : undefined,
 					};
-					return run(wire).then(
-						outcome => {
-							if (typeof outcome === "string" || !outcome.rendered) return outcome;
-							const { rendered: _, ...result } = outcome;
-							return withRenderedEnvelope(result, new SafeString(result.text));
-						},
-						(error: unknown) => {
-							if (error instanceof Error && Reflect.get(error, WIRE_RENDERED_ERROR_FIELD) === true) {
-								withRenderedEnvelope(error, new SafeString(error.message));
-							}
-							throw error;
-						},
-					);
+					// A result object's envelope crosses through the link's codec; an error's
+					// takes RPC's error path, which keeps only string-keyed fields.
+					return run(wire).catch((error: unknown) => {
+						if (error instanceof Error && Reflect.get(error, WIRE_RENDERED_ERROR_FIELD) === true) {
+							withRenderedEnvelope(error, new SafeString(error.message));
+						}
+						throw error;
+					});
 				},
 				mainRegisterOptions(options, feed),
 			);

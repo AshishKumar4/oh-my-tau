@@ -34,7 +34,7 @@ import type {
 	AsyncJobRunResult,
 	AsyncJobType,
 } from "../../async/job-manager";
-import { getRenderedEnvelope } from "../../harness/content";
+import { carryRenderedEnvelope, getRenderedEnvelope } from "../../harness/content";
 import type { JobTextSource, JobWidgetInputs, JobWidgetRegistry } from "../../job-widgets/types";
 import type { RemoteObject } from "../rpc";
 import {
@@ -155,6 +155,8 @@ export class RemoteAsyncJob implements AsyncJob {
 			local?.process ??
 			(wire.process ? { command: wire.process.command, cwd: wire.process.cwd, pids: () => pids } : undefined);
 		this.widgetInputs = local?.widgetInputs;
+		// Main's row may carry a producer's rendered envelope; deliveries here read it off this row.
+		carryRenderedEnvelope(wire, this);
 	}
 
 	/** Settles when main's run promise settles; never rejects. */
@@ -245,14 +247,12 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		const feed = local ? new WorkerJobFeed(local) : undefined;
 		const wired: WireJobRun = async ctx => {
 			try {
-				const outcome = await run({
+				return await run({
 					jobId: ctx.jobId,
 					signal: fromWireSignal(ctx.signal),
 					reportProgress: ctx.reportProgress,
 					markRunning: () => ignoreSettle(ctx.markRunning()),
 				});
-				if (typeof outcome === "string" || !getRenderedEnvelope(outcome, outcome.text)) return outcome;
-				return { ...outcome, rendered: true };
 			} catch (error) {
 				if (error instanceof Error && getRenderedEnvelope(error, error.message)) {
 					Object.defineProperty(error, WIRE_RENDERED_ERROR_FIELD, { value: true, configurable: true });

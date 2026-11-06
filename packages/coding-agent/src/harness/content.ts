@@ -18,6 +18,24 @@ export function withRenderedEnvelope<T extends object>(carrier: T, rendered: Saf
 	return carrier;
 }
 
+/**
+ * `carrier` and its envelope marker apart, for moving the marker across a worker
+ * thread link (which drops symbol-keyed fields); undefined when it carries none.
+ */
+export function detachRenderedEnvelope(carrier: object): { value: object; rendered: string } | undefined {
+	const rendered = Object.getOwnPropertyDescriptor(carrier, renderedEnvelope)?.value;
+	if (!(rendered instanceof SafeString)) return undefined;
+	const value: object = Array.isArray(carrier) ? [...carrier] : { ...carrier };
+	Reflect.deleteProperty(value, renderedEnvelope);
+	return { value, rendered: rendered.toString() };
+}
+
+/** Give `to`, a projection of `from` (a job's wire row), the envelope marker `from` carries. */
+export function carryRenderedEnvelope<T extends object>(from: object, to: T): T {
+	const rendered = Object.getOwnPropertyDescriptor(from, renderedEnvelope)?.value;
+	return rendered instanceof SafeString ? withRenderedEnvelope(to, rendered) : to;
+}
+
 /** Only unchanged, in-process rendering metadata can preserve an envelope. */
 export function getRenderedEnvelope(carrier: object | undefined, text: string): SafeString | undefined {
 	if (!carrier) return undefined;

@@ -109,17 +109,14 @@ export interface WireRunContext {
 }
 
 /**
- * A worker job body's result as main receives it. `rendered` marks text the
- * body produced as a trusted envelope (`withRenderedEnvelope`), whose
- * symbol-keyed marker a copy across the link drops.
+ * Hidden field on a job body's error whose message is a trusted envelope
+ * (`withRenderedEnvelope`): RPC's error path keeps only string-keyed fields,
+ * so the symbol-keyed marker is restored from it on main.
  */
-export type WireJobRunResult = string | (AsyncJobRunResult & { rendered?: true });
-
-/** Hidden field on a job body's error whose message is a trusted envelope; see {@link WireJobRunResult}. */
 export const WIRE_RENDERED_ERROR_FIELD = "renderedEnvelope";
 
 /** A worker job body as main calls it. */
-export type WireJobRun = (ctx: WireRunContext) => Promise<WireJobRunResult>;
+export type WireJobRun = (ctx: WireRunContext) => Promise<string | AsyncJobRunResult>;
 
 /** A worker delivery sink as main calls it. */
 export type WireDeliverySink = (jobId: string, text: string, job?: AsyncJobWire) => void | Promise<void>;
