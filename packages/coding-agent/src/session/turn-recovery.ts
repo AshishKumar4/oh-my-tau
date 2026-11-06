@@ -3137,6 +3137,12 @@ export class TurnRecovery {
 				{
 					success: false,
 					attempt,
+					// A billing cap has no wait to report — the account is out of
+					// money — so the message the user acts on is the provider's own
+					// (with every exhausted pool named when several are spent).
+					finalError: billingCap
+						? this.#credentialFailureError(errorMessage, id)
+						: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${this.#credentialFailureError(errorMessage, id)}`,
 				},
 				{ terminalTurn: message },
 			);
