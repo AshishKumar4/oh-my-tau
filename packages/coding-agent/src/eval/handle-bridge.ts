@@ -209,10 +209,13 @@ export async function runEvalWait(
 ): Promise<{ items: EvalHandleSnapshot[] }> {
 	const { items, timeoutMs } = parseRefs(args);
 	const resolved = items.map(item => resolveHandle(item, options));
+	// A worker's job rows are snapshots taken when read: read a job's row again for its current state.
+	const current = (handle: ResolvedHandle): ResolvedHandle =>
+		"job" in handle ? { ...handle, job: handle.manager.getJob(handle.ref.id) ?? handle.job } : handle;
 	const emittedProgress = new Map<string, unknown>();
 	const emitLatestProgress = (handle: ResolvedHandle): void => {
 		if (!("job" in handle)) return;
-		const progress = emitProgress(handle, options.emitStatus, emittedProgress.get(handle.ref.id));
+		const progress = emitProgress(current(handle), options.emitStatus, emittedProgress.get(handle.ref.id));
 		if (progress) emittedProgress.set(handle.ref.id, progress);
 	};
 	return await withBridgeTimeoutPause(
@@ -250,8 +253,9 @@ export async function runEvalWait(
 				);
 				throw new ToolAbortError(undefined, { cause: options.signal?.reason });
 			}
-			const snapshots = resolved.map(snapshot);
-			const settledAgentIds = resolved
+			const settled = resolved.map(current);
+			const snapshots = settled.map(snapshot);
+			const settledAgentIds = settled
 				.filter(handle => "job" in handle && handle.job.status !== "running")
 				.map(handle => handle.ref.id);
 			const manager = options.session.asyncJobManager;

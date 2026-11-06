@@ -136,6 +136,20 @@ describe("runtime thread services: async jobs", () => {
 		expect(await probe("deliveries")).toEqual([{ jobId: id, text: "all done", status: "completed", isRow: true }]);
 	});
 
+	it("settles an eval wait in the worker on the job's row as it is after the wait, and consumes its result", async () => {
+		const manager = newManager();
+		const probe = await startWorker();
+		const id = await jobId(probe, manager, "Worker");
+
+		// The job finishes while the worker's wait holds on it.
+		const waited = probe("evalWait", manager, "Worker", id);
+		await Bun.sleep(20);
+		await probe("finish", id, "all done");
+
+		expect(await waited).toEqual({ items: [{ kind: "agent", id, status: "completed", text: "all done" }] });
+		expect(manager.isJobResultConsumed(id)).toBe(true);
+	});
+
 	it("cancels the worker body from main and keeps the shutdown reason a symbol", async () => {
 		const manager = newManager();
 		const probe = await startWorker();

@@ -5,6 +5,7 @@ import {
 	type AsyncJobRunResult,
 } from "../../src/async/job-manager";
 import { Settings } from "../../src/config/settings";
+import { runEvalWait } from "../../src/eval/handle-bridge";
 import { TextTap } from "../../src/job-widgets/text-tap";
 import type { ArtifactManagerApi } from "../../src/session/artifacts";
 import { CostCapError, type CostGateApi } from "../../src/session/cost-gate";
@@ -15,6 +16,7 @@ import { RemoteAsyncJob, RemoteAsyncJobManager } from "../../src/thread/services
 import { runtimeThreadService } from "../../src/thread/services/runtime";
 import { RemoteArtifactManager, RemoteCostGate, RemoteEventBus } from "../../src/thread/services/runtime-remote";
 import { settingsThreadService } from "../../src/thread/services/settings";
+import type { ToolSession } from "../../src/tools";
 import { EventBus, emitSubagentFrame } from "../../src/utils/event-bus";
 
 /** Worker-side probe the test calls through the function it registers at boot. */
@@ -123,6 +125,12 @@ const probe: RuntimeProbe = async (op, ...args) => {
 				status: settled?.status,
 				resultText: settled?.resultText,
 			};
+		}
+		case "evalWait": {
+			// An eval `wait()` run in the worker, as a worker-homed session's cell runs it.
+			const jobs = manager(args[0]);
+			const session = { getAgentId: () => String(args[1]), asyncJobManager: jobs } as unknown as ToolSession;
+			return await runEvalWait({ items: [{ kind: "agent", id: String(args[2]) }], timeoutMs: 5_000 }, { session });
 		}
 		case "localInputs": {
 			const job = manager(args[0]).getJob(String(args[1]));

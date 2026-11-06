@@ -130,8 +130,8 @@ async function pollExecSession(
 	yieldMs: number,
 	ctx: CodexNestedCallContext,
 ): Promise<Record<string, unknown>> {
-	const job = ctx.session.asyncJobManager?.getJob(id);
-	if (job) {
+	const manager = ctx.session.asyncJobManager;
+	if (manager?.getJob(id)) {
 		const waited = await ctx.invoke(EVAL_WAIT_BRIDGE_NAME, {
 			items: [{ kind: "agent", id }],
 			timeoutMs: Math.max(0, yieldMs),
@@ -141,7 +141,8 @@ async function pollExecSession(
 		if (settled && settled.status !== "running") {
 			const text = typeof settled.text === "string" ? settled.text : undefined;
 			const error = typeof settled.error === "string" ? settled.error : undefined;
-			const exitCode = job.latestDetails?.exitCode;
+			// Read after the wait: a worker's job row is a snapshot of when it was read.
+			const exitCode = manager.getJob(id)?.latestDetails?.exitCode;
 			return {
 				output: text ?? error ?? "",
 				wall_time_seconds: ctx.elapsedSeconds(),
