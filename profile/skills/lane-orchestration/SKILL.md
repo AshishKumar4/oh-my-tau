@@ -74,9 +74,11 @@ Dependent work never waits. A consumer stacks on its producer, and the lanes for
 
 ## Messages and lifecycle
 
-- Message lanes by name. A broadcast to `all` wakes every finished agent.
+- Message one lane by name, and only to unblock: a question that blocks you, or a blocker or decision report to the one agent that can act on it. No FYIs, no "editing <file>" announcements.
+- Only Main broadcasts to `all`, and rarely: it wakes every finished agent.
+- Send interim status as a progress note (`agent://<id>?progress`, or `?progress` on the facade's recipient). It does not end the recipient's wait, so the real answer still follows.
 - Close finished helpers. Experts close their own.
-- Don't poll a lane. Wait for its completion or its message.
+- Don't poll a lane. `wait` blocks only on work you started or a reply you are owed, and returns at once otherwise: with nothing owed, switch to unblocked work instead of waiting on a peer's progress.
 
 ## Machine
 

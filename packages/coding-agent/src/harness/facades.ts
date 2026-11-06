@@ -39,7 +39,7 @@ function peerMessaging(host: HarnessFacadeHost): boolean {
 
 const claudeCodeSendMessageSchema = type({
 	to: type("string").describe(
-		'Recipient: an agent name (from a spawn result or ListAgents), "main" for the main conversation, or "all"',
+		'Recipient: an agent name (from a spawn result or ListAgents), "main" for the main conversation, or "all" (main agent only). Append "?progress" for a note that does not end the recipient\'s wait',
 	),
 	message: type("string").describe("Plain text message content"),
 });
@@ -316,7 +316,9 @@ const codexSpawnAgentSchema = type({
 });
 
 const codexTargetMessageSchema = type({
-	target: type("string").describe("Agent id to message (from spawn_agent or list_agents)."),
+	target: type("string").describe(
+		'Agent id to message (from spawn_agent or list_agents); "all" (main agent only) broadcasts, and a "?progress" suffix sends a progress note.',
+	),
 	message: type("string").describe("Message text to send to the target agent."),
 });
 
