@@ -59,7 +59,9 @@ fi
 if [ "$DO_BUILD" = 1 ]; then
 	say "Fetching source ($BRANCH)"
 	if [ -d "$SRC_DIR/.git" ]; then
-		git -C "$SRC_DIR" fetch --depth 1 origin "$BRANCH"
+		# Fetch the configured fork, not the checkout's `origin`: an existing
+		# upstream clone at this path must not install upstream.
+		git -C "$SRC_DIR" fetch --depth 1 "$REPO" "$BRANCH"
 		git -C "$SRC_DIR" checkout -q FETCH_HEAD
 	else
 		mkdir -p "$(dirname "$SRC_DIR")"
