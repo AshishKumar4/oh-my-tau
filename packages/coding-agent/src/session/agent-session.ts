@@ -9358,9 +9358,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				);
 			}
 
-			// Credentials resolve on the request path, so a transient refresh failure retries there; a provider
-			// with none configured walks the retry fallback chain first.
+			// Validate API key; a provider without one walks the retry fallback chain first. A configured
+			// credential whose refresh failed transiently resolves no key here but retries on the request path.
+			const apiKey = await logger.time("prompt:apiKey", () => this.#modelRegistry.getApiKey(model, this.sessionId));
 			if (
+				!apiKey &&
 				!this.#modelRegistry.hasConfiguredAuth(model) &&
 				!(await this.#recovery.applyMissingCredentialFallback(setupAbort.signal))
 			) {

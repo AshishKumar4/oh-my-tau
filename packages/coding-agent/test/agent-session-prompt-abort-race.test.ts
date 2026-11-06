@@ -480,6 +480,7 @@ describe("AgentSession prompt admission racing abort", () => {
 				await apiKeyGate.promise;
 				return undefined;
 			},
+			hasConfiguredAuth: () => false,
 		};
 		const { session } = await createSession(
 			[
@@ -534,6 +535,7 @@ describe("AgentSession prompt admission racing abort", () => {
 				await apiKeyGate.promise;
 				return undefined;
 			},
+			hasConfiguredAuth: () => false,
 		};
 		const { session } = await createSession(
 			[

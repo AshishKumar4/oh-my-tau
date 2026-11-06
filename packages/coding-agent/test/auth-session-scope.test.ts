@@ -206,7 +206,8 @@ describe("Anthropic hosted search for a pooled session", () => {
 					sessionId,
 					fetch: fetchImpl,
 				}),
-			).rejects.toThrow('Anthropic credentials not found for selected provider "anthropic".');
+				// A session bound to its account pool names the restriction rather than a generic missing key.
+			).rejects.toThrow(/No API key for provider: anthropic \(session \S+ is restricted to its OAuth account pool/);
 			expect(urls).toEqual([]);
 		}
 	});

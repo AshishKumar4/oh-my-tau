@@ -464,6 +464,10 @@ describe("AgentSession retry fallback", () => {
 				? Promise.resolve(undefined)
 				: getApiKey(model, ...rest),
 		);
+		const hasConfiguredAuth = modelRegistry.hasConfiguredAuth.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "hasConfiguredAuth").mockImplementation(model =>
+			model.provider === primaryModel.provider ? primaryCredential : hasConfiguredAuth(model),
+		);
 
 		const requestedModels: string[] = [];
 		const mock = createMockModel();
