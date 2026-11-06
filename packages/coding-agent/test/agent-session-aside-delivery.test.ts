@@ -1593,17 +1593,22 @@ describe("AgentSession aside delivery", () => {
 			ownedAsyncJobManager: manager,
 		});
 
+		let buildStarted = false;
 		session.setIrcWakeTurnObserver(_records => {
 			events.push("observer-start");
 			// The agent auto-backgrounded a build during the wake turn: the job
 			// outlives the turn, and its async-result continuation still reaches
-			// the agent after the observation ends.
-			manager.register(
-				"bash",
-				"wake rebuild",
-				({ signal }) => untilAborted(signal, gate.promise).then(() => "build ok"),
-				{ id: "wake-job", ownerId: "SubAgent" },
-			);
+			// the agent after the observation ends. The continuation is a delivery
+			// turn with its own observation, which starts nothing.
+			if (!buildStarted) {
+				buildStarted = true;
+				manager.register(
+					"bash",
+					"wake rebuild",
+					({ signal }) => untilAborted(signal, gate.promise).then(() => "build ok"),
+					{ id: "wake-job", ownerId: "SubAgent" },
+				);
+			}
 			return async () => {
 				events.push("observer-finish");
 				observerFinished.resolve();
@@ -1628,9 +1633,14 @@ describe("AgentSession aside delivery", () => {
 		await continuationRan.promise;
 		await session.waitForIdle();
 
-		expect(events).toContain("observer-start");
+		expect(events).toEqual([
+			"observer-start",
+			"observer-finish",
+			"observer-start",
+			"continuation-ran",
+			"observer-finish",
+		]);
 		expect(mock.calls.length).toBe(3);
-		expect(events.indexOf("observer-finish")).toBeLessThan(events.indexOf("continuation-ran"));
 		// The continuation turn received the job result through the delivery
 		// (injected as the background-completion system notice).
 		expect(JSON.stringify(mock.calls[2]!.context.messages)).toContain("build ok");
