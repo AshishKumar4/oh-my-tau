@@ -1077,7 +1077,7 @@ describe("codex wait_agent facade", () => {
 		expect(messaged.result.toolName).toBe("wait");
 		expect(messaged.result.details).toMatchObject({
 			op: "wait",
-			waited: expect.objectContaining({ body: "peer finished" }),
+			waited: [expect.objectContaining({ from: PEER, body: "peer finished" })],
 		});
 		expect(messaged.assistant.content[0]).toMatchObject({ name: "wait", wireName: "wait_agent" });
 
