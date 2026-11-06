@@ -66,6 +66,11 @@ type SidekickParams = typeof sidekickSchema.infer;
 /** How a call reached the sidekick. */
 export type SidekickHandoffMode = "spawn" | "rebrief" | "interrupt";
 
+/** A handoff's sidekick: the one the lead has, or a new one this call spawns. */
+type SidekickClaim =
+	| { ref: AgentRef }
+	| { ref?: undefined; agentId: string; registered: PromiseWithResolvers<AgentRef> };
+
 export interface SidekickToolDetails {
 	agentId?: string;
 	jobId?: string;
@@ -105,6 +110,8 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 	readonly strict = true;
 	/** First-handoff guard: a second call during spawn joins it instead of spawning twice. */
 	#spawning: Promise<AgentRef> | undefined;
+	/** The last {@link #claim}; each call claims after the one before it, so concurrent first handoffs spawn once. */
+	#claiming: Promise<unknown> = Promise.resolve();
 	/** Inline (no job manager) handoff in flight, so a parallel call steers instead of re-briefing. */
 	#inlineHandoff: Promise<SingleResult> | undefined;
 	#handoffs = 0;
@@ -147,20 +154,68 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		const leadId = this.#leadId();
 		const manager = cfgAsyncEnabled.get(this.session.settings) ? this.session.asyncJobManager : undefined;
 
-		// A sidekick from before a restart is a parked transcript until the roster
-		// loads it; reviving it keeps the pairing's conversation.
-		if (!this.#spawning) await ensurePersistedRoster(AgentRegistry.global(), this.session.getSessionFile());
-		const ref = this.#spawning ? await this.#spawning : findSidekickRef(leadId);
-		const runningJob =
-			ref && manager ? manager.getRunningJobs({ ownerId: leadId }).find(job => job.agentId === ref.id) : undefined;
-		if (ref && (runningJob || this.#inlineHandoff)) return this.#interrupt(ref, brief, runningJob);
+		const claiming = this.#claiming.then(() => this.#claim(leadId));
+		this.#claiming = claiming.catch(() => {});
+		const claim = await claiming;
+		const { ref } = claim;
+		// A spawn this call claimed but never started must not leave a waiting call hanging.
+		const spawn = ref ? undefined : claim.registered;
+		try {
+			const runningJob =
+				ref && manager
+					? manager.getRunningJobs({ ownerId: leadId }).find(job => job.agentId === ref.id)
+					: undefined;
+			if (ref && (runningJob || this.#inlineHandoff)) return await this.#interrupt(ref, brief, runningJob);
+			return await this.#handOff(claim, { brief, block, leadId, manager, signal, onUpdate });
+		} catch (error) {
+			spawn?.reject(error);
+			throw error;
+		}
+	}
 
+	/**
+	 * Who this handoff goes to: the sidekick the lead already has (one from
+	 * before a restart is a parked transcript until the roster loads it, and
+	 * reviving it keeps the pairing's conversation), the one a concurrent first
+	 * handoff is spawning, or a new one. A new one gets its id here, so its job,
+	 * this call's result and the lead's journal name it from the start (a worker
+	 * starts the job's body only after `register` returns); `registered` settles
+	 * once the executor registers it.
+	 */
+	async #claim(leadId: string): Promise<SidekickClaim> {
+		if (this.#spawning) return { ref: await this.#spawning };
+		await ensurePersistedRoster(AgentRegistry.global(), this.session.getSessionFile());
+		const ref = findSidekickRef(leadId);
+		if (ref) return { ref };
+		const agentId = await reserveStructuredSubagentId(this.session, { label: SIDEKICK_LABEL });
+		const registered = Promise.withResolvers<AgentRef>();
+		const spawning = registered.promise;
+		this.#spawning = spawning;
+		spawning.then(
+			() => {},
+			() => {
+				if (this.#spawning === spawning) this.#spawning = undefined;
+			},
+		);
+		return { agentId, registered };
+	}
+
+	async #handOff(
+		claim: SidekickClaim,
+		args: {
+			brief: string;
+			block: boolean;
+			leadId: string;
+			manager: AsyncJobManagerApi | undefined;
+			signal: AbortSignal | undefined;
+			onUpdate: AgentToolUpdateCallback<SidekickToolDetails> | undefined;
+		},
+	): Promise<AgentToolResult<SidekickToolDetails>> {
+		const { brief, block, leadId, manager, signal, onUpdate } = args;
+		const { ref } = claim;
+		const agentId = ref ? ref.id : claim.agentId;
 		const handoff = ++this.#handoffs;
 		const mode: SidekickHandoffMode = ref === undefined ? "spawn" : "rebrief";
-		// A first handoff reserves the sidekick's id up front, so its job, this
-		// call's result and the lead's journal name the sidekick from the start
-		// (a worker starts the job's body only after `register` returns).
-		const agentId = ref?.id ?? (await reserveStructuredSubagentId(this.session, { label: SIDEKICK_LABEL }));
 		const message = prompt.render(sidekickHandoffTemplate, { first: ref === undefined, message: brief });
 		// Progress streams into this call only while it is still waiting; a
 		// handoff that outlives the call (non-blocking, timeout) reports through
@@ -174,9 +229,9 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			});
 		};
 		const run = (runSignal: AbortSignal, onProgress: (progress: AgentProgress) => void): Promise<SingleResult> =>
-			ref === undefined
-				? this.#spawn(agentId, message, runSignal, onProgress)
-				: this.#followUp(ref, message, runSignal, onProgress);
+			ref
+				? this.#followUp(ref, message, runSignal, onProgress)
+				: this.#spawn(claim.agentId, claim.registered, message, runSignal, onProgress);
 
 		if (!manager) {
 			// Async jobs are off: every handoff blocks inside this call.
@@ -254,28 +309,25 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 		);
 	}
 
+	/** Spawn the sidekick a call claimed; `registered` resolves once the executor registers it, so a concurrent call steers it. */
 	async #spawn(
 		agentId: string,
+		registered: PromiseWithResolvers<AgentRef>,
 		message: string,
 		signal: AbortSignal,
 		onProgress: (progress: AgentProgress) => void,
 	): Promise<SingleResult> {
-		const { settings, modelRegistry } = this.session;
-		if (!modelRegistry) throw new ToolError("Sidekick spawn requires a model registry on this session.");
-		const model = resolveSidekickModel(settings, modelRegistry);
-		if (!model.model) throw new ToolError(`Cannot spawn the sidekick: ${model.error}`);
-		// Resolves as soon as the executor has registered the new agent, so a
-		// concurrent second call can steer it instead of spawning a twin.
-		const registered = Promise.withResolvers<AgentRef>();
-		registered.promise.catch(() => {});
-		this.#spawning = registered.promise;
 		const settleRegistered = (): void => {
 			const ref = findSidekickRef(this.#leadId());
 			if (ref) registered.resolve(ref);
 		};
-		const sidekick = getSidekickAgent();
-		const thinkingLevel = cfgFusionSidekickThinking.get(settings);
 		try {
+			const { settings, modelRegistry } = this.session;
+			if (!modelRegistry) throw new ToolError("Sidekick spawn requires a model registry on this session.");
+			const model = resolveSidekickModel(settings, modelRegistry);
+			if (!model.model) throw new ToolError(`Cannot spawn the sidekick: ${model.error}`);
+			const sidekick = getSidekickAgent();
+			const thinkingLevel = cfgFusionSidekickThinking.get(settings);
 			const execution = await runStructuredSubagent({
 				session: this.session,
 				invocationKind: "task",
@@ -307,7 +359,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 				throw new ToolError(`Cannot spawn the sidekick: ${error.message}`);
 			throw error;
 		} finally {
-			this.#spawning = undefined;
+			if (this.#spawning === registered.promise) this.#spawning = undefined;
 		}
 	}
 

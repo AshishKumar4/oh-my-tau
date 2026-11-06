@@ -414,6 +414,76 @@ describe("fusion sidekick tool", () => {
 
 		it.each([
 			{ name: "a body started during register", deferStart: false },
+			{ name: "a body started after register returns", deferStart: true },
+		])("spawns one sidekick for two first handoffs in one tool batch ($name)", async ({ deferStart }) => {
+			if (deferStart) {
+				const register = manager.register.bind(manager);
+				vi.spyOn(manager, "register").mockImplementation((kind, label, run, options) =>
+					register(
+						kind,
+						label,
+						async context => {
+							await Bun.sleep(0);
+							return run(context);
+						},
+						options,
+					),
+				);
+			}
+			const release = Promise.withResolvers<void>();
+			const steered: string[] = [];
+			const liveSession = {
+				isStreaming: true,
+				steer: async (text: string) => {
+					steered.push(text);
+				},
+			} as unknown as AgentSession;
+			const spawn = vi.spyOn(structured, "runStructuredSubagent").mockImplementation(async request => {
+				registerSidekick("running", liveSession, "Main", request.identity?.id);
+				request.onProgress?.({
+					index: 0,
+					id: request.identity?.id ?? SIDEKICK_ID,
+					agent: "sidekick",
+					agentSource: "bundled",
+					status: "running",
+					task: "handoff",
+					recentTools: [],
+					recentOutput: [],
+					toolCount: 0,
+					requests: 0,
+					tokens: 0,
+					cost: 0,
+					durationMs: 0,
+				});
+				await release.promise;
+				return {
+					result: singleResult("done"),
+					policy: {} as structured.EffectiveSubagentPolicy,
+					mergeSummary: "",
+					changesApplied: null,
+					artifactsDir: tempDir.path(),
+					temporaryArtifacts: true,
+				};
+			});
+			const tool = SidekickTool.createIf(makeSession());
+			if (!tool) throw new Error("sidekick tool should mount");
+
+			// Both calls start before either has spawned anything, as one parallel tool batch runs them.
+			const [first, second] = await Promise.all([
+				tool.execute("c1", { message: "Implement X", block: false }),
+				tool.execute("c2", { message: "Also Y", block: false }),
+			]);
+			expect(spawn).toHaveBeenCalledTimes(1);
+			expect(first.details?.mode).toBe("spawn");
+			expect(second.details).toMatchObject({ mode: "interrupt", agentId: first.details?.agentId });
+			expect(steered).toHaveLength(1);
+			expect(steered[0]).toEndWith("<lead_handoff>\nAlso Y\n</lead_handoff>");
+			release.resolve();
+			await manager.getJob(first.details?.jobId ?? "")?.promise;
+		});
+
+		it.each([
+			{ name: "a body started during register", deferStart: false },
 			// A worker's job manager registers on main and starts the body over RPC later.
 			{ name: "a body started after register returns", deferStart: true },
 		])("steers a call that arrives mid-handoff into the running turn ($name)", async ({ deferStart }) => {
