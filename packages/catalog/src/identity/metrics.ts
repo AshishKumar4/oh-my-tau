@@ -27,6 +27,11 @@ export interface CatalogMetrics {
 	tps?: number;
 }
 
+/** Keep measured serving-tier performance separate from the standard model aggregate. */
+export function modelPerfKey(modelKey: string, serviceTier?: string | null): string {
+	return serviceTier && serviceTier !== "auto" && serviceTier !== "default" ? `${modelKey}@${serviceTier}` : modelKey;
+}
+
 interface ScoredEntry extends CatalogMetrics {
 	identity: ModelIdentity;
 }

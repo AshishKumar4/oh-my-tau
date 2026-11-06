@@ -733,9 +733,11 @@ export interface AnthropicCompat {
 	/**
 	 * Replay unsigned `thinking` blocks from prior assistant turns as native
 	 * thinking instead of demoting them to text. Official Anthropic enforces
-	 * signature-based thinking-chain integrity, so unsigned blocks must stay
-	 * text there; compatible reasoning endpoints (Z.AI, DeepSeek, …) emit
+	 * signature-based thinking-chain integrity, so unsigned blocks never replay
+	 * natively there; compatible reasoning endpoints (Z.AI, DeepSeek, …) emit
 	 * unsigned blocks and expect them back as `type: "thinking"` (#2005).
+	 * Claude targets only replay their own unsigned turns this way, and drop
+	 * whatever they cannot replay natively instead of demoting it to text.
 	 * Default: auto-detected from provider/baseUrl and `model.reasoning`.
 	 */
 	replayUnsignedThinking?: boolean;
@@ -1780,6 +1782,8 @@ export interface Model<TApi extends Api = Api> {
 	preferWebsockets?: boolean;
 	/** Codex Responses Lite transport: send the lite marker and carry instructions/tools as input items (mirrors codex-rs `use_responses_lite`). */
 	useResponsesLite?: boolean;
+	/** Codex Code Mode restriction: model expects tools routed through a programmatic exec surface (mirrors codex-rs `tool_mode`). */
+	toolMode?: "code_mode_only";
 	/**
 	 * Service-tier ids the provider advertises for this model (Codex discovery
 	 * `service_tiers[].id`, or an OpenAI-compatible `/v1/models` row's

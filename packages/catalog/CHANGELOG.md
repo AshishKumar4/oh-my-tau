@@ -261,6 +261,15 @@
 - Fixed `/handoff` failing with `400 Provider returned error` on OpenRouter's hosted Muse Spark 1.x and Muse Wonder models: requests no longer send a `tool_choice` the upstream Meta backend rejects ([#15910](https://github.com/can1357/oh-my-pi/issues/15910))
 - Fixed OpenCode Zen bringing back retired bundled models from an authoritative model cache, and dropping drop-listed models such as `gemini-3.7-flash` when a refresh fails after an upgrade ([#15770](https://github.com/can1357/oh-my-pi/pull/15770) by [@adi-IL](https://github.com/adi-IL))
 
+### Added
+
+- Added the `codex` harness profile for `openai-codex/gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna`, so `harness.mode: auto` presents the Codex CLI surface on them as it already did on GPT-6 Astra and GPT-5.6 Sol; each surface was verified against a real Codex CLI 0.159.2 request.
+- Added `configuration_update` effort changes for `openai-codex/gpt-6.1-sol`, `gpt-6-sol` and `gpt-6-luna`, so changing the thinking level mid-session keeps the response chain and the cached prompt instead of resending the whole prompt uncached.
+- Added the `accepts-api-key` auth directive for a provider whose API also takes a plain API key next to its OAuth login; Anthropic declares it
+
+### Changed
+
+- Codex requests now report client version 0.159.2, the current Codex CLI release (was 0.159.0).
 ## [18.11.2] - 2026-10-16
 
 ### Added
@@ -872,6 +881,8 @@
 ## [18.1.17] - 2026-09-10
 
 ### Added
+
+- New `harness-profile` compat axis records the vendor request surface a model was post-trained on, so the harness recorder and the providers can serve that surface instead of omp's own: `claude-code` for `claude-opus-5`, `claude-fable-5` and `claude-fable-5-1` on the Anthropic Messages API, `codex` for `gpt-6-astra` and `gpt-5.6-sol` on the Codex route, and no profile for every other model. The pinned Codex client version is now `0.154.0`, matching the captured client so model discovery and `/responses` see the current client gate.
 
 - Added DeepSeek V4.1 Flash on OpenRouter with image input and low/high/max reasoning levels ([#11592](https://github.com/can1357/oh-my-pi/pull/11592) by [@mazzanfar](https://github.com/mazzanfar)).
 - Added DeepSeek cost estimates that follow published peak/off-peak rates.

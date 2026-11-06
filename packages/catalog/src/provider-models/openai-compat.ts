@@ -469,7 +469,7 @@ function mapAnthropicModelsDev(payload: unknown, baseUrl: string): ModelSpec<"an
 	return models;
 }
 
-function buildAnthropicDiscoveryHeaders(apiKey: string, baseUrl: string): Record<string, string> {
+function buildAnthropicDiscoveryHeaders(apiKey: string, baseUrl: string, workspaceId?: string): Record<string, string> {
 	const oauthToken = isAnthropicOAuthToken(apiKey);
 	const headers: Record<string, string> = {
 		"anthropic-version": resolveAnthropicApiVersion(baseUrl),
@@ -480,6 +480,7 @@ function buildAnthropicDiscoveryHeaders(apiKey: string, baseUrl: string): Record
 		headers.Authorization = `Bearer ${apiKey}`;
 	} else {
 		headers["x-api-key"] = apiKey;
+		if (workspaceId) headers["anthropic-workspace-id"] = workspaceId;
 	}
 	return headers;
 }
@@ -6988,6 +6989,8 @@ export interface AnthropicModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
 	fetch?: FetchImpl;
+	/** The discovery key's workspace, for a key not scoped to one. */
+	workspaceId?: string;
 }
 
 export function anthropicModelManagerOptions(
@@ -7017,7 +7020,7 @@ export function anthropicModelManagerOptions(
 						api: "anthropic-messages",
 						provider: "anthropic",
 						baseUrl: discoveryBaseUrl,
-						headers: buildAnthropicDiscoveryHeaders(apiKey, discoveryBaseUrl),
+						headers: buildAnthropicDiscoveryHeaders(apiKey, discoveryBaseUrl, config?.workspaceId),
 						mapModel: (
 							entry: OpenAICompatibleModelRecord,
 							defaults: ModelSpec<"anthropic-messages">,

@@ -116,6 +116,22 @@ class "anthropic" {
 			thinking-prefix-binding #true
 		}
 	}
+	// Claude Code is the harness these lineages were post-trained against, and
+	// its surface is expressible only on the Messages API (system blocks plus a
+	// flat tool array). OpenAI-shaped hosts for the same lineage keep omp's
+	// native surface.
+	on-api "anthropic-messages" {
+		family "opus" {
+			revision ">=5" {
+				harness-profile "claude-code"
+			}
+		}
+		family "fable" {
+			revision ">=5" {
+				harness-profile "claude-code"
+			}
+		}
+	}
 	// Adaptive Claude (Opus 4.7+, Sonnet/Fable/Mythos 5+, Haiku 5.5+) rejects explicit
 	// sampling params (`temperature`, `top_p`, `top_k`) with a 400 on every
 	// serving host. The `<10` bound keeps whole-number revisions such as

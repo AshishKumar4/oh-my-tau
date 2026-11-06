@@ -1196,6 +1196,27 @@ describe("Responses configuration_update compat", () => {
 		expect(model.compat.supportsConfigurationUpdate).toBe(false);
 	});
 
+	it("turns supportsConfigurationUpdate on for GPT-6 Sol, GPT-6 Luna and GPT-6.1 Sol on the Codex route, not GPT-5.6 Sol", () => {
+		const codexSpec = (id: string): ModelSpec<"openai-codex-responses"> => ({
+			id,
+			name: id,
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		});
+		for (const id of ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]) {
+			expect(buildModel(codexSpec(id)).compat.supportsConfigurationUpdate).toBe(true);
+		}
+		// Codex accepts the item from GPT-5.6 Sol without error but lists the SKU
+		// without effort-update support.
+		expect(buildModel(codexSpec("gpt-5.6-sol")).compat.supportsConfigurationUpdate).toBe(false);
+	});
+
 	it("lets a spec-level compat override switch configuration_update off for a custom endpoint", () => {
 		// Spec-authored overrides are the last compat layer, so a models.yml
 		// `compat.supportsConfigurationUpdate: false` beats the class rule.

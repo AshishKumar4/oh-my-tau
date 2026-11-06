@@ -57,6 +57,22 @@ class "openai" {
 		delegation-bias "restrained"
 		supports-steering #true
 	}
+	// The Codex CLI presents Code Mode: the tool surface arrives as an
+	// `additional_tools` input item of namespaced groups and the harness prompt
+	// rides as an ordinary message instead of `instructions`. That surface is
+	// imposed by the Codex route, so the same lineage on another host keeps
+	// omp's native surface.
+	//
+	// Exact ids on purpose: the advertised surface varies per SKU (the GPT-6
+	// SKUs add a `clock` namespace and `request_user_input_async`; GPT-5.6 Sol
+	// has neither), so a revision range would impersonate SKUs whose surface
+	// nobody has captured. Widen one id at a time as each is verified against a
+	// real client request.
+	on-api "openai-codex-responses" {
+		models "gpt-6-astra" "gpt-6.1-sol" "gpt-6-sol" "gpt-6-luna" "gpt-5.6-sol" {
+			harness-profile "codex"
+		}
+	}
 	// The GPT-6 family changes reasoning effort mid-conversation through a
 	// `configuration_update` input item so the request-level effort (and the
 	// cached prompt prefix) stays put. OpenAI's reasoning guide ("Change

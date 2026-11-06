@@ -64,6 +64,13 @@ export const EFFORT_TIERS: readonly string[] = [...EFFORTS, "off"];
  * forbids subagents unless the user or a skill asks.
  */
 export const DELEGATION_BIASES = ["eager", "restrained", "gated"] as const;
+
+/**
+ * Harness surfaces a session can emulate. `claude-code` and `codex` may also
+ * be assigned from KDL rules; `pi` is forced-only — no model line is
+ * post-trained on it, so no rule carries the directive.
+ */
+export const HARNESS_PROFILES = ["claude-code", "codex", "pi"] as const;
 const THINKING_MODES = [
 	"effort",
 	"budget",
@@ -475,6 +482,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 	"discovery-api": { key: "discoveryApi", set: "catalog", shape: "scalar" },
 	"edit-prompt-variant": { key: "editPromptVariant", set: "catalog", shape: "scalar", values: ["full", "compact"] },
 	"edit-revision": { key: "editRevision", set: "catalog", shape: "scalar" },
+	"harness-profile": { key: "harnessProfile", set: "catalog", shape: "scalar", values: HARNESS_PROFILES },
 	"input-modalities": { key: "inputModalities", set: "catalog", shape: "array", values: ["text", "image"] },
 	kind: { key: "kind", set: "catalog", shape: "scalar", values: MODEL_KINDS },
 	"web-search": {
