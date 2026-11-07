@@ -119,8 +119,10 @@ export async function createCleanseAgentRuntime(options: {
 	/** Live worker number → reserved registry agent id, for follow-up steering. */
 	const workerAgentIds = new Map<number, string>();
 	// Cleanse workers are all subagents, and only a session that binds process state
-	// holds the process-wide shared-LSP mode, so the runtime holds it for them until closed.
+	// holds the process-wide shared-LSP mode, so the runtime holds it for them until closed,
+	// following `lsp.shared` changes as a session's hold does.
 	const sharedLsp = holdSharedLsp(cfgLspShared.get(settings));
+	const stopFollowingLsp = cfgLspShared.listen(settings, shared => sharedLsp.set(shared));
 
 	return {
 		model: modelDisplay,
@@ -211,6 +213,7 @@ export async function createCleanseAgentRuntime(options: {
 		async close(result?: CleanseLoopResult): Promise<void> {
 			if (closed) return;
 			closed = true;
+			stopFollowingLsp();
 			sharedLsp.release();
 			sessionManager.appendCustomEntry("cleanse", {
 				status: result?.status ?? "interrupted",
