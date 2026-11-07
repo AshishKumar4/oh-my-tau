@@ -629,6 +629,38 @@ describe("IRC wake run delivery", () => {
 		expect(relaysTo(MAIN_AGENT_ID)).toEqual([]);
 	});
 
+	it("offers agent:// for a repeated wake's result only when that run wrote the lane's output", async () => {
+		const lane = createLane([
+			toolCall("yield", { data: { report: "fix ready" } }),
+			toolCall("yield", { data: { report: "still ready" } }),
+			{ content: ["Nothing changed."] },
+		]);
+		const notices: string[] = [];
+		const deliver = lane.manager.registerDeliverySink(MAIN_AGENT_ID, (jobId, text, job) => {
+			const notice = buildAsyncResultBatchMessage([{ jobId, result: text, job, durationMs: undefined, epoch: 0 }]);
+			notices.push(typeof notice?.content === "string" ? notice.content : "");
+		});
+		try {
+			// Later runs' jobs take suffixed ids while the first is retained, so their notices name the lane.
+			for (const body of ["Is the fix ready?", "Still?", "And now?"]) {
+				await IrcBus.global().send({ from: MAIN_AGENT_ID, to: LANE, body });
+				await lane.session.waitForIdle();
+				await drainEventLoop();
+				await lane.settle();
+			}
+		} finally {
+			deliver();
+		}
+
+		expect(notices).toHaveLength(3);
+		// The second run yielded, which rewrote the lane's output.
+		expect(notices[1]).toContain(`agent://${LANE}`);
+		// The third answered without a yield: the output is still the second run's.
+		expect(notices[2]).toContain("Nothing changed.");
+		expect(notices[2]).toContain(`history://${LANE}`);
+		expect(notices[2]).not.toContain(`agent://${LANE}`);
+	});
+
 	it("answers the parent through its job when the parent steers a run a peer woke", async () => {
 		const lane = createLane([
 			async () => {

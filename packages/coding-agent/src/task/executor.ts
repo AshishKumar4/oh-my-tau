@@ -3668,13 +3668,16 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
  * carried. Throws for a failed run, as a failed job.
  */
 function laneJobOutcome(end: LaneRunEnd, carrier: string): AsyncJobRunResult {
+	// Whether this run wrote `<id>.md`: one that did not leaves an earlier run's output there,
+	// which `agent://<id>` must not be offered for.
+	const agentOutputPublished = end.result?.outputPath !== undefined;
 	if (!end.yielded) {
 		const body = buildWakeRelayBody({
 			...end,
 			alreadyMessaged: IrcBus.global().sentSince(end.id, carrier, end.startTime),
 		});
 		if (wakeTurnFailed(end)) throw withRenderedEnvelope(new AsyncJobError(body), new SafeString(body));
-		return withRenderedEnvelope({ text: body }, new SafeString(body));
+		return withRenderedEnvelope({ text: body, agentOutputPublished }, new SafeString(body));
 	}
 	if (!end.result) {
 		const message = end.finalizeError instanceof Error ? end.finalizeError.message : String(end.finalizeError);
@@ -3688,7 +3691,7 @@ function laneJobOutcome(end: LaneRunEnd, carrier: string): AsyncJobRunResult {
 	if (end.result.aborted || end.result.exitCode !== 0 || end.result.error !== undefined) {
 		throw withRenderedEnvelope(new AsyncJobError(text, structured), new SafeString(text));
 	}
-	return withRenderedEnvelope({ text, structured }, new SafeString(text));
+	return withRenderedEnvelope({ text, structured, agentOutputPublished }, new SafeString(text));
 }
 
 /**
