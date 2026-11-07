@@ -9,9 +9,9 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -126,14 +126,29 @@ it("cold-revives an opted-in Fusion lead with its sidekick tool on the wire", as
 		"advisor.enabled": false,
 		modelRoles: { default: "mock/mock-model" },
 	});
-	const parent = {
-		sessionManager: main,
+	const { session: parent } = await createAgentSession({
+		cwd,
+		authStorage,
+		modelRegistry,
+		model: mock,
 		settings,
-		getAgentId: () => MAIN_AGENT_ID,
-		effectiveExtensionRoots: { explicit: [], mode: "merge", configured: [], configuredLevel: "user" },
-		preparedExtensions: undefined,
-		getSessionAgents: () => [],
-	} as unknown as AgentSession;
+		agentRegistry: AgentRegistry.global(),
+		agentId: MAIN_AGENT_ID,
+		sessionManager: main,
+		disableExtensionDiscovery: true,
+		preloadedExtensionPaths: [],
+		preloadedCustomToolPaths: [],
+		skills: [],
+		contextFiles: [],
+		promptTemplates: [],
+		slashCommands: [],
+		enableMCP: false,
+		enableLsp: false,
+		skipPythonPreflight: true,
+		cacheWarming: false,
+		toolNames: ["read"],
+		restrictToolNames: true,
+	});
 
 	try {
 		const ref = AgentRegistry.global().get(LEAD_ID);
@@ -153,7 +168,7 @@ it("cold-revives an opted-in Fusion lead with its sidekick tool on the wire", as
 
 		expect(requestedTools.at(-1)).toContain("sidekick");
 	} finally {
+		await parent.dispose();
 		authStorage.close();
-		await main.close();
 	}
 }, 20_000);
