@@ -259,7 +259,7 @@ PY
 RECORD_MARK="$WORK_DIR/.record-start"
 FAILED_CAPTURES=()
 recorded_since_mark() {
-	find "$CACHE_DIR/$1" -maxdepth 1 -name "*$2*.json" -newer "$RECORD_MARK" 2>/dev/null | grep -q .
+	find "$CACHE_DIR/$1" -maxdepth 1 -name "*$2.json" -newer "$RECORD_MARK" 2>/dev/null | grep -q .
 }
 
 if command -v claude >/dev/null; then
