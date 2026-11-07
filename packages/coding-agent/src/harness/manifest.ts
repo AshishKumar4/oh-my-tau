@@ -12,6 +12,7 @@ const CLAUDE_CODE_BINDINGS: Readonly<Record<string, HarnessToolBinding>> = {
 	task: { wireName: "Agent" },
 	ask: { wireName: "AskUserQuestion" },
 	web_search: { wireName: "WebSearch" },
+	tool_search: { wireName: "ToolSearch" },
 };
 
 /**

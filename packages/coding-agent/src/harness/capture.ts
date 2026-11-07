@@ -7,6 +7,7 @@ import {
 	claudeCodeEntrypoint,
 	claudeCodeSystemInstruction,
 } from "@oh-my-pi/pi-ai/providers/claude-code-fingerprint";
+import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { getHarnessCacheDir, isEnoent, isRecord, logger } from "@oh-my-pi/pi-utils";
@@ -589,6 +590,22 @@ export function servedHarnessPrompt(
 	const profile = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
 	if (profile === undefined) return undefined;
 	return servedPrompts.get(promptCacheKey(profile, model.id)) ?? servedPrompts.get(promptCacheKey(profile, undefined));
+}
+
+/**
+ * The tool-search surface `model` is served under: the capture's, when the
+ * session presents Claude Code on Anthropic's own API, the only endpoint known
+ * to resolve the `tool_reference`s a tool search returns. Elsewhere deferred
+ * tools stay `xd://` devices.
+ */
+export function servedToolSearch(
+	model: Model | undefined,
+	profile: HarnessProfile | undefined,
+): ToolSearchSurface | undefined {
+	if (profile !== "claude-code" || model?.api !== "anthropic-messages" || !isOfficialAnthropicApiUrl(model.baseUrl)) {
+		return undefined;
+	}
+	return servedHarnessPrompt(model, profile)?.toolSearch;
 }
 
 export function resetHarnessPromptCache(): void {

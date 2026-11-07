@@ -620,6 +620,8 @@ export interface BuildSystemPromptOptions {
 	xdevTools?: Array<{ name: string; summary: string; dynamic?: boolean }>;
 	/** Full docs + JSON schema for every `xd://`-mounted tool, inlined into the protocol section so no discovery `read` is needed. */
 	xdevDocs?: string;
+	/** Deferred tools under a tool-search harness, in place of `xd://`: the client's announcement naming them, and their omp names. */
+	toolSearch?: { readonly announcement: string; readonly names: readonly string[] };
 	/** Whether Auto-QA grievance reporting is enabled; renders the `xd://report_issue` note. */
 	autoQaEnabled?: boolean;
 	/** ovnfs command when its binary is found (`ovnfsCommand`); renders the separate-checkout guidance. */
@@ -727,6 +729,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		reactions = false,
 		xdevTools = [],
 		xdevDocs = "",
+		toolSearch,
 		autoQaEnabled = false,
 		ovnfs,
 		writeTransportOnly = false,
@@ -1101,6 +1104,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		xdevTools,
 		hasDynamicXdevTools: xdevTools.some(mounted => mounted.dynamic === true),
 		xdevDocs,
+		deferredToolsAnnouncement: toolSearch?.announcement,
 		autoQaEnabled,
 		ovnfs,
 		writeTransportOnly,
@@ -1164,6 +1168,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const xdevCatalogNames =
 		!resolvedCustomPrompt && xdevTools.length > 0 && rendered.includes("xd://")
 			? xdevTools.map(mounted => mounted.name)
-			: undefined;
+			: toolSearch !== undefined && rendered.includes(toolSearch.announcement)
+				? [...toolSearch.names]
+				: undefined;
 	return { systemPrompt, xdevCatalogNames };
 }

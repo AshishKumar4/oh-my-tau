@@ -31,7 +31,20 @@ import { anthropicHostRunsTool } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
 import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
-import { loadHarnessPrompt, servedHarnessPrompt } from "./harness/capture";
+import {
+	loadHarnessPrompt,
+	servedHarnessPrompt,
+	servedToolSearch,
+	type ToolSearchSurface,
+	type VendorTool,
+} from "./harness/capture";
+import {
+	defersUnderToolSearch,
+	ensureToolSearchTool,
+	listDeferredTools,
+	renderDeferredToolsAnnouncement,
+	TOOL_SEARCH_TOOL_NAME,
+} from "./tools/tool-search";
 import { effectiveHarnessProfile } from "./harness/effective-profile";
 import { type HarnessSurface, harnessSurface } from "./harness/facades";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
@@ -2908,13 +2921,24 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// tools: the computation SessionTools presents with, so the initial
 		// prompt, the tool predicates and `toolRefs` see the surface the wire
 		// carries before the session exists.
+		/** The served capture's declaration for a wire name, under the active model's effective profile. */
+		const servedVendorTool = (wireName: string): VendorTool | undefined => {
+			const promptModel = toolSession.getActiveModel?.();
+			const profile = promptModel ? effectiveHarnessProfile(settings, promptModel) : undefined;
+			return servedHarnessPrompt(promptModel, profile ?? null)?.tools[wireName];
+		};
+		/** Whether the active model's capture defers tools behind ToolSearch. */
+		const servedToolSearchSurface = (): ToolSearchSurface | undefined => {
+			const promptModel = toolSession.getActiveModel?.();
+			return servedToolSearch(promptModel, promptModel ? effectiveHarnessProfile(settings, promptModel) : undefined);
+		};
 		const harnessPromptSurface = (names: readonly string[]): HarnessSurface => {
 			const promptModel = toolSession.getActiveModel?.();
 			const profile = promptModel ? effectiveHarnessProfile(settings, promptModel) : undefined;
 			const host = {
 				settings,
 				session: toolSession,
-				vendorTool: (wireName: string) => servedHarnessPrompt(promptModel, profile ?? null)?.tools[wireName],
+				vendorTool: servedVendorTool,
 			};
 			return harnessSurface(profile, names, host, name => toolRegistry.has(name));
 		};
@@ -4487,13 +4511,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// List each mounted MCP tool once. A routed tool that the xd:// catalog
 			// would list carries its catalog summary on the route line and gets no
 			// catalog line; a tool the route bound omits keeps its catalog line.
-			const xdevPromptDocs = toolSession.xdev
-				? planXdevPromptDocs(
-						toolSession.xdev,
-						cfgToolsXdevDocs.get(settings),
-						cfgToolsXdevInlineDevices.get(settings),
-					)
-				: undefined;
+			const toolSearch = toolSession.xdev ? servedToolSearchSurface() : undefined;
+			const xdevPromptDocs =
+				toolSession.xdev && toolSearch === undefined
+					? planXdevPromptDocs(
+							toolSession.xdev,
+							cfgToolsXdevDocs.get(settings),
+							cfgToolsXdevInlineDevices.get(settings),
+						)
+					: undefined;
 			const projection = projectMountedMCPXdevGuidance(
 				collectMountedMCPToolRoutes(toolSession.xdev ? listXdevTools(toolSession.xdev) : []),
 			);
@@ -4560,8 +4586,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
 				noContextFiles: options.noContextFiles,
 				excludeAgentsMd,
-				xdevTools: toolSession.xdev ? xdevEntries(toolSession.xdev) : [],
+				xdevTools: toolSession.xdev && toolSearch === undefined ? xdevEntries(toolSession.xdev) : [],
 				xdevDocs: xdevPromptDocs ? renderXdevPromptDocs(xdevPromptDocs, routedCatalogNames) : "",
+				toolSearch:
+					toolSession.xdev && toolSearch && toolSession.xdev.mountedNames.size > 0
+						? {
+								announcement: renderDeferredToolsAnnouncement(
+									toolSearch,
+									listDeferredTools(toolSession.xdev, servedVendorTool),
+								),
+								names: [...toolSession.xdev.mountedNames],
+							}
+						: undefined,
 				resolvedCustomPrompt: options.customSystemPrompt,
 				systemPromptTemplate: options.systemPromptTemplate,
 				skills: cfgSkillful.get(settings) ? (session?.skills ?? skills) : [],
@@ -4750,30 +4786,41 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// discovers, `write xd://<tool>` executes); explicit-list sessions granted
 		// `read` without `write` can use the device-only transport registered by
 		// createTools without surfacing it when no device needs it.
+		// The initial predicates read the surface too, and the capture decides
+		// whether deferred tools are xd:// devices or ToolSearch's: load it first.
+		await loadServedHarnessPrompt(sessionManager.getCwd());
 		if (toolSession.xdev) {
+			// Under tool search the provider carries deferred tools itself; no transport is needed.
+			const toolSearch = servedToolSearchSurface();
 			const topLevelToolNames: string[] = [];
 			const mountedNames: string[] = [];
 			for (const name of initialToolNames) {
 				const tool = toolRegistry.get(name);
 				const explicitlyRequested = presentationPinnedToolNames?.has(name) === true;
-				if (tool && xdevReadAvailable && xdevWriteAvailable && !explicitlyRequested && isMountableUnderXdev(tool))
-					mountedNames.push(name);
+				const defers =
+					tool !== undefined &&
+					!explicitlyRequested &&
+					(toolSearch
+						? defersUnderToolSearch(tool, toolSearch)
+						: xdevReadAvailable && xdevWriteAvailable && isMountableUnderXdev(tool));
+				if (defers) mountedNames.push(name);
 				else topLevelToolNames.push(name);
 			}
 			toolSession.xdev.mountedNames.clear();
 			for (const name of mountedNames) toolSession.xdev.mountedNames.add(name);
 			initialToolNames = topLevelToolNames;
 			const deviceTransportNeeded =
-				mountedNames.length > 0 ||
+				(toolSearch === undefined && mountedNames.length > 0) ||
 				initialToolNames.some(name => toolRegistry.get(name)?.deferrable === true) ||
 				toolSession.getPlanModeState?.()?.enabled === true;
 			if (deviceTransportNeeded && xdevWriteAvailable && !initialToolNames.includes("write")) {
 				initialToolNames.push("write");
 			}
+			if (toolSearch && mountedNames.length > 0) {
+				ensureToolSearchTool(toolRegistry, toolSession.xdev, servedVendorTool);
+				initialToolNames.push(TOOL_SEARCH_TOOL_NAME);
+			}
 		}
-
-		// The initial predicates read the surface too: load its capture first.
-		await loadServedHarnessPrompt(sessionManager.getCwd());
 		setSessionActiveToolNames(initialToolNames);
 		const { systemPrompt } = await logger.time(
 			"buildSystemPrompt",

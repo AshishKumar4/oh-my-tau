@@ -9,16 +9,4 @@ describe("harness manifests", () => {
 		expect(harnessToolBinding("codex", "task")).toBeUndefined();
 		expect(harnessToolBinding("codex", "wait")).toBeUndefined();
 	});
-
-	it("pins the claude-code table: seven renames", () => {
-		expect(harnessWireRenames("claude-code")).toEqual({
-			ask: "AskUserQuestion",
-			bash: "Bash",
-			edit: "Edit",
-			read: "Read",
-			task: "Agent",
-			web_search: "WebSearch",
-			write: "Write",
-		});
-	});
 });

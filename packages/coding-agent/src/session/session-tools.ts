@@ -19,7 +19,7 @@ import { isEvalBridgeToolCallable } from "../eval/tool-bridge-policy";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import { SIDEKICK_TOOL_NAME } from "../fusion/config";
-import { servedHarnessPrompt, type VendorTool } from "../harness/capture";
+import { servedHarnessPrompt, servedToolSearch, type ToolSearchSurface, type VendorTool } from "../harness/capture";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
 import { cfgHarnessMode } from "../harness/settings";
 import { type HarnessFacadeHost, harnessFacade, presentedWireName, presentTool } from "../harness/facade";
@@ -37,6 +37,7 @@ import type { ToolSession } from "../tools";
 import evalPreludeNoticePrompt from "../prompts/system/eval-prelude-notice.md" with { type: "text" };
 import sessionAgentNoticePrompt from "../prompts/system/session-agent-notice.md" with { type: "text" };
 import toolRosterNoticePrompt from "../prompts/system/tool-roster-notice.md" with { type: "text" };
+import toolSearchNoticePrompt from "../prompts/system/tool-search-notice.md" with { type: "text" };
 import xdevMountNoticePrompt from "../prompts/system/xdev-mount-notice.md" with { type: "text" };
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
 import {
@@ -60,6 +61,14 @@ import {
 	xdevDocsFor,
 	xdevEntries,
 } from "../tools/xdev";
+import {
+	deferLoading,
+	defersUnderToolSearch,
+	ensureToolSearchTool,
+	listDeferredTools,
+	renderDeferredToolsAnnouncement,
+	TOOL_SEARCH_TOOL_NAME,
+} from "../tools/tool-search";
 import type { EditModeSetting } from "../edit/settings";
 import { resolveEditMode } from "../utils/edit-mode";
 import {
@@ -1263,8 +1272,23 @@ export class SessionTools {
 			this.#mountedFacades.set(facade.name, facade);
 			facades.push(facade);
 		}
-		if (facades.length === 0 && surface.hidden.size === 0) return tools;
-		return [...tools.filter(tool => !surface.hidden.has(tool.name)), ...facades];
+		const deferred = this.#deferredTools(profile);
+		if (facades.length === 0 && surface.hidden.size === 0 && deferred.length === 0) return tools;
+		return [...tools.filter(tool => !surface.hidden.has(tool.name)), ...facades, ...deferred];
+	}
+
+	/** The tool-search surface tools are presented under; undefined keeps deferred tools `xd://` devices. */
+	#servedToolSearch(profile: HarnessProfile | undefined): ToolSearchSurface | undefined {
+		return this.#xdev ? servedToolSearch(this.#host.model(), profile) : undefined;
+	}
+
+	/** Deferred tools as the wire declares them under tool search: presented, with `defer_loading`. */
+	#deferredTools(profile: HarnessProfile): AgentTool[] {
+		if (this.#servedToolSearch(profile) === undefined) return [];
+		return [...(this.#xdev?.mountedNames ?? [])].flatMap(name => {
+			const tool = this.#toolRegistry.get(name);
+			return tool ? [deferLoading(this.#wrapToolForAcpPermission(this.#present(tool, profile)))] : [];
+		});
 	}
 
 	/**
@@ -1579,13 +1603,16 @@ export class SessionTools {
 			(selectedTools.some(({ name }) => name === "write") || this.#deviceOnlyWriteTransportAvailable);
 		const isPresentationPinned = (name: string): boolean =>
 			this.#presentationPinnedToolNames?.has(name) === true || this.#runtimeSelectedToolNames?.has(name) === true;
+		// Under tool search the provider carries deferred tools itself, so the
+		// xd:// transport is not needed, and the client's own deferred tools join.
+		const toolSearch = this.#servedToolSearch(profile);
 		const mountCandidates = selectedTools.filter(
 			({ name, tool }) =>
 				this.#xdev !== undefined &&
-				xdevReadAvailable &&
-				xdevWriteAvailable &&
 				!isPresentationPinned(name) &&
-				isMountableUnderXdev(tool),
+				(toolSearch
+					? defersUnderToolSearch(tool, toolSearch)
+					: xdevReadAvailable && xdevWriteAvailable && isMountableUnderXdev(tool)),
 		);
 		const mountNames = new Set(mountCandidates.map(({ name }) => name));
 		// Demoted tools stay reachable through the eval bridge, so nothing is
@@ -1601,7 +1628,8 @@ export class SessionTools {
 
 		const pinnedWrite = isPresentationPinned("write");
 		const activeDeferrableTool = tools.some(tool => tool.deferrable === true);
-		const transportNeeded = mountNames.size > 0 || activeDeferrableTool || this.#host.planModeEnabled();
+		const transportNeeded =
+			(toolSearch === undefined && mountNames.size > 0) || activeDeferrableTool || this.#host.planModeEnabled();
 		if (transportNeeded && !builtInWriteAvailable) {
 			const writeRegistration = this.#ensureWriteRegistered?.();
 			builtInWriteAvailable = writeRegistration ? (await untilAborted(signal, writeRegistration)) === true : false;
@@ -1621,6 +1649,14 @@ export class SessionTools {
 			if (writeNameIndex >= 0 && this.#builtInToolNames.has("write")) validToolNames.splice(writeNameIndex, 1);
 			const writeToolIndex = tools.findIndex(tool => tool.name === "write" && this.#builtInToolNames.has("write"));
 			if (writeToolIndex >= 0) tools.splice(writeToolIndex, 1);
+		}
+		// Tool search is the deferred tools' transport, as `write` is the devices'.
+		if (toolSearch && profile !== undefined && this.#xdev && mountNames.size > 0) {
+			const search = ensureToolSearchTool(this.#toolRegistry, this.#xdev, wireName => this.#vendorTool(wireName));
+			if (!validToolNames.includes(TOOL_SEARCH_TOOL_NAME)) {
+				tools.push(this.#wrapToolForAcpPermission(this.#present(search, profile)));
+				validToolNames.push(TOOL_SEARCH_TOOL_NAME);
+			}
 		}
 
 		let appliedTools = tools;
@@ -2339,6 +2375,29 @@ export class SessionTools {
 		for (const name of removedNames) announcedMounts.delete(name);
 		if (addedNames.length === 0 && removedNames.length === 0) {
 			return { notice: undefined, announcedMounts };
+		}
+		const toolSearch = this.#servedToolSearch(this.#harnessProfile());
+		if (toolSearch && this.#xdev) {
+			// Under tool search the client's own announcement names deferred tools.
+			const added = new Set(addedNames);
+			const deferred = listDeferredTools(this.#xdev, wireName => this.#vendorTool(wireName)).filter(tool =>
+				added.has(tool.name),
+			);
+			return {
+				notice: {
+					role: "custom",
+					customType: XDEV_MOUNT_NOTICE_MESSAGE_TYPE,
+					content: prompt.render(toolSearchNoticePrompt, {
+						announcement: deferred.length > 0 ? renderDeferredToolsAnnouncement(toolSearch, deferred) : "",
+						removed: removedNames.map(name => this.presentedWireName(name) ?? name),
+					}),
+					details: { added: addedNames, removed: removedNames },
+					attribution: "agent",
+					display: false,
+					timestamp: Date.now(),
+				},
+				announcedMounts,
+			};
 		}
 		const summaries = new Map(this.#xdev ? xdevEntries(this.#xdev).map(entry => [entry.name, entry.summary]) : []);
 		const added = addedNames.map(name => ({ name, summary: summaries.get(name) ?? "" }));

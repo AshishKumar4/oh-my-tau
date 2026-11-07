@@ -376,6 +376,13 @@ function snapshotToolResultProviderMetadata(value: unknown): {
 	if (value === undefined) return { malformed: false };
 	if (!value || typeof value !== "object" || Array.isArray(value)) return { malformed: true };
 	const metadata = value as Record<string, unknown>;
+	if (metadata.type === "toolSearch") {
+		const { toolNames } = metadata;
+		if (!Array.isArray(toolNames) || !toolNames.every(name => typeof name === "string" && name.length > 0)) {
+			return { malformed: true };
+		}
+		return { malformed: false, metadata: { type: "toolSearch", toolNames: [...toolNames] } };
+	}
 	if (
 		metadata.type !== "computer" ||
 		!metadata.screenshot ||
