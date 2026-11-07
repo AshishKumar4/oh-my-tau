@@ -24,6 +24,7 @@ import {
 	type AsyncJobDetails,
 	type AsyncJobFilter,
 	type AsyncJobReapResult,
+	type AsyncJobInstance,
 	type AsyncJobRunResult,
 	type AsyncJobType,
 } from "../../async/job-manager";
@@ -151,7 +152,7 @@ export type AsyncJobManagerProtocol = {
 	watchJobs: RpcMethod<[jobIds: string[]], number>;
 	unwatchJobs: RpcMethod<[jobIds: string[]], number>;
 	acknowledgeDeliveries: RpcMethod<[jobIds: string[]], number>;
-	consumeJobResults: RpcMethod<[jobIds: string[]], number>;
+	consumeJobResults: RpcMethod<[jobs: AsyncJobInstance[]], number>;
 	isJobResultConsumed: RpcMethod<[jobId: string], boolean>;
 	cancelAll: RpcMethod<[filter: AsyncJobFilter | undefined, reason: unknown], void>;
 	evictCompletedJobs: RpcMethod<[filter: AsyncJobFilter | undefined], number>;

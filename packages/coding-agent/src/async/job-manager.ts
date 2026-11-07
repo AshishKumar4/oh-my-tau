@@ -339,8 +339,11 @@ export interface AsyncJobManagerApi {
 	/** Stop watching jobs, re-enqueueing skipped deliveries. */
 	unwatchJobs(jobIds: string[]): number;
 	acknowledgeDeliveries(jobIds: string[]): number;
-	/** Mark settled job results as recovered by a foreground snapshot. */
-	consumeJobResults(jobIds: string[]): number;
+	/**
+	 * Mark settled job results as recovered by a foreground snapshot. Each instance names
+	 * the job its caller read; one whose id now names a later job is skipped.
+	 */
+	consumeJobResults(jobs: readonly AsyncJobInstance[]): number;
 	/** True once a result was auto-delivered or recovered by a foreground snapshot. */
 	isJobResultConsumed(jobId: string): boolean;
 	/** Cancel running jobs (scoped by `filter`), aborting each with `reason`. */
@@ -359,6 +362,9 @@ export interface AsyncJobManagerApi {
 	drainDeliveries(options?: { timeoutMs?: number; filter?: AsyncJobFilter }): Promise<boolean>;
 	isDeliverySuppressed(jobId: string): boolean;
 }
+
+/** One job, by id and start: an id can name a later job once this one's row is evicted. */
+export type AsyncJobInstance = Pick<AsyncJob, "id" | "startTime">;
 
 export class AsyncJobManager implements AsyncJobManagerApi {
 	static #instance: AsyncJobManager | undefined;
@@ -757,8 +763,12 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	 * Suppresses queued delivery and marks retained bodies as consumed so later
 	 * snapshots report execution state without replaying the same result.
 	 */
-	consumeJobResults(jobIds: string[]): number {
-		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
+	consumeJobResults(jobs: readonly AsyncJobInstance[]): number {
+		// Once a job's row is evicted its id may name a later job, even another owner's,
+		// whose result is not the caller's to consume or to keep from delivery.
+		const uniqueJobIds = Array.from(
+			new Set(jobs.filter(job => this.#jobs.get(job.id)?.startTime === job.startTime).map(job => job.id)),
+		);
 		this.acknowledgeDeliveries(uniqueJobIds);
 		let consumed = 0;
 		for (const jobId of uniqueJobIds) {

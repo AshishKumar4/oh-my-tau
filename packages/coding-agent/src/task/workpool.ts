@@ -189,13 +189,9 @@ export class WorkPool {
 				try {
 					await this.#waitForDrain();
 					const batchIds = this.batches.map(batch => batch.jobId);
-					await Promise.allSettled(
-						batchIds.flatMap(batchId => {
-							const job = manager.getJob(batchId);
-							return job ? [job.promise] : [];
-						}),
-					);
-					manager.consumeJobResults(batchIds);
+					const batchJobs = batchIds.flatMap(batchId => manager.getJob(batchId) ?? []);
+					await Promise.allSettled(batchJobs.map(job => job.promise));
+					manager.consumeJobResults(batchJobs);
 					manager.unwatchJobs(batchIds);
 					this.closed = true;
 					const summary = `Pool \`${this.name}\` drained: ${this.items.length} item(s), ${this.batches.length} batch(es).`;

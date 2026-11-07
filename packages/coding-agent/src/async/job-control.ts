@@ -336,7 +336,7 @@ export function buildJobResult(
 			: [],
 	);
 
-	manager.consumeJobResults(jobResults.filter(j => j.status !== "running").map(j => j.id));
+	manager.consumeJobResults(uniqueJobs.filter((_, index) => jobResults[index]?.status !== "running"));
 
 	const completed = jobResults.filter(j => j.status !== "running");
 	const running = jobResults.filter(j => j.status === "running");

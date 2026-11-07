@@ -217,8 +217,7 @@ export async function runEvalWait(
 	const current = (handle: ResolvedHandle): ResolvedHandle => {
 		if (!("job" in handle)) return handle;
 		const row = handle.manager.getJob(handle.ref.id);
-		const sameJob = row?.ownerId === handle.job.ownerId && row?.startTime === handle.job.startTime;
-		const job = (sameJob ? row : undefined) ?? rows.get(handle) ?? handle.job;
+		const job = (row?.startTime === handle.job.startTime ? row : undefined) ?? rows.get(handle) ?? handle.job;
 		rows.set(handle, job);
 		return { ...handle, job };
 	};
@@ -268,11 +267,11 @@ export async function runEvalWait(
 			}
 			const settled = resolved.map(current);
 			const snapshots = settled.map(snapshot);
-			const settledAgentIds = settled
-				.filter(handle => "job" in handle && handle.job.status !== "running")
-				.map(handle => handle.ref.id);
+			const settledJobs = settled.flatMap(handle =>
+				"job" in handle && handle.job.status !== "running" ? [handle.job] : [],
+			);
 			const manager = options.session.asyncJobManager;
-			if (manager && settledAgentIds.length > 0) manager.consumeJobResults(settledAgentIds);
+			if (manager && settledJobs.length > 0) manager.consumeJobResults(settledJobs);
 			return { items: snapshots };
 		},
 		resolved.some(handle => "job" in handle) ? { deferExternalAbort: true } : undefined,

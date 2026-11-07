@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockHandler } from "@oh-my-pi/pi-ai/providers/mock";
-import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as daemonClient from "@oh-my-pi/pi-coding-agent/launch/client";
@@ -16,6 +16,13 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { TempDir } from "@oh-my-pi/pi-utils";
+
+/** The row of a job the test registered: a consumer names the job it read. */
+function jobRow(manager: AsyncJobManager, id: string): AsyncJob {
+	const job = manager.getJob(id);
+	if (!job) throw new Error(`Expected job ${id}`);
+	return job;
+}
 
 /**
  * An eval cell awaiting a subagent consumes the subagent's output after the
@@ -107,7 +114,7 @@ describe("AgentSession peek at consumed background completions", () => {
 				// takes its result after the delivery was queued.
 				subagent.resolve("subagent report");
 				await queued.promise;
-				manager.consumeJobResults(["subagent"]);
+				manager.consumeJobResults([jobRow(manager, "subagent")]);
 				return { content: [{ type: "toolCall", name: "wait", arguments: {} }] };
 			},
 			{ content: ["Done"] },
@@ -148,7 +155,7 @@ describe("AgentSession peek at consumed background completions", () => {
 
 		subagent.resolve("subagent report");
 		await queued.promise;
-		manager.consumeJobResults(["subagent"]);
+		manager.consumeJobResults([jobRow(manager, "subagent")]);
 
 		expect(active.hasPendingAsyncWork()).toBe(false);
 	});

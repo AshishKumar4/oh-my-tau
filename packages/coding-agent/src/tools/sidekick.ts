@@ -417,7 +417,7 @@ export class SidekickTool implements AgentTool<typeof sidekickSchema, SidekickTo
 			signal?.removeEventListener("abort", onAbort);
 		}
 		if (settled.status !== "running") {
-			manager.consumeJobResults([jobId]);
+			manager.consumeJobResults([job]);
 			if (settled.status === "failed") throw new ToolError(settled.errorText ?? "Sidekick handoff failed.");
 			if (settled.status === "cancelled") throw new ToolError("Sidekick handoff was cancelled.");
 			return textResult(settled.resultText ?? "", { agentId: settled.agentId, jobId, mode, pending: false });

@@ -247,7 +247,7 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 		watchJobs: (manager, jobIds) => manager.watchJobs(jobIds),
 		unwatchJobs: (manager, jobIds) => manager.unwatchJobs(jobIds),
 		acknowledgeDeliveries: (manager, jobIds) => manager.acknowledgeDeliveries(jobIds),
-		consumeJobResults: (manager, jobIds) => manager.consumeJobResults(jobIds),
+		consumeJobResults: (manager, jobs) => manager.consumeJobResults(jobs),
 		isJobResultConsumed: (manager, jobId) => manager.isJobResultConsumed(jobId),
 		cancelAll: (manager, filter, reason) => manager.cancelAll(filter, fromWireReason(reason)),
 		evictCompletedJobs: (manager, filter) => manager.evictCompletedJobs(filter),

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { AsyncJobError, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { type AsyncJob, AsyncJobError, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { SafeString } from "@oh-my-pi/pi-utils/template";
 import { getRenderedEnvelope, withRenderedEnvelope } from "@oh-my-pi/pi-coding-agent/harness/content";
 import { formatTaskResultSummary } from "@oh-my-pi/pi-coding-agent/task/result-summary";
@@ -21,6 +21,13 @@ async function waitForCondition(predicate: () => boolean, timeoutMs = 2_000): Pr
 		if (Date.now() >= deadline) throw new Error("Timed out waiting for condition");
 		await scheduler.yield();
 	}
+}
+
+/** The row of a job the test registered: a consumer names the job it read. */
+function jobRow(manager: AsyncJobManager, id: string): AsyncJob {
+	const job = manager.getJob(id);
+	if (!job) throw new Error(`Expected job ${id}`);
+	return job;
 }
 
 /** Resolve positive-duration sleeps immediately so grace-period waits don't cost real wall-clock time. */
@@ -685,7 +692,7 @@ describe("AsyncJobManager", () => {
 			vi.advanceTimersByTime(1_000);
 			expect(manager.getJob(jobId)?.resultText).toBe("orphan result");
 
-			expect(manager.consumeJobResults([jobId])).toBe(1);
+			expect(manager.consumeJobResults([jobRow(manager, jobId)])).toBe(1);
 			vi.advanceTimersByTime(25);
 			expect(manager.getJob(jobId)).toBeUndefined();
 		} finally {
@@ -714,7 +721,7 @@ describe("AsyncJobManager", () => {
 			await waitForCondition(() => manager.getDeliveryState({ ownerId: "Main" }).delivering);
 
 			// A foreground recovery read consumes the result mid-park.
-			expect(manager.consumeJobResults([jobId])).toBe(1);
+			expect(manager.consumeJobResults([jobRow(manager, jobId)])).toBe(1);
 			vi.advanceTimersByTime(1_000);
 
 			// Row and suppression marker both survive the consumed grace: the
@@ -753,7 +760,7 @@ describe("AsyncJobManager", () => {
 			await manager.waitForAll();
 			await waitForCondition(() => manager.getDeliveryState({ ownerId: "Main" }).delivering);
 
-			expect(manager.consumeJobResults([jobId])).toBe(1);
+			expect(manager.consumeJobResults([jobRow(manager, jobId)])).toBe(1);
 			vi.advanceTimersByTime(120_000);
 			expect(manager.isDeliverySuppressed(jobId)).toBe(true);
 

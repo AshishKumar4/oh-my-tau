@@ -26,6 +26,7 @@ import type {
 	AsyncJobDeliveryState,
 	AsyncJobDetails,
 	AsyncJobFilter,
+	AsyncJobInstance,
 	AsyncJobManagerApi,
 	AsyncJobProcess,
 	AsyncJobReapResult,
@@ -342,8 +343,11 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		return this.#remote.callSync("acknowledgeDeliveries", jobIds);
 	}
 
-	consumeJobResults(jobIds: string[]): number {
-		return this.#remote.callSync("consumeJobResults", jobIds);
+	consumeJobResults(jobs: readonly AsyncJobInstance[]): number {
+		return this.#remote.callSync(
+			"consumeJobResults",
+			jobs.map(({ id, startTime }) => ({ id, startTime })),
+		);
 	}
 
 	isJobResultConsumed(jobId: string): boolean {
