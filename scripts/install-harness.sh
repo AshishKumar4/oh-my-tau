@@ -180,7 +180,7 @@ PY
 # the interactive TUI sends the `cli` entrypoint omp serves, so drive a PTY.
 # One recording per model: the vendor prompt names the model it runs on, so a
 # Fable recording replayed to Opus would assert the wrong identity.
-CLAUDE_MODELS="${OMP_HARNESS_CLAUDE_MODELS:-claude-fable-5-1 claude-opus-5}"
+CLAUDE_MODELS="${OMP_HARNESS_CLAUDE_MODELS:-claude-fable-5-1 claude-opus-5 claude-opus-5-5}"
 
 drive_claude_tui() {
 	python3 - "$WORK_DIR" "$GATEWAY_PORT" "$1" "$WORK_DIR/claude-$1.log" <<'PY'
