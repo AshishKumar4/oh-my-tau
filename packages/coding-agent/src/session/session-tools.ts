@@ -298,6 +298,12 @@ export function projectMountedMCPXdevGuidance(routes: Iterable<MountedMCPToolRou
 }
 
 const TOOL_ROSTER_NOTICE_MESSAGE_TYPE = "tool-roster-notice";
+/** A harness profile, and whether its deferred tools are ToolSearch's rather than `xd://` devices. */
+interface HarnessPresentation {
+	readonly profile: HarnessProfile | undefined;
+	readonly toolSearch: boolean;
+}
+
 const XDEV_MOUNT_NOTICE_MESSAGE_TYPE = "xdev-mount-notice";
 const EVAL_PRELUDE_NOTICE_MESSAGE_TYPE = "eval-prelude-notice";
 
@@ -492,8 +498,8 @@ export class SessionTools {
 	#promptModelKey: string | undefined;
 	/** Inline-descriptor decision of the model the base prompt was rendered for. */
 	#promptInlineDescriptors: boolean | undefined;
-	/** Harness profile the base prompt and the presented tools were rendered for. */
-	#promptHarness: HarnessProfile | undefined;
+	/** Harness presentation the base prompt and the presented tools were rendered for; see {@link #harnessPresentation}. */
+	#promptHarness: HarnessPresentation | undefined;
 	#rebuildSystemPrompt: SessionToolsOptions["rebuildSystemPrompt"];
 	#getMcpServerInstructions: SessionToolsOptions["getMcpServerInstructions"];
 	/**
@@ -601,7 +607,7 @@ export class SessionTools {
 		this.#basePromptRoutedXdevNames = this.#routedSummaryXdevNames();
 		this.#promptModelKey = this.#currentPromptModelKey();
 		this.#promptInlineDescriptors = this.#currentInlineDescriptors();
-		this.#promptHarness = this.#harnessProfile();
+		this.#promptHarness = this.#harnessPresentation();
 		// The construction slate carries the profile's wire identities AND its
 		// facades, so a session that never applies a selection (headless `-p`)
 		// still presents the full surface on its first request. The live slate is
@@ -774,7 +780,12 @@ export class SessionTools {
 
 	/** Names of tools currently exposed at the top level. */
 	getActiveToolNames(): string[] {
-		return [...new Set(this.#host.agent.state.tools.map(t => t.persistAs ?? t.name))];
+		// A mounted tool is never active top level: under tool search it rides the
+		// request deferred, which is still the mounted half of the partition.
+		const mounted = this.#xdev?.mountedNames;
+		return [
+			...new Set(this.#host.agent.state.tools.filter(t => !mounted?.has(t.name)).map(t => t.persistAs ?? t.name)),
+		];
 	}
 	/** Enabled top-level, `xd://`, and Code Mode bridge tool names. */
 	getEnabledToolNames(): string[] {
@@ -1114,13 +1125,22 @@ export class SessionTools {
 	 * (#11983), or the inline-descriptor decision, which also turns provider-side description pruning
 	 * on or off (#14200). The kept key makes a later switch back to the rendered model a no-op, and a
 	 * deliberate switch (`/model`, `setModel`) compares against the model the prompt describes. A
-	 * hop across harness profiles is a full switch: the new model sees its own harness.
+	 * hop across harness presentations is a full switch: the new model sees its own harness.
 	 */
 	async syncAfterModelChange(previousEditMode: EditModeSetting, options?: { retryFallback?: boolean }): Promise<void> {
 		const currentEditMode = this.resolveActiveEditMode();
-		if (options?.retryFallback && this.#harnessProfile() === this.#promptHarness) {
+		const presentation = this.#harnessPresentation();
+		const rendered = this.#promptHarness;
+		const presentationChanged =
+			presentation.profile !== rendered?.profile || presentation.toolSearch !== rendered?.toolSearch;
+		if (options?.retryFallback && !presentationChanged) {
 			const inlineDescriptorsChanged = this.#currentInlineDescriptors() !== this.#promptInlineDescriptors;
 			if (previousEditMode !== currentEditMode || inlineDescriptorsChanged) await this.refreshBaseSystemPrompt();
+			return;
+		}
+		if (presentationChanged && (presentation.toolSearch || rendered?.toolSearch === true)) {
+			// Deferred tools move between `xd://` and ToolSearch: partition the enabled set again.
+			await this.applyActiveToolsByName(this.getEnabledToolNames(), true);
 			return;
 		}
 		const editModeChanged = previousEditMode !== currentEditMode && this.getActiveToolNames().includes("edit");
@@ -1275,6 +1295,16 @@ export class SessionTools {
 		const deferred = this.#deferredTools(profile);
 		if (facades.length === 0 && surface.hidden.size === 0 && deferred.length === 0) return tools;
 		return [...tools.filter(tool => !surface.hidden.has(tool.name)), ...facades, ...deferred];
+	}
+
+	/**
+	 * What the request presents for the active model: its harness profile, and whether deferred
+	 * tools are ToolSearch's or `xd://` devices. The same profile on another endpoint (a gateway
+	 * serving the same Claude) can lose tool search, and its request must not carry it.
+	 */
+	#harnessPresentation(): HarnessPresentation {
+		const profile = this.#harnessProfile();
+		return { profile, toolSearch: this.#servedToolSearch(profile) !== undefined };
 	}
 
 	/** The tool-search surface tools are presented under; undefined keeps deferred tools `xd://` devices. */
@@ -1593,8 +1623,9 @@ export class SessionTools {
 			if (goalRegistration) await untilAborted(signal, goalRegistration);
 		}
 		const presentedRegistry = this.#presentedRegistry(profile);
+		// `tool_search` is the deferred tools' transport: the surface adds it, a selection never does.
 		const selectedTools = toolNames.flatMap(name => {
-			const tool = presentedRegistry.get(name);
+			const tool = name === TOOL_SEARCH_TOOL_NAME ? undefined : presentedRegistry.get(name);
 			return tool ? [{ name, tool }] : [];
 		});
 		const xdevReadAvailable = this.#builtInToolNames.has("read") && selectedTools.some(({ name }) => name === "read");
@@ -1842,7 +1873,7 @@ export class SessionTools {
 				this.#lastAppliedToolSignature = rebuiltSignature;
 				this.#promptModelKey = this.#currentPromptModelKey();
 				this.#promptInlineDescriptors = this.#currentInlineDescriptors();
-				this.#promptHarness = this.#harnessProfile();
+				this.#promptHarness = this.#harnessPresentation();
 				this.#setBasePromptXdevNames(rebuiltXdevCatalogNames);
 				// The rebuilt prompt is a fresh roster snapshot. Keep the complete
 				// pending delta for a turn override that hides it, while separately
@@ -2758,7 +2789,7 @@ export class SessionTools {
 				this.#pendingToolRosterDeltaAfterBase = undefined;
 				this.#promptModelKey = this.#currentPromptModelKey();
 				this.#promptInlineDescriptors = this.#currentInlineDescriptors();
-				this.#promptHarness = this.#harnessProfile();
+				this.#promptHarness = this.#harnessPresentation();
 				this.#lastAppliedToolSignature = signature;
 				return true;
 			},
