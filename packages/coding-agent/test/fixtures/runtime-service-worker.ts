@@ -16,7 +16,6 @@ import { RemoteAsyncJob, RemoteAsyncJobManager } from "../../src/thread/services
 import { runtimeThreadService } from "../../src/thread/services/runtime";
 import { RemoteArtifactManager, RemoteCostGate, RemoteEventBus } from "../../src/thread/services/runtime-remote";
 import { settingsThreadService } from "../../src/thread/services/settings";
-import type { ToolSession } from "../../src/tools";
 import { EventBus, emitSubagentFrame } from "../../src/utils/event-bus";
 
 /** Worker-side probe the test calls through the function it registers at boot. */
@@ -129,7 +128,7 @@ const probe: RuntimeProbe = async (op, ...args) => {
 		case "evalWait": {
 			// An eval `wait()` run in the worker, as a worker-homed session's cell runs it.
 			const jobs = manager(args[0]);
-			const session = { getAgentId: () => String(args[1]), asyncJobManager: jobs } as unknown as ToolSession;
+			const session = { getAgentId: () => String(args[1]), asyncJobManager: jobs };
 			const items = args.slice(2).map(id => ({ kind: "agent", id: String(id) }));
 			return await runEvalWait({ items, timeoutMs: 5_000 }, { session });
 		}

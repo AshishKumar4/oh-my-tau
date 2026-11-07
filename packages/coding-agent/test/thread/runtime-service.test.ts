@@ -173,6 +173,31 @@ describe("runtime thread services: async jobs", () => {
 		});
 	});
 
+	it("does not take another owner's job that reuses an evicted id as the waited job", async () => {
+		const manager = newManager(30);
+		const probe = await startWorker();
+		const first = await jobId(probe, manager, "Worker");
+		const second = await jobId(probe, manager, "Worker");
+
+		const waited = probe("evalWait", manager, "Worker", first, second);
+		await Bun.sleep(20);
+		await probe("finish", first, "first done");
+		await manager.getJob(first)?.promise;
+		await Bun.sleep(120);
+		// Main reuses the evicted id for a running job of another owner.
+		const other = Promise.withResolvers<string>();
+		expect(manager.register("bash", "other", () => other.promise, { id: first, ownerId: "Other" })).toBe(first);
+		await probe("finish", second, "second done");
+
+		expect(await waited).toEqual({
+			items: [
+				{ kind: "agent", id: first, status: "completed", text: "first done" },
+				{ kind: "agent", id: second, status: "completed", text: "second done" },
+			],
+		});
+		other.resolve("other done");
+	});
+
 	it("cancels the worker body from main and keeps the shutdown reason a symbol", async () => {
 		const manager = newManager();
 		const probe = await startWorker();

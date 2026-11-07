@@ -35,7 +35,7 @@ export interface EvalHandleSnapshot extends EvalHandleRef {
 }
 
 interface EvalHandleBridgeOptions {
-	session: ToolSession;
+	session: Pick<ToolSession, "getAgentId" | "asyncJobManager" | "agentRegistry">;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
 }
@@ -211,11 +211,14 @@ export async function runEvalWait(
 	const resolved = items.map(item => resolveHandle(item, options));
 	// A worker's job rows are snapshots taken when read, so a job's state is its row read
 	// last. Each job's row is read at its own settlement too: main may evict a settled row
-	// (its retention, or the consumed grace) while another handle keeps the wait open.
+	// (its retention, or the consumed grace) while another handle keeps the wait open, and
+	// may then reuse its id for another job, whose row is not this handle's.
 	const rows = new Map<ResolvedHandle, AsyncJob>();
 	const current = (handle: ResolvedHandle): ResolvedHandle => {
 		if (!("job" in handle)) return handle;
-		const job = handle.manager.getJob(handle.ref.id) ?? rows.get(handle) ?? handle.job;
+		const row = handle.manager.getJob(handle.ref.id);
+		const sameJob = row?.ownerId === handle.job.ownerId && row?.startTime === handle.job.startTime;
+		const job = (sameJob ? row : undefined) ?? rows.get(handle) ?? handle.job;
 		rows.set(handle, job);
 		return { ...handle, job };
 	};
