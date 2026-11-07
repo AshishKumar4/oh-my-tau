@@ -69,7 +69,7 @@ function context(deferLoading: boolean): Context {
 	};
 }
 
-async function capture(deferLoading: boolean) {
+async function capture(deferLoading: boolean, target: Model<"anthropic-messages"> = model) {
 	let body: Record<string, unknown> | undefined;
 	let betas = "";
 	const fetchMock: FetchImpl = async (_input, init) => {
@@ -80,7 +80,7 @@ async function capture(deferLoading: boolean) {
 			{ status: 400 },
 		);
 	};
-	await streamSimple(model, context(deferLoading), {
+	await streamSimple(target, context(deferLoading), {
 		apiKey: "sk-ant-oat-test",
 		fetch: fetchMock,
 		harnessProfile: "claude-code",
@@ -102,10 +102,33 @@ describe("Anthropic tool search wire", () => {
 		]);
 		const resultTurn = records(records(body.messages).at(-1)?.content);
 		expect(resultTurn).toEqual([
-			{ type: "tool_result", tool_use_id: "toolu_1", content: [{ type: "tool_reference", tool_name: "WebSearch" }] },
+			{
+				type: "tool_result",
+				tool_use_id: "toolu_1",
+				content: [{ type: "tool_reference", tool_name: "WebSearch" }],
+				is_error: false,
+			},
 			expect.objectContaining({ type: "text", text: "Tool loaded." }),
 		]);
 		expect(betas.split(",")).toContain("advanced-tool-use-2025-11-20");
+	});
+
+	it("keeps an endpoint's tool-result envelope on a replayed search result", async () => {
+		// Z.AI's Anthropic endpoint needs `id` on every tool result (issue #814).
+		const zai = buildModel({
+			...model,
+			id: "glm-5",
+			provider: "zai",
+			baseUrl: "https://api.z.ai/api/anthropic",
+			compat: { ...model.compat, requiresToolResultId: true },
+		});
+		const { body } = await capture(false, zai);
+		expect(records(records(body.messages).at(-1)?.content)[0]).toMatchObject({
+			type: "tool_result",
+			tool_use_id: "toolu_1",
+			id: "toolu_1",
+			content: [{ type: "text", text: "Loaded WebSearch." }],
+		});
 	});
 
 	it("names a loaded tool in text when the request no longer defers it, and drops the beta", async () => {

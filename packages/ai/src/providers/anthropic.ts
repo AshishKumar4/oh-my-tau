@@ -124,6 +124,7 @@ import {
 	type CompactionBlockParam,
 	type CompactionEdit,
 	type ContentBlockParam,
+	type ToolResultBlockParam,
 	type FallbackParam,
 	isAnthropicServerToolHistoryBlock,
 	type MessageCreateParams,
@@ -5782,19 +5783,19 @@ export function streamBedrockAnthropicCompaction(
 	});
 }
 
+/** A tool result's wire content: converted blocks, or a tool search's references. */
+type ToolResultContent = NonNullable<ToolResultBlockParam["content"]>;
+
 const EMPTY_ERROR_TOOL_RESULT_TEXT = "Tool failed with no output.";
 
-function isEmptyToolResultWireContent(content: AnthropicToolResultContent): boolean {
+function isEmptyToolResultWireContent(content: ToolResultContent): boolean {
 	if (typeof content === "string") {
 		return content.trim().length === 0;
 	}
 	return content.length === 0;
 }
 
-function ensureErrorToolResultWireContent(
-	content: AnthropicToolResultContent,
-	isError: boolean | undefined,
-): AnthropicToolResultContent {
+function ensureErrorToolResultWireContent(content: ToolResultContent, isError: boolean | undefined): ToolResultContent {
 	if (!isError || !isEmptyToolResultWireContent(content)) {
 		return content;
 	}
@@ -5811,36 +5812,9 @@ function buildToolResultBlock(
 	toolName: (name: string) => string,
 	deferredToolNames: ReadonlySet<string>,
 ): ContentBlockParam {
-	// A tool search's result is the tools it loads, as Claude Code sends it: the
-	// references inside the result, its text after the run. A reference resolves
-	// only against a tool this request declares deferred; a tool it no longer
-	// defers (another endpoint, a server that left) is named in text instead.
-	if (msg.providerMetadata?.type === "toolSearch" && !msg.isError) {
-		const loaded = msg.providerMetadata.toolNames;
-		const references = loaded.filter(name => deferredToolNames.has(name));
-		if (references.length > 0) {
-			for (const block of msg.content) {
-				if (block.type === "text" && block.text.trim().length > 0)
-					trailingText.push({ type: "text", text: block.text });
-			}
-			return {
-				type: "tool_result",
-				tool_use_id: msg.toolCallId,
-				content: [
-					...references.map(name => ({ type: "tool_reference" as const, tool_name: toolName(name) })),
-					...loaded
-						.filter(name => !deferredToolNames.has(name))
-						.map(name => ({ type: "text" as const, text: `Loaded ${toolName(name)}.` })),
-				],
-			};
-		}
-		return {
-			type: "tool_result",
-			tool_use_id: msg.toolCallId,
-			content: loaded.map(name => ({ type: "text", text: `Loaded ${toolName(name)}.` })),
-		};
-	}
-	let content = convertContentBlocks(msg.content, { supportsImages: model.input.includes("image") });
+	let content: ToolResultContent =
+		toolSearchResultContent(msg, trailingText, toolName, deferredToolNames) ??
+		convertContentBlocks(msg.content, { supportsImages: model.input.includes("image") });
 	// Anthropic rejects images inside error tool results ("all content must be
 	// type `text` if `is_error` is true") — keep the text in the block and
 	// hoist the images after the message's tool_result run.
@@ -5868,6 +5842,34 @@ function buildToolResultBlock(
 		(block as unknown as Record<string, unknown>).id = msg.toolCallId;
 	}
 	return block;
+}
+
+/**
+ * A tool search's result as Claude Code sends it: references to the tools it
+ * loads, with its own text after the run. A reference resolves only against a
+ * tool this request declares deferred; a tool it no longer defers (another
+ * endpoint, a server that left) is named in text instead. Undefined for any
+ * other result, which converts as usual.
+ */
+function toolSearchResultContent(
+	msg: ToolResultMessage,
+	trailingText: ContentBlockParam[],
+	toolName: (name: string) => string,
+	deferredToolNames: ReadonlySet<string>,
+): ToolResultContent | undefined {
+	if (msg.providerMetadata?.type !== "toolSearch" || msg.isError) return undefined;
+	const loaded = msg.providerMetadata.toolNames;
+	if (loaded.length === 0) return undefined;
+	const named = loaded.filter(name => !deferredToolNames.has(name)).map(name => `Loaded ${toolName(name)}.`);
+	const references = loaded.filter(name => deferredToolNames.has(name));
+	if (references.length === 0) return named.map(text => ({ type: "text", text }));
+	for (const block of msg.content) {
+		if (block.type === "text" && block.text.trim().length > 0) trailingText.push({ type: "text", text: block.text });
+	}
+	return [
+		...references.map(name => ({ type: "tool_reference" as const, tool_name: toolName(name) })),
+		...named.map(text => ({ type: "text" as const, text })),
+	];
 }
 
 /**
