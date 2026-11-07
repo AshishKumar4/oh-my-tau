@@ -82,6 +82,19 @@ function reply(turn: number, call?: { name: string; input: Record<string, unknow
 	]);
 }
 
+/** Tools a request's mid-conversation controls add or remove: none, while every load goes through ToolSearch. */
+function toolControls(request: MessagesRequest): string[] {
+	return request.messages.flatMap(message =>
+		message.role === "system" && Array.isArray(message.content)
+			? message.content.flatMap(block =>
+					typeof block === "object" && block !== null && "tool" in block && "type" in block
+						? [`${String(block.type)}:${String((block.tool as { name?: unknown }).name)}`]
+						: [],
+				)
+			: [],
+	);
+}
+
 async function seedCapture(cache: string, toolSearch: boolean): Promise<void> {
 	const dir = path.join(cache, "claude-code");
 	await fs.mkdir(dir, { recursive: true });
@@ -235,6 +248,9 @@ describe("tool search under a Claude Code capture that defers tools", () => {
 			expect.objectContaining({ type: "text", text: "Tool loaded." }),
 		]);
 
+		// Nothing loads a deferred tool but the search: no request activates one with a control.
+		for (const request of requests) expect(toolControls(request)).toEqual([]);
+
 		// The loaded tool runs.
 		const ran = third.messages.at(-1)?.content;
 		expect(ran).toEqual([expect.objectContaining({ type: "tool_result", tool_use_id: "toolu_2" })]);
@@ -269,6 +285,9 @@ describe("tool search under a Claude Code capture that defers tools", () => {
 		expect(requests).toHaveLength(2);
 		const [before, after] = requests;
 		expect(after.tools).toEqual(before.tools);
+		// A follow-up that searches for nothing leaves every deferred tool deferred.
+		expect(after.tools.filter(tool => tool.defer_loading === true).map(tool => tool.name)).toContain("ast_edit");
+		expect(toolControls(after)).toEqual([]);
 	});
 
 	it("keeps xd:// devices under a capture without tool search", async () => {

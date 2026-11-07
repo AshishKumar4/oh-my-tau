@@ -4965,7 +4965,9 @@ function planAnthropicToolControls(
 	for (const tool of context.inactiveTools ?? []) {
 		if (!definitions.has(tool.name)) definitions.set(tool.name, tool);
 	}
-	const activeNames = context.tools.map(tool => tool.name);
+	// A tool that defers itself (tool search's deferred tools) is declared but never
+	// active: only a tool search's reference loads it, so no control ever adds it.
+	const activeNames = context.tools.filter(tool => tool.deferLoading !== true).map(tool => tool.name);
 
 	const toolRecords: { index: number; live: boolean; tools: AnthropicToolControls }[] = [];
 	for (const record of records) {
@@ -4974,8 +4976,8 @@ function planAnthropicToolControls(
 		}
 	}
 	const inserts: AnthropicControlInsert[] = [];
-	let declared = activeNames;
-	const deferred = new Set<string>();
+	let declared = context.tools.map(tool => tool.name);
+	const deferred = new Set(context.tools.filter(tool => tool.deferLoading === true).map(tool => tool.name));
 	const latest = toolRecords.at(-1);
 	if (latest) {
 		// A declared name without a definition cannot be re-sent: accepted cache miss (e.g. after a resume).
@@ -4984,7 +4986,7 @@ function planAnthropicToolControls(
 		for (const name of latest.tools.deferred) {
 			if (declaredSet.has(name)) deferred.add(name);
 		}
-		for (const name of activeNames) {
+		for (const { name } of context.tools) {
 			if (declaredSet.has(name)) continue;
 			declared.push(name);
 			declaredSet.add(name);
@@ -5008,10 +5010,14 @@ function planAnthropicToolControls(
 		if (toolChanges.length > 0) inserts.push({ index: context.messages.length, spec: { toolChanges } });
 	}
 
+	// The deferred set alone decides each declaration's `defer_loading`, so the
+	// declaration and the active chain above describe the same tools.
 	const tools: Tool[] = [];
 	for (const name of declared) {
 		const tool = definitions.get(name);
-		if (tool) tools.push(deferred.has(name) ? { ...tool, deferLoading: true } : tool);
+		if (!tool) continue;
+		const deferLoading = deferred.has(name);
+		tools.push(deferLoading === (tool.deferLoading === true) ? tool : { ...tool, deferLoading });
 	}
 	return {
 		tools,
