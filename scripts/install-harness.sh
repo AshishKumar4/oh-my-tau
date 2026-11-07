@@ -265,6 +265,16 @@ recorded_since_mark() {
 if command -v claude >/dev/null; then
 	say "Recording the Claude Code prompt (interactive TUI)"
 	trust_scratch_dir
+	# Claude Code refuses to start without a login of its own, though the gateway
+	# answers it with omp's credentials. Lend it an access token from omp's pool
+	# for this run: an access token only, so it can never refresh, and so rotate,
+	# the login omp stores. Without one, Claude Code's own login is used.
+	LENT_TOKEN="$("$OMP" token anthropic 2>/dev/null || true)"
+	case "$LENT_TOKEN" in
+	sk-ant-oat*) export CLAUDE_CODE_OAUTH_TOKEN="$LENT_TOKEN" ;;
+	*) say "  no omp Anthropic login to lend; using Claude Code's own" ;;
+	esac
+	unset LENT_TOKEN
 	# The capture is written from the INBOUND request, before omp calls Anthropic,
 	# so a rate-limited or out-of-quota account still produces a valid capture.
 	for model in $CLAUDE_MODELS; do
@@ -278,6 +288,7 @@ if command -v claude >/dev/null; then
 		fi
 	done
 	restore_claude_config
+	unset CLAUDE_CODE_OAUTH_TOKEN
 fi
 
 
