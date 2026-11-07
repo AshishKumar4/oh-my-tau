@@ -183,10 +183,10 @@ PY
 CLAUDE_MODELS="${OMP_HARNESS_CLAUDE_MODELS:-claude-fable-5-1 claude-opus-5}"
 
 drive_claude_tui() {
-	python3 - "$WORK_DIR" "$GATEWAY_PORT" "$1" <<'PY'
+	python3 - "$WORK_DIR" "$GATEWAY_PORT" "$1" "$WORK_DIR/claude-$1.log" <<'PY'
 import os, pty, select, sys, time
 
-work_dir, port, model = sys.argv[1], sys.argv[2], sys.argv[3]
+work_dir, port, model, transcript = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 pid, fd = pty.fork()
 if pid == 0:
     os.chdir(work_dir)
@@ -211,7 +211,11 @@ def drain(seconds):
         if not chunk:
             break
         out += chunk
+        log.write(chunk)
     return out
+
+
+log = open(transcript, "wb")
 
 
 try:
@@ -224,6 +228,7 @@ try:
     os.write(fd, b"hi\r")
     drain(25)
 finally:
+    log.close()
     os.close(fd)
     try:
         os.kill(pid, 15)
@@ -233,6 +238,30 @@ finally:
 PY
 }
 
+# The last lines a client printed, as plain text, to say why a recording failed.
+client_tail() {
+	python3 - "$1" <<'PY'
+import re, sys
+raw = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+# A TUI places words by moving the cursor across the row: each move separates words.
+raw = re.sub(r"\x1b\[\d*[CG]", " ", raw)
+raw = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]", "", raw)
+lines = []
+for line in raw.replace("\r", "\n").split("\n"):
+    line = " ".join(line.split())
+    if len(line) > 3 and line not in lines[-4:]:
+        lines.append(line)
+print("\n".join(f"    | {line}" for line in lines[-6:]))
+PY
+}
+
+# Captures this run wrote: a capture from an earlier run never counts as this run's success.
+RECORD_MARK="$WORK_DIR/.record-start"
+FAILED_CAPTURES=()
+recorded_since_mark() {
+	find "$CACHE_DIR/$1" -maxdepth 1 -name "*$2*.json" -newer "$RECORD_MARK" 2>/dev/null | grep -q .
+}
+
 if command -v claude >/dev/null; then
 	say "Recording the Claude Code prompt (interactive TUI)"
 	trust_scratch_dir
@@ -240,7 +269,13 @@ if command -v claude >/dev/null; then
 	# so a rate-limited or out-of-quota account still produces a valid capture.
 	for model in $CLAUDE_MODELS; do
 		say "  model $model"
+		touch "$RECORD_MARK"
 		drive_claude_tui "$model" || true
+		if ! recorded_since_mark claude-code "-$model"; then
+			warn "no Claude Code capture for $model; the client's last output:"
+			client_tail "$WORK_DIR/claude-$model.log" >&2 || true
+			FAILED_CAPTURES+=("claude-code/$model")
+		fi
 	done
 	restore_claude_config
 fi
@@ -248,12 +283,18 @@ fi
 
 if command -v codex >/dev/null; then
 	say "Recording the Codex prompt"
+	touch "$RECORD_MARK"
 	(cd "$WORK_DIR" && timeout 120 codex exec --skip-git-repo-check \
 		-c 'model_provider="omprec"' \
 		-c 'model_providers.omprec.name="omprec"' \
 		-c "model_providers.omprec.base_url=\"http://127.0.0.1:$GATEWAY_PORT/v1\"" \
 		-c 'model_providers.omprec.wire_api="responses"' \
-		"hi" >/dev/null 2>&1) || true
+		"hi" >"$WORK_DIR/codex.log" 2>&1) || true
+	if ! recorded_since_mark codex ""; then
+		warn "no Codex capture; the client's last output:"
+		client_tail "$WORK_DIR/codex.log" >&2 || true
+		FAILED_CAPTURES+=("codex")
+	fi
 fi
 
 # ─── verify ─────────────────────────────────────────────────────────────────
@@ -278,6 +319,17 @@ if [ "$FOUND" -eq 0 ]; then
 	warn "cache framing under a profile, but it will serve its own system prompt."
 	warn "Gateway log: $WORK_DIR/gateway.log (copied below)"
 	tail -20 "$WORK_DIR/gateway.log" >&2 || true
+	exit 1
+fi
+
+if [ "${#FAILED_CAPTURES[@]}" -gt 0 ]; then
+	echo
+	printf -v missing '%s, ' "${FAILED_CAPTURES[@]}"
+	warn "This run recorded no capture for: ${missing%, }."
+	warn "omp keeps serving the older captures listed above until a new one is recorded."
+	warn "Fix what each client printed above, then run: $0 --record-only"
+	warn "Gateway log (last lines):"
+	tail -10 "$WORK_DIR/gateway.log" >&2 || true
 	exit 1
 fi
 
