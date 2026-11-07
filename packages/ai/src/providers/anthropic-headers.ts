@@ -59,6 +59,8 @@ const oauthAuthBeta = "oauth-2025-04-20";
 const midConversationSystemBeta = "mid-conversation-system-2026-04-07";
 export const midConversationSystemClearAtBeta = "mid-conversation-system-clear-at-2026-08-21";
 export const midConversationToolChangesBeta = "mid-conversation-tool-changes-2026-07-01";
+/** Tool search: `defer_loading` declarations and `tool_reference` tool results. */
+export const advancedToolUseBeta = "advanced-tool-use-2025-11-20";
 export const midConversationOutputConfigBeta = "mid-conversation-output-config-2026-07-01";
 export const contextManagementBeta = "context-management-2025-06-27";
 export const structuredOutputsBeta = "structured-outputs-2025-12-15";

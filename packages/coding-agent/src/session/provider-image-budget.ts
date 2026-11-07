@@ -333,7 +333,7 @@ function otherRequestBytes(context: Context, model: Model, metadataWire: boolean
 		const message = gemini ? adoptFactoryReplay(original, gemini, nativeReplay) : original;
 		if (message.role === "toolResult") {
 			const metadata = message.providerMetadata;
-			if (!metadata || sentScreenshotBytes(message, metadataWire) === undefined) {
+			if (metadata?.type !== "computer" || sentScreenshotBytes(message, metadataWire) === undefined) {
 				return {
 					...message,
 					content: measuredContent(message.content, stringArguments),

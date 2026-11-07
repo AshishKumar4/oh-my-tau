@@ -190,6 +190,7 @@ import {
 	mergeAnthropicBetaHeader,
 	midConversationSystemClearAtBeta,
 	midConversationToolChangesBeta,
+	advancedToolUseBeta,
 	midConversationOutputConfigBeta,
 	contextManagementBeta,
 	structuredOutputsBeta,
@@ -268,6 +269,7 @@ const killSwitchBetas: Record<string, true> = {
 	[structuredOutputsBeta]: true,
 	[taskBudgetBeta]: true,
 	[midConversationToolChangesBeta]: true,
+	[advancedToolUseBeta]: true,
 };
 
 /**
@@ -2211,6 +2213,13 @@ const streamAnthropicOnce = (
 				if (options?.taskBudget && !extraBetas.includes(taskBudgetBeta)) {
 					extraBetas.push(taskBudgetBeta);
 				}
+				if (
+					usesToolSearch(context) &&
+					!isVertexRawPredictUrl(baseUrl) &&
+					!extraBetas.includes(advancedToolUseBeta)
+				) {
+					extraBetas.push(advancedToolUseBeta);
+				}
 				// `output_config.effort` ships on thinking-on requests, explicit
 				// thinking-off adaptive pins, and forced-tool adaptive pins. The beta
 				// must accompany the field even when direct streamAnthropic callers omit
@@ -3897,6 +3906,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (model, con
 		retryEmptyCompletion: true,
 	});
 
+/** Whether a request defers tools or carries a tool search's result. */
+function usesToolSearch(context: Context): boolean {
+	return (
+		context.tools?.some(tool => tool.deferLoading === true) === true ||
+		context.messages.some(message => message.role === "toolResult" && message.providerMetadata?.type === "toolSearch")
+	);
+}
+
 /** Whether Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to this model's provider. */
 function experimentalBetasDisabled(model: Model<"anthropic-messages">): boolean {
 	return model.compat.honorsClaudeCodeBetaKillSwitch === true && $flag("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS");
@@ -3930,6 +3947,17 @@ function withholdKillSwitchFields(params: MessageCreateParamsStreaming): void {
 		if ("strict" in tool) delete tool.strict;
 		if ("defer_loading" in tool) delete tool.defer_loading;
 		if ("eager_input_streaming" in tool) delete tool.eager_input_streaming;
+	}
+	// Without `defer_loading` every tool is declared in full, so a tool search's
+	// references only name tools the model already has.
+	for (const message of params.messages) {
+		if (!Array.isArray(message.content)) continue;
+		for (const block of message.content) {
+			if (block.type !== "tool_result" || !Array.isArray(block.content)) continue;
+			block.content = block.content.map(part =>
+				part.type === "tool_reference" ? { type: "text", text: `Loaded ${part.tool_name}.` } : part,
+			);
+		}
 	}
 	for (const message of params.messages) {
 		// Per-message `output_config` (mid-conversation effort) may carry the same controls.
@@ -5781,7 +5809,22 @@ function buildToolResultBlock(
 	model: Model<"anthropic-messages">,
 	msg: ToolResultMessage,
 	hoistedImages: ContentBlockParam[],
+	trailingText: ContentBlockParam[],
+	toolName: (name: string) => string,
 ): ContentBlockParam {
+	// A tool search's result is the tools it loads, as Claude Code sends it: the
+	// references inside the result, its text after the run.
+	if (msg.providerMetadata?.type === "toolSearch" && msg.providerMetadata.toolNames.length > 0 && !msg.isError) {
+		for (const block of msg.content) {
+			if (block.type === "text" && block.text.trim().length > 0)
+				trailingText.push({ type: "text", text: block.text });
+		}
+		return {
+			type: "tool_result",
+			tool_use_id: msg.toolCallId,
+			content: msg.providerMetadata.toolNames.map(name => ({ type: "tool_reference", tool_name: toolName(name) })),
+		};
+	}
 	let content = convertContentBlocks(msg.content, { supportsImages: model.input.includes("image") });
 	// Anthropic rejects images inside error tool results ("all content must be
 	// type `text` if `is_error` is true") — keep the text in the block and
@@ -6302,26 +6345,32 @@ export function convertAnthropicMessages(
 			const toolResults: ContentBlockParam[] = [];
 			// Images stripped out of error tool results, re-attached after the run.
 			const hoistedImages: ContentBlockParam[] = [];
+			// Text of tool-search results, which carry references in the result itself.
+			const trailingText: ContentBlockParam[] = [];
 			const toolResultParam: AnthropicMessageParam = {
 				role: "user",
 				content: toolResults,
 			};
+			const referencedToolName = (name: string): string =>
+				encodeAnthropicToolName(name, isOAuthToken, model.compat.escapeBuiltinToolNames, harnessToolNames);
 
 			// Add the current tool result
-			toolResults.push(buildToolResultBlock(model, msg, hoistedImages));
+			toolResults.push(buildToolResultBlock(model, msg, hoistedImages, trailingText, referencedToolName));
 			copyPerCallContextMessage(toolResultParam, msg);
 
 			// Look ahead for consecutive toolResult messages
 			let j = i + 1;
 			while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
 				const nextMsg = transformedMessages[j] as ToolResultMessage; // We know it's a toolResult
-				toolResults.push(buildToolResultBlock(model, nextMsg, hoistedImages));
+				toolResults.push(buildToolResultBlock(model, nextMsg, hoistedImages, trailingText, referencedToolName));
 				copyPerCallContextMessage(toolResultParam, nextMsg);
 				j++;
 			}
 
 			// Skip the messages we've already processed
 			i = j - 1;
+
+			toolResults.push(...trailingText);
 
 			if (hoistedImages.length > 0) {
 				toolResults.push(

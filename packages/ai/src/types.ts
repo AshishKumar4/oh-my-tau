@@ -1112,7 +1112,18 @@ export interface ComputerToolResultMetadata {
 	acknowledgedSafetyChecks: ComputerSafetyCheck[];
 }
 
-export type ToolResultProviderMetadata = ComputerToolResultMetadata;
+/**
+ * A tool search's result: the deferred tools it loads. Providers with tool
+ * search (Anthropic) send each as a `tool_reference`, which the API expands
+ * into the tool's definition; others send the result's text alone.
+ */
+export interface ToolSearchResultMetadata {
+	type: "toolSearch";
+	/** Loaded tools by their omp names; providers encode the wire names. */
+	toolNames: string[];
+}
+
+export type ToolResultProviderMetadata = ComputerToolResultMetadata | ToolSearchResultMetadata;
 
 export interface ToolCall {
 	type: "toolCall";
