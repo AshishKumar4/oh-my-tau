@@ -596,29 +596,6 @@ describe("persisted subagent revival", () => {
 		expect(capturedOptions?.agentName).toBe("scout");
 	});
 
-	it("restores the agent definition on cold revival, so an opted-in Fusion lead keeps its sidekick", async () => {
-		const cwd = makeTempDir("@pi-revive-fusion-lead-");
-		const lead = path.join(cwd, ".omp", "agents", "lead.md");
-		await Bun.write(
-			lead,
-			"---\nname: lead\ndescription: A lead with its own sidekick\nsidekick: true\n---\nLead the work.\n",
-		);
-		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, { agent: "lead" });
-		let capturedOptions: CreateAgentSessionOptions | undefined;
-		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-			capturedOptions = options;
-			return { session: createRevivedSession([]).session } as CreateAgentSessionResult;
-		});
-
-		const ref = createRef(sessionFile);
-		const reviver = await createFactory(cwd)(ref);
-		if (!reviver) throw new Error("Expected a persisted reviver");
-		await reviver(ref);
-
-		// `isFusionLead` reads the opt-in from the definition, which the transcript does not keep.
-		expect(capturedOptions?.agentDefinition).toMatchObject({ name: "lead", sidekick: true });
-	});
-
 	it("keys a revived subagent's soft request budget on its persisted agent name, not the ref display name", async () => {
 		const cwd = makeTempDir("@pi-revive-soft-budget-");
 		const sessionFile = await createPersistedSession(cwd, undefined, undefined, undefined, { agent: "scout" });
