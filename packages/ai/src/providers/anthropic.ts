@@ -3906,12 +3906,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (model, con
 		retryEmptyCompletion: true,
 	});
 
-/** Whether a request defers tools or carries a tool search's result. */
+/** Whether a request defers tools; only then can a tool search's references resolve. */
 function usesToolSearch(context: Context): boolean {
-	return (
-		context.tools?.some(tool => tool.deferLoading === true) === true ||
-		context.messages.some(message => message.role === "toolResult" && message.providerMetadata?.type === "toolSearch")
-	);
+	return context.tools?.some(tool => tool.deferLoading === true) === true;
 }
 
 /** Whether Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to this model's provider. */
@@ -5580,6 +5577,7 @@ function buildParams(
 		// Facade replay checks the declaration this request sends, which the
 		// tool plan may extend past the active set with withdrawn tools.
 		declaredNames: declaredToolNames(toolPlan.tools),
+		deferredToolNames: new Set(toolPlan.tools?.filter(tool => tool.deferLoading === true).map(tool => tool.name)),
 		...(harnessOverride !== undefined ? { harnessProfile: harnessOverride } : {}),
 		compactionRequest,
 	};
@@ -5811,18 +5809,35 @@ function buildToolResultBlock(
 	hoistedImages: ContentBlockParam[],
 	trailingText: ContentBlockParam[],
 	toolName: (name: string) => string,
+	deferredToolNames: ReadonlySet<string>,
 ): ContentBlockParam {
 	// A tool search's result is the tools it loads, as Claude Code sends it: the
-	// references inside the result, its text after the run.
-	if (msg.providerMetadata?.type === "toolSearch" && msg.providerMetadata.toolNames.length > 0 && !msg.isError) {
-		for (const block of msg.content) {
-			if (block.type === "text" && block.text.trim().length > 0)
-				trailingText.push({ type: "text", text: block.text });
+	// references inside the result, its text after the run. A reference resolves
+	// only against a tool this request declares deferred; a tool it no longer
+	// defers (another endpoint, a server that left) is named in text instead.
+	if (msg.providerMetadata?.type === "toolSearch" && !msg.isError) {
+		const loaded = msg.providerMetadata.toolNames;
+		const references = loaded.filter(name => deferredToolNames.has(name));
+		if (references.length > 0) {
+			for (const block of msg.content) {
+				if (block.type === "text" && block.text.trim().length > 0)
+					trailingText.push({ type: "text", text: block.text });
+			}
+			return {
+				type: "tool_result",
+				tool_use_id: msg.toolCallId,
+				content: [
+					...references.map(name => ({ type: "tool_reference" as const, tool_name: toolName(name) })),
+					...loaded
+						.filter(name => !deferredToolNames.has(name))
+						.map(name => ({ type: "text" as const, text: `Loaded ${toolName(name)}.` })),
+				],
+			};
 		}
 		return {
 			type: "tool_result",
 			tool_use_id: msg.toolCallId,
-			content: msg.providerMetadata.toolNames.map(name => ({ type: "tool_reference", tool_name: toolName(name) })),
+			content: loaded.map(name => ({ type: "text", text: `Loaded ${toolName(name)}.` })),
 		};
 	}
 	let content = convertContentBlocks(msg.content, { supportsImages: model.input.includes("image") });
@@ -5935,6 +5950,8 @@ type AnthropicConversionOptions = {
 	credentialId?: number;
 	harnessToolNames?: HarnessToolNames;
 	declaredNames?: ReadonlySet<string>;
+	/** Tools this request declares with `defer_loading`: the ones a tool search's reference can resolve to. */
+	deferredToolNames?: ReadonlySet<string>;
 	harnessProfile?: HarnessProfile | null;
 	/** On-demand compaction request: it ends inside the conversation, so it gets nothing live requests lack there. */
 	compactionRequest?: AnthropicCompactionRequest;
@@ -5969,6 +5986,7 @@ export function convertAnthropicMessages(
 ): AnthropicMessageParam[] {
 	const harnessToolNames = opts?.harnessToolNames;
 	const declaredNames = opts?.declaredNames;
+	const deferredToolNames = opts?.deferredToolNames ?? new Set<string>();
 	const harnessOverride = opts?.harnessProfile;
 	// Indices of params emitted from agent-owned `developer` messages. After the
 	// main pass, the ones whose placement satisfies Anthropic's mid-conversation
@@ -6355,14 +6373,18 @@ export function convertAnthropicMessages(
 				encodeAnthropicToolName(name, isOAuthToken, model.compat.escapeBuiltinToolNames, harnessToolNames);
 
 			// Add the current tool result
-			toolResults.push(buildToolResultBlock(model, msg, hoistedImages, trailingText, referencedToolName));
+			toolResults.push(
+				buildToolResultBlock(model, msg, hoistedImages, trailingText, referencedToolName, deferredToolNames),
+			);
 			copyPerCallContextMessage(toolResultParam, msg);
 
 			// Look ahead for consecutive toolResult messages
 			let j = i + 1;
 			while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
 				const nextMsg = transformedMessages[j] as ToolResultMessage; // We know it's a toolResult
-				toolResults.push(buildToolResultBlock(model, nextMsg, hoistedImages, trailingText, referencedToolName));
+				toolResults.push(
+					buildToolResultBlock(model, nextMsg, hoistedImages, trailingText, referencedToolName, deferredToolNames),
+				);
 				copyPerCallContextMessage(toolResultParam, nextMsg);
 				j++;
 			}

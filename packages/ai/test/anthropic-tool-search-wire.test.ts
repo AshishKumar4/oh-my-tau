@@ -108,12 +108,16 @@ describe("Anthropic tool search wire", () => {
 		expect(betas.split(",")).toContain("advanced-tool-use-2025-11-20");
 	});
 
-	it("keeps a search result's references when no tool is deferred, as on a resumed history", async () => {
+	it("names a loaded tool in text when the request no longer defers it, and drops the beta", async () => {
 		const { body, betas } = await capture(false);
 		expect(records(body.tools).every(tool => tool.defer_loading === undefined)).toBe(true);
-		expect(records(records(body.messages).at(-1)?.content)[0]).toMatchObject({
-			content: [{ type: "tool_reference", tool_name: "WebSearch" }],
-		});
-		expect(betas.split(",")).toContain("advanced-tool-use-2025-11-20");
+		expect(records(records(body.messages).at(-1)?.content)).toEqual([
+			expect.objectContaining({
+				type: "tool_result",
+				tool_use_id: "toolu_1",
+				content: [{ type: "text", text: "Loaded WebSearch." }],
+			}),
+		]);
+		expect(betas.split(",")).not.toContain("advanced-tool-use-2025-11-20");
 	});
 });
