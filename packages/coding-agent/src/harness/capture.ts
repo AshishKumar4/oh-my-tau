@@ -59,6 +59,9 @@ const captureSchema = type({
 	// captures recorded before declarations were kept still serve their prompt.
 	"declarations?": [{ name: "string", description: "string", "input_schema?": "unknown" }, "[]"],
 	"ambient?": "string[]",
+	// The client's own announcement of the tools it defers behind ToolSearch,
+	// and their names: the wording omp serves its own deferred tools in.
+	"toolSearch?": { announcement: "string", deferred: "string[]" },
 	"fallback?": "unknown",
 });
 
@@ -70,12 +73,21 @@ export interface VendorTool {
 	readonly inputSchema?: TJsonSchema;
 }
 
+/**
+ * How a capture's client defers tools behind ToolSearch: the line that
+ * introduces the deferred tools (one name per line follows it) and the
+ * client's own deferred tools, by wire name.
+ */
+export type ToolSearchSurface = NonNullable<HarnessCapture["toolSearch"]>;
+
 export interface HarnessPrompt {
 	readonly text: string;
 	readonly clientVersion: string;
 	readonly path: string;
 	/** Vendor declarations by wire name; empty for captures that recorded names only. */
 	readonly tools: Readonly<Record<string, VendorTool>>;
+	/** Present when the client defers tools behind ToolSearch. */
+	readonly toolSearch?: ToolSearchSurface;
 }
 
 type CaptureProjection =
@@ -86,6 +98,7 @@ type CaptureProjection =
 			readonly capturedAt: number;
 			readonly model?: string;
 			readonly tools: Readonly<Record<string, VendorTool>>;
+			readonly toolSearch?: ToolSearchSurface;
 			/** Ids of the profile's surface edits whose anchor this recording does not carry. */
 			readonly unmatchedEdits: readonly string[];
 	  }
@@ -499,6 +512,7 @@ export function projectHarnessCapture(profile: HarnessProfile, raw: unknown): Ca
 		tools: surface.tools,
 		unmatchedEdits: surface.unmatched,
 		...(capture.model === undefined ? {} : { model: capture.model }),
+		...(capture.toolSearch && capture.tools.includes("ToolSearch") && { toolSearch: capture.toolSearch }),
 	};
 }
 
@@ -661,7 +675,13 @@ async function readHarnessPrompt(profile: HarnessProfile, modelId?: string): Pro
 			continue;
 		}
 		const text = alignModelIdentity(projection.text, modelId);
-		best = { text, clientVersion: projection.clientVersion, path: file, tools: projection.tools };
+		best = {
+			text,
+			clientVersion: projection.clientVersion,
+			path: file,
+			tools: projection.tools,
+			...(projection.toolSearch && { toolSearch: projection.toolSearch }),
+		};
 		bestCapturedAt = projection.capturedAt;
 		bestExact = exact;
 	}

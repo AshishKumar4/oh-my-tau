@@ -279,6 +279,53 @@ describe("harness capture recorder", () => {
 		expect(served?.text).not.toContain(claudeCodeSystemInstruction);
 	});
 
+	it("records how a tool-search client announces its deferred tools, and serves that surface", async () => {
+		const announcement =
+			'The following deferred tools are now available via ToolSearch. Use ToolSearch with query "select:<name>" to load them:';
+		const body = claudeCodeBody(claudeCodeEntrypoint, false);
+		body.tools = [
+			...(body.tools as unknown[]),
+			{ name: "ToolSearch", description: "Fetch deferred tools", input_schema: { type: "object", properties: {} } },
+			{
+				name: "DeferredToolPlaceholder",
+				description: "Never call",
+				input_schema: { type: "object" },
+				defer_loading: true,
+			},
+		];
+		body.messages = [
+			...(body.messages as unknown[]).slice(0, 1),
+			{
+				role: "system",
+				content: [
+					{ type: "text", text: `${AMBIENT_ENVIRONMENT}\n\n${announcement}\nCronList\nWebFetch\nWebSearch` },
+				],
+			},
+		];
+		await recordTurn("/v1/messages", body, ANTHROPIC_HEADERS);
+
+		const file = `${CLIENT_VERSION}-${claudeCodeEntrypoint}-claude-sonnet-5.json`;
+		const capture = await readCapture("claude-code", file);
+		expect(isRecord(capture) ? capture.toolSearch : undefined).toEqual({
+			announcement,
+			deferred: ["CronList", "WebFetch", "WebSearch"],
+		});
+		expect((await servedPrompt("claude-code"))?.toolSearch).toEqual({
+			announcement,
+			deferred: ["CronList", "WebFetch", "WebSearch"],
+		});
+	});
+
+	it("records no tool-search surface for a client that does not declare ToolSearch", async () => {
+		await recordTurn("/v1/messages", claudeCodeBody(claudeCodeEntrypoint, false), ANTHROPIC_HEADERS);
+		const capture = await readCapture(
+			"claude-code",
+			`${CLIENT_VERSION}-${claudeCodeEntrypoint}-claude-sonnet-5.json`,
+		);
+		expect(isRecord(capture) ? capture.toolSearch : "missing").toBeUndefined();
+		expect((await servedPrompt("claude-code"))?.toolSearch).toBeUndefined();
+	});
+
 	it.skipIf(process.platform === "win32")("writes the capture owner-only", async () => {
 		await recordTurn("/v1/messages", claudeCodeBody(claudeCodeEntrypoint, false), ANTHROPIC_HEADERS);
 

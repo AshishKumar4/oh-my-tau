@@ -10,6 +10,7 @@ import {
 	HARNESS_CAPTURE_SCHEMA,
 	type HarnessCapture,
 	projectHarnessCapture,
+	type ToolSearchSurface,
 } from "./capture";
 
 const CODEX_FALLBACK_KEYS = ["instructions", "tools"] as const;
@@ -31,6 +32,7 @@ interface Derivation {
 	readonly tools: string[];
 	readonly declarations: ToolDeclaration[];
 	readonly ambient: string[];
+	readonly toolSearch?: ToolSearchSurface;
 	readonly fallback?: CaptureFallback;
 }
 
@@ -104,15 +106,38 @@ function deriveClaudeCode(body: unknown): Derivation | undefined {
 		.filter(message => stringField(message, "role") !== "assistant")
 		.flatMap(textParts);
 	const model = stringField(body, "model");
+	const surface = toolSurface(arrayField(body, "tools") ?? []);
+	const toolSearch = surface.tools.includes(TOOL_SEARCH_WIRE_NAME) ? toolSearchAnnouncement(ambient) : undefined;
 	return {
 		profile: "claude-code",
 		clientVersion: identity.clientVersion,
 		entrypoint: identity.entrypoint,
 		...(model === undefined ? {} : { model }),
 		instructions,
-		...toolSurface(arrayField(body, "tools") ?? []),
+		...surface,
 		ambient,
+		...(toolSearch && { toolSearch }),
 	};
+}
+
+const TOOL_SEARCH_WIRE_NAME = "ToolSearch";
+const TOOL_NAME_LINE = /^[A-Za-z0-9_.:-]+$/;
+
+/**
+ * The client's announcement of its deferred tools: a paragraph whose first
+ * line names ToolSearch and whose every following line is one tool name.
+ */
+function toolSearchAnnouncement(ambient: readonly string[]): ToolSearchSurface | undefined {
+	for (const text of ambient) {
+		for (const paragraph of text.split(/\n\s*\n/)) {
+			const [announcement, ...names] = paragraph.trim().split("\n");
+			if (announcement === undefined || !announcement.includes(TOOL_SEARCH_WIRE_NAME) || names.length === 0)
+				continue;
+			const deferred = names.map(name => name.trim());
+			if (deferred.every(name => TOOL_NAME_LINE.test(name))) return { announcement: announcement.trim(), deferred };
+		}
+	}
+	return undefined;
 }
 
 /** The declared tools plus their names, which the reader keys on. */
