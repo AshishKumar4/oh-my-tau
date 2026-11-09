@@ -1339,7 +1339,7 @@ export class SessionTools {
 		if (PERMISSION_REQUIRED_TOOLS[tool.name] !== true) return tool;
 		// Default-config ACP sessions still ask for executable calls even though
 		// the schema defaults to yolo; explicit yolo is an intentional opt-in.
-		if (tool.name !== "bash" && this.#isExplicitAutoApproveMode()) {
+		if (!SHELL_COMMAND_TOOLS[tool.name] && this.#isExplicitAutoApproveMode()) {
 			const userPolicies: Record<string, unknown> = cfgToolsApproval.get(this.#host.settings);
 			const toolPolicy = userPolicies[tool.name];
 			if (!toolPolicy || toolPolicy === "allow") return tool;
@@ -1357,7 +1357,9 @@ export class SessionTools {
 					const restrictions = approvalRestrictions(this.#host.settings, this.#host.sessionManager.getCwd());
 					// A restricted call is approved per call: a remembered ACP answer never covers it.
 					let cacheable = restrictedFolderReason(target, args, restrictions) === undefined;
-					if (target.name === "bash") {
+					// Shell commands resolve the session's policy first: a critical or
+					// pattern-forced prompt stays per call, whatever was granted before.
+					if (SHELL_COMMAND_TOOLS[target.name]) {
 						const explicitAutoApprove = this.#isExplicitAutoApproveMode();
 						const { approvalMode, userPolicies } = resolveApprovalFromContext({
 							autoApprove: this.#autoApprove,

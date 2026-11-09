@@ -27,6 +27,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { MonitorTool } from "@oh-my-pi/pi-coding-agent/tools/monitor";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
@@ -448,6 +449,46 @@ it("ACP bash uses pattern decisions and scopes persistent grants to noncritical 
 	// Critical commands ask on every call, whatever was granted.
 	expect(requests).toEqual(["echo probe-1", "rm -rf /", "rm -rf /"]);
 	expect(bashTool.executeCalls).toBe(5);
+});
+
+it("ACP monitor commands follow bash's grant scoping: Always allow never covers a critical command", async () => {
+	const settingsOverrides = { "tools.approvalMode": "always-ask", "tools.approval": { monitor: "prompt" } };
+	const settings = Settings.isolated(settingsOverrides);
+	const requests: string[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall) {
+			const input = toolCall.rawInput;
+			requests.push(input && typeof input === "object" && "command" in input ? String(input.command) : "");
+			return { outcome: "selected", optionId: "allow_always", kind: "allow_always" };
+		},
+	};
+	const monitorTool = makeFakeTool("monitor");
+	monitorTool.approval = new MonitorTool({ ...makeToolSession(bridge), settings }).approval;
+	const wrapped = new ExtensionToolWrapper(monitorTool, noUiRunner()) as unknown as AgentTool;
+	session = await createSession([wrapped], bridge, settingsOverrides);
+	await session.setActiveToolsByName(["monitor"]);
+	const gated = session.agent.state.tools.find(tool => tool.name === "monitor");
+	if (!gated) throw new Error("Missing monitor tool");
+	const ctx = { settings } as never;
+	const run = (command: string) =>
+		gated.execute(
+			`call-${command}`,
+			{ description: "x", timeout_ms: 1_000, command },
+			undefined,
+			undefined as never,
+			ctx,
+		);
+
+	await run("tail -f a.log");
+	await run("tail -f b.log");
+	// "Always allow" covers later ordinary monitors.
+	expect(requests).toEqual(["tail -f a.log"]);
+	await run("rm -rf /");
+	await run("rm -rf /");
+	// A critical command asks on every call, whatever was granted.
+	expect(requests).toEqual(["tail -f a.log", "rm -rf /", "rm -rf /"]);
+	expect(monitorTool.executeCalls).toBe(4);
 });
 
 it("always-ask: an ordinary edit without an ACP grant still faces the inner approval gate", async () => {
