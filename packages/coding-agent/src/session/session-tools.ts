@@ -77,6 +77,7 @@ import {
 	PERMISSION_OPTIONS,
 	PERMISSION_OPTIONS_BY_ID,
 	PERMISSION_REQUIRED_TOOLS,
+	SHELL_COMMAND_TOOLS,
 } from "./acp-permission-gate";
 import type { ClientBridge, ClientBridgePermissionOutcome } from "./client-bridge";
 import { resolveCodeMode } from "./code-mode";
@@ -1388,7 +1389,7 @@ export class SessionTools {
 					// persisted ACP grant; inner handlers may mutate `args` in place.
 					const approvedCtx = (ctx ? { ...ctx, acpApprovedArgs: structuredCloneJSON(args) } : ctx) as never;
 					const command =
-						target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)
+						SHELL_COMMAND_TOOLS[target.name] && args && typeof args === "object" && !Array.isArray(args)
 							? stringProperty(args, "command")
 							: undefined;
 					const commandContent = command
@@ -1508,7 +1509,7 @@ export class SessionTools {
 									toolCallId,
 									toolName: target.name,
 									title: permissionIntent.title,
-									...(target.name === "bash" ? { kind: "execute" } : {}),
+									...(SHELL_COMMAND_TOOLS[target.name] ? { kind: "execute" } : {}),
 									status: "pending",
 									rawInput: args,
 									...(commandContent ? { content: commandContent } : {}),

@@ -898,6 +898,47 @@ it("bash permission requests include execute metadata and command content", asyn
 	expect(bashTool.executeCalls).toBe(1);
 });
 
+it("a monitor's command asks permission like a bash command, and a WebSocket monitor does not", async () => {
+	const monitorTool = makeFakeTool("monitor");
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall, _options, _signal) {
+			requests.push(toolCall);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	session = await createSession([monitorTool], bridge);
+
+	await session.setActiveToolsByName(["monitor"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "monitor");
+	const command = "tail -f run.log | grep --line-buffered ERROR";
+	await wrapped!.execute(
+		"call-monitor",
+		{ description: "errors", timeout_ms: 60_000, command },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+	expect(requests).toHaveLength(1);
+	expect(requests[0]).toMatchObject({
+		toolName: "monitor",
+		title: command,
+		kind: "execute",
+		content: [{ type: "content", content: { type: "text", text: `$ ${command}` } }],
+	});
+
+	await wrapped!.execute(
+		"call-monitor-ws",
+		{ description: "deploys", timeout_ms: 60_000, ws: { url: "wss://events.example.com" } },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+	expect(requests).toHaveLength(1);
+	expect(monitorTool.executeCalls).toBe(2);
+});
+
 it("ordinary edit calls still bypass ACP permission after rejecting edit moves forever", async () => {
 	const editTool = makeFakeTool("edit");
 	const bridge = makeBridge({ outcome: "selected", optionId: "reject_always", kind: "reject_always" });

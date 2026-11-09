@@ -208,8 +208,8 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 							{
 								cwd: this.session.cwd,
 								env,
-								// Its own shell: a watch never holds the session's.
-								sessionKey: `${sessionId ?? ""}:monitor:${jobId}`,
+								// Its own per-job shell, released when the watch ends, like a background bash job's.
+								sessionKey: `${sessionId ?? ""}:async:${jobId}`,
 								timeout: 0,
 								signal: watch,
 								gitGuard: cfgBashGitGuard.get(this.session.settings),

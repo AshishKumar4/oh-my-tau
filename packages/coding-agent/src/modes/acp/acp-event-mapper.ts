@@ -578,7 +578,7 @@ function mergeToolUpdateContent(startContent: ToolCallContent[], resultContent: 
 }
 
 function isCommandToolName(toolName: string): boolean {
-	return toolName === "bash" || toolName === "shell" || toolName === "exec";
+	return toolName === "bash" || toolName === "monitor" || toolName === "shell" || toolName === "exec";
 }
 
 function buildToolTitle(toolName: string, args: unknown, intent: string | undefined): string {
