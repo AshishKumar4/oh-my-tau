@@ -25,10 +25,9 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { completeOnTier } from "../eval/completion-bridge";
 import { isIrcEnabled } from "../irc/messaging";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
-import type { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
-import { isPerCallModelApproved, type PerCallModelGrants, parentModelGrantPattern } from "../task/model-approval";
+import { approvedPerCallModels, parentModelGrantPattern, spawnModelGrants } from "../task/model-approval";
 import { cfgTaskBatch, cfgTaskEnableEffort, cfgTaskIsolationEnabled, perCallModelEnabled } from "../task/settings";
 import { cfgFetchEnabled } from "../tools/settings";
 import type { HarnessFacadeHost, HarnessFacadeSpec } from "./facade";
@@ -171,35 +170,6 @@ function claudeCodeAgentSchema(surface: ClaudeCodeAgentSurface): TSchema {
 	return schema;
 }
 
-/**
- * The newest available model of a Claude family that the per-call grants approve: a
- * configured role's model or the parent's own. The parent's provider wins a tie.
- */
-function newestApprovedModel(
-	family: ClaudeCodeModelAlias,
-	grants: PerCallModelGrants,
-	registry: ModelRegistry,
-	parent: Model | undefined,
-): Model | undefined {
-	const ranked = registry
-		.getAvailable("chat")
-		.flatMap(model => {
-			const { identity } = model;
-			if (identity.class !== "anthropic" || identity.family !== family) return [];
-			return [{ model, revision: identity.revision === undefined ? undefined : parseRevision(identity.revision) }];
-		})
-		.sort((a, b) => {
-			const byRevision =
-				a.revision && b.revision
-					? compareRevision(b.revision, a.revision)
-					: Number(!a.revision) - Number(!b.revision);
-			return (
-				byRevision || Number(b.model.provider === parent?.provider) - Number(a.model.provider === parent?.provider)
-			);
-		});
-	return ranked.find(({ model }) => isPerCallModelApproved(model, grants, registry))?.model;
-}
-
 /** Claude Code's family alias → the exact selector the task tool's per-call `model` takes. */
 function claudeCodeModelSelector(
 	alias: ClaudeCodeModelAlias,
@@ -210,18 +180,36 @@ function claudeCodeModelSelector(
 	if (!registry) unsupported("Agent.model", "this session has no model registry");
 	const parent = host.session?.getActiveModel?.();
 	const parentModelPattern = parent && parentModelGrantPattern(parent);
-	const grants: PerCallModelGrants = {
-		settings: host.settings,
-		agentName: agent ?? "task",
-		...(parentModelPattern !== undefined ? { parentModelPattern } : {}),
-	};
-	const model = newestApprovedModel(alias, grants, registry, parent);
-	if (model) return formatModelStringWithRouting(model);
-	const approved = CLAUDE_CODE_MODEL_ALIASES.filter(
-		other => other !== alias && newestApprovedModel(other, grants, registry, parent),
+	const approved = approvedPerCallModels(
+		spawnModelGrants(host.settings, {
+			agentName: agent ?? "task",
+			...(parentModelPattern !== undefined ? { parentModelPattern } : {}),
+		}),
+		registry,
 	);
+	// The newest of the family; the parent's provider wins a tie.
+	const newest = (family: ClaudeCodeModelAlias): Model | undefined =>
+		approved
+			.filter(model => model.identity.class === "anthropic" && model.identity.family === family)
+			.map(model => {
+				const { revision } = model.identity;
+				return { model, revision: revision === undefined ? undefined : parseRevision(revision) };
+			})
+			.sort((a, b) => {
+				const byRevision =
+					a.revision && b.revision
+						? compareRevision(b.revision, a.revision)
+						: Number(!a.revision) - Number(!b.revision);
+				return (
+					byRevision ||
+					Number(b.model.provider === parent?.provider) - Number(a.model.provider === parent?.provider)
+				);
+			})[0]?.model;
+	const model = newest(alias);
+	if (model) return formatModelStringWithRouting(model);
+	const others = CLAUDE_CODE_MODEL_ALIASES.filter(other => other !== alias && newest(other));
 	throw new ToolError(
-		`Agent.model "${alias}" names no approved model in this session${approved.length > 0 ? `; approved: ${approved.map(other => `"${other}"`).join(", ")}` : ""}. Omit model to use the agent's configured model.`,
+		`Agent.model "${alias}" names no approved model in this session${others.length > 0 ? `; approved: ${others.map(other => `"${other}"`).join(", ")}` : ""}. Omit model to use the agent's configured model.`,
 	);
 }
 

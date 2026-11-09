@@ -14,7 +14,6 @@ import {
 	resolveAgentModelSelection,
 	resolveConfiguredModelPatterns,
 	resolveExplicitModelRole,
-	getModelMatchPreferences,
 	resolveModelOverride,
 } from "../config/model-resolver";
 import { type OAuthAccountPools, validateAgentAccountPools } from "../config/account-pools";
@@ -94,6 +93,7 @@ import {
 	parentModelGrantPattern,
 	PerCallModelError,
 	type PerCallModelGrants,
+	spawnModelGrants,
 } from "./model-approval";
 
 /** Final structured completion metadata returned for a schema-bearing run. */
@@ -460,14 +460,12 @@ function preflightPerCallModel(
 	});
 	if (selectorProblem) fail(selectorProblem);
 	const perCallModel = selector as string;
-	const grants: PerCallModelGrants = {
-		settings,
+	const grants = spawnModelGrants(settings, {
 		agentName: agent.name,
 		agentModel: agent.model,
 		agentSource: agent.source,
 		parentModelPattern,
-		matchPreferences: structuredClone(getModelMatchPreferences(settings.grantAuthority())),
-	};
+	});
 	// A cold registry is checked again in the executor once models are loaded.
 	const available = modelRegistry?.getAvailable("all");
 	if (!modelRegistry || !available?.length) return grants;

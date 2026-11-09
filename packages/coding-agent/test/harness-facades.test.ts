@@ -18,6 +18,7 @@ import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { formatModelStringWithRouting, resolveModelOverride } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import type { VendorTool } from "@oh-my-pi/pi-coding-agent/harness/capture";
 import { harnessFacade, presentTool } from "@oh-my-pi/pi-coding-agent/harness/facade";
 import { harnessFacadeSpecs, harnessSurface } from "@oh-my-pi/pi-coding-agent/harness/facades";
@@ -845,8 +846,14 @@ describe("claude-code Agent facade", () => {
 				requests: 1,
 			};
 		});
-		const models = getBundledModels("anthropic");
-		const spawnThrough = async (settings: Settings, args: Record<string, unknown>) => {
+		const opus55 = getBundledModel("anthropic", "claude-opus-5-5");
+		if (!opus55) throw new Error("Expected claude-opus-5-5 model to exist");
+		const spawnThrough = async (
+			settings: Settings,
+			args: Record<string, unknown>,
+			models: Model[] = getBundledModels("anthropic"),
+			parent: Model = opus55,
+		) => {
 			const session = {
 				cwd: process.cwd(),
 				hasUI: false,
@@ -854,8 +861,8 @@ describe("claude-code Agent facade", () => {
 				getSessionFile: () => null,
 				getSessionSpawns: () => "*",
 				modelRegistry: { getAll: () => models, getAvailable: () => models },
-				getActiveModel: () => getBundledModel("anthropic", "claude-opus-5-5"),
-				getActiveModelString: () => "anthropic/claude-opus-5-5",
+				getActiveModel: () => parent,
+				getActiveModelString: () => formatModelStringWithRouting(parent),
 			} as unknown as ToolSession;
 			const task = await TaskTool.create(session);
 			const facade = facadeFor("claude-code", "Agent", task as unknown as AgentTool, settings, session);
@@ -882,6 +889,37 @@ describe("claude-code Agent facade", () => {
 			["expert", ["anthropic/claude-fable-5-2:high"], undefined],
 			// Effort alone keeps the agent's own routing: here the parent's model.
 			["task", ["anthropic/claude-opus-5-5"], Effort.XHigh],
+		]);
+
+		// The facade resolves a bare role with the operator's provider order, as dispatch does.
+		spawns.length = 0;
+		const fable52 = getBundledModel("anthropic", "claude-fable-5-2");
+		if (!fable52) throw new Error("Expected claude-fable-5-2 model to exist");
+		const ordered = Settings.isolated({
+			"async.enabled": false,
+			"task.batch": false,
+			"task.perCallModel": "on",
+			modelProviderOrder: ["relay"],
+		});
+		ordered.setModelRole("FABLE", "claude-fable-5-2");
+		const relayed = [...getBundledModels("anthropic"), { ...fable52, provider: "relay" }];
+		expect((await spawnThrough(ordered, { prompt: "p", model: "fable" }, relayed)).isError).not.toBe(true);
+		// A parent on a pinned aggregator route grants that route, pin included.
+		const openrouter = getBundledModels("openrouter");
+		const pinned = resolveModelOverride(
+			["openrouter/anthropic/claude-opus-5.5@anthropic"],
+			{ getAvailable: () => openrouter },
+			undefined,
+			{ exactOnly: true },
+		).model;
+		if (!pinned) throw new Error("Expected the pinned OpenRouter route to resolve");
+		const parentOnly = Settings.isolated({ "async.enabled": false, "task.batch": false, "task.perCallModel": "on" });
+		expect((await spawnThrough(parentOnly, { prompt: "p", model: "opus" }, openrouter, pinned)).isError).not.toBe(
+			true,
+		);
+		expect(spawns.map(spawn => spawn.modelOverride)).toEqual([
+			["relay/claude-fable-5-2"],
+			["openrouter/anthropic/claude-opus-5.5@anthropic"],
 		]);
 
 		// The task tool honors a caller's effort only under task.enableEffort, so Agent refuses it rather than drop it.
