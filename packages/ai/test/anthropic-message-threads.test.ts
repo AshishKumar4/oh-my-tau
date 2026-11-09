@@ -301,6 +301,44 @@ describe("anthropic message threads", () => {
 		expect(userTexts(sent[2].body)).toEqual(["first", "reply 1", "second"]);
 	});
 
+	it("sends a history that holds a compaction block without a thread, and keeps threading the session", async () => {
+		const { fetch, sent } = endpoint();
+		const chat = session(fetch);
+		const compacted: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "Earlier summary." }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: MODEL.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			providerPayload: {
+				type: "anthropicCompaction",
+				provider: "anthropic",
+				content: "Earlier summary.",
+				signature: "sig",
+			},
+			timestamp: 0,
+		};
+		chat.messages.push(compacted);
+
+		await chat.turn("first");
+
+		// The server refuses `thread` beside a compaction block, so the request never asks for one.
+		expect(sent).toHaveLength(1);
+		expect(sent[0].body.thread).toBeUndefined();
+		expect(sent[0].betas).not.toContain(THREADS_BETA);
+		const [summary] = sent[0].body.messages;
+		expect(Array.isArray(summary?.content) ? summary.content[0] : undefined).toMatchObject({ type: "compaction" });
+	});
+
 	it("disables the thread only when the unthreaded resend after an unexplained 400 succeeds", async () => {
 		const { fetch, sent } = endpoint([
 			textResponse("msg_a", "one"),

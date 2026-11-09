@@ -317,11 +317,19 @@ export class AnthropicThreadTurn {
 	}
 }
 
-/** Whether a thread can hold this body: no compaction, unsupported context edits, turn-scoped messages or credit redemption. */
+/**
+ * Whether a thread can hold this body: no compaction (requested, or a summary
+ * block in the history), unsupported context edits, turn-scoped messages or
+ * credit redemption. The server refuses `thread` beside a compaction block.
+ */
 function isThreadable(params: MessageCreateParamsStreaming): boolean {
 	if (params.compaction || params.fallback_credit_token) return false;
 	if (params.context_management?.edits.some(edit => edit.type !== "clear_thinking_20251015")) return false;
-	return !params.messages.some(message => message.clear_at === "next_user_message");
+	return !params.messages.some(
+		message =>
+			message.clear_at === "next_user_message" ||
+			(Array.isArray(message.content) && message.content.some(block => block.type === "compaction")),
+	);
 }
 
 function fingerprintOf(params: MessageCreateParamsStreaming, betaHeader: string): ThreadFingerprint {
