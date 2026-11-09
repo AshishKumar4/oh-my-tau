@@ -19,6 +19,7 @@ import type { AgentRegistryApi } from "../registry/agent-registry";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { CoordinationDetails } from "@oh-my-pi/pi-tui/tools/wait";
 import { readToolExecutionStart } from "../session/exit-diagnostics";
+import type { SessionEntry } from "../session/session-entries";
 import { getCacheWarmingDelayMs } from "../session/cache-warmer";
 import waitKeepWorkingTemplate from "../prompts/tools/wait-keep-working.md" with { type: "text" };
 import { throwIfAborted } from "./tool-errors";
@@ -33,8 +34,6 @@ const waitSchema = type({});
  * and still hands a hung job's caller its turn back.
  */
 const WAIT_MAX_MS = 25 * 60_000;
-/** Shortest block: a cache already near its refresh point still gets a real wait. */
-const WAIT_MIN_MS = 60_000;
 /** After one watched job settles, keep collecting briefly so near-simultaneous completions share one wait result. */
 const WAIT_SETTLE_WINDOW_MS = 1500;
 const PROGRESS_INTERVAL_MS = 500;
@@ -48,8 +47,24 @@ const PROGRESS_INTERVAL_MS = 500;
 function waitWindowMs(session: ToolSession, now: number): number {
 	const cache = session.getPromptCacheStatus?.();
 	if (cache?.state !== "warm" || cache.ttlMs === undefined) return WAIT_MAX_MS;
+	// A refresh point already past wakes at once, before the entry expires: that wake's request warms it.
 	const refreshAt = cache.touchedAt + (getCacheWarmingDelayMs(cache.ttlMs) ?? cache.ttlMs);
-	return Math.min(Math.max(refreshAt - now, WAIT_MIN_MS), Math.max(cache.ttlMs, WAIT_MIN_MS));
+	return Math.max(refreshAt - now, 0);
+}
+
+/**
+ * Whether the transcript records a tool start other than `waitName` after the
+ * entry `entryId`, in journal order. A cursor no longer on the branch (a rewind)
+ * counts as work in between.
+ */
+function workedSince(branch: readonly SessionEntry[], entryId: string | undefined, waitName: string): boolean {
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.id === entryId) return false;
+		const start = readToolExecutionStart(entry);
+		if (start && start.toolName !== waitName) return true;
+	}
+	return entryId !== undefined;
 }
 
 /** The caller's open todo items: work it could do instead of waiting. */
@@ -166,8 +181,8 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 	readonly approval = "read";
 	readonly loadMode = "essential";
 	readonly intent = "optional";
-	/** When this tool last handed back open items instead of blocking; see {@link #keepWorking}. */
-	#offeredWorkAt: number | undefined;
+	/** The transcript's last entry when this tool last handed back open items; see {@link #keepWorking}. */
+	#offeredAfter: { entryId: string | undefined } | undefined;
 
 	constructor(private readonly session: ToolSession) {}
 
@@ -177,8 +192,6 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<CoordinationDetails>,
 	): Promise<AgentToolResult<CoordinationDetails>> {
-		const offeredWorkAt = this.#offeredWorkAt;
-		this.#offeredWorkAt = undefined;
 		const registry = this.session.agentRegistry;
 		const senderId = this.session.getAgentId?.() ?? undefined;
 		const messaging = registry && senderId ? { registry, senderId } : undefined;
@@ -228,7 +241,7 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 				};
 			}
 		}
-		const keepWorking = this.#keepWorking(jobs, serviceRunning, offeredWorkAt);
+		const keepWorking = this.#keepWorking(jobs, serviceRunning);
 		if (keepWorking) return keepWorking;
 		return this.#blockUntilWake({ jobs, manager, messaging, serviceRunning, signal, onUpdate });
 	}
@@ -240,33 +253,20 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 	 * no other tool run in between, means everything left needs the result, so
 	 * it blocks.
 	 */
-	#keepWorking(
-		jobs: AsyncJob[],
-		serviceRunning: boolean,
-		offeredWorkAt: number | undefined,
-	): AgentToolResult<CoordinationDetails> | undefined {
+	#keepWorking(jobs: AsyncJob[], serviceRunning: boolean): AgentToolResult<CoordinationDetails> | undefined {
+		// Without a transcript the tool cannot tell work in between from a repeat wait.
+		const branch = this.session.sessionManager?.getBranch();
+		if (!branch) return undefined;
 		const items = openTodoItems(this.session);
 		if (items.length === 0) return undefined;
-		if (offeredWorkAt !== undefined && !this.#workedSince(offeredWorkAt)) return undefined;
-		this.#offeredWorkAt = Date.now();
+		if (this.#offeredAfter && !workedSince(branch, this.#offeredAfter.entryId, this.name)) return undefined;
+		this.#offeredAfter = { entryId: branch.at(-1)?.id };
 		const text = prompt.render(waitKeepWorkingTemplate, {
 			jobs: jobs.map(job => ({ id: job.id, label: job.intent ?? job.label })),
 			service: serviceRunning,
 			items,
 		});
 		return { content: [{ type: "text", text }], details: { op: "wait", jobs: [] } };
-	}
-
-	/** Whether the caller started a tool other than `wait` since `sinceMs`, read off the transcript's tool starts. */
-	#workedSince(sinceMs: number): boolean {
-		const branch = this.session.sessionManager?.getBranch() ?? [];
-		for (let index = branch.length - 1; index >= 0; index--) {
-			const entry = branch[index];
-			if (Date.parse(entry.timestamp) < sinceMs) return false;
-			const start = readToolExecutionStart(entry);
-			if (start && start.toolName !== this.name) return true;
-		}
-		return false;
 	}
 
 	/**
