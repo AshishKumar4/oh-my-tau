@@ -241,6 +241,12 @@ function claudeCodeAgentParams(args: ClaudeCodeAgentArgs, host: HarnessFacadeHos
 	}
 	const isolated = args.isolation === "worktree" ? { isolated: true } : {};
 	if (args.tasks !== undefined) {
+		// Like task's batch shape, a per-spawn field at the top level is refused, never silently dropped.
+		for (const field of ["subagent_type", "model", "effort"] as const) {
+			if (args[field] !== undefined) {
+				throw new ToolError(`Agent.${field} with \`tasks\` is not supported: set it on each \`tasks\` item.`);
+			}
+		}
 		const tasks = args.tasks.map(item => {
 			if (item.subagent_type === "fork") {
 				throw new ToolError('subagent_type "fork" applies to a single Agent call, not to `tasks` items.');

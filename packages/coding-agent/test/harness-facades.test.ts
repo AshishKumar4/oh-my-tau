@@ -922,6 +922,35 @@ describe("claude-code Agent facade", () => {
 			["openrouter/anthropic/claude-opus-5.5@anthropic"],
 		]);
 
+		// A batch carries routing per item: top-level fields beside `tasks` are refused, not dropped.
+		spawns.length = 0;
+		const batched = Settings.isolated({
+			"async.enabled": false,
+			"task.batch": true,
+			"task.perCallModel": "on",
+			"task.enableEffort": true,
+		});
+		for (const field of [{ model: "opus" }, { effort: "high" }, { subagent_type: "expert" }]) {
+			const refused = await spawnThrough(batched, {
+				prompt: "brief",
+				...field,
+				tasks: [{ description: "a", prompt: "one" }],
+			});
+			expect(refused.isError).toBe(true);
+		}
+		expect(spawns).toEqual([]);
+		expect(
+			(
+				await spawnThrough(batched, {
+					prompt: "brief",
+					tasks: [{ description: "a", prompt: "one", subagent_type: "expert", model: "opus", effort: "high" }],
+				})
+			).isError,
+		).not.toBe(true);
+		expect(spawns.map(spawn => [spawn.agent.name, spawn.modelOverride])).toEqual([
+			["expert", ["anthropic/claude-opus-5-5:high"]],
+		]);
+
 		// The task tool honors a caller's effort only under task.enableEffort, so Agent refuses it rather than drop it.
 		spawns.length = 0;
 		const noEffort = Settings.isolated({ "async.enabled": false, "task.batch": false, "task.perCallModel": "on" });
