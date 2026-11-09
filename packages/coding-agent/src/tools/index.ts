@@ -76,6 +76,7 @@ import { SidekickTool } from "./sidekick";
 import type { PlanProposalHandler } from "./resolve";
 import { SecurityScanTool } from "./security-scan";
 import { supportsExternalThinking, ThinkTool } from "./think";
+import type { PromptCacheStatus } from "@oh-my-pi/pi-tui/status-line/host";
 import { type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { TodoTool } from "./todo";
 import { WriteTool } from "./write";
@@ -511,6 +512,8 @@ export interface ToolSession {
 	getClientBridge?: () => ClientBridge | undefined;
 	/** Get cached todo phases for this session. */
 	getTodoPhases?: () => TodoPhase[];
+	/** What the next request finds in the prompt cache; see `AgentSession.getPromptCacheStatus`. */
+	getPromptCacheStatus?: () => PromptCacheStatus | undefined;
 	/** Replace cached todo phases for this session. */
 	setTodoPhases?: (phases: TodoPhase[]) => void;
 	/**
