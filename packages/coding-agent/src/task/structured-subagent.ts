@@ -36,7 +36,7 @@ import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.m
 import isolationRecoveryHintTemplate from "../prompts/tools/isolation-recovery-hint.md" with { type: "text" };
 import salvagedChildHintTemplate from "../prompts/tools/salvaged-child-hint.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
-import { AUTO_THINKING, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
+import { AUTO_THINKING, type SpawnEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
 import { buildOutputValidator } from "../tools/output-schema-validator";
@@ -171,7 +171,7 @@ export interface StructuredSubagentRequest {
 	 */
 	structured?: boolean;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
-	effort?: TaskEffort;
+	effort?: SpawnEffort;
 	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
 	solutionSpace?: string;
 	/**
@@ -251,7 +251,7 @@ export interface EffectiveSubagentPolicy {
 	enableLsp: boolean;
 	enableIrc: boolean;
 	/** Caller `effort` hint to apply; dropped when the agent's level comes from the user's `^model:level` tag. */
-	effort?: TaskEffort;
+	effort?: SpawnEffort;
 }
 
 /** Settled child execution plus data needed by the frontends' own rendering. */

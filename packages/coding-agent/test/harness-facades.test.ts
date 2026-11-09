@@ -14,7 +14,7 @@ import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-response
 import type { AssistantMessage, Context, FetchImpl, Message, Model, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -27,6 +27,8 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { type AgentDefinition, TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
+import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { resolveApproval } from "@oh-my-pi/pi-coding-agent/tools/approval";
@@ -700,7 +702,7 @@ describe("claude-code Agent facade", () => {
 		).toThrow(/fork/);
 	});
 
-	it("serves isolation only while task isolation is enabled and never a model override", () => {
+	it("serves isolation, model and effort only while the session honors them", () => {
 		const schemaOf = (settings: Settings) =>
 			JSON.stringify(
 				(
@@ -708,18 +710,31 @@ describe("claude-code Agent facade", () => {
 				).toJsonSchema(),
 			);
 		const plain = schemaOf(Settings.isolated({ "task.isolation.enabled": false, "task.batch": false }));
-		expect(plain).not.toContain('"isolation"');
-		expect(plain).not.toContain('"tasks"');
-		expect(plain).not.toContain('"model"');
-		const full = schemaOf(Settings.isolated({ "task.isolation.enabled": true, "task.batch": true }));
-		expect(full).toContain('"isolation"');
-		expect(full).toContain('"worktree"');
+		for (const field of ['"isolation"', '"tasks"', '"model"', '"effort"']) expect(plain).not.toContain(field);
+		const full = schemaOf(
+			Settings.isolated({
+				"task.isolation.enabled": true,
+				"task.batch": true,
+				"task.perCallModel": "on",
+				"task.enableEffort": true,
+			}),
+		);
+		for (const field of ['"isolation"', '"worktree"', '"tasks"', '"model"', '"fable"', '"effort"', '"xhigh"']) {
+			expect(full).toContain(field);
+		}
 		expect(full).not.toContain('"remote"');
-		expect(full).toContain('"tasks"');
-		expect(full).not.toContain('"model"');
+		// Each field follows its own gate; eval-only per-call models never reach Agent.
+		const effortOnly = schemaOf(Settings.isolated({ "task.enableEffort": true, "task.perCallModel": "eval" }));
+		expect(effortOnly).toContain('"effort"');
+		expect(effortOnly).not.toContain('"model"');
+		const modelOnly = schemaOf(Settings.isolated({ "task.perCallModel": "on" }));
+		expect(modelOnly).toContain('"model"');
+		expect(modelOnly).not.toContain('"effort"');
 
 		const off = facadeFor("claude-code", "Agent", stubTool("task"), Settings.isolated());
 		expect(() => off.toNativeArgs?.({ description: "x", prompt: "y", isolation: "worktree" })).toThrow(/isolation/);
+		expect(() => off.toNativeArgs?.({ description: "x", prompt: "y", model: "opus" })).toThrow(/Agent\.model/);
+		expect(() => off.toNativeArgs?.({ description: "x", prompt: "y", effort: "high" })).toThrow(/Agent\.effort/);
 		const on = facadeFor(
 			"claude-code",
 			"Agent",
@@ -730,6 +745,150 @@ describe("claude-code Agent facade", () => {
 			task: "y",
 			isolated: true,
 		});
+	});
+
+	it("routes model aliases to the newest approved model and effort to an exact level", async () => {
+		const models = getBundledModels("anthropic");
+		const routingSession = (settings: Settings, parent: string): ToolSession =>
+			({
+				...toolSession(),
+				settings,
+				modelRegistry: { getAll: () => models, getAvailable: () => models },
+				getActiveModel: () => getBundledModel("anthropic", parent),
+			}) as unknown as ToolSession;
+		const spawned: unknown[] = [];
+		const task = stubTool("task", {
+			async execute(_id, params) {
+				spawned.push(params);
+				return { content: [{ type: "text", text: "report" }] };
+			},
+		});
+		const settings = Settings.isolated({ "task.perCallModel": "on", "task.enableEffort": true, "task.batch": true });
+		settings.setModelRole("FABLE", "anthropic/claude-fable-5-2");
+		const facade = facadeFor("claude-code", "Agent", task, settings, routingSession(settings, "claude-opus-5-5"));
+		const call = async (args: Record<string, unknown>) =>
+			(await runFacadeCall(CLAUDE_CODE_MODEL, [facade], { name: "Agent", arguments: { description: "d", ...args } }))
+				.result;
+
+		// A configured role grants Fable 5.2; the parent's own model grants Opus 5.5.
+		await call({ prompt: "p", subagent_type: "expert", model: "fable", effort: "high" });
+		await call({ prompt: "p", model: "opus" });
+		await call({ prompt: "p", effort: "xhigh" });
+		// A fork runs on the parent's model and effort, so both fields are ignored.
+		await call({ prompt: "p", subagent_type: "fork", model: "fable", effort: "max" });
+		expect(spawned).toEqual([
+			{ task: "p", agent: "expert", model: "anthropic/claude-fable-5-2:high" },
+			{ task: "p", model: "anthropic/claude-opus-5-5" },
+			{ task: "p", effort: Effort.XHigh },
+			{ task: "p", fork: "all" },
+		]);
+
+		spawned.length = 0;
+		const refused = await call({ prompt: "p", model: "haiku" });
+		expect(refused.isError).toBe(true);
+		expect(refused.content[0]).toMatchObject({ type: "text", text: expect.stringContaining('"opus", "fable"') });
+		expect(spawned).toEqual([]);
+
+		expect(
+			facade.toNativeArgs?.({
+				description: "d",
+				prompt: "brief",
+				tasks: [
+					{ description: "a", prompt: "one", model: "fable" },
+					{ description: "b", prompt: "two", subagent_type: "scout", effort: "low" },
+				],
+			}),
+		).toEqual({
+			context: "brief",
+			tasks: [
+				{ task: "one", model: "anthropic/claude-fable-5-2" },
+				{ task: "two", agent: "scout", effort: Effort.Low },
+			],
+		});
+
+		// Without the role, the newest approved Fable is the parent's own, not the newest in the catalog.
+		const parentOnly = Settings.isolated({ "task.perCallModel": "on" });
+		const onFable51 = facadeFor(
+			"claude-code",
+			"Agent",
+			task,
+			parentOnly,
+			routingSession(parentOnly, "claude-fable-5-1"),
+		);
+		expect(onFable51.toNativeArgs?.({ description: "d", prompt: "p", model: "fable" })).toEqual({
+			task: "p",
+			model: "anthropic/claude-fable-5-1",
+		});
+	});
+
+	it("hands the chosen model and effort to the spawn through the real task tool", async () => {
+		const agents: AgentDefinition[] = [
+			{ name: "task", description: "General-purpose worker", systemPrompt: "task", source: "bundled" },
+			{ name: "expert", description: "Owns large work", systemPrompt: "expert", source: "user" },
+		];
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents, projectAgentsDir: null });
+		const spawns: ExecutorOptions[] = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			spawns.push(options);
+			return {
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				task: options.task,
+				exitCode: 0,
+				output: "Completed.",
+				stderr: "",
+				truncated: false,
+				durationMs: 1,
+				tokens: 0,
+				requests: 1,
+			};
+		});
+		const models = getBundledModels("anthropic");
+		const spawnThrough = async (settings: Settings, args: Record<string, unknown>) => {
+			const session = {
+				cwd: process.cwd(),
+				hasUI: false,
+				settings,
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+				modelRegistry: { getAll: () => models, getAvailable: () => models },
+				getActiveModel: () => getBundledModel("anthropic", "claude-opus-5-5"),
+				getActiveModelString: () => "anthropic/claude-opus-5-5",
+			} as unknown as ToolSession;
+			const task = await TaskTool.create(session);
+			const facade = facadeFor("claude-code", "Agent", task as unknown as AgentTool, settings, session);
+			return (
+				await runFacadeCall(CLAUDE_CODE_MODEL, [facade], {
+					name: "Agent",
+					arguments: { description: "d", ...args },
+				})
+			).result;
+		};
+		const routed = Settings.isolated({
+			"async.enabled": false,
+			"task.batch": false,
+			"task.perCallModel": "on",
+			"task.enableEffort": true,
+		});
+		routed.setModelRole("FABLE", "anthropic/claude-fable-5-2");
+
+		expect(
+			(await spawnThrough(routed, { prompt: "p", subagent_type: "expert", model: "fable", effort: "high" })).isError,
+		).not.toBe(true);
+		expect((await spawnThrough(routed, { prompt: "p", effort: "xhigh" })).isError).not.toBe(true);
+		expect(spawns.map(spawn => [spawn.agent.name, spawn.modelOverride, spawn.effort])).toEqual([
+			["expert", ["anthropic/claude-fable-5-2:high"], undefined],
+			// Effort alone keeps the agent's own routing: here the parent's model.
+			["task", ["anthropic/claude-opus-5-5"], Effort.XHigh],
+		]);
+
+		// The task tool honors a caller's effort only under task.enableEffort, so Agent refuses it rather than drop it.
+		spawns.length = 0;
+		const noEffort = Settings.isolated({ "async.enabled": false, "task.batch": false, "task.perCallModel": "on" });
+		expect((await spawnThrough(noEffort, { prompt: "p", effort: "xhigh" })).isError).toBe(true);
+		expect(spawns).toEqual([]);
 	});
 
 	it("describes the task tool's live agent roster in Claude Code's words", async () => {
@@ -803,7 +962,7 @@ describe("codex collaboration facades on the wire", () => {
 });
 
 describe("codex spawn_agent facade", () => {
-	it("spawns through task under the vendor name and maps reasoning_effort onto task effort", async () => {
+	it("spawns through task under the vendor name and runs reasoning_effort at that exact level", async () => {
 		const spawned: unknown[] = [];
 		const task: AgentTool = {
 			...stubTool("task"),
@@ -881,7 +1040,7 @@ describe("codex spawn_agent facade", () => {
 			name: "spawn_agent",
 			arguments: { task_name: "a", message: "b", reasoning_effort: "xhigh" },
 		});
-		expect(spawned).toEqual([{ name: "a", task: "b", fork: "all", effort: "hi" }]);
+		expect(spawned).toEqual([{ name: "a", task: "b", fork: "all", effort: Effort.XHigh }]);
 
 		// A model override is accepted and ignored: the agent definition owns the model.
 		spawned.length = 0;

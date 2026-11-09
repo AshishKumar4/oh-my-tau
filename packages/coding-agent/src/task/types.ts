@@ -11,7 +11,7 @@ import { type BaseType, type FluentType, type } from "@oh-my-pi/omptype";
 import { $env, isRecord } from "@oh-my-pi/pi-utils";
 
 import type { AgentSessionEvent } from "../session/agent-session";
-import type { ConfiguredThinkingLevel, TaskEffort } from "@oh-my-pi/pi-tui/thinking";
+import type { ConfiguredThinkingLevel, SpawnEffort } from "@oh-my-pi/pi-tui/thinking";
 
 const parseNumber = (value: string | undefined, defaultValue: number): number => {
 	if (value) {
@@ -317,8 +317,8 @@ export interface TaskParams {
 	agent?: string;
 	/** The work (flat form). */
 	task?: string;
-	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
-	effort?: TaskEffort;
+	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports, or an exact level from a harness facade. */
+	effort?: SpawnEffort;
 	/**
 	 * Fork the parent's conversation into the child (flat form): `"all"`
 	 * inherits the whole resolved history, a positive integer the last N

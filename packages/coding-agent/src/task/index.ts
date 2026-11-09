@@ -38,7 +38,8 @@ import taskCoordinationAdvisoryTemplate from "../prompts/tools/task-coordination
 import taskSpawnFeedbackTemplate from "../prompts/tools/task-spawn-feedback.md" with { type: "text" };
 import taskSpecializationAdvisoryTemplate from "../prompts/tools/task-specialization-advisory.md" with { type: "text" };
 import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { type: "text" };
-import { TASK_EFFORTS, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
+import { type SpawnEffort, TASK_EFFORTS } from "@oh-my-pi/pi-tui/thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { hasWaitTool } from "../tools/wait";
 import { sessionToolRefs } from "../harness/effective-profile";
@@ -315,8 +316,8 @@ function validateShapeParams(batchEnabled: boolean, params: TaskParams): string 
  */
 
 /** Reject an out-of-range `effort` selector on internal/stale-transcript calls that bypass the wire schema. */
-function validateEffort(effort: TaskEffort | undefined, label: string): string | undefined {
-	if (effort === undefined || TASK_EFFORTS.includes(effort)) return undefined;
+function validateEffort(effort: SpawnEffort | undefined, label: string): string | undefined {
+	if (effort === undefined || [...TASK_EFFORTS, ...THINKING_EFFORTS].includes(effort)) return undefined;
 	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
 }
 

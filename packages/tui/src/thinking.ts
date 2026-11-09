@@ -314,18 +314,22 @@ export const TASK_EFFORTS = ["lo", "med", "hi"] as const;
 /** Coarse task-spawn effort: the lowest, middle, or highest thinking level the target model supports. */
 export type TaskEffort = (typeof TASK_EFFORTS)[number];
 
+/** A spawn's effort: the task tool's coarse selector, or an exact level a harness facade forwards. */
+export type SpawnEffort = TaskEffort | Effort;
+
 /**
- * Maps a coarse task effort onto the model's supported thinking range:
+ * Maps a spawn effort onto the model's supported thinking range:
  * `lo` = lowest supported level, `hi` = highest (whatever the model tops out
  * at — high, xhigh, or max), `med` = the middle (lower of the two middles for
- * an even-sized range). Without a model, maps over the full canonical range.
+ * an even-sized range). An exact level steps down to the nearest supported
+ * one. Without a model, maps over the full canonical range.
  * Returns `undefined` when the model has no controllable effort surface, so
  * callers fall back to their default selector (e.g. `auto`). Throws when the
  * configured ceiling is below the model's lowest supported effort.
  */
 export function resolveTaskEffortLevel(
 	model: Model | undefined,
-	effort: TaskEffort,
+	effort: SpawnEffort,
 	maxEffort?: Effort,
 ): Effort | undefined {
 	const supported = model ? getSupportedEfforts(model) : THINKING_EFFORTS;
@@ -341,6 +345,8 @@ export function resolveTaskEffortLevel(
 		case "hi":
 			resolved = supported[supported.length - 1];
 			break;
+		default:
+			resolved = (model ? clampThinkingLevelForModel(model, effort) : effort) ?? supported[0];
 	}
 	if (maxEffort === undefined) return resolved;
 	if (model) assertModelSupportsEffortCeiling(model, maxEffort);

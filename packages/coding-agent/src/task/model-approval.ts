@@ -317,12 +317,15 @@ const decisionCache = new WeakMap<
 	ApprovalCacheKey & { catalog: Model<Api>[]; decisions: Map<string, boolean> }
 >();
 
-/** Throw {@link PerCallModelError} unless `model` is an available chat model the configuration approves. */
-export function assertPerCallModelApproved(
+/**
+ * Whether the configuration approves `model`. Throws {@link PerCallModelUnavailableError} when it
+ * is not an available chat model.
+ */
+export function isPerCallModelApproved(
 	model: Model<Api>,
 	grants: PerCallModelGrants,
 	registry: ApprovalRegistry,
-): void {
+): boolean {
 	const target = formatModelStringWithRouting(model);
 	let cache = decisionCache.get(grants);
 	if (!cache || !isCurrent(cache, grants.settings, registry)) {
@@ -344,7 +347,17 @@ export function assertPerCallModelApproved(
 		granted = computeGranted(model, target, grants, chat, cache.catalog);
 		cache.decisions.set(target, granted);
 	}
-	if (granted) return;
+	return granted;
+}
+
+/** Throw {@link PerCallModelError} unless `model` is an available chat model the configuration approves. */
+export function assertPerCallModelApproved(
+	model: Model<Api>,
+	grants: PerCallModelGrants,
+	registry: ApprovalRegistry,
+): void {
+	if (isPerCallModelApproved(model, grants, registry)) return;
+	const target = formatModelStringWithRouting(model);
 	const allowGuidance = perCallAllowlists(grants.settings).some(allow => allow.length > 0)
 		? " It must also be listed in task.perCallModelAllow."
 		: "";

@@ -2,6 +2,9 @@ import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult, ToolSpeculationPolicy } from "@oh-my-pi/pi-agent-core";
 import type { TSchema, ToolNamespace } from "@oh-my-pi/pi-ai";
 import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { compareRevision, parseRevision } from "@oh-my-pi/pi-catalog/compat/revision";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import type { Model } from "@oh-my-pi/pi-catalog/types";
 import { prompt } from "@oh-my-pi/pi-utils";
 import claudeCodeAgent from "../prompts/tools/harness/claude-code-agent.md" with { type: "text" };
 import claudeCodeListAgents from "../prompts/tools/harness/claude-code-list-agents.md" with { type: "text" };
@@ -18,12 +21,15 @@ import codexSendMessage from "../prompts/tools/harness/codex-send-message.md" wi
 import codexSpawnAgent from "../prompts/tools/harness/codex-spawn-agent.md" with { type: "text" };
 import codexWaitAgent from "../prompts/tools/harness/codex-wait-agent.md" with { type: "text" };
 import codexWait from "../prompts/tools/harness/codex-wait.md" with { type: "text" };
-import type { TaskEffort } from "@oh-my-pi/pi-tui/thinking";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { completeOnTier } from "../eval/completion-bridge";
 import { isIrcEnabled } from "../irc/messaging";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
-import { cfgTaskBatch, cfgTaskEnableEffort, cfgTaskIsolationEnabled } from "../task/settings";
+import type { ModelRegistry } from "../config/model-registry";
+import { formatModelStringWithRouting } from "../config/model-resolver";
+import type { Settings } from "../config/settings";
+import { isPerCallModelApproved, type PerCallModelGrants, parentModelGrantPattern } from "../task/model-approval";
+import { cfgTaskBatch, cfgTaskEnableEffort, cfgTaskIsolationEnabled, perCallModelEnabled } from "../task/settings";
 import { cfgFetchEnabled } from "../tools/settings";
 import type { HarnessFacadeHost, HarnessFacadeSpec } from "./facade";
 import { CODEX_COLLABORATION_NAMESPACE, harnessToolRefs } from "./manifest";
@@ -31,6 +37,16 @@ import { CODEX_COLLABORATION_NAMESPACE, harnessToolRefs } from "./manifest";
 function unsupported(field: string, reason: string): never {
 	throw new ToolError(`${field} is not supported: ${reason}. Retry without the field.`);
 }
+
+/** Vendor effort names → the exact level a spawn runs at; Codex's `ultra` is omp's top level. */
+const VENDOR_EFFORTS: Readonly<Record<string, Effort>> = {
+	low: Effort.Low,
+	medium: Effort.Medium,
+	high: Effort.High,
+	xhigh: Effort.XHigh,
+	max: Effort.Max,
+	ultra: Effort.Max,
+};
 
 /** Peer messaging is on: always for a subagent, for the root while it can spawn one. */
 function peerMessaging(host: HarnessFacadeHost): boolean {
@@ -71,10 +87,28 @@ const claudeCodeAgentItem = {
 	"subagent_type?": type("string").describe("The type of specialized agent to use for this task"),
 };
 
+const CLAUDE_CODE_MODEL_ALIASES = ["sonnet", "opus", "haiku", "fable"] as const;
+type ClaudeCodeModelAlias = (typeof CLAUDE_CODE_MODEL_ALIASES)[number];
+type ClaudeCodeEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
+const claudeCodeAgentModel = {
+	"model?": type("'sonnet' | 'opus' | 'haiku' | 'fable'").describe(
+		"Optional model override for this agent: the newest approved model of that family. Takes precedence over the agent definition's model frontmatter; an agent whose model the user configured rejects it. If omitted, uses the agent definition's model, else inherits from the parent. Ignored for subagent_type: \"fork\" — forks always inherit the parent model.",
+	),
+};
+
+const claudeCodeAgentEffort = {
+	"effort?": type("'low' | 'medium' | 'high' | 'xhigh' | 'max'").describe(
+		'Reasoning effort for this agent. Set this ONLY when the user, or instructions such as CLAUDE.md or a skill, explicitly ask that this agent or delegated work run at a specific effort level, never on your own judgment; otherwise omit it and the agent runs at its usual effort. Ignored for subagent_type: "fork": a fork runs at your own effort.',
+	),
+};
+
 interface ClaudeCodeAgentItem {
 	description: string;
 	prompt: string;
 	subagent_type?: string;
+	model?: ClaudeCodeModelAlias;
+	effort?: ClaudeCodeEffort;
 }
 
 interface ClaudeCodeAgentArgs extends ClaudeCodeAgentItem {
@@ -82,26 +116,51 @@ interface ClaudeCodeAgentArgs extends ClaudeCodeAgentItem {
 	tasks?: ClaudeCodeAgentItem[];
 }
 
+/** Which optional Agent fields a session honors. */
+interface ClaudeCodeAgentSurface {
+	isolation: boolean;
+	batch: boolean;
+	/** `model`, while `task.perCallModel` admits task calls. */
+	model: boolean;
+	/** `effort`, while `task.enableEffort` is on: the task tool honors a caller's effort only then. */
+	effort: boolean;
+}
+
+function claudeCodeAgentSurface(settings: Settings): ClaudeCodeAgentSurface {
+	return {
+		isolation: cfgTaskIsolationEnabled.get(settings),
+		batch: cfgTaskBatch.get(settings),
+		model: perCallModelEnabled(settings, "task"),
+		effort: cfgTaskEnableEffort.get(settings),
+	};
+}
+
 const claudeCodeAgentSchemas = new Map<string, TSchema>();
 
 /**
- * Claude Code's Agent schema with only what a session honors: no `model` (an
- * agent's definition owns its model), `isolation` while task isolation is
- * enabled, and the batch `tasks` form while `task.batch` is on. `tasks` comes
- * last so a streamed call closes its shared `prompt` before the first item.
+ * Claude Code's Agent schema with only what a session honors: `model` and
+ * `effort` while the settings let a call choose them, `isolation` while task
+ * isolation is enabled, and the batch `tasks` form while `task.batch` is on.
+ * `tasks` comes last so a streamed call closes its shared `prompt` before the
+ * first item.
  */
-function claudeCodeAgentSchema(isolation: boolean, batch: boolean): TSchema {
-	const key = `${isolation}:${batch}`;
+function claudeCodeAgentSchema(surface: ClaudeCodeAgentSurface): TSchema {
+	const key = `${surface.isolation}:${surface.batch}:${surface.model}:${surface.effort}`;
 	let schema = claudeCodeAgentSchemas.get(key);
 	if (!schema) {
-		schema = type.raw({
+		const item = {
 			...claudeCodeAgentItem,
-			...(isolation
+			...(surface.model ? claudeCodeAgentModel : {}),
+			...(surface.effort ? claudeCodeAgentEffort : {}),
+		};
+		schema = type.raw({
+			...item,
+			...(surface.isolation
 				? { "isolation?": type("'worktree'").describe('"worktree" runs the agent on its own git worktree') }
 				: {}),
-			...(batch
+			...(surface.batch
 				? {
-						"tasks?": type(claudeCodeAgentItem)
+						"tasks?": type(item)
 							.array()
 							.describe("One agent per item; each receives the top-level `prompt` as a shared brief"),
 					}
@@ -110,6 +169,76 @@ function claudeCodeAgentSchema(isolation: boolean, batch: boolean): TSchema {
 		claudeCodeAgentSchemas.set(key, schema);
 	}
 	return schema;
+}
+
+/**
+ * The newest available model of a Claude family that the per-call grants approve: a
+ * configured role's model or the parent's own. The parent's provider wins a tie.
+ */
+function newestApprovedModel(
+	family: ClaudeCodeModelAlias,
+	grants: PerCallModelGrants,
+	registry: ModelRegistry,
+	parent: Model | undefined,
+): Model | undefined {
+	const ranked = registry
+		.getAvailable("chat")
+		.flatMap(model => {
+			const { identity } = model;
+			if (identity.class !== "anthropic" || identity.family !== family) return [];
+			return [{ model, revision: identity.revision === undefined ? undefined : parseRevision(identity.revision) }];
+		})
+		.sort((a, b) => {
+			const byRevision =
+				a.revision && b.revision
+					? compareRevision(b.revision, a.revision)
+					: Number(!a.revision) - Number(!b.revision);
+			return (
+				byRevision || Number(b.model.provider === parent?.provider) - Number(a.model.provider === parent?.provider)
+			);
+		});
+	return ranked.find(({ model }) => isPerCallModelApproved(model, grants, registry))?.model;
+}
+
+/** Claude Code's family alias → the exact selector the task tool's per-call `model` takes. */
+function claudeCodeModelSelector(
+	alias: ClaudeCodeModelAlias,
+	agent: string | undefined,
+	host: HarnessFacadeHost,
+): string {
+	const registry = host.session?.modelRegistry;
+	if (!registry) unsupported("Agent.model", "this session has no model registry");
+	const parent = host.session?.getActiveModel?.();
+	const parentModelPattern = parent && parentModelGrantPattern(parent);
+	const grants: PerCallModelGrants = {
+		settings: host.settings,
+		agentName: agent ?? "task",
+		...(parentModelPattern !== undefined ? { parentModelPattern } : {}),
+	};
+	const model = newestApprovedModel(alias, grants, registry, parent);
+	if (model) return formatModelStringWithRouting(model);
+	const approved = CLAUDE_CODE_MODEL_ALIASES.filter(
+		other => other !== alias && newestApprovedModel(other, grants, registry, parent),
+	);
+	throw new ToolError(
+		`Agent.model "${alias}" names no approved model in this session${approved.length > 0 ? `; approved: ${approved.map(other => `"${other}"`).join(", ")}` : ""}. Omit model to use the agent's configured model.`,
+	);
+}
+
+/** An item's `model`/`effort` as task spawn params; a named model carries the effort as its `:level`. */
+function claudeCodeSpawnRouting(
+	item: ClaudeCodeAgentItem,
+	host: HarnessFacadeHost,
+): { model?: string; effort?: Effort } {
+	const surface = claudeCodeAgentSurface(host.settings);
+	if (item.effort !== undefined && !surface.effort) {
+		unsupported("Agent.effort", "task.enableEffort is off in this session");
+	}
+	const effort = item.effort === undefined ? undefined : VENDOR_EFFORTS[item.effort];
+	if (item.model === undefined) return effort === undefined ? {} : { effort };
+	if (!surface.model) unsupported("Agent.model", "task.perCallModel is off in this session");
+	const selector = claudeCodeModelSelector(item.model, item.subagent_type, host);
+	return { model: effort === undefined ? selector : `${selector}:${effort}` };
 }
 
 /**
@@ -128,17 +257,21 @@ function claudeCodeAgentParams(args: ClaudeCodeAgentArgs, host: HarnessFacadeHos
 			if (item.subagent_type === "fork") {
 				throw new ToolError('subagent_type "fork" applies to a single Agent call, not to `tasks` items.');
 			}
-			return { task: item.prompt, ...(item.subagent_type !== undefined ? { agent: item.subagent_type } : {}) };
+			return {
+				task: item.prompt,
+				...(item.subagent_type !== undefined ? { agent: item.subagent_type } : {}),
+				...claudeCodeSpawnRouting(item, host),
+			};
 		});
 		return { context: args.prompt, tasks, ...isolated };
 	}
 	// `subagent_type: "fork"` forks the conversation, not an agent type:
-	// the default task agent runs with the parent's history inherited.
-	const isFork = args.subagent_type === "fork";
+	// the default task agent runs with the parent's history and model.
+	if (args.subagent_type === "fork") return { task: args.prompt, fork: "all", ...isolated };
 	return {
 		task: args.prompt,
-		...(args.subagent_type !== undefined && !isFork ? { agent: args.subagent_type } : {}),
-		...(isFork ? { fork: "all" as const } : {}),
+		...(args.subagent_type !== undefined ? { agent: args.subagent_type } : {}),
+		...claudeCodeSpawnRouting(args, host),
 		...isolated,
 	};
 }
@@ -243,10 +376,9 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 		replacesTarget: true,
 		ownSurface: true,
 		description: prompt.render(claudeCodeAgent, { agents: [], defaultAgent: "task", asyncEnabled: true }),
-		parameters: claudeCodeAgentSchema(false, false),
+		parameters: claudeCodeAgentSchema({ isolation: false, batch: false, model: false, effort: false }),
 		describe: target => (target as AgentTool & TaskToolSurface).renderDescriptionAs?.(claudeCodeAgent),
-		schema: host =>
-			claudeCodeAgentSchema(cfgTaskIsolationEnabled.get(host.settings), cfgTaskBatch.get(host.settings)),
+		schema: host => claudeCodeAgentSchema(claudeCodeAgentSurface(host.settings)),
 		intent: (args: Partial<ClaudeCodeAgentArgs>) => args.description,
 		toParams: (args: ClaudeCodeAgentArgs, host) => claudeCodeAgentParams(args, host),
 		speculation: (target, toParams) =>
@@ -295,14 +427,6 @@ const CLAUDE_CODE_FACADES: readonly HarnessFacadeSpec[] = [
 const CODEX_COLLABORATION: ToolNamespace = {
 	name: CODEX_COLLABORATION_NAMESPACE,
 	description: codexCollaborationNamespace.trim(),
-};
-const CODEX_REASONING_EFFORTS: Readonly<Record<string, TaskEffort>> = {
-	low: "lo",
-	medium: "med",
-	high: "hi",
-	xhigh: "hi",
-	max: "hi",
-	ultra: "hi",
 };
 
 const codexSpawnAgentSchema = type({
@@ -384,9 +508,9 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 			} else {
 				throw new ToolError("fork_turns must be `none`, `all`, or a positive integer string");
 			}
-			let effort: TaskEffort | undefined;
+			let effort: Effort | undefined;
 			if (args.reasoning_effort !== undefined) {
-				effort = CODEX_REASONING_EFFORTS[args.reasoning_effort];
+				effort = VENDOR_EFFORTS[args.reasoning_effort];
 				if (effort === undefined) {
 					unsupported(
 						`spawn_agent.reasoning_effort "${args.reasoning_effort}"`,

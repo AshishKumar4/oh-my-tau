@@ -291,6 +291,16 @@ Side requests the session makes for maintenance (compaction summaries and adviso
 
 For a per-call `model`, `task.maxEffort` bounds every per-call-model spawn, not the endpoint's eventual behavior: an explicit `:level` is clamped to the highest supported effort at or below the cap, and an omitted `:level` inherits the agent's thinking level capped at this value. Unset, `:inherit` and `:off` keep their existing meaning; the ceiling does not replace them with an explicit effort or change provider defaults. A model with no supported effort under the cap fails the spawn and every later request. Cold revival reapplies the live cap to the saved effort selector. An endpoint's own effort-negotiation retry can still round to the nearest supported tier, including above the request (for example `minimal` → `low` or `xhigh` → `max`).
 
+### Claude Code and Codex facades
+
+Opus 5+ and Fable 5+ sessions see Claude Code's `Agent` tool in place of `task`. Its `model` and `effort` fields use the per-call path above:
+
+- `model` appears while `task.perCallModel` is `on`. It takes a Claude family alias: `sonnet`, `opus`, `haiku` or `fable`. The facade picks the newest available model of that family that a configured role or the parent's own model approves. The parent's provider wins a tie. The selected agent's frontmatter is not consulted. An alias with no approved model fails the call and names the aliases that would work.
+- `effort` appears while `task.enableEffort` is on, the same gate the task tool applies to a caller's effort. With `model`, it becomes the selector's `:level`. Without `model`, the spawn runs at that exact level on the model the agent resolves to. An unsupported level steps down to the nearest supported one, and `task.maxEffort` still caps it.
+- A `fork` ignores both fields: it runs on the parent's model and effort.
+
+Codex's `spawn_agent` maps `reasoning_effort` the same way, to an exact level (`ultra` is `max`). It still needs `task.enableEffort`, and its `model` field stays unused.
+
 After policy resolution, the `before_subagent_spawn` extension hook runs once for the actual dispatch. It can block the spawn or replace the resolved model patterns; a routing note is carried into progress metadata.
 
 The `Alt+P` task model pick is session-only; saving a model in `/agents` replaces that runtime selection for the current session and persists the new value for future sessions.

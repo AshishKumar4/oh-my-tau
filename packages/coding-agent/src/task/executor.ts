@@ -102,7 +102,7 @@ import {
 	clampThinkingLevelToCeiling,
 	prewalkWouldBeNoop,
 	resolveTaskEffortLevel,
-	type TaskEffort,
+	type SpawnEffort,
 } from "@oh-my-pi/pi-tui/thinking";
 import type { ContextFileEntry, ToolSession } from "../tools";
 import { resolveEvalBackends } from "../tools/eval-backends";
@@ -491,8 +491,8 @@ export interface ExecutorOptions {
 	/** Set for a per-call `model`; every model the child sends to must stay approved by these grants. */
 	perCallModelGrants?: PerCallModelGrants;
 	thinkingLevel?: ConfiguredThinkingLevel;
-	/** Caller-requested coarse effort (`lo`/`med`/`hi`); maps onto the resolved model's supported thinking range and wins over {@link thinkingLevel}. */
-	effort?: TaskEffort;
+	/** Caller-requested effort, coarse (`lo`/`med`/`hi`) or an exact level; maps onto the resolved model's supported thinking range and wins over {@link thinkingLevel}. */
+	effort?: SpawnEffort;
 	/** Caller's description of how open-ended the work is; rides the initial prompt into the child's `auto` thinking classifier. */
 	solutionSpace?: string;
 	/**
