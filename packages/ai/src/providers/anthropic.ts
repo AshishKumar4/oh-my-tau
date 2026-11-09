@@ -4967,7 +4967,8 @@ function planAnthropicToolControls(
 	}
 	// A tool that defers itself (tool search's deferred tools) is declared but never
 	// active: only a tool search's reference loads it, so no control ever adds it.
-	const activeNames = context.tools.filter(tool => tool.deferLoading !== true).map(tool => tool.name);
+	const selfDeferred = new Set(context.tools.filter(tool => tool.deferLoading === true).map(tool => tool.name));
+	const activeNames = context.tools.filter(tool => !selfDeferred.has(tool.name)).map(tool => tool.name);
 
 	const toolRecords: { index: number; live: boolean; tools: AnthropicToolControls }[] = [];
 	for (const record of records) {
@@ -4977,7 +4978,7 @@ function planAnthropicToolControls(
 	}
 	const inserts: AnthropicControlInsert[] = [];
 	let declared = context.tools.map(tool => tool.name);
-	const deferred = new Set(context.tools.filter(tool => tool.deferLoading === true).map(tool => tool.name));
+	const deferred = new Set(selfDeferred);
 	const latest = toolRecords.at(-1);
 	if (latest) {
 		// A declared name without a definition cannot be re-sent: accepted cache miss (e.g. after a resume).
@@ -5002,9 +5003,12 @@ function planAnthropicToolControls(
 		let previous = declared.filter(name => !deferred.has(name));
 		for (const record of toolRecords) {
 			if (!record.live) continue;
-			const toolChanges = diffAnthropicActiveTools(previous, record.tools.active, declaredSet);
+			// Records written before self-deferred tools left the active set list them
+			// active; read every record by today's rule so no control ever adds them.
+			const active = record.tools.active.filter(name => !selfDeferred.has(name));
+			const toolChanges = diffAnthropicActiveTools(previous, active, declaredSet);
 			if (toolChanges.length > 0) inserts.push({ index: record.index, spec: { toolChanges } });
-			previous = record.tools.active;
+			previous = active;
 		}
 		const toolChanges = ownChange ? diffAnthropicActiveTools(previous, activeNames, declaredSet) : [];
 		if (toolChanges.length > 0) inserts.push({ index: context.messages.length, spec: { toolChanges } });
