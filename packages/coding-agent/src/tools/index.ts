@@ -77,10 +77,12 @@ import type { PlanProposalHandler } from "./resolve";
 import { SecurityScanTool } from "./security-scan";
 import { supportsExternalThinking, ThinkTool } from "./think";
 import type { PromptCacheStatus } from "@oh-my-pi/pi-tui/status-line/host";
+import type { MonitorEvent } from "../session/monitor-events";
 import { type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { TodoTool } from "./todo";
 import { WriteTool } from "./write";
 import { WaitTool } from "./wait";
+import { MonitorTool } from "./monitor";
 import { isMountableUnderXdev, resolveXdevTool, type XdevState } from "./xdev";
 import { YieldTool } from "./yield";
 
@@ -512,6 +514,8 @@ export interface ToolSession {
 	getClientBridge?: () => ClientBridge | undefined;
 	/** Get cached todo phases for this session. */
 	getTodoPhases?: () => TodoPhase[];
+	/** Deliver a monitor's events to this session; see `AgentSession.deliverMonitorEvent`. */
+	deliverMonitorEvent?: (event: MonitorEvent) => void;
 	/** What the next request finds in the prompt cache; see `AgentSession.getPromptCacheStatus`. */
 	getPromptCacheStatus?: () => PromptCacheStatus | undefined;
 	/** Replace cached todo phases for this session. */
@@ -643,6 +647,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	new_context: NewContextTool.createIf,
 	task: s => TaskTool.create(s),
 	wait: s => new WaitTool(s),
+	monitor: s => new MonitorTool(s),
 	todo: s => new TodoTool(s),
 	web_search: s => new WebSearchTool(s),
 	write: s => new WriteTool(s),

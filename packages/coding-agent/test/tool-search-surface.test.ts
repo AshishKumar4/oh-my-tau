@@ -231,6 +231,8 @@ describe("tool search under a Claude Code capture that defers tools", () => {
 		const declared = new Map(first.tools.map(tool => [tool.name, tool.defer_loading === true]));
 		expect(declared.get("ToolSearch")).toBe(false);
 		expect(declared.get("ast_edit")).toBe(true);
+		// Claude Code defers its Monitor; omp's monitor stands in for it under the same name.
+		expect(declared.get("Monitor")).toBe(true);
 		expect(declared.get("WebSearch")).toBe(true);
 		expect(declared.get("Bash")).toBe(false);
 		// The prompt names them in the client's words and has no xd:// devices.
@@ -238,6 +240,7 @@ describe("tool search under a Claude Code capture that defers tools", () => {
 		const announced = system.slice(system.indexOf(ANNOUNCEMENT)).split("\n");
 		expect(announced[0]).toBe(ANNOUNCEMENT);
 		expect(announced).toContain("ast_edit");
+		expect(announced).toContain("Monitor");
 		expect(announced).toContain("WebSearch");
 		expect(system).not.toContain("xd://");
 

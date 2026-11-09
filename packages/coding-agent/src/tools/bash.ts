@@ -540,6 +540,19 @@ function formatTimeoutClampNotice(
 }
 
 /**
+ * The session identity a command sees, read when its tool call starts (see
+ * `BashTool.#sessionEnv`): every key set, so an empty value replaces a stale
+ * one inherited from a parent omp process.
+ */
+export function toolCallSessionEnv(session: ToolSession, toolCallId: string): Record<string, string> {
+	return {
+		PI_SESSION_ID: session.sessionManager?.getSessionId?.() ?? session.getSessionId?.() ?? "",
+		PI_SESSION_FILE: session.getSessionFile() ?? "",
+		PI_TOOL_CALL_ID: toolCallId,
+	};
+}
+
+/**
  * Bash tool implementation.
  *
  * Executes bash commands with optional timeout and working directory.
@@ -579,11 +592,25 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const input: Partial<BashToolInput> = harnessParams(this.session, BASH_BRIDGES, args ?? {});
 		const rawCommand = input.command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
-		// An intercepted call is refused outright; asking first would only approve a doomed call.
-		const cwdCommand = input.cwd ? command : (extractLeadingCdTarget(command)?.rest ?? command);
 		const name = typeof input.name === "string" ? blankToUndefined(input.name) : undefined;
 		const managed = name !== undefined || (this.parameters === claudeCodeBashSchema && input.async === true);
-		const interception = this.#interception(command, cwdCommand, managed, ctx?.toolNames ?? []);
+		return this.commandApproval(command, { cwd: input.cwd, managed }, ctx);
+	};
+
+	/**
+	 * Approval for running `command` in this session's shell: interception,
+	 * the user's bash patterns, and critical commands. A `managed` command (a
+	 * service, a background job, a monitor) is exempt from the rules that route
+	 * foreground reads to dedicated tools.
+	 */
+	commandApproval(
+		command: string,
+		options: { cwd?: string; managed: boolean },
+		ctx?: AgentToolContext,
+	): ToolApprovalDecision {
+		// An intercepted call is refused outright; asking first would only approve a doomed call.
+		const cwdCommand = options.cwd ? command : (extractLeadingCdTarget(command)?.rest ?? command);
+		const interception = this.#interception(command, cwdCommand, options.managed, ctx?.toolNames ?? []);
 		if (interception) {
 			return { tier: "exec", override: true, policy: "deny", reason: interception.replace(/^Blocked:\s*/u, "") };
 		}
@@ -668,7 +695,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			};
 		}
 		return "exec";
-	};
+	}
 	readonly formatApprovalDetails = (args: unknown): string[] => {
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "(missing)";
@@ -752,11 +779,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 * omp process, since an env overlay cannot unset.
 	 */
 	#sessionEnv(toolCallId: string): Record<string, string> {
-		return {
-			PI_SESSION_ID: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? "",
-			PI_SESSION_FILE: this.session.getSessionFile() ?? "",
-			PI_TOOL_CALL_ID: toolCallId,
-		};
+		return toolCallSessionEnv(this.session, toolCallId);
 	}
 
 	/** Service launch mode: live `launch.enabled` while `bash` itself is an active tool. */

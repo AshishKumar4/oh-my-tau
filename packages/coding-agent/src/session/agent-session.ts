@@ -361,6 +361,12 @@ import {
 } from "./async-job-delivery";
 import { type BashExecuteOptions, BashRunner, type BashRunnerHost } from "./bash-runner";
 import {
+	buildMonitorEventMessage,
+	MONITOR_EVENT_MESSAGE_TYPE,
+	type MonitorEvent,
+	type MonitorEventEntry,
+} from "./monitor-events";
+import {
 	checkpointStartedAtFromEntry,
 	completedRewindFromEntry,
 	isSuccessfulCheckpointEntry,
@@ -2564,7 +2570,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// are dropped by the drain, so they must not cut a wait short.
 		this.agent.hasBackgroundCompletions = () =>
 			this.yieldQueue.hasDeliverable(LAUNCH_COMPLETION_MESSAGE_TYPE) ||
-			this.yieldQueue.hasDeliverable(ASYNC_RESULT_MESSAGE_TYPE);
+			this.yieldQueue.hasDeliverable(ASYNC_RESULT_MESSAGE_TYPE) ||
+			this.yieldQueue.hasDeliverable(MONITOR_EVENT_MESSAGE_TYPE);
 		// Passive asides (`deliverAs: "aside"`) also end an interruptible `wait`
 		// instead of sitting behind it. Deferred wakes are not peeked: no
 		// boundary injection would drain them. Foreground tools are unaffected.
@@ -2724,6 +2731,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#accountPoolScope = config.accountPoolScope;
 		this.#inheritedProviderPromptCacheKey =
 			config.providerPromptCacheKeySource === "fork" ? this.agent.promptCacheKey : undefined;
+		// Before job results, so a monitor's last events reach the model ahead of its end notice.
+		this.yieldQueue.register<MonitorEventEntry>(MONITOR_EVENT_MESSAGE_TYPE, {
+			isStale: entry => entry.epoch !== this.#asyncDeliveryEpoch,
+			build: buildMonitorEventMessage,
+		});
 		// Owner-routed async delivery: completions for jobs this agent owns are
 		// injected into THIS session's run as async-result follow-ups. Without a
 		// registered sink the manager dead-letters owned deliveries, so this
@@ -10346,6 +10358,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	queueDeferredMessage(message: CustomMessage): void {
 		this.#queueHiddenNextTurnMessage(message, true);
+	}
+
+	/**
+	 * Deliver a monitor's events like a completion notice: they end a blocked
+	 * `wait`, join a running turn at its next boundary, and wake an idle session.
+	 */
+	deliverMonitorEvent(event: MonitorEvent): void {
+		if (this.#isDisposed) return;
+		this.yieldQueue.enqueue<MonitorEventEntry>(MONITOR_EVENT_MESSAGE_TYPE, {
+			...event,
+			epoch: this.#asyncDeliveryEpoch,
+		});
+		this.yieldQueue.requestIdleFlush();
 	}
 
 	queueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
