@@ -55,9 +55,31 @@ export function parseBind(raw: string): ParsedBind {
 	return { hostname: hostPart, port: parsePort(portPart, raw) };
 }
 
+/** The eight 16-bit groups of an IPv6 literal, `::` expanded; undefined when it is not one. */
+function ipv6Groups(host: string): number[] | undefined {
+	const halves = host.split("::");
+	if (halves.length > 2) return undefined;
+	const parse = (part: string): number[] | undefined => {
+		if (part.length === 0) return [];
+		const groups: number[] = [];
+		for (const group of part.split(":")) {
+			if (!/^[0-9a-f]{1,4}$/.test(group)) return undefined;
+			groups.push(Number.parseInt(group, 16));
+		}
+		return groups;
+	};
+	const head = parse(halves[0]!);
+	const tail = halves.length === 2 ? parse(halves[1]!) : [];
+	if (!head || !tail) return undefined;
+	if (halves.length === 1) return head.length === 8 ? head : undefined;
+	const zeros = 8 - head.length - tail.length;
+	return zeros >= 1 ? [...head, ...Array<number>(zeros).fill(0), ...tail] : undefined;
+}
+
+/** `::1` in any spelling: seven zero groups, then 1. `1::` (and every other address) is not loopback. */
 function isIpv6Loopback(host: string): boolean {
-	const significant = host.split(":").filter(group => group.length > 0 && Number.parseInt(group, 16) !== 0);
-	return significant.length === 1 && Number.parseInt(significant[0] ?? "", 16) === 1;
+	const groups = ipv6Groups(host);
+	return groups !== undefined && groups.slice(0, 7).every(group => group === 0) && groups[7] === 1;
 }
 
 export function isLoopbackBind(hostname: string): boolean {
