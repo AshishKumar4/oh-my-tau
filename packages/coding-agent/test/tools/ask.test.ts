@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
-import { agentLoop, type AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { Agent, agentLoop, type AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { AgentLoopConfig } from "@oh-my-pi/pi-agent-core/types";
 import * as ai from "@oh-my-pi/pi-ai";
 import type { Api, AssistantMessage, Message, Model } from "@oh-my-pi/pi-ai";
@@ -13,6 +13,8 @@ import type {
 	ExtensionUIDialogOptions,
 	ExtensionUISelectItem,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { presentTool } from "@oh-my-pi/pi-coding-agent/harness/facade";
+import { harnessToolBinding } from "@oh-my-pi/pi-coding-agent/harness/manifest";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { AskTool, recoverAskHtml } from "@oh-my-pi/pi-coding-agent/tools/ask";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
@@ -795,5 +797,121 @@ describe("AskTool under the claude-code harness", () => {
 	it("recovers the form from a persisted vendor-shaped call for /tree re-answer", () => {
 		expect(recoverAskHtml(VENDOR_CALL)).toContain("<legend>Storage: Which backend?</legend>");
 		expect(recoverAskHtml({ questions: [{ question: "no header" }] })).toBeUndefined();
+	});
+});
+
+describe("AskTool under the codex harness", () => {
+	const CODEX = getBundledModel("openai-codex", "gpt-6-astra");
+	/** `request_user_input` as codex-rs 0.155.1 declares it (the owner's served capture). */
+	const SERVED_DECLARATION = {
+		description:
+			"Request user input for one to three short questions and wait for the response. This tool is only available in Plan mode.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				questions: {
+					type: "array",
+					description: "Questions to show the user. Prefer 1 and do not exceed 3",
+					items: {
+						type: "object",
+						properties: {
+							header: { type: "string", description: "Short header label shown in the UI (12 or fewer chars)." },
+							id: { type: "string", description: "Stable identifier for mapping answers (snake_case)." },
+							options: {
+								type: "array",
+								description: "Provide 2-3 mutually exclusive choices.",
+								items: {
+									type: "object",
+									properties: {
+										description: { type: "string", description: "One short sentence explaining impact." },
+										label: { type: "string", description: "User-facing label (1-5 words)." },
+									},
+									required: ["label", "description"],
+									additionalProperties: false,
+								},
+							},
+							question: { type: "string", description: "Single-sentence prompt shown to the user." },
+						},
+						required: ["id", "header", "question", "options"],
+						additionalProperties: false,
+					},
+				},
+			},
+			required: ["questions"],
+			additionalProperties: false,
+		},
+	};
+	const VENDOR_CALL = {
+		questions: [
+			{
+				id: "storage_backend",
+				header: "Storage",
+				question: "Which backend?",
+				options: [
+					{ label: "SQLite (Recommended)", description: "Single file." },
+					{ label: "PostgreSQL", description: "Server <db>." },
+				],
+			},
+			{
+				id: "retention_days",
+				header: "Retention",
+				question: "How long to keep sessions?",
+				options: [
+					{ label: "30 days", description: "Default." },
+					{ label: "90 days", description: "Longer." },
+				],
+			},
+		],
+	};
+
+	it("runs a request_user_input call through the agent loop under the served declaration, answered by question id", async () => {
+		const ask = new AskTool(createSession({ getActiveModel: () => CODEX }));
+		const presented = presentTool(ask as never, harnessToolBinding("codex", "ask"), () => SERVED_DECLARATION);
+		expect(presented.customWireName).toBe("request_user_input");
+		expect(presented.parameters).toBe(SERVED_DECLARATION.inputSchema);
+		const formDialog = vi.fn<FormDialog>(async html => {
+			expect(html).toContain('name="storage_backend"');
+			expect(html).toContain('name="retention_days"');
+			return { data: { storage_backend: "PostgreSQL", storage_backend_other: "", retention_days: "30 days" } };
+		});
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "call_ask", name: "request_user_input", arguments: VENDOR_CALL }] },
+				{ content: ["done"] },
+			],
+		});
+		const agent = new Agent({
+			initialState: { model: mock, systemPrompt: [], tools: [presented], messages: [] },
+			streamFn: mock.stream,
+			getToolContext: () => createContext({ formDialog }),
+		});
+		await agent.prompt("go");
+
+		const result = agent.state.messages.find(message => message.role === "toolResult");
+		if (result?.role !== "toolResult") throw new Error("the call produced no tool result");
+		expect(result.isError).toBeFalsy();
+		expect(formDialog).toHaveBeenCalledTimes(1);
+		const html = formDialog.mock.calls[0]?.[0] ?? "";
+		expect(html).toContain("<legend>Storage: Which backend?</legend>");
+		expect(html).toContain("Server &lt;db&gt;.");
+		expect(html).toContain('<input type="radio" name="storage_backend" value="PostgreSQL">');
+		const text = result.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
+		expect(text).toContain('"storage_backend": "PostgreSQL"');
+		expect(text).toContain('"retention_days": "30 days"');
+	});
+
+	it("declares Codex's questions shape with its own description when no capture is served", () => {
+		const tool = new AskTool(createSession({ getActiveModel: () => CODEX }));
+		const schema = ai.toolWireSchema({ name: "ask", description: "", parameters: tool.parameters }) as {
+			properties: { questions: { items: { required: string[] } } };
+		};
+		expect(schema.properties.questions.items.required).toEqual(["id", "header", "question", "options"]);
+		expect(tool.description).toContain("snake_case `id`");
+	});
+
+	it("recovers the form from a persisted request_user_input call for /tree re-answer", () => {
+		const html = recoverAskHtml(VENDOR_CALL);
+		expect(html).toContain('name="storage_backend"');
+		expect(html).toContain("<legend>Retention: How long to keep sessions?</legend>");
 	});
 });

@@ -48,6 +48,7 @@ import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import askHeadlessForkMessage from "../prompts/tools/ask-headless-fork.md" with { type: "text" };
 import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "text" };
 import claudeCodeAskDescription from "../prompts/tools/harness/claude-code-ask.md" with { type: "text" };
+import codexAskDescription from "../prompts/tools/harness/codex-request-user-input.md" with { type: "text" };
 import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
 import { cfgSpeechEnabled } from "../tts/settings";
 import { vocalizer } from "../tts/vocalizer";
@@ -93,42 +94,91 @@ const claudeCodeAskSchema = arkType({
 		.atMostLength(4)
 		.describe("questions to ask (1-4)"),
 });
-type AskInputSchema = typeof askSchema | typeof claudeCodeAskSchema;
+/** Codex's `request_user_input`: one to three multiple-choice questions, answered by their ids. */
+const codexAskSchema = arkType({
+	questions: arkType({
+		id: arkType("string").describe("stable identifier for mapping answers (snake_case)"),
+		header: arkType("string").describe("short header label shown in the UI (12 or fewer chars)"),
+		question: arkType("string").describe("single-sentence prompt shown to the user"),
+		options: arkType({
+			label: arkType("string").describe("user-facing label (1-5 words)"),
+			description: arkType("string").describe("one short sentence explaining impact/tradeoff if selected"),
+		})
+			.array()
+			.describe("2-3 mutually exclusive choices; the client adds a free-form Other"),
+	})
+		.array()
+		.atLeastLength(1)
+		.atMostLength(3)
+		.describe("questions to show the user; prefer 1 and do not exceed 3"),
+});
+type AskInputSchema = typeof askSchema | typeof claudeCodeAskSchema | typeof codexAskSchema;
+
+/** One group of a vendor's question form: answered under `name`. */
+interface VendorQuestion {
+	name: string;
+	header: string;
+	question: string;
+	multi: boolean;
+	options: readonly { label: string; description: string; preview?: string }[];
+}
 
 /**
- * The form `ask` shows for Claude Code's questions: one group per question,
- * named `q1`…`q4` in order, so the submitted JSON answers them by position.
- * Each group ends with a free-text `qN_other` field: Claude Code's picker
- * always offers "Other", and its tool description promises it.
+ * The form `ask` shows for a vendor's multiple-choice questions: one group per
+ * question, answered under its `name`, ending with a free-text `<name>_other`
+ * field, since both vendors' pickers always offer "Other" and their tool
+ * descriptions promise it.
  */
-function claudeCodeAskForm(questions: (typeof claudeCodeAskSchema.infer)["questions"]): string {
-	const groups = questions.map((question, index) => {
-		const type = question.multiSelect ? "checkbox" : "radio";
+function vendorQuestionForm(questions: readonly VendorQuestion[]): string {
+	const groups = questions.map(question => {
+		const type = question.multi ? "checkbox" : "radio";
+		const name = Bun.escapeHTML(question.name);
 		const options = question.options.map(option => {
-			const label = `<label><input type="${type}" name="q${index + 1}" value="${Bun.escapeHTML(option.label)}"> ${Bun.escapeHTML(option.label)}: ${Bun.escapeHTML(option.description)}</label>`;
+			const label = `<label><input type="${type}" name="${name}" value="${Bun.escapeHTML(option.label)}"> ${Bun.escapeHTML(option.label)}: ${Bun.escapeHTML(option.description)}</label>`;
 			return option.preview ? `${label}\n<pre>${Bun.escapeHTML(option.preview)}</pre>` : label;
 		});
 		const legend = `${Bun.escapeHTML(question.header)}: ${Bun.escapeHTML(question.question)}`;
-		const other = `<label>Other <input type="text" name="q${index + 1}_other"></label>`;
+		const other = `<label>Other <input type="text" name="${name}_other"></label>`;
 		return `<fieldset>\n<legend>${legend}</legend>\n${options.join("\n")}\n${other}\n</fieldset>`;
 	});
 	return `<form>\n${groups.join("\n")}\n</form>`;
+}
+
+/** Claude Code's questions carry no ids: they are named `q1`…`q4` in order and answered by position. */
+function claudeCodeAskForm(questions: (typeof claudeCodeAskSchema.infer)["questions"]): string {
+	return vendorQuestionForm(
+		questions.map((question, index) => ({ ...question, name: `q${index + 1}`, multi: question.multiSelect })),
+	);
+}
+
+/** Codex's questions are answered under their own ids; each is single-choice. */
+function codexAskForm(questions: (typeof codexAskSchema.infer)["questions"]): string {
+	return vendorQuestionForm(questions.map(question => ({ ...question, name: question.id, multi: false })));
 }
 
 const CLAUDE_CODE_ASK: HarnessSchemaBridge<AskParams, typeof claudeCodeAskSchema> = {
 	parameters: claudeCodeAskSchema,
 	toParams: args => ({ html: claudeCodeAskForm(args.questions) }),
 };
-const ASK_BRIDGES: HarnessBridges<AskParams, typeof claudeCodeAskSchema> = { "claude-code": CLAUDE_CODE_ASK };
+const CODEX_ASK: HarnessSchemaBridge<AskParams, typeof codexAskSchema> = {
+	parameters: codexAskSchema,
+	toParams: args => ({ html: codexAskForm(args.questions) }),
+};
+const ASK_BRIDGES: HarnessBridges<AskParams, typeof claudeCodeAskSchema | typeof codexAskSchema> = {
+	"claude-code": CLAUDE_CODE_ASK,
+	codex: CODEX_ASK,
+};
 
 /** The `html` of a persisted or streamed `ask` call, for `/tree` re-answer and status lines. */
 export function recoverAskHtml(toolCallArguments: unknown): string | undefined {
 	if (!isRecord(toolCallArguments)) return undefined;
 	const html = toolCallArguments.html;
 	if (typeof html === "string") return html;
-	// A call recorded under the claude-code profile carries the vendor's questions.
-	const vendor = claudeCodeAskSchema(toolCallArguments);
-	return vendor instanceof arkType.errors ? undefined : claudeCodeAskForm(vendor.questions);
+	// A call recorded under a vendor profile carries that vendor's questions.
+	const codex = codexAskSchema(toolCallArguments);
+	if (!(codex instanceof arkType.errors)) return codexAskForm(codex.questions);
+	const claudeCode = claudeCodeAskSchema(toolCallArguments);
+	return claudeCode instanceof arkType.errors ? undefined : claudeCodeAskForm(claudeCode.questions);
 }
 
 // =============================================================================
@@ -429,11 +479,12 @@ export class AskTool implements AgentTool<AskInputSchema, AskToolDetails> {
 	constructor(private readonly session: ToolSession) {}
 
 	readonly #nativeDescription = prompt.render(askDescription);
-	/** Claude Code's `AskUserQuestion` describes its own fields when no vendor declaration is served. */
+	/** A vendor's question tool describes its own fields when no vendor declaration is served. */
 	get description(): string {
-		return this.parameters === claudeCodeAskSchema
-			? prompt.render(claudeCodeAskDescription)
-			: this.#nativeDescription;
+		const parameters = this.parameters;
+		if (parameters === claudeCodeAskSchema) return prompt.render(claudeCodeAskDescription);
+		if (parameters === codexAskSchema) return prompt.render(codexAskDescription);
+		return this.#nativeDescription;
 	}
 
 	static createIf(session: ToolSession): AskTool | null {
@@ -497,7 +548,7 @@ export class AskTool implements AgentTool<AskInputSchema, AskToolDetails> {
 
 	async execute(
 		_toolCallId: string,
-		input: AskParams | typeof claudeCodeAskSchema.infer,
+		input: AskParams | typeof claudeCodeAskSchema.infer | typeof codexAskSchema.infer,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
