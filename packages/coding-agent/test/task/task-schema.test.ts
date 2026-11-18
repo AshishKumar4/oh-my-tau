@@ -42,7 +42,7 @@ describe("task schema (single-spawn)", () => {
 	it.each([false, true])("advertises only the source task.steps selects (batch=%s)", batchEnabled => {
 		// Enabled first: the disabled schema must not reuse the enabled one from the cache.
 		for (const steps of [true, false]) {
-			const schema = getTaskSchema({ batchEnabled, isolationEnabled: false, structured: false, steps });
+			const schema = getTaskSchema({ batchEnabled, isolationEnabled: false, steps });
 			const item = steps
 				? { steps: ["Add the parser.", "Wire it in."], solutionSpace: "one defined change" }
 				: { task: "Add the parser.", solutionSpace: "one defined change" };

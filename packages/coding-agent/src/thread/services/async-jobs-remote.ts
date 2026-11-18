@@ -26,6 +26,7 @@ import type {
 	AsyncJobDeliveryState,
 	AsyncJobDetails,
 	AsyncJobFilter,
+	AsyncJobInstance,
 	AsyncJobManagerApi,
 	AsyncJobProcess,
 	AsyncJobReapResult,
@@ -34,6 +35,7 @@ import type {
 	AsyncJobRunResult,
 	AsyncJobType,
 } from "../../async/job-manager";
+import { carryRenderedEnvelope, getRenderedEnvelope } from "../../harness/content";
 import type { JobTextSource, JobWidgetInputs, JobWidgetRegistry } from "../../job-widgets/types";
 import type { RemoteObject } from "../rpc";
 import {
@@ -46,6 +48,7 @@ import {
 	type WireJobFeed,
 	type WireJobRun,
 	type WireRegisterOptions,
+	WIRE_RENDERED_ERROR_FIELD,
 } from "./async-jobs-protocol";
 import { ignoreSettle, localUnsubscribe } from "./support";
 
@@ -153,6 +156,8 @@ export class RemoteAsyncJob implements AsyncJob {
 			local?.process ??
 			(wire.process ? { command: wire.process.command, cwd: wire.process.cwd, pids: () => pids } : undefined);
 		this.widgetInputs = local?.widgetInputs;
+		// Main's row may carry a producer's rendered envelope; deliveries here read it off this row.
+		carryRenderedEnvelope(wire, this);
 	}
 
 	/** Settles when main's run promise settles; never rejects. */
@@ -249,6 +254,11 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 					reportProgress: ctx.reportProgress,
 					markRunning: () => ignoreSettle(ctx.markRunning()),
 				});
+			} catch (error) {
+				if (error instanceof Error && getRenderedEnvelope(error, error.message)) {
+					Object.defineProperty(error, WIRE_RENDERED_ERROR_FIELD, { value: true, configurable: true });
+				}
+				throw error;
 			} finally {
 				// Sent ahead of the result, so main's final widget read sees the job's last output.
 				if (feed && ctx.pushFeed) ignoreSettle(ctx.pushFeed(feed.delta()));
@@ -333,8 +343,11 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 		return this.#remote.callSync("acknowledgeDeliveries", jobIds);
 	}
 
-	consumeJobResults(jobIds: string[]): number {
-		return this.#remote.callSync("consumeJobResults", jobIds);
+	consumeJobResults(jobs: readonly AsyncJobInstance[]): number {
+		return this.#remote.callSync(
+			"consumeJobResults",
+			jobs.map(({ id, startTime }) => ({ id, startTime })),
+		);
 	}
 
 	isJobResultConsumed(jobId: string): boolean {
@@ -363,6 +376,10 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 
 	waitForOwnerJobs(ownerId: string, options?: { timeoutMs?: number; excludeSuppressed?: boolean }): Promise<boolean> {
 		return this.#remote.call("waitForOwnerJobs", ownerId, options);
+	}
+
+	cancelAndReapJobs(jobIds: readonly string[], deadlineAt: number): Promise<AsyncJobReapResult> {
+		return this.#remote.call("cancelAndReapJobs", jobIds, deadlineAt);
 	}
 
 	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {

@@ -128,10 +128,18 @@ function lastAssistantText(messages: readonly AgentMessage[]): string | undefine
 	return undefined;
 }
 
-/** Whether `<id>`'s published output predates the run the agent has open now. */
+/**
+ * Whether `<id>`'s published output predates a run the agent is in now or is
+ * about to start: a turn it is streaming, or a kept-alive lane's open run,
+ * which spans the gaps where the lane waits on its own background work and
+ * rewrites the output only when it ends. Every lane run holds its session's
+ * IRC wakes, so `ircWakesPending` (mirrored for worker-homed sessions) reports
+ * it on any thread, as it does a wake still queued for a run.
+ */
 function isSuperseded(registry: AgentRegistryApi, outputId: string): boolean {
 	const ref = registry.get(outputId);
-	return ref !== undefined && ref.kind !== "advisor" && registry.isRunning(ref);
+	if (ref === undefined || ref.kind === "advisor") return false;
+	return registry.isRunning(ref) || ref.session?.ircWakesPending === true;
 }
 
 /**
@@ -245,16 +253,21 @@ export class AgentProtocolHandler implements ProtocolHandler {
 
 		const rawContent = await Bun.file(scan.foundPath).text();
 		const notes: string[] = [];
+		const warnings: string[] = [];
 		let content = rawContent;
 		// A published file belongs to a finished run. If the agent is streaming
 		// again (follow-up or IRC wake), the file is the previous run's result;
-		// unmarked, a reader takes it as the current state.
-		if (!extraction && isSuperseded(registry, outputId)) {
+		// unmarked, a reader takes it as the current state. A document carries the
+		// banner inline; an extracted value must stay exactly the value, so the
+		// banner goes with it as a warning instead.
+		if (isSuperseded(registry, outputId)) {
 			const publishedAt = (await fs.stat(scan.foundPath)).mtimeMs;
-			content = `${prompt.render(agentSupersededTemplate, {
+			const banner = prompt.render(agentSupersededTemplate, {
 				id: outputId,
 				age: formatDuration(Math.max(0, Date.now() - publishedAt)),
-			})}${rawContent}`;
+			});
+			if (extraction) warnings.push(banner.trim());
+			else content = `${banner}${rawContent}`;
 			notes.push(`Superseded: ${outputId} is running a newer turn`);
 		}
 		let contentType: InternalResource["contentType"] = "text/markdown";
@@ -309,6 +322,7 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: extractedFrom,
 			notes,
+			...(warnings.length > 0 ? { warnings } : {}),
 			shape,
 			...(absent ? { absent } : {}),
 		};

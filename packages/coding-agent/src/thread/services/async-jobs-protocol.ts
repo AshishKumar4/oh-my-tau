@@ -24,6 +24,7 @@ import {
 	type AsyncJobDetails,
 	type AsyncJobFilter,
 	type AsyncJobReapResult,
+	type AsyncJobInstance,
 	type AsyncJobRunResult,
 	type AsyncJobType,
 } from "../../async/job-manager";
@@ -108,6 +109,13 @@ export interface WireRunContext {
 	readonly pushFeed?: WireCallback<[delta: JobFeedDelta]>;
 }
 
+/**
+ * Hidden field on a job body's error whose message is a trusted envelope
+ * (`withRenderedEnvelope`): RPC's error path keeps only string-keyed fields,
+ * so the symbol-keyed marker is restored from it on main.
+ */
+export const WIRE_RENDERED_ERROR_FIELD = "renderedEnvelope";
+
 /** A worker job body as main calls it. */
 export type WireJobRun = (ctx: WireRunContext) => Promise<string | AsyncJobRunResult>;
 
@@ -144,7 +152,7 @@ export type AsyncJobManagerProtocol = {
 	watchJobs: RpcMethod<[jobIds: string[]], number>;
 	unwatchJobs: RpcMethod<[jobIds: string[]], number>;
 	acknowledgeDeliveries: RpcMethod<[jobIds: string[]], number>;
-	consumeJobResults: RpcMethod<[jobIds: string[]], number>;
+	consumeJobResults: RpcMethod<[jobs: AsyncJobInstance[]], number>;
 	isJobResultConsumed: RpcMethod<[jobId: string], boolean>;
 	cancelAll: RpcMethod<[filter: AsyncJobFilter | undefined, reason: unknown], void>;
 	evictCompletedJobs: RpcMethod<[filter: AsyncJobFilter | undefined], number>;
@@ -154,6 +162,7 @@ export type AsyncJobManagerProtocol = {
 		[ownerId: string, options: { timeoutMs?: number; excludeSuppressed?: boolean } | undefined],
 		boolean
 	>;
+	cancelAndReapJobs: RpcMethod<[jobIds: readonly string[], deadlineAt: number], AsyncJobReapResult>;
 	cancelAndReapOwnerJobs: RpcMethod<[ownerId: string, deadlineAt: number], AsyncJobReapResult>;
 	drainDeliveries: RpcMethod<[options: { timeoutMs?: number; filter?: AsyncJobFilter } | undefined], boolean>;
 	isDeliverySuppressed: RpcMethod<[jobId: string], boolean>;

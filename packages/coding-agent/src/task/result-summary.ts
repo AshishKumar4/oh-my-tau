@@ -6,10 +6,12 @@
  * preview, `agent://` pointer) regardless of which path delivered it.
  */
 import { prompt } from "@oh-my-pi/pi-utils";
+import { escapeExpression } from "@oh-my-pi/pi-utils/template";
+import { escapeHarnessText, getRenderedEnvelope } from "../harness/content";
+import { harnessToolRefs } from "../harness/manifest";
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import { AgentRegistry, isResumable } from "../registry/agent-registry";
 import { ASYNC_INLINE_RESULT_MAX_CHARS } from "../session/async-job-delivery";
-import { escapeHarnessTags } from "../session/harness-tags";
 import { formatBytes, formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 
@@ -51,7 +53,12 @@ function previewHead(output: string): string {
 /** Render the `<task-result>` envelope for a settled run. */
 export function formatTaskResultSummary(
 	result: SingleResult,
-	options: { totalDurationMs: number; mergeSummary?: string },
+	options: {
+		totalDurationMs: number;
+		mergeSummary?: string;
+		/** Tool names under the reader's harness profile; native names when omitted. */
+		toolRefs?: Readonly<Record<string, string>>;
+	},
 ): string {
 	const status = result.aborted
 		? "cancelled"
@@ -73,14 +80,14 @@ export function formatTaskResultSummary(
 	const resumable = result.aborted && !result.isolated && isResumable(AgentRegistry.global().get(result.id));
 	const render = (truncated: boolean): string =>
 		prompt.render(taskSummaryTemplate, {
-			agentName: result.agent,
-			id: result.id,
+			agentName: escapeExpression(result.agent),
+			id: escapeExpression(result.id),
 			status,
 			duration: formatDuration(options.totalDurationMs),
-			abortReason: result.aborted ? escapeHarnessTags(result.abortReason ?? "") || undefined : undefined,
-			error: error === undefined ? undefined : escapeHarnessTags(error),
+			abortReason: result.aborted && result.abortReason ? escapeHarnessText(result.abortReason) : undefined,
+			error: error === undefined ? undefined : escapeHarnessText(error),
 			resumable,
-			preview: escapeHarnessTags(truncated ? previewHead(output) : output),
+			preview: escapeHarnessText(truncated ? previewHead(output) : output),
 			truncated,
 			meta: result.outputMeta
 				? {
@@ -88,7 +95,10 @@ export function formatTaskResultSummary(
 						charSize: formatBytes(result.outputMeta.charCount),
 					}
 				: undefined,
-			mergeSummary: options.mergeSummary === undefined ? "" : escapeHarnessTags(options.mergeSummary),
+			mergeSummary:
+				getRenderedEnvelope(options, options.mergeSummary ?? "")?.toString() ??
+				escapeHarnessText(options.mergeSummary ?? ""),
+			toolRefs: options.toolRefs ?? harnessToolRefs(undefined),
 		});
 	if (result.outputPath === undefined) return render(false);
 	if (outputCharCount > INLINE_OUTPUT_CHARS) return render(true);

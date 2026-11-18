@@ -187,6 +187,40 @@ describe("runtime thread services: async jobs", () => {
 		});
 	});
 
+	it("does not take another owner's job that reuses an evicted id as the waited job", async () => {
+		const manager = newManager();
+		const probe = await startWorker();
+		const first = await jobId(probe, manager, "Worker");
+		const second = await jobId(probe, manager, "Worker");
+
+		const waited = probe("evalWait", manager, "Worker", first, second);
+		await probe("awaitWaitStart", first);
+		await probe("finish", first, "first done");
+		await probe("awaitJob", manager, first);
+		expect(manager.evictCompletedJobs({ ownerId: "Worker" })).toBe(1);
+		// Main reuses the evicted id for a running job of another owner.
+		const other = Promise.withResolvers<string>();
+		expect(manager.register("bash", "other", () => other.promise, { id: first, ownerId: "Other" })).toBe(first);
+		const delivered: string[] = [];
+		const stopDelivery = manager.registerDeliverySink("Other", (jobId, text) => {
+			delivered.push(`${jobId}: ${text}`);
+		});
+		await probe("finish", second, "second done");
+
+		expect(await waited).toEqual({
+			items: [
+				{ kind: "agent", id: first, status: "completed", text: "first done" },
+				{ kind: "agent", id: second, status: "completed", text: "second done" },
+			],
+		});
+		// The wait consumed its own first job, not the other owner's: that result still reaches its owner.
+		other.resolve("other done");
+		await manager.getJob(first)?.promise;
+		await manager.drainDeliveries({ timeoutMs: 1_000, filter: { ownerId: "Other" } });
+		stopDelivery();
+		expect(delivered).toEqual([`${first}: other done`]);
+	});
+
 	it("cancels the worker body from main and keeps the shutdown reason a symbol", async () => {
 		const manager = newManager();
 		const probe = await startWorker();

@@ -1,6 +1,7 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { PipeStreams } from "@oh-my-pi/pi-natives";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import { getRenderedEnvelope, withRenderedEnvelope } from "../harness/content";
 import type { StructuredSubagentOutput } from "@oh-my-pi/pi-tui/tools/task";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { IrcBus } from "../irc/bus";
@@ -46,7 +47,7 @@ const DEFAULT_MAX_RUNNING_JOBS = 15;
 export const ASYNC_JOB_MANAGER_SHUTDOWN_REASON = Symbol("AsyncJobManager shutdown");
 
 /** Kind of work a managed job runs; drives job-row badges and delivery labels. */
-export type AsyncJobType = "bash" | "task" | "eval";
+export type AsyncJobType = "bash" | "task" | "eval" | "monitor";
 
 /** Settled job-body payload: delivery text plus its parsed structured output. */
 export interface AsyncJobRunResult {
@@ -367,8 +368,11 @@ export interface AsyncJobManagerApi {
 	/** Stop watching jobs, re-enqueueing skipped deliveries. */
 	unwatchJobs(jobIds: string[]): number;
 	acknowledgeDeliveries(jobIds: string[]): number;
-	/** Mark settled job results as recovered by a foreground snapshot. */
-	consumeJobResults(jobIds: string[]): number;
+	/**
+	 * Mark settled job results as recovered by a foreground snapshot. Each instance names
+	 * the job its caller read; one whose id now names a later job is skipped.
+	 */
+	consumeJobResults(jobs: readonly AsyncJobInstance[]): number;
 	/** True once a result was auto-delivered or recovered by a foreground snapshot. */
 	isJobResultConsumed(jobId: string): boolean;
 	/** Cancel running jobs (scoped by `filter`), aborting each with `reason`. */
@@ -380,6 +384,8 @@ export interface AsyncJobManagerApi {
 	registerDeliverySink(ownerId: string, sink: AsyncJobDeliverySink): () => void;
 	/** Wait until every job owned by `ownerId` settled; false when `timeoutMs` elapses first. */
 	waitForOwnerJobs(ownerId: string, options?: { timeoutMs?: number; excludeSuppressed?: boolean }): Promise<boolean>;
+	/** Cancel `jobIds`, then wait until `deadlineAt`; unknown ids are skipped. */
+	cancelAndReapJobs(jobIds: readonly string[], deadlineAt: number): Promise<AsyncJobReapResult>;
 	/** Cancel every job owned by `ownerId`, then wait until `deadlineAt`. */
 	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult>;
 	drainDeliveries(options?: { timeoutMs?: number; filter?: AsyncJobFilter }): Promise<boolean>;
@@ -389,6 +395,9 @@ export interface AsyncJobManagerApi {
 	/** True when a foreground snapshot consumed this job's result while its push was still queued. */
 	isDeliverySuperseded(jobId: string): boolean;
 }
+
+/** One job, by id and start: an id can name a later job once this one's row is evicted. */
+export type AsyncJobInstance = Pick<AsyncJob, "id" | "startTime">;
 
 export class AsyncJobManager implements AsyncJobManagerApi {
 	static #instance: AsyncJobManager | undefined;
@@ -565,6 +574,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 				});
 				job.endTime = Date.now();
 				const text = typeof outcome === "string" ? outcome : outcome.text;
+				if (typeof outcome !== "string") withRenderedEnvelope(job, getRenderedEnvelope(outcome, text));
 				const structured = typeof outcome === "string" ? undefined : outcome.structured;
 				if (structured) job.structured = structured;
 				if (typeof outcome !== "string" && outcome.agentOutputPublished !== undefined) {
@@ -582,6 +592,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 				job.endTime = Date.now();
 				if (error instanceof AsyncJobError && error.structured) job.structured = error.structured;
 				const errorText = error instanceof Error ? error.message : String(error);
+				if (error instanceof Error) withRenderedEnvelope(job, getRenderedEnvelope(error, errorText));
 				job.errorText = errorText;
 				if (job.status !== "cancelled") {
 					job.status = "failed";
@@ -635,6 +646,7 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 			structured: result.structured,
 			agentOutputPublished: result.agentOutputPublished,
 		};
+		withRenderedEnvelope(job, getRenderedEnvelope(result, result.text));
 		this.#jobs.set(id, job);
 		this.#recordAgentReply(job);
 		this.#enqueueDelivery(id, result.text);
@@ -793,8 +805,12 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	 * Suppresses queued delivery and marks retained bodies as consumed so later
 	 * snapshots report execution state without replaying the same result.
 	 */
-	consumeJobResults(jobIds: string[]): number {
-		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
+	consumeJobResults(jobs: readonly AsyncJobInstance[]): number {
+		// Once a job's row is evicted its id may name a later job, even another owner's,
+		// whose result is not the caller's to consume or to keep from delivery.
+		const uniqueJobIds = Array.from(
+			new Set(jobs.filter(job => this.#jobs.get(job.id)?.startTime === job.startTime).map(job => job.id)),
+		);
 		// Record the superseded push BEFORE acknowledging: acknowledgement drops
 		// the queued entry, so `isDeliveryPending` is false by the time the
 		// per-job consume below runs, and the delivery line could no longer tell a
@@ -912,23 +928,27 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	}
 
 	/**
-	 * Cancel every job owned by `ownerId`, then wait only until `deadlineAt`.
-	 * The returned completion keeps waiting for actual process settlement when
-	 * the deadline expires, so callers can move that cleanup out of the
-	 * user-visible Task wait without losing ownership of the live work.
+	 * Cancel the given jobs, then wait only until `deadlineAt` for them to
+	 * settle. The returned completion keeps waiting for actual process
+	 * settlement when the deadline expires, so callers can move that cleanup
+	 * out of the user-visible wait without losing ownership of the live work.
+	 * Unknown ids are skipped.
 	 */
-	async cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
-		this.cancelAll({ ownerId });
-		const timeoutMs = Math.max(0, deadlineAt - Date.now());
-		const settled = await this.waitForOwnerJobs(ownerId, { timeoutMs });
-		if (settled) {
+	async cancelAndReapJobs(jobIds: readonly string[], deadlineAt: number): Promise<AsyncJobReapResult> {
+		const jobs = jobIds.flatMap(id => this.#jobs.get(id) ?? []);
+		for (const job of jobs) this.cancel(job.id);
+		const completion = Promise.all(jobs.map(job => job.promise)).then(() => {});
+		const unsettled = () => jobs.filter(job => job.endTime === undefined).map(job => job.id);
+		if (unsettled().length === 0 || (await this.#waitForDeliveryPromise(completion, deadlineAt))) {
 			return { settled: true, pendingJobIds: [], completion: Promise.resolve() };
 		}
-		const pendingJobIds = this.#filterJobs(this.#jobs.values(), { ownerId })
-			.filter(job => job.status === "running" || job.status === "cancelled")
-			.map(job => job.id);
-		const completion = this.waitForOwnerJobs(ownerId).then(() => {});
-		return { settled: false, pendingJobIds, completion };
+		return { settled: false, pendingJobIds: unsettled(), completion };
+	}
+
+	/** {@link cancelAndReapJobs} for every job `ownerId` registered. */
+	cancelAndReapOwnerJobs(ownerId: string, deadlineAt: number): Promise<AsyncJobReapResult> {
+		const jobIds = this.#filterJobs(this.#jobs.values(), { ownerId }).map(job => job.id);
+		return this.cancelAndReapJobs(jobIds, deadlineAt);
 	}
 
 	async #waitForAllUntil(deadline: number): Promise<boolean> {
@@ -1337,18 +1357,21 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 			nextAttemptAt: Date.now(),
 			ownerId: job?.ownerId,
 			jobSnapshot: job
-				? {
-						type: job.type,
-						status: job.status,
-						startTime: job.startTime,
-						endTime: job.endTime,
-						label: job.label,
-						intent: job.intent,
-						structured: job.structured,
-						agentId: job.agentId,
-						agentOutputPublished: job.agentOutputPublished,
-						latestDetails: job.latestDetails,
-					}
+				? withRenderedEnvelope(
+						{
+							type: job.type,
+							status: job.status,
+							startTime: job.startTime,
+							endTime: job.endTime,
+							label: job.label,
+							intent: job.intent,
+							structured: job.structured,
+							agentId: job.agentId,
+							agentOutputPublished: job.agentOutputPublished,
+							latestDetails: job.latestDetails,
+						},
+						getRenderedEnvelope(job, text),
+					)
 				: undefined,
 		});
 		this.#ensureDeliveryLoop();
@@ -1478,22 +1501,25 @@ export class AsyncJobManager implements AsyncJobManagerApi {
 	#reconstructEvictedJob(delivery: AsyncJobDelivery): AsyncJob | undefined {
 		const snapshot = delivery.jobSnapshot;
 		if (!snapshot) return undefined;
-		return {
-			id: delivery.jobId,
-			type: snapshot.type,
-			status: snapshot.status,
-			startTime: snapshot.startTime,
-			endTime: snapshot.endTime,
-			label: snapshot.label,
-			intent: snapshot.intent,
-			abortController: new AbortController(),
-			promise: Promise.resolve(),
-			resultText: delivery.text,
-			structured: snapshot.structured,
-			agentId: snapshot.agentId,
-			agentOutputPublished: snapshot.agentOutputPublished,
-			latestDetails: snapshot.latestDetails,
-		};
+		return withRenderedEnvelope(
+			{
+				id: delivery.jobId,
+				type: snapshot.type,
+				status: snapshot.status,
+				startTime: snapshot.startTime,
+				endTime: snapshot.endTime,
+				label: snapshot.label,
+				intent: snapshot.intent,
+				abortController: new AbortController(),
+				promise: Promise.resolve(),
+				resultText: delivery.text,
+				structured: snapshot.structured,
+				agentId: snapshot.agentId,
+				agentOutputPublished: snapshot.agentOutputPublished,
+				latestDetails: snapshot.latestDetails,
+			},
+			getRenderedEnvelope(snapshot, delivery.text),
+		);
 	}
 
 	#queueDelivery(delivery: AsyncJobDelivery): void {

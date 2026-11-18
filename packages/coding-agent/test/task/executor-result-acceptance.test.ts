@@ -27,12 +27,13 @@ import {
 	runSubagentFollowUpTurn,
 	runSubprocess,
 } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { laneRuns } from "@oh-my-pi/pi-coding-agent/task/lane-runs";
+import { type AgentDefinition, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
 
 const AGENT_ID = "accepted-result";
 
@@ -77,6 +78,8 @@ interface SessionHarness {
 	emitAgentEnd: () => void;
 	/** Finish a `toolName` call whose result is `text`. */
 	emitToolResult: (toolName: string, text: string) => void;
+	/** Emit a session event, e.g. the `irc_message` an incoming IRC message publishes. */
+	emit: (event: AgentSessionEvent) => void;
 	/** The observer factory installed by {@link attachIrcWakeTurnMonitor}, if any. */
 	wakeObserver: () =>
 		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
@@ -89,7 +92,12 @@ interface SessionHarness {
  * `subscribeRunState` never fires — the run-state mirror omits `idle`, which is
  * exactly the leak the acceptance boundary must cover.
  */
-function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: AsyncJobManager }): SessionHarness {
+function createHarness(options?: {
+	hangPrompt?: boolean;
+	asyncJobManager?: AsyncJobManager;
+	/** Enabled tools; a list without `yield` is a message-result (`structured: false`) session. */
+	tools?: string[];
+}): SessionHarness {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const messages: AssistantMessage[] = [];
 	const promptEntered = Promise.withResolvers<void>();
@@ -135,8 +143,8 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		model: undefined,
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
-		getActiveToolNames: () => ["read", "yield"],
-		getEnabledToolNames: () => ["read", "yield"],
+		getActiveToolNames: () => options?.tools ?? ["read", "yield"],
+		getEnabledToolNames: () => options?.tools ?? ["read", "yield"],
 		getMountedXdevToolNames: () => [],
 		getToolByName: () => undefined,
 		setActiveToolsByName: async () => {},
@@ -175,7 +183,9 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		hasIrcInterrupts: () => false,
 		holdIrcWakes: () => () => {},
 		subscribeRunState: () => () => {},
-		isParentIrcSteer: () => false,
+		// A steered message the agent loop consumed carries the parent's flag, as IrcBridge marks it.
+		isParentIrcSteer: (message: AgentMessage) =>
+			message.role === "custom" && isRecord(message.details) && message.details.fromParent === true,
 		asyncJobManager: options?.asyncJobManager,
 	};
 	return {
@@ -186,6 +196,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		emitAssistantContent,
 		emitAgentEnd,
 		emitToolResult,
+		emit,
 		wakeObserver: () => wakeObserver,
 	};
 }
@@ -198,6 +209,11 @@ function registerRunning(session: AgentSession) {
 		session,
 		status: "running",
 	});
+}
+
+/** Waits out the lane's open run: its finalization and relays. */
+async function laneRunReleased(session: AgentSession): Promise<void> {
+	await laneRuns.get(session)?.released;
 }
 
 async function flushMicrotasks(): Promise<void> {
@@ -316,7 +332,12 @@ describe("runSubprocess result acceptance", () => {
 	it("terminalizes the ref when an autonomous wake turn's yield is accepted", async () => {
 		const harness = createHarness();
 		registerRunning(harness.session);
-		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		const eventBus = new EventBus();
+		const runEnded = Promise.withResolvers<void>();
+		eventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, data => {
+			if (isRecord(data) && data.status !== "started") runEnded.resolve();
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, eventBus });
 		const observer = harness.wakeObserver();
 		expect(observer).toBeDefined();
 
@@ -333,6 +354,8 @@ describe("runSubprocess result acceptance", () => {
 		expect(finish).toBeDefined();
 		harness.emitTerminalYield({ report: "answered while woken" });
 		await finish?.(undefined);
+		// The turn's settle only lets the run go on; the run ends once it has driven the session to rest.
+		await runEnded.promise;
 
 		const settled = AgentRegistry.global().get(AGENT_ID);
 		expect(settled?.status).not.toBe("running");
@@ -374,7 +397,7 @@ describe("runSubprocess result acceptance", () => {
 					} as unknown as AgentMessage,
 				]);
 				harness.emitTerminalYield({ report });
-				// Pending from acceptance until finalization: the parent's `wait` can block on it.
+				// Pending from the run's start until finalization: the parent's `wait` can block on it.
 				expect(manager.getRunningJobs({ ownerId: "Parent" }).map(job => job.agentId)).toEqual([AGENT_ID]);
 				await finish?.(undefined);
 				await manager.waitForAll();
@@ -392,7 +415,7 @@ describe("runSubprocess result acceptance", () => {
 	it("reads the latest message-result completion after an IRC wake instead of the first result", async () => {
 		const tempDir = TempDir.createSync("@omp-latest-agent-result-");
 		const artifactsDir = tempDir.path();
-		const harness = createHarness();
+		const harness = createHarness({ tools: ["read"] });
 		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
 		AgentRegistry.global().register({
 			id: AGENT_ID,
@@ -402,11 +425,7 @@ describe("runSubprocess result acceptance", () => {
 			session: harness.session,
 			status: "idle",
 		});
-		attachIrcWakeTurnMonitor(harness.session, {
-			id: AGENT_ID,
-			agent: baseAgent,
-			artifactsDir,
-		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, artifactsDir });
 		const observer = harness.wakeObserver();
 		if (!observer) throw new Error("wake-turn observer was not registered");
 		const reader = new ReadTool({
@@ -435,6 +454,7 @@ describe("runSubprocess result acceptance", () => {
 			]);
 			harness.emitAssistantText('{"reports":[{"verdict":"round-2"}]}');
 			await finish?.(undefined);
+			await laneRunReleased(harness.session);
 			AgentRegistry.global().setStatus(AGENT_ID, "idle");
 
 			const resolved = await InternalUrlRouter.instance().resolve(`agent://${AGENT_ID}`);
@@ -457,7 +477,7 @@ describe("runSubprocess result acceptance", () => {
 	it("preserves the accepted message result and sidecar when a peer wakes the agent", async () => {
 		const tempDir = TempDir.createSync("@omp-peer-agent-result-");
 		const artifactsDir = tempDir.path();
-		const harness = createHarness();
+		const harness = createHarness({ tools: ["read"] });
 		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
 		AgentRegistry.global().register({
 			id: AGENT_ID,
@@ -488,6 +508,7 @@ describe("runSubprocess result acceptance", () => {
 			]);
 			harness.emitAssistantText("line 42 is fine");
 			await finish?.(undefined);
+			await laneRunReleased(harness.session);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
 		} finally {
@@ -506,7 +527,63 @@ describe("runSubprocess result acceptance", () => {
 		manager.registerDeliverySink("Parent", (_jobId, text) => {
 			delivered.push(text);
 		});
-		const harness = createHarness({ asyncJobManager: manager });
+		const harness = createHarness({ asyncJobManager: manager, tools: ["read"] });
+		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent, artifactsDir });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+
+		try {
+			// The initial run died on a provider error before reporting.
+			await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), "");
+			const finish = observer([
+				{
+					role: "user",
+					content: "credits are back, finish the report",
+					attribution: "user",
+					timestamp: Date.now(),
+				},
+			]);
+			harness.emitAssistantText("## Report\nroot cause found");
+			// The run settles after its turn's settle callback, which never waits on it.
+			const run = laneRuns.get(harness.session);
+			await finish?.(undefined);
+			await run?.released;
+			expect(manager.atCapacity).toBe(true);
+			await manager.drainDeliveries({ timeoutMs: 1000 });
+			AgentRegistry.global().setStatus(AGENT_ID, "idle");
+
+			const resolved = await InternalUrlRouter.instance().resolve(`agent://${AGENT_ID}`);
+			expect(resolved.content).toBe("## Report\nroot cause found");
+			expect(delivered).toHaveLength(1);
+			expect(delivered[0]).toContain("root cause found");
+		} finally {
+			InternalUrlRouter.resetForTests();
+			blocker.resolve("finished");
+			resetRegisteredArtifactDirsForTests();
+			await manager.waitForAll();
+			await manager.dispose({ timeoutMs: 1000 });
+			tempDir.removeSync();
+		}
+	});
+
+	it("publishes and delivers a message result once when the user resumes a failed agent directly", async () => {
+		const tempDir = TempDir.createSync("@omp-user-resumed-result-");
+		const artifactsDir = tempDir.path();
+		const manager = new AsyncJobManager({});
+		const delivered: string[] = [];
+		manager.registerDeliverySink("Parent", (_jobId, text) => {
+			delivered.push(text);
+		});
+		const harness = createHarness({ asyncJobManager: manager, tools: ["read"] });
 		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
 		AgentRegistry.global().register({
 			id: AGENT_ID,
@@ -533,7 +610,8 @@ describe("runSubprocess result acceptance", () => {
 			]);
 			harness.emitAssistantText("## Report\nroot cause found");
 			await finish?.(undefined);
-			expect(manager.atCapacity).toBe(true);
+			await laneRunReleased(harness.session);
+			await manager.waitForAll();
 			await manager.drainDeliveries({ timeoutMs: 1000 });
 			AgentRegistry.global().setStatus(AGENT_ID, "idle");
 
@@ -543,9 +621,7 @@ describe("runSubprocess result acceptance", () => {
 			expect(delivered[0]).toContain("root cause found");
 		} finally {
 			InternalUrlRouter.resetForTests();
-			blocker.resolve("finished");
 			resetRegisteredArtifactDirsForTests();
-			await manager.waitForAll();
 			await manager.dispose({ timeoutMs: 1000 });
 			tempDir.removeSync();
 		}
@@ -555,7 +631,7 @@ describe("runSubprocess result acceptance", () => {
 		const tempDir = TempDir.createSync("@omp-cancelled-wake-result-");
 		const artifactsDir = tempDir.path();
 		const manager = new AsyncJobManager({});
-		const harness = createHarness({ asyncJobManager: manager });
+		const harness = createHarness({ asyncJobManager: manager, tools: ["read"] });
 		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
 		AgentRegistry.global().register({
 			id: AGENT_ID,
@@ -587,6 +663,7 @@ describe("runSubprocess result acceptance", () => {
 			harness.emitAssistantText("cancelled answer");
 			expect(manager.cancel(AGENT_ID)).toBe(true);
 			await finish?.(undefined);
+			await laneRunReleased(harness.session);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
 		} finally {
@@ -599,7 +676,7 @@ describe("runSubprocess result acceptance", () => {
 		const tempDir = TempDir.createSync("@omp-wake-job-widget-");
 		const artifactsDir = tempDir.path();
 		const manager = new AsyncJobManager({});
-		const harness = createHarness({ asyncJobManager: manager });
+		const harness = createHarness({ asyncJobManager: manager, tools: ["read"] });
 		harness.session.sessionManager.getArtifactsDir = () => artifactsDir;
 		AgentRegistry.global().register({
 			id: AGENT_ID,
@@ -645,7 +722,7 @@ describe("runSubprocess result acceptance", () => {
 	it("keeps the accepted artifact and sidecar when an unstructured follow-up starts aborted", async () => {
 		const tempDir = TempDir.createSync("@omp-aborted-agent-result-");
 		const artifactsDir = tempDir.path();
-		const harness = createHarness();
+		const harness = createHarness({ tools: ["read"] });
 		registerRunning(harness.session);
 		vi.spyOn(harness.session, "prompt").mockImplementation(async () => {
 			harness.emitAssistantText("cancelled replacement");
@@ -914,5 +991,71 @@ describe("runSubprocess result acceptance", () => {
 		});
 		expect(body).not.toContain("Running the tests.");
 		expect(body).toContain("produced no output");
+	});
+
+	it("answers the parent through its job when the parent steers a plain lane a peer woke", async () => {
+		const manager = new AsyncJobManager({});
+		const harness = createHarness({ asyncJobManager: manager, tools: ["read"] });
+		AgentRegistry.global().register({
+			id: AGENT_ID,
+			displayName: AGENT_ID,
+			kind: "sub",
+			parentId: "Parent",
+			session: harness.session,
+			status: "idle",
+		});
+		attachIrcWakeTurnMonitor(harness.session, { id: AGENT_ID, agent: baseAgent });
+		const observer = harness.wakeObserver();
+		if (!observer) throw new Error("wake-turn observer was not registered");
+		const parent = {
+			cwd: "/tmp",
+			settings: Settings.isolated({ "launch.enabled": false }),
+			agentRegistry: AgentRegistry.global(),
+			asyncJobManager: manager,
+			getAgentId: () => "Parent",
+		} as unknown as ToolSession;
+
+		try {
+			const finish = observer([
+				{
+					role: "custom",
+					customType: "irc:incoming",
+					content: "is line 42 fine?",
+					display: false,
+					details: { id: "msg-peer", from: "OtherAgent", message: "is line 42 fine?" },
+					attribution: "agent",
+					timestamp: Date.now(),
+				} as unknown as AgentMessage,
+			]);
+			// The parent's message arrives mid-turn: IrcBridge steers it in and
+			// publishes it as an `irc_message`; no wake observer sees it. The agent
+			// loop then consumes it (message_end), which is what makes it the parent's run.
+			const steer = {
+				role: "custom",
+				customType: "irc:incoming",
+				content: "and the mask path?",
+				display: true,
+				details: { id: "msg-parent", from: "Parent", message: "and the mask path?", fromParent: true },
+				attribution: "agent",
+				timestamp: Date.now(),
+			} as const;
+			harness.emit({ type: "irc_message", message: steer } as AgentSessionEvent);
+			harness.emit({ type: "message_end", message: steer } as unknown as AgentSessionEvent);
+			const waiting = new WaitTool(parent).execute("parent-wait", {});
+			harness.emitAssistantText("line 42 is fine; mask path fixed");
+			await finish?.(undefined);
+
+			const result = await waiting;
+			// The parent asked, so the plain lane's final report is its published result.
+			expect(result.details?.jobs?.[0]).toMatchObject({
+				id: AGENT_ID,
+				status: "completed",
+				resultText: expect.stringContaining("line 42 is fine; mask path fixed"),
+			});
+			// The job carries the parent's answer; a relay message would deliver it twice.
+			expect(IrcBus.global().take("Parent")).toBeUndefined();
+		} finally {
+			await manager.dispose({ timeoutMs: 1000 });
+		}
 	});
 });

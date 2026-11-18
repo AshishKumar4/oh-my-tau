@@ -28,6 +28,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { SingleResult, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { type RecordedAwaitHold, recordAwaitHolds } from "../helpers/await-holds";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -277,5 +278,38 @@ describe("task per-item blocking split", () => {
 		expect(result.details?.results.map(r => r.id)).toEqual(["ScoutThree"]);
 		expect(result.details?.async?.state).toBe("failed");
 		expect(manager.getJob("WorkerThree")).toBeUndefined();
+	});
+
+	it("never holds the turn on an inline spawn its spawn hook refuses", async () => {
+		mockDiscovery();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options =>
+			makeResult(options.id ?? "?", options.agent.name),
+		);
+		const registry = AgentRegistry.global();
+		const manager = createManager();
+		const session = createSession({ manager });
+		session.agentRegistry = registry;
+		const mainHolds = recordAwaitHolds(registry, "Main");
+		const heldAtRefusal: RecordedAwaitHold[][] = [];
+		session.emitBeforeSubagentSpawn = async event => {
+			if (event.agent !== "scout") return undefined;
+			heldAtRefusal.push(mainHolds());
+			return { block: true, reason: "scout pool exhausted" };
+		};
+		const tool = await TaskTool.create(session);
+
+		const result = await tool.execute("tc-mixed-refused", {
+			context: "ctx",
+			tasks: [
+				{ name: "ScoutFour", agent: "scout", task: "Research." },
+				{ name: "WorkerFour", agent: "task", task: "Build." },
+			],
+		} as TaskParams);
+
+		// The hold starts with the child's run, after the hook allowed it: a refused spawn never had one.
+		expect(heldAtRefusal).toEqual([[]]);
+		expect(firstText(result)).toContain("scout pool exhausted");
+		expect(mainHolds()).toEqual([]);
+		await manager.getJob("WorkerFour")?.promise;
 	});
 });

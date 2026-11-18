@@ -15,11 +15,9 @@ Run one agent synchronously.
 {{/if}}
 {{/if}}
 {{#if asyncEnabled}}
-{{#ifAny structured hasStructuredAgents}}
 
 # Results
-{{#if structured}}`outputSchema`{{else}}STRUCTURED agents'{{/if}} parsed payload, even invalid: agent://<id> (field /<field>, nested /reports/0/data); invalid preview inline.
-{{/ifAny}}
+`outputSchema`{{#if hasStructuredAgents}} or STRUCTURED agent{{/if}} parsed payload, even invalid: agent://<id> (field /<field>, nested /reports/0/data); invalid preview inline.
 
 {{asyncGuidance}}
 {{/if}}
@@ -39,13 +37,13 @@ Run one agent synchronously.
   - First step carries `# Target` files/non-goals{{#if batchEnabled}} beyond `context`{{/if}}.
   - Each step: one `# Change` stage.
   - Last step adds `# Acceptance` observable result.
-  - Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via local://<path>, NEVER inline.
+  - Children start blank{{#unless batchEnabled}} unless `fork` inherits yours{{/unless}};{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via local://<path>, NEVER inline.
   - Independent work → separate tasks.
 {{else}}
 - `task`: self-contained (`# Target` files/non-goals, `# Change` steps/APIs, `# Acceptance` observable result).
-  - Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via local://<path>, NEVER inline.
+  - Children start blank{{#unless batchEnabled}} unless `fork` inherits yours{{/unless}};{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via local://<path>, NEVER inline.
 {{/if}}
-- `name`: CamelCase ≤32, auto-generated if omitted; address agent by name.{{#if structured}} `outputSchema` overrides agent/session schemas.{{/if}}
+- `name`: CamelCase ≤32, auto-generated if omitted; address agent by name. `outputSchema` overrides agent/session schemas.
 - `solutionSpace`: how open-ended the child's problem is: fix or design given, or which causes or designs remain open.
   - Volume of work does not widen it; NEVER mention sibling agents or coordination.
   - Examples: `one fix: rename, names given`; `one fix: slice end in paginate`; `single-flight cache load; races easy to miss`;
@@ -77,9 +75,10 @@ Run one agent synchronously.
   - Requested model unavailable → stop and report; NEVER substitute another.
   - Every request requires an approved model; retry fallback, context promotion and prewalk are off.
 {{/if}}
-{{#if structured}}
 - `schemaMode`: default permissive warns after retries; strict fails.
-{{/if}}
+{{#unless batchEnabled}}
+- `fork`: inherit your conversation: `"all"` (every turn) or a positive integer (the last N turns); omit for a blank start.
+{{/unless}}
 {{#if isolationEnabled}}
 {{#if applyIsolatedChanges}}
 - `isolated`: worktree; successful changes apply to parent.

@@ -17,6 +17,7 @@
  *
  * Worker side: see `./async-jobs-remote`.
  */
+import { SafeString } from "@oh-my-pi/pi-utils/template";
 import {
 	type AsyncJob,
 	AsyncJobError,
@@ -24,6 +25,7 @@ import {
 	type AsyncJobProcess,
 	type AsyncJobRegisterOptions,
 } from "../../async/job-manager";
+import { carryRenderedEnvelope, withRenderedEnvelope } from "../../harness/content";
 import { TextTap } from "../../job-widgets/text-tap";
 import type { JobTextSource, JobWidgetBrief, JobWidgetInputs } from "../../job-widgets/types";
 import type { ThreadId } from "../identity";
@@ -39,6 +41,7 @@ import {
 	type WireJobFeed,
 	type WireRegisterOptions,
 	type WireRunContext,
+	WIRE_RENDERED_ERROR_FIELD,
 } from "./async-jobs-protocol";
 import { RemoteAsyncJobManager } from "./async-jobs-remote";
 import { ignoreSettle, PeerCleanups } from "./support";
@@ -135,7 +138,7 @@ class JobFeedMirror implements JobWidgetInputs {
 /** Cloneable projection of a main job row. */
 export function toJobWire(job: AsyncJob): AsyncJobWire {
 	const process = job.process;
-	return {
+	return carryRenderedEnvelope(job, {
 		id: job.id,
 		type: job.type,
 		status: job.status,
@@ -167,7 +170,7 @@ export function toJobWire(job: AsyncJob): AsyncJobWire {
 				}
 			: undefined,
 		hasWidgetInputs: job.widgetInputs !== undefined,
-	};
+	});
 }
 
 function toJobWires(jobs: readonly AsyncJob[]): AsyncJobWire[] {
@@ -215,7 +218,14 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 						markRunning: ctx.markRunning,
 						pushFeed: feed ? delta => feed.apply(delta, true) : undefined,
 					};
-					return run(wire);
+					// A result object's envelope crosses through the link's codec; an error's
+					// takes RPC's error path, which keeps only string-keyed fields.
+					return run(wire).catch((error: unknown) => {
+						if (error instanceof Error && Reflect.get(error, WIRE_RENDERED_ERROR_FIELD) === true) {
+							withRenderedEnvelope(error, new SafeString(error.message));
+						}
+						throw error;
+					});
 				},
 				mainRegisterOptions(options, feed),
 			);
@@ -237,7 +247,7 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 		watchJobs: (manager, jobIds) => manager.watchJobs(jobIds),
 		unwatchJobs: (manager, jobIds) => manager.unwatchJobs(jobIds),
 		acknowledgeDeliveries: (manager, jobIds) => manager.acknowledgeDeliveries(jobIds),
-		consumeJobResults: (manager, jobIds) => manager.consumeJobResults(jobIds),
+		consumeJobResults: (manager, jobs) => manager.consumeJobResults(jobs),
 		isJobResultConsumed: (manager, jobId) => manager.isJobResultConsumed(jobId),
 		cancelAll: (manager, filter, reason) => manager.cancelAll(filter, fromWireReason(reason)),
 		evictCompletedJobs: (manager, filter) => manager.evictCompletedJobs(filter),
@@ -250,6 +260,7 @@ function serveManager(threadId: ThreadId): RpcServe<AsyncJobManager, AsyncJobMan
 				),
 			),
 		waitForOwnerJobs: (manager, ownerId, options) => manager.waitForOwnerJobs(ownerId, options),
+		cancelAndReapJobs: (manager, jobIds, deadlineAt) => manager.cancelAndReapJobs(jobIds, deadlineAt),
 		cancelAndReapOwnerJobs: (manager, ownerId, deadlineAt) => manager.cancelAndReapOwnerJobs(ownerId, deadlineAt),
 		drainDeliveries: (manager, options) => manager.drainDeliveries(options),
 		isDeliverySuppressed: (manager, jobId) => manager.isDeliverySuppressed(jobId),

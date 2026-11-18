@@ -19,6 +19,7 @@
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { sessionToolRefs } from "../harness/effective-profile";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import type { AgentRef } from "../registry/agent-registry";
 import { AgentRegistry } from "../registry/agent-registry";
@@ -391,8 +392,16 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		if (isCurrentFullRoute(url)) return this.#resolveCurrentFull(url, context);
 		const agentId = url.rawHost || url.hostname;
 		if (!agentId) {
-			const { visible, preferredArtifactDir } = await this.#roster(context);
-			const content = await this.#renderIndex(visible, preferredArtifactDir);
+			// `history://?live` lists only agents a message reaches without a
+			// revival: running or idle, no parked refs or on-disk transcripts.
+			const live = url.searchParams.has("live");
+			const { visible: roster, preferredArtifactDir } = await this.#roster(context);
+			const visible = live ? roster.filter(ref => ref.status === "running" || ref.status === "idle") : roster;
+			const content = await this.#renderIndex(visible, {
+				includeDisk: !live,
+				preferredArtifactDir,
+				readRef: context?.session ? sessionToolRefs(context.session).read : "read",
+			});
 			return {
 				url: url.href,
 				content,
@@ -497,7 +506,10 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		return match;
 	}
 
-	async #renderIndex(refs: AgentRef[], preferredArtifactDir: string | undefined): Promise<string> {
+	async #renderIndex(
+		refs: AgentRef[],
+		options: { includeDisk: boolean; preferredArtifactDir: string | undefined; readRef: string | undefined },
+	): Promise<string> {
 		const entries: IndexEntry[] = refs.map(ref => ({
 			id: ref.id,
 			status: ref.status,
@@ -506,11 +518,13 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			lastActivity: formatAgo(ref.lastActivity),
 		}));
 		// Merge on-disk transcripts for agents absent from the registry.
-		const registered = new Set(refs.map(ref => ref.id));
-		const disk = await sessionFilesFromDisk(preferredArtifactDir);
-		for (const id of disk.keys()) {
-			if (registered.has(id)) continue;
-			entries.push({ id, status: "on disk", kind: "—", parent: "—", lastActivity: "—" });
+		if (options.includeDisk) {
+			const registered = new Set(refs.map(ref => ref.id));
+			const disk = await sessionFilesFromDisk(options.preferredArtifactDir);
+			for (const id of disk.keys()) {
+				if (registered.has(id)) continue;
+				entries.push({ id, status: "on disk", kind: "—", parent: "—", lastActivity: "—" });
+			}
 		}
 
 		const lines: string[] = ["# Agents", ""];
@@ -522,7 +536,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 		for (const entry of entries) {
 			lines.push(`| ${entry.id} | ${entry.status} | ${entry.kind} | ${entry.parent} | ${entry.lastActivity} |`);
 		}
-		lines.push("", "Read a transcript with `read history://<id>`.");
+		if (options.readRef) lines.push("", `Read a transcript with \`${options.readRef} history://<id>\`.`);
 		return `${lines.join("\n")}\n`;
 	}
 

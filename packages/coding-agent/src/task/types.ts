@@ -1,4 +1,4 @@
-import type { AgentSource } from "@oh-my-pi/pi-tui/tools/task";
+import type { AgentSource, TaskItem } from "@oh-my-pi/pi-tui/tools/task";
 export {
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
@@ -11,7 +11,7 @@ import { type BaseType, type FluentType, type } from "@oh-my-pi/omptype";
 import { $env, isRecord } from "@oh-my-pi/pi-utils";
 
 import type { AgentSessionEvent } from "../session/agent-session";
-import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import type { ConfiguredThinkingLevel, SpawnEffort } from "@oh-my-pi/pi-tui/thinking";
 
 const parseNumber = (value: string | undefined, defaultValue: number): number => {
 	if (value) {
@@ -84,11 +84,14 @@ const taskItemSchemaIsolated = type({
 	"+": "delete",
 });
 
+const forkRule = '"all" | number' as const;
+
 export const taskSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
+	"fork?": forkRule,
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
@@ -100,6 +103,7 @@ const taskSchemaNoIsolation = type({
 	agent: "string = 'task'",
 	task: "string",
 	solutionSpace: "string",
+	"fork?": forkRule,
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
@@ -155,16 +159,12 @@ function createTaskSchema(options: {
 	defaultAgent: string;
 	effortEnabled: boolean;
 	evalToolsEnabled: boolean;
-	structured: boolean;
 	steps: boolean;
 	perCallModel: boolean;
 }): BaseType {
 	const agent = taskAgentSchemaRule(options.defaultAgent);
 	const taskFields = options.steps ? { steps: "string[]" } : { task: "string" };
 	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
-	const schemaFields = options.structured
-		? { "outputSchema?": outputSchemaInputSchema, "schemaMode?": '"permissive" | "strict"' }
-		: {};
 	const toolsField = options.evalToolsEnabled ? { "tools?": "string[]" } : {};
 	// `model` is declared only when the caller may send it: a per-call selector
 	// while `task.perCallModel` allows task calls. An
@@ -179,7 +179,8 @@ function createTaskSchema(options: {
 				...taskFields,
 				solutionSpace: "string",
 				...effortField,
-				...schemaFields,
+				"outputSchema?": outputSchemaInputSchema,
+				"schemaMode?": '"permissive" | "strict"',
 				...toolsField,
 				...gatedFields,
 				"isolated?": "boolean",
@@ -199,7 +200,8 @@ function createTaskSchema(options: {
 			...taskFields,
 			solutionSpace: "string",
 			...effortField,
-			...schemaFields,
+			"outputSchema?": outputSchemaInputSchema,
+			"schemaMode?": '"permissive" | "strict"',
 			...toolsField,
 			...gatedFields,
 			"+": "delete",
@@ -219,7 +221,9 @@ function createTaskSchema(options: {
 			...taskFields,
 			solutionSpace: "string",
 			...effortField,
-			...schemaFields,
+			"fork?": forkRule,
+			"outputSchema?": outputSchemaInputSchema,
+			"schemaMode?": '"permissive" | "strict"',
 			...toolsField,
 			...gatedFields,
 			"isolated?": "boolean",
@@ -232,7 +236,9 @@ function createTaskSchema(options: {
 		...taskFields,
 		solutionSpace: "string",
 		...effortField,
-		...schemaFields,
+		"fork?": forkRule,
+		"outputSchema?": outputSchemaInputSchema,
+		"schemaMode?": '"permissive" | "strict"',
 		...toolsField,
 		...gatedFields,
 		"+": "delete",
@@ -246,8 +252,6 @@ export function getTaskSchema(options: {
 	effortEnabled?: boolean;
 	/** Advertise the `tools` field for eval-defined tools (`eval.tools.enabled`, default on). */
 	evalToolsEnabled?: boolean;
-	/** Advertise `outputSchema`/`schemaMode` (`task.structured`); default on. */
-	structured?: boolean;
 	/** Advertise `steps` instead of `task` (`task.steps`); default off. */
 	steps?: boolean;
 	defaultAgent?: string;
@@ -257,14 +261,13 @@ export function getTaskSchema(options: {
 	const defaultAgent = options.defaultAgent ?? "task";
 	const effortEnabled = options.effortEnabled ?? false;
 	const evalToolsEnabled = options.evalToolsEnabled ?? true;
-	const structured = options.structured ?? true;
 	const steps = options.steps ?? false;
 	const perCallModel = options.perCallModel ?? false;
-	if (defaultAgent === "task" && !effortEnabled && evalToolsEnabled && structured && !steps && !perCallModel) {
+	if (defaultAgent === "task" && !effortEnabled && evalToolsEnabled && !steps && !perCallModel) {
 		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
 		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
 	}
-	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${structured ? "structured" : "prose"}:${steps ? "steps" : "task"}:${perCallModel ? "model" : "nomodel"}:${defaultAgent}`;
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${steps ? "steps" : "task"}:${perCallModel ? "model" : "nomodel"}:${defaultAgent}`;
 	const cached = taskSchemaCache.get(key);
 	if (cached) return cached;
 	const schema = createTaskSchema({
@@ -272,12 +275,46 @@ export function getTaskSchema(options: {
 		steps,
 		effortEnabled,
 		evalToolsEnabled,
-		structured,
 		defaultAgent,
 		perCallModel,
 	});
 	taskSchemaCache.set(key, schema);
 	return schema;
+}
+
+/**
+ * Runtime params union over both wire shapes. The model sees exactly one shape
+ * (`{ context, tasks[] }` when `task.batch` is on, `{ name?, agent?, task }`
+ * otherwise); runtime stays permissive so internal callers and stale
+ * transcripts using the flat form keep working under either setting.
+ */
+export interface TaskParams {
+	/** Stable agent name (flat form). */
+	name?: string;
+	/** Agent type to spawn (flat form); omitted values resolve from the session spawn policy. */
+	agent?: string;
+	/** The work (flat form). */
+	task?: string;
+	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports, or an exact level from a harness facade. */
+	effort?: SpawnEffort;
+	/**
+	 * Fork the parent's conversation into the child (flat form): `"all"`
+	 * inherits the whole resolved history, a positive integer the last N
+	 * user-message turns. The spawn call and its result never carry over.
+	 */
+	fork?: "all" | number;
+	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
+	outputSchema?: unknown;
+	/** Validation behavior for a caller-provided or inherited output schema. */
+	schemaMode?: "permissive" | "strict";
+	/** Eval-defined tool names exposed to the flat-form child. */
+	tools?: string[];
+	/** Batch form (`task.batch`): one subagent per item. */
+	tasks?: TaskItem[];
+	/** Batch form: shared background prepended to every assignment; required by the batch schema. */
+	context?: string;
+	/** Run in an isolated worktree (flat form; per-item in batch form). */
+	isolated?: boolean;
 }
 
 /**
@@ -300,7 +337,10 @@ export interface AgentDefinition {
 	thinkingLevel?: ConfiguredThinkingLevel;
 	output?: unknown;
 	blocking?: boolean;
-	/** `true` = task spawns keep this agent's `output` schema, and with it the `yield` tool, even when `task.structured` is off. */
+	/**
+	 * `true` = task spawns keep the `yield` tool even when `task.structured` is
+	 * off. Declaring `output` already does; this opts in an agent without one.
+	 */
 	structured?: boolean;
 	autoloadSkills?: string[];
 	/** When `false`, the agent's `read` tool returns verbatim file content instead of structural summaries. */
@@ -309,6 +349,14 @@ export interface AgentDefinition {
 	prewalk?: boolean | string;
 	/** Advisor for spawned sessions of this agent: `true` = advise with the default advisor-role model, string = advise with that model pattern (optional `:level` suffix). Absent/`false` = no advisor. */
 	advisor?: boolean | string;
+	/** Under Fusion, sessions of this agent lead a sidekick of their own (see `isFusionLead`). Default: only the top-level session leads. */
+	sidekick?: boolean;
+	/**
+	 * The agent's model is a hard pairing: sessions run with no retry fallback
+	 * chain, so a transient provider error is retried on the same model rather
+	 * than walking the parent's chain onto another one. Default: inherit.
+	 */
+	pinModel?: boolean;
 	source: AgentSource;
 	filePath?: string;
 }

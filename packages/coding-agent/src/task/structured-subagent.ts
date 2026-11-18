@@ -14,7 +14,6 @@ import {
 	resolveAgentModelSelection,
 	resolveConfiguredModelPatterns,
 	resolveExplicitModelRole,
-	getModelMatchPreferences,
 	resolveModelOverride,
 } from "../config/model-resolver";
 import { type OAuthAccountPools, validateAgentAccountPools } from "../config/account-pools";
@@ -36,7 +35,7 @@ import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.m
 import isolationRecoveryHintTemplate from "../prompts/tools/isolation-recovery-hint.md" with { type: "text" };
 import salvagedChildHintTemplate from "../prompts/tools/salvaged-child-hint.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
-import { AUTO_THINKING, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
+import { AUTO_THINKING, type SpawnEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../irc/messaging";
 import { buildOutputValidator } from "../tools/output-schema-validator";
@@ -44,6 +43,7 @@ import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { renderStepPrompts } from "./steps";
 import { type ExecutorOptions, runSubprocess, type SubagentToolResult, usesYield } from "./executor";
+import type { ForkSnapshot } from "./fork";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -92,6 +92,7 @@ import {
 	parentModelGrantPattern,
 	PerCallModelError,
 	type PerCallModelGrants,
+	spawnModelGrants,
 } from "./model-approval";
 
 /** Final structured completion metadata returned for a schema-bearing run. */
@@ -136,6 +137,13 @@ export interface StructuredSubagentRequest {
 	steps?: string[];
 	agent?: string;
 	/**
+	 * A pre-resolved definition that bypasses agent discovery and the session's
+	 * `spawns` allow-list. The caller owns its spawnability (e.g. the Fusion
+	 * sidekick, which `task` must never list); every other policy, including
+	 * `task.maxRecursionDepth`, still applies.
+	 */
+	agentDefinition?: AgentDefinition;
+	/**
 	 * Model chosen by host code (SDK callers, `omp cleanse --model`).
 	 * Not gated by `task.perCallModel`.
 	 */
@@ -151,16 +159,24 @@ export interface StructuredSubagentRequest {
 	outputSchema?: unknown;
 	schemaMode?: StructuredSubagentSchemaMode;
 	/**
-	 * `false` = ignore caller, agent, and session output schemas (`task.structured`
-	 * off); an agent declaring `structured: true` keeps them. Default `true`.
-	 * Without a resolved schema the child has no `yield` tool and its final
-	 * assistant message is its result.
+	 * `false` = honor only a declared schema: this request's `outputSchema`, or
+	 * the agent's (see {@link declaresStructuredResult}); session output schemas
+	 * are ignored (`task.structured` off). Default `true`. Without a resolved
+	 * schema the child has no `yield` tool and its final assistant message is
+	 * its result.
 	 */
 	structured?: boolean;
 	/** Per-spawn thinking effort mapped onto the resolved model's supported range; overrides the agent's default selector. */
-	effort?: TaskEffort;
+	effort?: SpawnEffort;
 	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
 	solutionSpace?: string;
+	/**
+	 * Resolved parent history for a forked spawn, seeded into the child's
+	 * journal before its first prompt (Codex `fork_turns` / Claude Code
+	 * `subagent_type: "fork"`). Captured by the caller via `forkMessages` at
+	 * spawn-call time.
+	 */
+	fork?: ForkSnapshot;
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -229,7 +245,7 @@ export interface EffectiveSubagentPolicy {
 	enableLsp: boolean;
 	enableIrc: boolean;
 	/** Caller `effort` hint to apply; dropped when the agent's level comes from the user's `^model:level` tag. */
-	effort?: TaskEffort;
+	effort?: SpawnEffort;
 }
 
 /** Settled child execution plus data needed by the frontends' own rendering. */
@@ -280,6 +296,14 @@ export function renderSubagentUserPrompt(assignment: string): string {
 function trimToUndefined(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
 	return trimmed || undefined;
+}
+
+/**
+ * Whether an agent's definition declares a result contract: an `output` schema
+ * or `structured: true`. Such an agent keeps `yield` under `task.structured` off.
+ */
+export function declaresStructuredResult(agent: AgentDefinition): boolean {
+	return agent.output !== undefined || agent.structured === true;
 }
 
 function resolveSchema(
@@ -347,6 +371,13 @@ function assertDepthAndSpawnAllowed(request: StructuredSubagentRequest, agentNam
 			`Cannot spawn ${blockedAgent} agent from within itself (recursion prevention). Use a different agent type.`,
 		);
 	}
+	// A caller-supplied definition owns its own spawnability (see
+	// `StructuredSubagentRequest.agentDefinition`): the Fusion sidekick is
+	// dispatched by the `sidekick` tool, never through `task`, so a subagent
+	// lead's `spawns` allow-list (or absent `spawns`, which disables `task`
+	// spawning) must not block it. The depth check above still applies: the
+	// sidekick occupies one recursion level under its lead like any child.
+	if (request.agentDefinition) return;
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
 	if (!spawnPolicy.enabled || (spawnPolicy.allowedAgents !== null && !spawnPolicy.allowedAgents.includes(agentName))) {
 		throw new StructuredSubagentError(
@@ -431,14 +462,12 @@ function preflightPerCallModel(
 	});
 	if (selectorProblem) fail(selectorProblem);
 	const perCallModel = selector as string;
-	const grants: PerCallModelGrants = {
-		settings,
+	const grants = spawnModelGrants(settings, {
 		agentName: agent.name,
 		agentModel: agent.model,
 		agentSource: agent.source,
 		parentModelPattern,
-		matchPreferences: structuredClone(getModelMatchPreferences(settings.grantAuthority())),
-	};
+	});
 	// A cold registry is checked again in the executor once models are loaded.
 	const available = modelRegistry?.getAvailable("all");
 	if (!modelRegistry || !available?.length) return grants;
@@ -510,7 +539,7 @@ export async function resolveEffectiveSubagentPolicy(
 		includeParents: request.perCallModel !== undefined,
 	});
 	const spawnPolicy = resolveSpawnPolicy(request.session.getSessionSpawns());
-	const agentName = request.agent?.trim() || spawnPolicy.defaultAgent;
+	const agentName = request.agentDefinition?.name ?? (request.agent?.trim() || spawnPolicy.defaultAgent);
 	const planMode = request.session.getPlanModeState?.()?.enabled === true;
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
@@ -518,7 +547,10 @@ export async function resolveEffectiveSubagentPolicy(
 	const discovery = await discoverAgentsShared(request.session.cwd, request.session.effectiveExtensionRoots?.());
 	const sessionAgents = request.session.getSessionAgents?.() ?? [];
 	const agents = [...discovery.agents, ...sessionAgents];
-	const agent = getAgent(agents, agentName);
+	const agent =
+		request.agentDefinition ??
+		request.session.pinnedAgents?.find(pinned => pinned.name === agentName) ??
+		getAgent(agents, agentName);
 	if (!agent) {
 		const available = agents.map(candidate => candidate.name).join(", ") || "none";
 		const searched = discovery.searchedDirs?.map(dir => shortenPath(dir)).join(", ") || "none";
@@ -538,11 +570,13 @@ export async function resolveEffectiveSubagentPolicy(
 		);
 	}
 	const effectiveAgent = planMode ? createPlanModeAgent(agent) : agent;
-	// An agent declaring `structured: true` keeps its result contract when the caller opts out (`task.structured` off).
+	// A declared schema keeps the result contract when the caller opts out (`task.structured` off).
 	const schema = resolveSchema(
 		request,
 		effectiveAgent,
-		request.structured !== false || effectiveAgent.structured === true,
+		request.structured !== false ||
+			Object.hasOwn(request, "outputSchema") ||
+			declaresStructuredResult(effectiveAgent),
 	);
 	const structured = usesYield(schema.schema);
 	if (schema.source === "caller" || (schema.source !== "none" && schema.mode === "strict")) {
@@ -763,6 +797,7 @@ function buildExecutorOptions(
 		assignment: request.assignment.trim(),
 		context: request.context?.trim() || undefined,
 		planReference: undefined,
+		fork: request.fork,
 		// Task `name` is the spawn handle (id allocation). Eval `label` is a
 		// real UI description. Copy it only for eval so generateTaskLabel can run.
 		description: request.invocationKind === "eval" ? trimToUndefined(request.identity?.label) : undefined,

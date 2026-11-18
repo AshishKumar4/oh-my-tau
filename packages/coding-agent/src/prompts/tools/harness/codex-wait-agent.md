@@ -1,0 +1,1 @@
+Wait for the agents and background jobs you started, or for a reply you are owed: returns the first job to settle or a direct message, whichever comes first. Progress notes and broadcasts do not end it; new user input steered into the turn does. With nothing running and no reply owed it returns immediately. `timeout_ms` is accepted but not applied. Re-issue to keep waiting.

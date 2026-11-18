@@ -35,7 +35,7 @@ export interface EvalHandleSnapshot extends EvalHandleRef {
 }
 
 interface EvalHandleBridgeOptions {
-	session: ToolSession;
+	session: Pick<ToolSession, "getAgentId" | "asyncJobManager" | "agentRegistry">;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
 }
@@ -232,19 +232,25 @@ export async function runEvalWait(
 ): Promise<{ items: EvalHandleSnapshot[] }> {
 	const { items, timeoutMs } = parseRefs(args);
 	const resolved = items.map(item => resolveHandle(item, options));
-	// Worker job rows are snapshots: re-read each row when it settles, before
-	// another handle can hold this wait open past the row's retention.
-	const refresh = (handle: ResolvedHandle): void => {
-		if ("job" in handle) handle.job = handle.manager.getJob(handle.ref.id) ?? handle.job;
+	// A worker's job rows are snapshots taken when read, so a job's state is its row read
+	// last. Each job's row is read at its own settlement too: main may evict a settled row
+	// (its retention, or the consumed grace) while another handle keeps the wait open, and
+	// may then reuse its id for another job, whose row is not this handle's.
+	const rows = new Map<ResolvedHandle, AsyncJob>();
+	const current = (handle: ResolvedHandle): ResolvedHandle => {
+		if (!("job" in handle)) return handle;
+		const row = handle.manager.getJob(handle.ref.id);
+		const job = (row?.startTime === handle.job.startTime ? row : undefined) ?? rows.get(handle) ?? handle.job;
+		rows.set(handle, job);
+		return { ...handle, job };
 	};
 	for (const handle of resolved) {
-		if ("job" in handle) void handle.job.promise.then(() => refresh(handle));
+		if ("job" in handle) void handle.job.promise.then(() => current(handle));
 	}
 	const emittedProgress = new Map<string, unknown>();
 	const emitLatestProgress = (handle: ResolvedHandle): void => {
 		if (!options.emitStatus || !("job" in handle)) return;
-		refresh(handle);
-		const progress = emitProgress(handle, options.emitStatus, emittedProgress.get(handle.ref.id));
+		const progress = emitProgress(current(handle), options.emitStatus, emittedProgress.get(handle.ref.id));
 		if (progress) emittedProgress.set(handle.ref.id, progress);
 	};
 	return await withBridgeTimeoutPause(
@@ -274,10 +280,7 @@ export async function runEvalWait(
 				clearInterval(interval);
 				for (const release of releaseHolds) release();
 			}
-			for (const handle of resolved) {
-				refresh(handle);
-				emitLatestProgress(handle);
-			}
+			for (const handle of resolved) emitLatestProgress(handle);
 			if (outcome === "aborted") {
 				for (const handle of resolved) cancelResolved(handle, options.signal?.reason);
 				await Promise.allSettled(
@@ -285,12 +288,13 @@ export async function runEvalWait(
 				);
 				throw new ToolAbortError(undefined, { cause: options.signal?.reason });
 			}
-			const snapshots = resolved.map(snapshot);
-			const settledAgentIds = resolved
-				.filter(handle => "job" in handle && handle.job.status !== "running")
-				.map(handle => handle.ref.id);
+			const settled = resolved.map(current);
+			const snapshots = settled.map(snapshot);
+			const settledJobs = settled.flatMap(handle =>
+				"job" in handle && handle.job.status !== "running" ? [handle.job] : [],
+			);
 			const manager = options.session.asyncJobManager;
-			if (manager && settledAgentIds.length > 0) manager.consumeJobResults(settledAgentIds);
+			if (manager && settledJobs.length > 0) manager.consumeJobResults(settledJobs);
 			return { items: snapshots };
 		},
 		resolved.some(handle => "job" in handle) ? { deferExternalAbort: true } : undefined,

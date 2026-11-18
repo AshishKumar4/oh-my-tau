@@ -473,7 +473,10 @@ describe("Agent hub Enter activation", () => {
 		expect(workerEntry).toContain("1 req");
 		expect(workerEntry).toContain("2 tools");
 		expect(workerEntry).toContain("135 tok");
-		expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain("Read-only · 0 LoC");
+		// scout's `bash` is exec-tier, so its runs are not labelled read-only.
+		const frame = Bun.stripANSI(hub.render(120).join("\n"));
+		expect(frame).toContain("Shared workspace");
+		expect(frame).not.toContain("Read-only");
 		hub.dispose();
 	});
 	it("yields to a macrotask at the configured streaming threshold", async () => {
@@ -530,7 +533,7 @@ describe("Agent hub Enter activation", () => {
 				ownerId: "Main",
 				parentSessionId,
 				cli: "fast",
-				agent: "sonic",
+				agent: "task",
 				childSessionFile: `${id}.jsonl`,
 				createdAt: Date.now(),
 			});
@@ -1159,8 +1162,10 @@ describe("Agent hub data refresh coalescing", () => {
 			const manager = SessionManager.inMemory();
 			manager.appendMessage({ role: "user", content: "initial turn", timestamp: 1 });
 			const ownerParent = manager.appendMessage(assistantTurn(model, 0.6, 2));
-			const activeLeaf = manager.appendMessage({ role: "user", content: "successor turn", timestamp: 3 });
+			manager.appendMessage({ role: "user", content: "successor turn", timestamp: 3 });
 			session = liveAgentSession(manager, model, modelRegistry);
+			// A live session records its session_open marker after the successor turn; that is the active leaf.
+			const activeLeaf = manager.getLeafId();
 			const registry = new AgentRegistry();
 			const ref = registry.register({
 				id: "LateProbe",

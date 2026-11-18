@@ -318,7 +318,7 @@ describe("agent-loop wait wake delivery", () => {
 				}
 				if (source === "background") {
 					expect(manager.isJobResultConsumed(jobId)).toBe(true);
-					expect(consumed.mock.calls.filter(([ids]) => ids.includes(jobId))).toHaveLength(1);
+					expect(consumed.mock.calls.filter(([jobs]) => jobs.some(job => job.id === jobId))).toHaveLength(1);
 				} else {
 					// A message never rides in the wait's result: it arrives as a user turn after it.
 					expect(result.result.details).toMatchObject({ interrupted: true });

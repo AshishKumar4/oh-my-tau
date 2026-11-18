@@ -1551,11 +1551,12 @@ describe("AgentSession aside delivery", () => {
 		}
 	});
 
-	it("holds the wake observer across the async-result continuation so a late yield still registers (#11564)", async () => {
+	it("finishes the aside wake observation at turn end and still delivers the job's continuation (#11564)", async () => {
 		const modelRegistry = new ModelRegistry(authStorage);
 		const started = Promise.withResolvers<void>();
 		const wakeModelCalled = Promise.withResolvers<void>();
 		const observerFinished = Promise.withResolvers<void>();
+		const continuationRan = Promise.withResolvers<void>();
 		const gate = Promise.withResolvers<string>();
 		const events: string[] = [];
 		const mock = createMockModel({
@@ -1572,6 +1573,7 @@ describe("AgentSession aside delivery", () => {
 				},
 				() => {
 					events.push("continuation-ran");
+					continuationRan.resolve();
 					return { content: ["rebuild finished"] };
 				},
 			],
@@ -1596,17 +1598,22 @@ describe("AgentSession aside delivery", () => {
 			ownedAsyncJobManager: manager,
 		});
 
+		let buildStarted = false;
 		session.setIrcWakeTurnObserver(_records => {
 			events.push("observer-start");
 			// The agent auto-backgrounded a build during the wake turn: the job
-			// outlives the turn and its async-result continuation is where the
-			// agent would finally yield.
-			manager.register(
-				"bash",
-				"wake rebuild",
-				({ signal }) => untilAborted(signal, gate.promise).then(() => "build ok"),
-				{ id: "wake-job", ownerId: "SubAgent" },
-			);
+			// outlives the turn, and its async-result continuation still reaches
+			// the agent after the observation ends. The continuation is a delivery
+			// turn with its own observation, which starts nothing.
+			if (!buildStarted) {
+				buildStarted = true;
+				manager.register(
+					"bash",
+					"wake rebuild",
+					({ signal }) => untilAborted(signal, gate.promise).then(() => "build ok"),
+					{ id: "wake-job", ownerId: "SubAgent" },
+				);
+			}
 			return async () => {
 				events.push("observer-finish");
 				observerFinished.resolve();
@@ -1623,16 +1630,22 @@ describe("AgentSession aside delivery", () => {
 		await run.catch(() => {});
 		await wakeModelCalled.promise;
 
-		// The wake turn ended in prose and the gated job is still running: the
-		// observer finish must wait for the job's continuation, not race it.
-		gate.resolve("BUILD GREEN");
+		// The aside wake observation ends with its turn: the subagent's lane driver
+		// (runLane) waits on the job and its continuation, so the session must not
+		// also hold the observation open for them (both waiting deadlocks).
 		await observerFinished.promise;
+		gate.resolve("BUILD GREEN");
+		await continuationRan.promise;
 		await session.waitForIdle();
 
-		expect(events).toContain("observer-start");
+		expect(events).toEqual([
+			"observer-start",
+			"observer-finish",
+			"observer-start",
+			"continuation-ran",
+			"observer-finish",
+		]);
 		expect(mock.calls.length).toBe(3);
-		expect(events.indexOf("continuation-ran")).toBeGreaterThanOrEqual(0);
-		expect(events.indexOf("observer-finish")).toBeGreaterThan(events.indexOf("continuation-ran"));
 		// The continuation turn received the job result through the delivery
 		// (injected as the background-completion system notice).
 		expect(JSON.stringify(mock.calls[2]!.context.messages)).toContain("build ok");

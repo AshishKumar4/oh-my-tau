@@ -13,13 +13,16 @@ interface SessionStub {
 	disposeCalls: () => number;
 }
 
-/** Minimal session: the lifecycle manager only ever calls dispose() on it. */
-function makeSessionStub(dispose?: () => Promise<void>): SessionStub {
+/** Minimal session: the lifecycle manager only disposes it and asks whether background work is pending. */
+function makeSessionStub(dispose?: () => Promise<void>, ircWakesPending = () => false): SessionStub {
 	let calls = 0;
 	const stub = {
 		dispose: async () => {
 			calls++;
 			await dispose?.();
+		},
+		get ircWakesPending() {
+			return ircWakesPending();
 		},
 	};
 	return { session: stub as unknown as AgentSession, disposeCalls: () => calls };
@@ -155,6 +158,27 @@ describe("AgentLifecycleManager", () => {
 		vi.advanceTimersByTime(TTL);
 		await flushAsync();
 		expect(registry.get("2-Sub")?.status).toBe("parked");
+		expect(stub.disposeCalls()).toBe(1);
+	});
+
+	it("does not idle-park an agent whose open run waits on its own background jobs; parks once the run ends", async () => {
+		vi.useFakeTimers();
+		// A lane run holds its session's IRC wakes across the gaps it spends waiting on its jobs.
+		let runOpen = true;
+		const stub = makeSessionStub(undefined, () => runOpen);
+		registerIdleSub("Busy-Sub", stub.session);
+		lifecycle.adopt("Busy-Sub", { idleTtlMs: TTL });
+
+		vi.advanceTimersByTime(TTL * 3);
+		await flushAsync();
+		expect(registry.get("Busy-Sub")?.status).toBe("idle");
+		expect(registry.get("Busy-Sub")?.session).toBe(stub.session);
+		expect(stub.disposeCalls()).toBe(0);
+
+		runOpen = false;
+		vi.advanceTimersByTime(TTL);
+		await flushAsync();
+		expect(registry.get("Busy-Sub")?.status).toBe("parked");
 		expect(stub.disposeCalls()).toBe(1);
 	});
 

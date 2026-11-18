@@ -266,6 +266,7 @@ describe("AgentSession yield empty-stop suppression", () => {
 		expect(mock.calls).toHaveLength(3);
 		expect(reminderMessages(session.agent.state.messages)).toHaveLength(1);
 		expect(assistantText(session.agent.state.messages)).toContain("recovered after IRC retry");
-		expect(observerEvents).toEqual(["started", "agent_end:3", "finished:3"]);
+		// The observer finishes at the wake turn's end; the run's `agent_end` follows once the run closes.
+		expect(observerEvents).toEqual(["started", "finished:3", "agent_end:3"]);
 	});
 });

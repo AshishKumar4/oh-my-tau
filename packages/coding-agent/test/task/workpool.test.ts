@@ -343,7 +343,7 @@ describe("WorkPool dispatch", () => {
 		expect(details.jobs?.map(job => job.status)).toEqual(["completed"]);
 		expect(workpool.peek().pending).toBe(0);
 		expect(workpool.peek().batches).toHaveLength(1);
-		expect(consume).toHaveBeenCalledWith([workpool.batches[0]!.jobId]);
+		expect(consume).toHaveBeenCalledWith([expect.objectContaining({ id: workpool.batches[0]?.jobId })]);
 	});
 
 	it("auto-delivers one aggregate completion under the pool id", async () => {

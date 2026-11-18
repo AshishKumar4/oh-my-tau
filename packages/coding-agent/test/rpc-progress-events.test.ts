@@ -44,7 +44,7 @@ describe("RPC progress events", () => {
 		await rpc.promptAndWait("second turn");
 
 		const committed = await rpc.compact();
-		expect(committed.summary).toBe("compacted by the test hook");
+		expect(committed?.summary).toBe("compacted by the test hook");
 		const pair = events.filter(event => event.type.startsWith("manual_compaction_"));
 		expect(pair).toEqual([
 			{ type: "manual_compaction_start" },

@@ -13,7 +13,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
-import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -21,9 +21,12 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { createAgentsHubDeps } from "@oh-my-pi/pi-coding-agent/modes/agents-hub-deps";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { ForkRequestSnapshot } from "@oh-my-pi/pi-coding-agent/session/fork-context";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { AgentProgress, SingleResult, TaskParams } from "@oh-my-pi/pi-tui/tools/task";
@@ -1062,5 +1065,253 @@ describe("task spawn routing", () => {
 
 		gates.get("Fifth")!.resolve();
 		await Promise.all(jobs.map(job => job.promise));
+	});
+
+	it("forks the parent's journal into a flat spawn, cut at the spawn call", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+		const seen: Array<{ id: string | undefined; messages: unknown[] | undefined }> = [];
+		const gates = new Map<string, Deferred>();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			const gate = deferred();
+			gates.set(options.id ?? "?", gate);
+			seen.push({ id: options.id, messages: options.fork?.messages });
+			await gate.promise;
+			return makeResult(options.id ?? "?");
+		});
+
+		const parentHistory = [
+			{ role: "user", content: "first turn", timestamp: 1 },
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "first answer" }],
+				api: "openai-responses",
+				provider: "openai",
+				model: "mock",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 2,
+			},
+			{ role: "user", content: "second turn", timestamp: 3 },
+			// The in-flight spawn call that produced this run; the child must not
+			// inherit it or its toolResult.
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "tc-fork", name: "task", arguments: { task: "Do the thing." } }],
+				api: "openai-responses",
+				provider: "openai",
+				model: "mock",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: 4,
+			},
+			{
+				role: "toolResult",
+				toolCallId: "tc-fork",
+				toolName: "task",
+				content: [{ type: "text", text: "" }],
+				isError: false,
+				timestamp: 5,
+			},
+		] satisfies AgentMessage[];
+		const parentSession = {
+			cwd: "/tmp",
+			hasUI: false,
+			settings: Settings.isolated({}),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			sessionManager: { buildSessionContext: () => ({ messages: parentHistory }) },
+		} as unknown as ToolSession;
+
+		const manager = createManager();
+		parentSession.asyncJobManager = manager;
+		const tool = await TaskTool.create(parentSession);
+
+		const result = await tool.execute("tc-fork", {
+			agent: "task",
+			name: "Forked",
+			task: "Do the thing.",
+			fork: 1,
+		} as TaskParams);
+		const jobId = result.details?.async?.jobId;
+		// Sync or async: the spawn options must carry the forked slice either way.
+		await pollUntil(() => seen.length === 1, 2000);
+		expect(seen[0]!.messages).toEqual([{ role: "user", content: "second turn", attribution: "user", timestamp: 3 }]);
+		for (const gate of gates.values()) gate.resolve();
+		if (jobId) await manager.getJob(jobId)?.promise;
+	});
+
+	it("carries the parent's request snapshot on fork:all, never on an N-turn fork", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+		const seen: Array<{ id: string | undefined; fork: ExecutorOptions["fork"] }> = [];
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			seen.push({ id: options.id, fork: options.fork });
+			return makeResult(options.id ?? "?");
+		});
+
+		const parentRequest: ForkRequestSnapshot = {
+			request: {
+				provider: "openai-codex-responses",
+				model: "gpt-5",
+				baseUrl: "https://api.openai.com/v1",
+				accountId: "acct-parent",
+				sessionId: "sess-parent",
+				threadId: "thread-parent",
+				input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "seed" }] }],
+			},
+			messageFingerprints: [],
+		};
+		const parentSession = {
+			cwd: "/tmp",
+			hasUI: false,
+			settings: Settings.isolated({}),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getForkRequestSnapshot: () => parentRequest,
+			sessionManager: {
+				buildSessionContext: () => ({
+					messages: [{ role: "user", content: "first turn", timestamp: 1 }] satisfies AgentMessage[],
+				}),
+			},
+		} as unknown as ToolSession;
+
+		const manager = createManager();
+		parentSession.asyncJobManager = manager;
+		const tool = await TaskTool.create(parentSession);
+
+		await tool.execute("tc-fork-all", {
+			agent: "task",
+			name: "AllFork",
+			task: "Inherit everything.",
+			fork: "all",
+		} as TaskParams);
+		await pollUntil(() => seen.length === 1, 2000);
+		expect(seen[0]!.fork?.request?.request.sessionId).toBe("sess-parent");
+
+		await tool.execute("tc-fork-one", {
+			agent: "task",
+			name: "TurnFork",
+			task: "Inherit the last turn only.",
+			fork: 1,
+		} as TaskParams);
+		await pollUntil(() => seen.length === 2, 2000);
+		expect(seen[1]!.fork?.request).toBeUndefined();
+	});
+
+	it("rejects invalid fork values and fork+batch before any spawn work", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+		const runSpy = vi.spyOn(executorModule, "runSubprocess");
+		const manager = createManager();
+		const tool = await TaskTool.create(createSession({ manager, settings: { "task.batch": true } }));
+
+		const invalidForks = [0, -1, 1.5, Number.NaN, "yes", "NONE"] as const;
+		for (const fork of invalidForks) {
+			const result = await tool.execute("tc-bad-fork", {
+				agent: "task",
+				name: "Bad",
+				task: "Do the thing.",
+				fork,
+			} as unknown as TaskParams);
+			expect(getFirstText(result)).toContain("invalid `fork` value");
+		}
+		expect(runSpy).not.toHaveBeenCalled();
+
+		const batched = await tool.execute("tc-fork-batch", {
+			tasks: [{ task: "one" }, { task: "two" }],
+			context: "shared context",
+			fork: "all",
+		} as unknown as TaskParams);
+		expect(getFirstText(batched)).toContain("only applies to a single spawn");
+		expect(runSpy).not.toHaveBeenCalled();
+	});
+
+	it("freezes the fork snapshot at call time, before a queued spawn starts", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [taskAgent], projectAgentsDir: null });
+		const seen: Array<{ id: string | undefined; messages: unknown[] | undefined }> = [];
+		const gates = new Map<string, Deferred>();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			const id = options.id ?? "?";
+			const gate = deferred();
+			gates.set(id, gate);
+			seen.push({ id, messages: options.fork?.messages });
+			await gate.promise;
+			return makeResult(id);
+		});
+
+		// A real journal on the parent: the snapshot is what the child would
+		// actually inherit, not a stubbed message list.
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage({ role: "user", content: "first turn", timestamp: 1 } as never);
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "toolCall", id: "tc-blocker", name: "task", arguments: {} }],
+			api: "openai-responses",
+			provider: "openai",
+			model: "mock",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: 2,
+		} as never);
+
+		const manager = createManager();
+		const tool = await TaskTool.create({
+			cwd: "/tmp",
+			hasUI: false,
+			settings: Settings.isolated({ "task.maxConcurrency": 1 }),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			asyncJobManager: manager,
+			sessionManager,
+		} as unknown as ToolSession);
+
+		// Occupy the single semaphore slot so the forked spawn queues behind it.
+		const blocker = await tool.execute("tc-blocker", {
+			agent: "task",
+			name: "Blocker",
+			task: "Hold the slot.",
+		} as TaskParams);
+		await pollUntil(() => seen.length === 1);
+
+		const forked = await tool.execute("tc-forked", {
+			agent: "task",
+			name: "Forked",
+			task: "Inherit me.",
+			fork: "all",
+		} as TaskParams);
+		expect(forked.details?.async?.jobId).toBeTruthy();
+
+		// Parent turns appended after the call must not leak into the snapshot.
+		sessionManager.appendMessage({ role: "user", content: "too late", timestamp: 3 } as never);
+
+		gates.get("Blocker")?.resolve();
+		await pollUntil(() => seen.length === 2);
+		const messages = seen[1]?.messages ?? [];
+		expect(messages.map(m => (m as { role: string }).role)).toEqual(["user"]);
+		expect(messages.some(m => JSON.stringify(m).includes("too late"))).toBe(false);
+		expect(messages.some(m => JSON.stringify(m).includes("tc-blocker"))).toBe(false);
+
+		gates.get("Forked")?.resolve();
+		await manager.getJob(blocker.details!.async!.jobId)?.promise;
+		await manager.getJob(forked.details!.async!.jobId)?.promise;
 	});
 });

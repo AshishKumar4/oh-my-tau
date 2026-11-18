@@ -16,6 +16,9 @@
  * ref when the generation still matches, else to a detached tombstone that
  * equals nothing, so a stale expectation fails every CAS.
  */
+import { isRecord } from "@oh-my-pi/pi-utils";
+import { SafeString } from "@oh-my-pi/pi-utils/template";
+import { detachRenderedEnvelope, withRenderedEnvelope } from "../../harness/content";
 import type { AgentRef } from "../../registry/agent-registry";
 import { AgentRegistry, isMintedAgentRef } from "../../registry/agent-registry";
 import type { AgentSessionHandle } from "../../session/agent-session-handle";
@@ -211,15 +214,38 @@ const workerRefCodec: RpcCodec<AgentRef> = {
 	},
 };
 
+/**
+ * A producer's rendered envelope (task and lane results, relays, deliveries) stays
+ * trusted across a worker link: its symbol-keyed marker would otherwise be dropped,
+ * and the receiving thread would escape the envelope as untrusted text. Errors take
+ * RPC's error path instead; see the job-run seam in `async-jobs.ts`.
+ */
+const renderedEnvelopeCodec: RpcCodec<object> = {
+	kind: "rendered-envelope",
+	is: (value): value is object =>
+		typeof value === "object" &&
+		value !== null &&
+		!(value instanceof Error) &&
+		detachRenderedEnvelope(value) !== undefined,
+	encode: value => detachRenderedEnvelope(value),
+	decode: data => {
+		if (!isRecord(data) || typeof data.value !== "object" || data.value === null || typeof data.rendered !== "string")
+			throw new Error("Malformed rendered envelope");
+		return withRenderedEnvelope(data.value, new SafeString(data.rendered));
+	},
+};
+
 /** Session and ref identity codecs; installed first so every other service's payloads can embed them. */
 export const identityThreadService: ThreadService = {
 	name: "identity",
 	installMain(peer) {
 		peer.link.codec(sessionCodec);
 		peer.link.codec(mainRefCodec);
+		peer.link.codec(renderedEnvelopeCodec);
 	},
 	installWorker(link) {
 		link.codec(sessionCodec);
 		link.codec(workerRefCodec);
+		link.codec(renderedEnvelopeCodec);
 	},
 };
