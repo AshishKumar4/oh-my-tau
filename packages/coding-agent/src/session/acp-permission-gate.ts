@@ -3,9 +3,15 @@ import { isRecord, stringProperty } from "@oh-my-pi/pi-utils";
 import { resolveToCwd } from "../tools/path-utils";
 import type { ClientBridgePermissionOption } from "./client-bridge";
 
+/** Tools whose `command` argument runs in the session's shell. */
+export const SHELL_COMMAND_TOOLS: Record<string, true> = {
+	bash: true,
+	monitor: true,
+};
+
 /** Tools that require user permission before execution when an ACP client is connected. */
 export const PERMISSION_REQUIRED_TOOLS: Record<string, true> = {
-	bash: true,
+	...SHELL_COMMAND_TOOLS,
 	edit: true,
 	delete: true,
 	move: true,
@@ -50,8 +56,10 @@ export function getPermissionIntent(
 	args: unknown,
 ): { toolName: string; title: string; paths?: string[]; cacheKey: string } | undefined {
 	const input = isRecord(args) ? args : {};
-	if (toolName === "bash") {
+	if (SHELL_COMMAND_TOOLS[toolName]) {
 		const command = stringProperty(input, "command")?.slice(0, 80);
+		// A monitor without a command only receives a WebSocket's frames.
+		if (toolName === "monitor" && !command) return undefined;
 		return { toolName, title: command || toolName, cacheKey: toolName };
 	}
 	if (toolName === "delete") {
