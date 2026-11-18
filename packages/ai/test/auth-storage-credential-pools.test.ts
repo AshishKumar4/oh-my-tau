@@ -165,6 +165,22 @@ describe("provider credential pools", () => {
 		expect(await storage.keys.get(PROVIDER, "session-2")).toBe("key-a");
 	});
 
+	it("attributes a session to no held account, and to its row again once released", async () => {
+		await open();
+		await storage.credentials.upsert(PROVIDER, oauth("max@example.com"));
+		const [subscription] = storage.oauth.accounts(PROVIDER);
+		if (!subscription) throw new Error("expected the subscription account");
+		await storage.keys.get(PROVIDER, "session-1");
+		expect(storage.sessions.sticky?.(PROVIDER, "session-1")?.credentialId).toBe(subscription.credentialId);
+
+		// A held account serves no request, so it is not the session's auth source.
+		storage.holdCredential(PROVIDER, subscription.credentialId);
+		expect(storage.sessions.sticky?.(PROVIDER, "session-1")).toBeUndefined();
+
+		storage.releaseCredential(PROVIDER, subscription.credentialId);
+		expect(storage.sessions.sticky?.(PROVIDER, "session-1")?.credentialId).toBe(subscription.credentialId);
+	});
+
 	it("keeps pooled keys through an OAuth login and keeps subscriptions through key adds", async () => {
 		await open();
 		await storage.credentials.addApiKey(PROVIDER, "key-a");

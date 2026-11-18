@@ -293,11 +293,12 @@ export class SessionAffinity implements SessionsApi {
 	 * rows: `KeyCascade` resolves runtime (`--api-key`) and config keys ahead
 	 * of the pool, and an env key can take over once stored rows go unusable —
 	 * its branch only forgets the in-memory pin, so a persisted row survives
-	 * and must not be reported as the session's auth source.
+	 * and must not be reported as the session's auth source. Nor is a held
+	 * account: it serves no request, so the next one resolves around it.
 	 */
 	sticky(provider: string, sessionId: string | undefined): SessionCredential | undefined {
 		const pin = this.get(provider, sessionId);
-		if (!pin) return undefined;
+		if (!pin || this.#blocks.isHeld(provider, pin.index)) return undefined;
 		const restricted = this.isRestricted(provider, sessionId);
 		if (this.#overrides.suppressesOAuth(provider, restricted)) return undefined;
 		if (!restricted && getEnvApiKey(provider)) return undefined;
