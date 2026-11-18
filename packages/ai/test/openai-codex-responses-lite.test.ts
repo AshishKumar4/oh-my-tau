@@ -785,6 +785,7 @@ describe("openai-codex Responses Lite and client metadata wire format", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(captured?.headers.get("x-openai-internal-codex-responses-lite")).toBeNull();
 		expect(captured?.body.instructions).toBeUndefined();
+		expect(captured?.body.reasoning).toBeUndefined();
 		expect(Object.keys(captured?.body ?? {}).slice(0, 3)).toEqual(["model", "stream", "input"]);
 		expect((captured!.body.input as Array<Record<string, unknown>>)[0]).toMatchObject(
 			baseInstructions("You are a helpful assistant."),

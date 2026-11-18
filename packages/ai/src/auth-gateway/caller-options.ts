@@ -72,7 +72,7 @@ const OPTION_TIERS = {
 	signal: "server",
 	apiKey: "server",
 	credentialId: "server",
-	oauthIdentity: "server",
+	credentialScope: "server",
 	fetch: "server",
 	cwd: "server",
 	providerOptions: "server",
@@ -100,6 +100,11 @@ const OPTION_TIERS = {
 	fallbacks: "server",
 	disableServerSideFallback: "server",
 	textVerbosity: "server",
+	// The vendor client a request presents as: how the gateway talks to the provider.
+	harnessProfile: "gateway",
+	harnessClientVersion: "gateway",
+	codexFork: "server",
+	onCodexRequestSnapshot: "server",
 } as const satisfies Record<keyof SimpleStreamOptions, OptionTier>;
 
 const TIERED_KEYS = Object.entries(OPTION_TIERS) as [keyof SimpleStreamOptions, OptionTier][];

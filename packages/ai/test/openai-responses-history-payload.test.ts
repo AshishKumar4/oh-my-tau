@@ -715,6 +715,138 @@ describe("OpenAI responses history payload", () => {
 		expect(collectResponsesInputImageDetails(openaiInput)).toEqual(["original"]);
 	});
 
+	it("maps legacy apply_patch replay through the seeded wire-name map", () => {
+		const legacy = [
+			{ type: "custom_tool_call", call_id: "call_legacy_apply", name: "apply_patch", input: ISSUE_5002_PATCH },
+			{ type: "custom_tool_call_output", call_id: "call_legacy_apply", output: ISSUE_5002_TOOL_OUTPUT },
+		];
+		const legacyContext: Context = {
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "fallback should not be replayed" }],
+					api: "openai-responses",
+					provider: "xai-oauth",
+					model: issue5002XaiOAuthModel.id,
+					usage: issue5002ZeroUsage,
+					stopReason: "stop",
+					providerPayload: createOpenAIResponsesHistoryPayload("xai-oauth", legacy),
+					timestamp: Date.now(),
+				},
+				{ role: "user", content: "continue", timestamp: Date.now() },
+			],
+			tools: [],
+		};
+		const xaiInput = buildResponsesInput({
+			model: issue5002XaiOAuthModel,
+			context: legacyContext,
+			strictResponsesPairing: false,
+			supportsImageDetailOriginal: issue5002XaiOAuthModel.compat.supportsImageDetailOriginal,
+			nativeHistory: { replay: true, filterReasoning: issue5002XaiOAuthModel.compat.filterReasoningHistory },
+		});
+		expect(findResponsesInputItemByCallId(xaiInput, "function_call", "call_legacy_apply")).toEqual({
+			type: "function_call",
+			call_id: "call_legacy_apply",
+			name: "edit",
+			arguments: JSON.stringify({ input: ISSUE_5002_PATCH }),
+		});
+		const reconstructed: Context = {
+			messages: [
+				{ role: "user", content: "apply it", timestamp: Date.now() },
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: "call_reconstructed_apply",
+							name: "apply_patch",
+							arguments: { input: ISSUE_5002_PATCH },
+							customWireName: "apply_patch",
+						},
+					],
+					api: "openai-responses",
+					provider: "xai-oauth",
+					model: issue5002XaiOAuthModel.id,
+					usage: issue5002ZeroUsage,
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_reconstructed_apply",
+					toolName: "edit",
+					content: [{ type: "text", text: ISSUE_5002_TOOL_OUTPUT }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+			],
+			tools: [],
+		};
+		const reconstructedInput = buildResponsesInput({
+			model: issue5002XaiOAuthModel,
+			context: reconstructed,
+			strictResponsesPairing: false,
+			supportsImageDetailOriginal: issue5002XaiOAuthModel.compat.supportsImageDetailOriginal,
+			nativeHistory: { replay: true, filterReasoning: issue5002XaiOAuthModel.compat.filterReasoningHistory },
+		});
+		expect(findResponsesInputItemByCallId(reconstructedInput, "function_call", "call_reconstructed_apply")).toEqual({
+			type: "function_call",
+			call_id: "call_reconstructed_apply",
+			name: "edit",
+			arguments: JSON.stringify({ input: ISSUE_5002_PATCH }),
+		});
+	});
+
+	it("preserves encrypted_function_args on replayed Codex function calls", () => {
+		// codex-rs #35845: an empty `encrypted_function_args` array marks plaintext
+		// collaboration arguments; the marker must survive replay verbatim or the
+		// backend would treat the replayed arguments as encrypted.
+		const codexModel = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.6-luna");
+		const nativeItems = [
+			{
+				type: "function_call",
+				id: "fc_plaintext_1",
+				call_id: "call_plaintext_collab",
+				name: "send_message",
+				namespace: "collaboration",
+				arguments: JSON.stringify({ message: "hello", task_name: "worker" }),
+				encrypted_function_args: [],
+				status: "completed",
+			},
+			{
+				type: "function_call_output",
+				call_id: "call_plaintext_collab",
+				output: "delivered",
+			},
+		];
+		const context: Context = {
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "fallback should not be replayed" }],
+					api: "openai-codex-responses",
+					provider: "openai-codex",
+					model: codexModel.id,
+					usage: issue5002ZeroUsage,
+					stopReason: "stop",
+					providerPayload: createOpenAIResponsesHistoryPayload("openai-codex", nativeItems),
+					timestamp: Date.now(),
+				},
+				{ role: "user", content: "continue", timestamp: Date.now() },
+			],
+		};
+
+		const input = convertCodexResponsesMessages(codexModel, context);
+		expect(findResponsesInputItemByCallId(input, "function_call", "call_plaintext_collab")).toEqual({
+			type: "function_call",
+			call_id: "call_plaintext_collab",
+			name: "send_message",
+			namespace: "collaboration",
+			arguments: JSON.stringify({ message: "hello", task_name: "worker" }),
+			encrypted_function_args: [],
+		});
+	});
+
 	it("uses canonical instructions field for endpoints without developer-role support", async () => {
 		const baseModel = getOpenAIReasoningModel("openai", "gpt-5-mini");
 		const model = buildModel({

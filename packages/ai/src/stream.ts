@@ -28,7 +28,7 @@ import {
 	resolvedApiKeyBearer,
 	resolveNextAuthRetryKey,
 } from "./auth-retry";
-import type { OAuthRequestIdentity } from "./auth/types";
+import type { CredentialRequestScope } from "./auth/types";
 import { withProbedThinking } from "./thinking-probe";
 import { getEnvApiKey } from "./env-api-key";
 import * as AIError from "./error";
@@ -49,6 +49,7 @@ import type { GoogleOptions } from "./providers/google";
 import { getVertexAccessToken } from "./providers/google-auth";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
+import { applyHarnessNameCodec } from "./providers/harness-name-codec";
 import { streamKimi } from "./providers/kimi";
 import type { KiroOptions } from "./providers/kiro/stream";
 import type { OllamaChatOptions } from "./providers/ollama";
@@ -1224,6 +1225,15 @@ export function streamSimple<TApi extends Api>(
 	const effortRequested =
 		sessionOptions.reasoning !== undefined && !sessionOptions.disableReasoning && !sessionOptions.forceReasoningOff;
 	if (!effortRequested) model = withoutUnverifiedThinking(model);
+	const harness = applyHarnessNameCodec(model, context, sessionOptions);
+	return harness.wrap(streamSimpleGlyphs(model, harness.context, harness.options));
+}
+
+function streamSimpleGlyphs<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	sessionOptions: SimpleStreamOptions,
+): AssistantMessageEventStream {
 	if (!model.requiresGlyphTokenization) {
 		return streamSimpleRequest(model, context, sessionOptions);
 	}
@@ -1281,7 +1291,7 @@ function streamSimpleRequest<TApi extends Api>(
 		const runAttempt = async (
 			apiKey?: string,
 			credentialId?: number,
-			oauthIdentity?: OAuthRequestIdentity,
+			credentialScope?: CredentialRequestScope,
 		): Promise<AuthRetryFailure | undefined> => {
 			const bufferedEvents: AssistantMessageEvent[] = [];
 			let emittedReplayUnsafeEvent = false;
@@ -1291,7 +1301,7 @@ function streamSimpleRequest<TApi extends Api>(
 			};
 
 			try {
-				const attemptOptions = { ...requestOptions, apiKey, credentialId, oauthIdentity };
+				const attemptOptions = { ...requestOptions, apiKey, credentialId, credentialScope };
 				const inner = streamSimpleRequest(model, context, attemptOptions);
 				for await (const event of inner) {
 					if (credentialId !== undefined) {
@@ -1359,12 +1369,12 @@ function streamSimpleRequest<TApi extends Api>(
 		void (async () => {
 			let lastKey: string | undefined;
 			let credentialId: number | undefined;
-			let oauthIdentity: OAuthRequestIdentity | undefined;
+			let credentialScope: CredentialRequestScope | undefined;
 			try {
 				const resolved = await apiKeyResolver({ lastChance: false, error: undefined, signal });
 				lastKey = resolvedApiKeyBearer(resolved);
 				credentialId = typeof resolved === "string" ? undefined : resolved?.credentialId;
-				oauthIdentity = typeof resolved === "string" ? undefined : resolved?.oauthIdentity;
+				credentialScope = typeof resolved === "string" ? undefined : resolved?.credentialScope;
 			} catch (error) {
 				// A thrown resolver is a broker/OAuth/network failure, not a missing
 				// key — surface the cause instead of masking it as "No API key".
@@ -1386,7 +1396,7 @@ function streamSimpleRequest<TApi extends Api>(
 				return;
 			}
 			const retryState = createAuthRetryKeyState(lastKey);
-			let failure = await runAttempt(lastKey, credentialId, oauthIdentity);
+			let failure = await runAttempt(lastKey, credentialId, credentialScope);
 			if (!failure) return;
 			let reportedFailure = failure;
 			while (true) {
@@ -1394,7 +1404,7 @@ function streamSimpleRequest<TApi extends Api>(
 				// another doomed request — emit the captured failure instead.
 				if (signal?.aborted) break;
 				let nextCredentialId: number | undefined;
-				let nextOAuthIdentity: OAuthRequestIdentity | undefined;
+				let nextCredentialScope: CredentialRequestScope | undefined;
 				const nextKey = await resolveNextAuthRetryKey(
 					retryState,
 					apiKeyResolver,
@@ -1402,11 +1412,11 @@ function streamSimpleRequest<TApi extends Api>(
 					signal,
 					resolved => {
 						nextCredentialId = typeof resolved === "string" ? undefined : resolved?.credentialId;
-						nextOAuthIdentity = typeof resolved === "string" ? undefined : resolved?.oauthIdentity;
+						nextCredentialScope = typeof resolved === "string" ? undefined : resolved?.credentialScope;
 					},
 				);
 				if (nextKey === undefined) break;
-				const next = await runAttempt(nextKey, nextCredentialId, nextOAuthIdentity);
+				const next = await runAttempt(nextKey, nextCredentialId, nextCredentialScope);
 				if (!next) return;
 				reportedFailure =
 					preferAuthRetryError(reportedFailure.error, next.error) === reportedFailure.error
@@ -1852,7 +1862,7 @@ function mapOptionsForApi<TApi extends Api>(
 		maxHttpAttempts: options?.maxHttpAttempts,
 		apiKey: apiKey ?? (typeof options?.apiKey === "string" ? options.apiKey : undefined),
 		credentialId: options?.credentialId,
-		oauthIdentity: options?.oauthIdentity,
+		credentialScope: options?.credentialScope,
 		cacheRetention: options?.cacheRetention,
 		headers: options?.headers,
 		initiatorOverride: options?.initiatorOverride,
@@ -1884,6 +1894,10 @@ function mapOptionsForApi<TApi extends Api>(
 		anthropicCompaction: options?.anthropicCompaction,
 		anthropicSlowMode: options?.anthropicSlowMode,
 		userProfileId: options?.userProfileId,
+		// `null` forces the native surface and differs from absent (catalog
+		// profile), so only an absent field may stay unset.
+		...(options?.harnessProfile !== undefined ? { harnessProfile: options.harnessProfile } : {}),
+		harnessClientVersion: options?.harnessClientVersion,
 		...simpleProviderOptions,
 	};
 
@@ -2146,6 +2160,8 @@ function mapOptionsForApi<TApi extends Api>(
 				preferWebsockets: options?.preferWebsockets,
 				codexCompaction: options?.codexCompaction,
 				codexAccessPrograms: options?.codexAccessPrograms,
+				codexFork: options?.codexFork,
+				onCodexRequestSnapshot: options?.onCodexRequestSnapshot,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
 				textVerbosity: options?.textVerbosity,
 				disableReasoning: options?.disableReasoning,

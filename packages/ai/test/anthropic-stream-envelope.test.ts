@@ -1728,7 +1728,12 @@ describe("anthropic stream envelope handling", () => {
 			expect(result.errorMessage).toBe(`Anthropic stream error (${type}): ${message}`);
 			expect(AIError.isStreamEnvelopeErrorText(result.errorMessage ?? "")).toBe(false);
 			expect(AIError.isStreamEnvelopeTruncationText(result.errorMessage ?? "")).toBe(false);
-			expect(AIError.retriable(AIError.classifyMessage(result))).toBe(false);
+			// A spent credit balance is the account's state, not the request's: it is a
+			// usage limit that sets this credential aside for a sibling, never a replay
+			// on the same one (`created` stays 1 above).
+			const id = AIError.classifyMessage(result);
+			if (type === "billing_error") expect(AIError.is(id, AIError.Flag.UsageLimit)).toBe(true);
+			else expect(AIError.retriable(id)).toBe(false);
 			vi.restoreAllMocks();
 		}
 	});
@@ -2246,46 +2251,54 @@ describe("anthropic stream envelope handling", () => {
 		},
 	});
 
-	it("reports the other models' reasoning a refused request replayed as text", async () => {
+	// A Claude target receives prior reasoning only as native thinking it accepts
+	// (see `dropsUnreplayableThinking`): other models' reasoning and Claude's own
+	// unsigned note beside signed thinking never reach it, so a refusal has no
+	// demoted reasoning to report or to leave out on a retry.
+	const expectNoForeignReasoning = (body: string) => {
+		expect(body).not.toContain("gemini private plan");
+		expect(body).not.toContain("kimi private plan");
+		expect(body).not.toContain("opus unsigned note");
+		expect(body).toContain("Gemini answer");
+		expect(body).toContain("Kimi answer");
+		expect(body).toContain("opus signed plan");
+	};
+
+	it("sends a Claude target no other model's reasoning, so a refusal reports none", async () => {
 		const sent: string[] = [];
 		const result = await streamAnthropic(model, crossModelReasoningContext(), {
 			client: refusingClient(sent),
 		}).result();
 
 		expect(sent).toHaveLength(1);
-		expect(sent[0]).toContain("gemini private plan");
-		expect(sent[0]).toContain("kimi private plan");
-		expect(sent[0]).toContain("opus unsigned note");
+		expectNoForeignReasoning(sent[0]!);
 		expect(result.errorMessage).toBe("Refusal (reasoning_extraction)");
-		expect(result.demotedReasoningBlocks).toBe(2);
+		expect(result.demotedReasoningBlocks).toBeUndefined();
 	});
 
-	it("leaves other models' reasoning out under omitDemotedReasoning and keeps a turn's own", async () => {
+	it("sends the same request under omitDemotedReasoning, which has nothing to leave out", async () => {
 		const sent: string[] = [];
+		await streamAnthropic(model, crossModelReasoningContext(), { client: refusingClient(sent) }).result();
 		const result = await streamAnthropic(model, crossModelReasoningContext(), {
 			client: refusingClient(sent),
 			omitDemotedReasoning: true,
 		}).result();
 
-		expect(sent).toHaveLength(1);
-		expect(sent[0]).not.toContain("gemini private plan");
-		expect(sent[0]).not.toContain("kimi private plan");
-		expect(sent[0]).toContain("Gemini answer");
-		expect(sent[0]).toContain("Kimi answer");
-		expect(sent[0]).toContain("opus signed plan");
-		expect(sent[0]).toContain("opus unsigned note");
+		expect(sent).toHaveLength(2);
+		expect(sent[1]).toBe(sent[0]!);
+		expectNoForeignReasoning(sent[1]!);
 		expect(result.stopReason).toBe("error");
 		expect(result.demotedReasoningBlocks).toBeUndefined();
 	});
 
-	it("keeps the refused request's demoted reasoning count through a fallback-credit redemption", async () => {
+	it("redeems fallback credit for a refused request that carried no demoted reasoning", async () => {
 		const sent: string[] = [];
 		const refused = await streamAnthropic(model, crossModelReasoningContext(), {
 			client: refusingClient(sent, { category: "cyber", explanation: null, fallback_credit_token: "fct_carried" }),
 		}).result();
-		expect(refused.fallbackCreditHandle?.demotedReasoningBlocks).toBe(2);
+		expect(refused.fallbackCreditHandle?.demotedReasoningBlocks ?? 0).toBe(0);
 
-		// The fallback model replays the frozen body, which carries the same reasoning.
+		// The fallback model replays the frozen body, which carries no foreign reasoning either.
 		const redeemed = await streamAnthropic({ ...model, id: "claude-opus-4-8" }, crossModelReasoningContext(), {
 			client: refusingClient(sent),
 			fallbackCreditRedemption: refused.fallbackCreditHandle,
@@ -2293,8 +2306,9 @@ describe("anthropic stream envelope handling", () => {
 
 		expect(sent).toHaveLength(2);
 		expect(sent[1]).toContain("fct_carried");
+		expectNoForeignReasoning(sent[1]!);
 		expect(redeemed.errorMessage).toBe("Refusal (reasoning_extraction)");
-		expect(redeemed.demotedReasoningBlocks).toBe(2);
+		expect(redeemed.demotedReasoningBlocks).toBeUndefined();
 	});
 
 	it("redeems fallback credit token with frozen request body and continuation prefill", async () => {

@@ -5,6 +5,7 @@ import {
 	resolveAnthropicApiVersion,
 } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import { hostMatchesUrl, isVertexRawPredictUrl, modelMatchesHost } from "@oh-my-pi/pi-catalog/hosts";
+import { type HarnessProfile, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -71,7 +72,7 @@ import {
 	isRecord,
 	normalizeSystemPrompts,
 	normalizeToolCallId,
-	resolveCacheRetention,
+	explicitCacheRetention,
 } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import {
@@ -124,6 +125,7 @@ import {
 	type CompactionBlockParam,
 	type CompactionEdit,
 	type ContentBlockParam,
+	type ToolResultBlockParam,
 	type FallbackParam,
 	isAnthropicServerToolHistoryBlock,
 	type MessageCreateParams,
@@ -137,10 +139,13 @@ import {
 	type ThinkingConfigParam,
 } from "./anthropic-wire";
 import {
+	claudeCodeBillingHeaderPrefix,
+	claudeCodeEntrypoint,
 	claudeCodeSystemInstruction,
 	adoptRequiredClaudeCodeVersion,
 	claudeToolPrefix,
 	getClaudeCodeVersion,
+	SUBAGENT_CONTEXT_TAG,
 } from "./claude-code-fingerprint";
 import {
 	buildCopilotDynamicHeaders,
@@ -154,7 +159,15 @@ import { prepareAnthropicImageContext } from "./anthropic-images";
 import { isAnthropicNarrationSignature, servedModelFromAnthropicSignature } from "./anthropic-signature";
 import { getOpenAIPromptCacheKey } from "./openai-shared";
 import { applyInferenceHeaders } from "./inference-headers";
-import { hasAnthropicMessageControls, redactSensitiveCredentials, transformMessages } from "./transform-messages";
+import {
+	buildHarnessToolNames,
+	declaredToolNames,
+	facadeToolCallReplay,
+	type HarnessToolNames,
+	hasAnthropicMessageControls,
+	redactSensitiveCredentials,
+	transformMessages,
+} from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 import {
 	injectedClientBaseUrl,
@@ -181,6 +194,7 @@ import {
 	mergeAnthropicBetaHeader,
 	midConversationSystemClearAtBeta,
 	midConversationToolChangesBeta,
+	advancedToolUseBeta,
 	midConversationOutputConfigBeta,
 	contextManagementBeta,
 	structuredOutputsBeta,
@@ -259,6 +273,7 @@ const killSwitchBetas: Record<string, true> = {
 	[structuredOutputsBeta]: true,
 	[taskBudgetBeta]: true,
 	[midConversationToolChangesBeta]: true,
+	[advancedToolUseBeta]: true,
 };
 
 /**
@@ -552,20 +567,31 @@ function getCacheControl(
 	model: Model<"anthropic-messages">,
 	cacheRetention: CacheRetention | undefined,
 	isOAuthToken = false,
-): { retention: CacheRetention; cacheControl?: AnthropicCacheControl } {
+): { retention: CacheRetention; headCacheControl?: AnthropicCacheControl; tailCacheControl?: AnthropicCacheControl } {
 	// Five-minute writes are the cheapest cache population strategy for pay-per-token API keys.
 	// For OAuth (Claude Code subscriber seats), match Claude Code's native policy by defaulting
 	// to 1h retention where supported, avoiding cold cache re-writes after 15m idle intervals.
 	// An explicit cacheRetention ('short', 'long', 'none') or PI_CACHE_RETENTION always takes precedence.
+	const explicit = explicitCacheRetention(cacheRetention);
 	const defaultRetention = isOAuthToken && model.compat.supportsLongCacheRetention ? "long" : "short";
-	const retention = resolveCacheRetention(cacheRetention, defaultRetention);
+	const retention = explicit ?? defaultRetention;
 	if (retention === "none") {
 		return { retention };
 	}
-	const ttl = retention === "long" && model.compat.supportsLongCacheRetention ? "1h" : undefined;
+	// The head (tools + system) is written once and re-read for the rest of the
+	// session, so an hour of retention is cheap insurance. The message tail is
+	// rewritten every turn, and Anthropic charges 2x base input for a 1h write
+	// against 1.25x for 5m — so pinning the tail taxes every turn to insure
+	// against idle gaps that measurement says are rare. Default to the mixed
+	// shape; an explicit `long` still pins everything, since the caller asked.
+	// Anthropic requires longer TTLs to precede shorter ones, which the wire
+	// order (tools, system, then messages) already satisfies.
+	const longSupported = model.compat.supportsLongCacheRetention;
+	const ephemeral: AnthropicCacheControl = { type: "ephemeral" };
 	return {
 		retention,
-		cacheControl: { type: "ephemeral", ...(ttl && { ttl }) },
+		headCacheControl: retention === "long" && longSupported ? { type: "ephemeral", ttl: "1h" } : ephemeral,
+		tailCacheControl: explicit === "long" && longSupported ? { type: "ephemeral", ttl: "1h" } : ephemeral,
 	};
 }
 
@@ -573,18 +599,32 @@ function getCacheControl(
 // in the leaf module so registry/usage consumers avoid an init cycle.
 export * from "./claude-code-fingerprint";
 
-const CLAUDE_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
-
-function createClaudeBillingHeader(firstUserMessageText: string): string {
+function createClaudeBillingHeader(firstUserMessageText: string, servedClaudeCodeVersion?: string): string {
 	// Fingerprint: SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]
 	// Matches CC's computeFingerprint in utils/fingerprint.ts.
 	// Uses chars from the first conversational wire user turn (not the system prompt).
 	const k = [4, 7, 20].map(i => firstUserMessageText[i] ?? "0").join("");
-	const version = getClaudeCodeVersion();
+	const version = getClaudeCodeVersion(servedClaudeCodeVersion);
 	const versionSuffix = Bun.SHA256.hash(`59cf53e54c78${k}${version}`, "hex").slice(0, 3);
 	// cch=00000: placeholder replaced with the real attestation hash by wrapFetchForCch
 	// before the request hits the wire (see below).
-	return `${CLAUDE_BILLING_HEADER_PREFIX} cc_version=${version}.${versionSuffix}; cc_entrypoint=cli; ${CCH_PLACEHOLDER_STR};`;
+	return `${claudeCodeBillingHeaderPrefix} cc_version=${version}.${versionSuffix}; cc_entrypoint=${claudeCodeEntrypoint}; ${CCH_PLACEHOLDER_STR};`;
+}
+
+/**
+ * The served capture's `clientVersion` when the request runs the claude-code
+ * profile. Only a request that carries the capture's prompt and tools may
+ * claim the capture's release; native requests and forced foreign profiles
+ * keep the process-wide version.
+ */
+function resolveServedClaudeCodeVersion(
+	model: Model<"anthropic-messages">,
+	override: HarnessProfile | null | undefined,
+	clientVersion: string | undefined,
+): string | undefined {
+	if (clientVersion === undefined) return undefined;
+	const profile = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
+	return profile === "claude-code" ? clientVersion : undefined;
 }
 
 // cch attestation: XXHash64(body_with_placeholder, seed) low-20-bits, 5 hex chars.
@@ -599,7 +639,7 @@ const CCH_PLACEHOLDER = cchEncoder.encode(CCH_PLACEHOLDER_STR);
 // "system" in Anthropic SDK payloads (~byte 29 vs ~byte 4705), so user content
 // in the messages array can never match this sequence.  User system prompt text
 // lives in system[2] and therefore also cannot match.
-const BILLING_SYSTEM_MARKER = cchEncoder.encode(`"system":[{"type":"text","text":"${CLAUDE_BILLING_HEADER_PREFIX}`);
+const BILLING_SYSTEM_MARKER = cchEncoder.encode(`"system":[{"type":"text","text":"${claudeCodeBillingHeaderPrefix}`);
 const CCH_BILLING_SEARCH_WINDOW = 150;
 
 function patchCch(body: Uint8Array): "patched" | "no-billing-header" | "unanchored" {
@@ -694,14 +734,64 @@ function encodeAnthropicToolName(
 	name: string,
 	isOAuthToken: boolean,
 	escapeBuiltinToolNames: boolean,
-	useUmansGatewayWebSearch = false,
+	toolNames: HarnessToolNames | undefined,
 ): string {
-	if (shouldUseUmansGatewayWebSearch(name, useUmansGatewayWebSearch)) return name;
+	if (toolNames) return toolNames.toWire.get(name) ?? name;
 	if (escapeBuiltinToolNames) return `${claudeToolPrefix}${name}`;
 	return isOAuthToken ? applyClaudeToolPrefix(name) : name;
 }
 
-function decodeAnthropicToolName(name: string, isOAuthToken: boolean, escapeBuiltinToolNames: boolean): string {
+/**
+ * Replay name for a single-identity call: no facade involved, or a facade
+ * block persisted before `nativeArguments` existed. Prefers the active map,
+ * keeps the persisted vendor name only while the claude-code profile is
+ * active, and otherwise re-encodes the omp name.
+ */
+function replayAnthropicToolName(
+	name: string,
+	wireName: string | undefined,
+	model: Model<"anthropic-messages">,
+	isOAuthToken: boolean,
+	toolNames: HarnessToolNames | undefined,
+	override?: HarnessProfile | null,
+): string {
+	const activeWireName = toolNames?.toWire.get(name);
+	if (activeWireName !== undefined) return activeWireName;
+	const effective = override === undefined ? resolveHarnessProfile(model) : (override ?? undefined);
+	if (wireName !== undefined && effective === "claude-code") return wireName;
+	return encodeAnthropicToolName(name, isOAuthToken, model.compat.escapeBuiltinToolNames, toolNames);
+}
+
+function replayAnthropicToolCall(
+	block: ToolCall,
+	model: Model<"anthropic-messages">,
+	isOAuthToken: boolean,
+	toolNames: HarnessToolNames | undefined,
+	declaredNames: ReadonlySet<string> | undefined,
+	override?: HarnessProfile | null,
+): { name: string; input: Record<string, unknown> } {
+	const facade = facadeToolCallReplay(block, declaredNames);
+	if (facade === undefined) {
+		return {
+			name: replayAnthropicToolName(block.name, block.wireName, model, isOAuthToken, toolNames, override),
+			input: block.arguments ?? {},
+		};
+	}
+	return {
+		name: facade.native
+			? encodeAnthropicToolName(facade.name, isOAuthToken, model.compat.escapeBuiltinToolNames, toolNames)
+			: facade.name,
+		input: facade.arguments,
+	};
+}
+
+function decodeAnthropicToolName(
+	name: string,
+	isOAuthToken: boolean,
+	escapeBuiltinToolNames: boolean,
+	toolNames: HarnessToolNames | undefined,
+): string {
+	if (toolNames) return toolNames.fromWire.get(name) ?? name;
 	if (isOAuthToken || escapeBuiltinToolNames) return stripClaudeToolPrefix(name);
 	return name;
 }
@@ -871,6 +961,13 @@ export interface AnthropicOptions extends StreamOptions {
 	 * response (a gateway opted in) is still persisted as a replay boundary.
 	 */
 	fallbacks?: FallbackParam[];
+	/**
+	 * Session effective harness profile (`harness.mode`) threaded by the
+	 * session stream wrapper. Overrides the model's catalog profile for wire
+	 * naming, head caching, and replay: `null` forces native, a profile
+	 * forces that surface, omission keeps catalog behavior.
+	 */
+	harnessProfile?: HarnessProfile | null;
 }
 
 export type AnthropicClientOptionsArgs = {
@@ -900,6 +997,13 @@ export type AnthropicClientOptionsArgs = {
 	fetch?: FetchImpl;
 	maxRetryDelayMs?: number;
 	sessionId?: string;
+	/**
+	 * Served claude-code capture's `clientVersion`. Carried unresolved so a
+	 * client rebuilt after a version rejection resolves the adopted version.
+	 */
+	servedClaudeCodeVersion?: string;
+	/** API key only: the stored key's workspace (`anthropic-workspace-id`). */
+	workspaceId?: string;
 	/** Working-identity cache key for this credential+host; undefined off the Copilot path. */
 	copilotCacheKey?: string;
 	/**
@@ -1415,6 +1519,7 @@ function compactionBlockParam(payload: AnthropicCompactionPayload): CompactionBl
 		type: "compaction",
 		content,
 		...(signature !== undefined ? { signature } : {}),
+		...(toolChanges !== undefined ? { tool_changes: toolChanges } : {}),
 		...(encryptedContent !== undefined ? { encrypted_content: encryptedContent } : {}),
 		...(toolChanges !== undefined ? { tool_changes: toolChanges } : {}),
 	};
@@ -1997,9 +2102,16 @@ const streamAnthropicOnce = (
 			// means no nested refusal is possible — `type` is mandatory and its only
 			// legal value is constant — and the ladder skips its first rung.
 			// Re-read per rung because `isOAuthToken` is resolved with the client.
+			// The head and tail breakpoints carry separate lifetimes; either may hold the option.
 			const requestCarriesCacheControlOptions = (): boolean => {
-				const cacheControl = getCacheControl(model, options?.cacheRetention, isOAuthToken).cacheControl;
-				return cacheControl !== undefined && (cacheControl.ttl !== undefined || cacheControl.scope !== undefined);
+				const { headCacheControl, tailCacheControl } = getCacheControl(
+					model,
+					options?.cacheRetention,
+					isOAuthToken,
+				);
+				return [headCacheControl, tailCacheControl].some(
+					control => control !== undefined && (control.ttl !== undefined || control.scope !== undefined),
+				);
 			};
 			let dropAllThinking = droppedAllThinkingForSignature;
 			let prefixBindingRetryAttempted = false;
@@ -2044,6 +2156,13 @@ const streamAnthropicOnce = (
 			// The binding-controls beta follows the finalized body's
 			// `thinking.block_binding` per request (see below), not the client.
 			const controlBetas = resolveAnthropicControlBetas(model, undefined);
+			// User-Agent and billing header claim the served capture's release; a
+			// version rejection is judged against it (see getClaudeCodeVersion).
+			const servedClaudeCodeVersion = resolveServedClaudeCodeVersion(
+				model,
+				options?.harnessProfile,
+				options?.harnessClientVersion,
+			);
 			const mergedCallerHeaders = mergeHeaders(model.headers, options?.headers);
 			const umansGatewayWebSearchHeader = getUmansWebSearchHeader(model, mergedCallerHeaders);
 			// Base for the per-request beta override an injected client needs.
@@ -2084,11 +2203,14 @@ const streamAnthropicOnce = (
 			// when the client is built so a `claude_code_version_too_old` rejection is
 			// judged against the version that request sent, not the process-wide
 			// adopted one (concurrent first requests would otherwise race).
-			let sentClaudeCodeVersion = getClaudeCodeVersion();
+			let sentClaudeCodeVersion = getClaudeCodeVersion(servedClaudeCodeVersion);
 			let requestExtraBetas: readonly string[] = [];
 			let clientDefaultHeaders: Record<string, string> | undefined;
-			// Rebuild headers when a retry changes the advertised beta set.
-			const resolveClient = (): { client: AnthropicMessagesClientLike; isOAuthToken: boolean } => {
+			// Rebuild headers when a retry changes the advertised beta set. A client
+			// serving a frozen redemption body advertises that body's saved betas.
+			const resolveClient = (
+				servesFrozenRedemption: boolean,
+			): { client: AnthropicMessagesClientLike; isOAuthToken: boolean } => {
 				if (options?.client && !transport) {
 					return { client: options.client, isOAuthToken: false };
 				}
@@ -2104,6 +2226,13 @@ const streamAnthropicOnce = (
 				}
 				if (options?.taskBudget && !extraBetas.includes(taskBudgetBeta)) {
 					extraBetas.push(taskBudgetBeta);
+				}
+				if (
+					usesToolSearch(context) &&
+					!isVertexRawPredictUrl(baseUrl) &&
+					!extraBetas.includes(advancedToolUseBeta)
+				) {
+					extraBetas.push(advancedToolUseBeta);
 				}
 				// `output_config.effort` ships on thinking-on requests, explicit
 				// thinking-off adaptive pins, and forced-tool adaptive pins. The beta
@@ -2176,7 +2305,7 @@ const streamAnthropicOnce = (
 					!dropCacheControlOptions &&
 					!isVertexRawPredictUrl(baseUrl) &&
 					model.compat.extendedCacheTtlBeta !== false &&
-					getCacheControl(model, options?.cacheRetention, isOAuth).cacheControl?.ttl === "1h" &&
+					getCacheControl(model, options?.cacheRetention, isOAuth).headCacheControl?.ttl === "1h" &&
 					!extraBetas.includes(extendedCacheTtlBeta)
 				) {
 					extraBetas.push(extendedCacheTtlBeta);
@@ -2186,7 +2315,7 @@ const streamAnthropicOnce = (
 				}
 				// A forfeited frozen body is rebuilt fresh, so it keeps the betas
 				// computed above instead of the saved list describing the old body.
-				if (options?.fallbackCreditRedemption && !forfeitFrozenForKillSwitch) {
+				if (servesFrozenRedemption && options?.fallbackCreditRedemption) {
 					const frozenBetas = (options.fallbackCreditRedemption.betas ?? []).filter(
 						b => !b.startsWith("server-side-fallback-"),
 					);
@@ -2252,15 +2381,17 @@ const streamAnthropicOnce = (
 						options?.sessionId ??
 						extractClaudeMetadataSessionId(options?.metadata?.user_id) ??
 						options?.promptCacheKey,
+					servedClaudeCodeVersion,
+					workspaceId: options?.credentialScope?.workspaceId,
 					disableStrictTools,
 					dropPromptCacheBetas: dropCacheControl || dropCacheControlOptions,
 				};
-				sentClaudeCodeVersion = getClaudeCodeVersion();
+				sentClaudeCodeVersion = getClaudeCodeVersion(servedClaudeCodeVersion);
 				const created = createClient(model, clientArgs);
 				clientDefaultHeaders = created.defaultHeaders;
 				return created;
 			};
-			let { client, isOAuthToken } = resolveClient();
+			let { client, isOAuthToken } = resolveClient(!forfeitFrozenForKillSwitch);
 			// Message threads: only for this provider's own client against a
 			// session. Per-call context messages are rebuilt next request, so a
 			// thread could never continue past them; such requests go without one
@@ -2279,6 +2410,17 @@ const streamAnthropicOnce = (
 					: undefined;
 			let replayResponse: AnthropicResponseReplay | undefined;
 			const preparedContext = await prepareAnthropicImageContext(context, model);
+			// The tool plan keeps withdrawn tools declared from `inactiveTools`, so
+			// the vendor renames must cover them too: a withdrawn facade tool would
+			// otherwise redeclare under its omp name and rewrite the cached head.
+			const harnessToolNames = buildHarnessToolNames(
+				model,
+				"claude-code",
+				preparedContext.inactiveTools
+					? [...(preparedContext.tools ?? []), ...preparedContext.inactiveTools]
+					: preparedContext.tools,
+				options?.harnessProfile,
+			);
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
 				if (transport) rawRequestDump = undefined;
 				const built = buildParams(model, preparedContext, isOAuthToken, options, {
@@ -2293,6 +2435,8 @@ const streamAnthropicOnce = (
 					dropCacheControl,
 					dropCacheControlOptions,
 					droppedThinkingBlocks: providerSessionState?.prefixDroppedThinkingBlocks,
+					harnessToolNames,
+					...(options?.harnessProfile !== undefined ? { harnessProfile: options.harnessProfile } : {}),
 					controlRecords: getControlRecords(),
 					fallbacks,
 					effectiveBaseUrl: baseUrl,
@@ -2497,8 +2641,8 @@ const streamAnthropicOnce = (
 			const idleTimeoutAbortError = new AIError.StreamTimeoutError(
 				"Anthropic stream stalled while waiting for the next event",
 			);
-			const resetStreamOutputState = (): void => {
-				providerRetryAttempt = 0;
+			/** Discards what a failed attempt streamed into `output` before the next one. */
+			const clearStreamOutput = (): void => {
 				output.content.length = 0;
 				output.model = sourceModel.id;
 				output.responseId = undefined;
@@ -2510,6 +2654,11 @@ const streamAnthropicOnce = (
 				output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
 				output.stopReason = "stop";
 				firstTokenTime = undefined;
+			};
+			/** A changed request starts over, transient-retry budget included. */
+			const resetStreamOutputState = (): void => {
+				providerRetryAttempt = 0;
+				clearStreamOutput();
 			};
 			// A rebuilt body no longer matches the refused request, so it cannot carry
 			// the credit token. When the refused turn already ran server tools, a
@@ -3011,6 +3160,7 @@ const streamAnthropicOnce = (
 										event.content_block.name,
 										isOAuthToken,
 										model.compat.escapeBuiltinToolNames,
+										harnessToolNames,
 									),
 									arguments: event.content_block.input ?? {},
 									[kStreamingPartialJson]: "",
@@ -3401,22 +3551,13 @@ const streamAnthropicOnce = (
 					) {
 						logger.warn("anthropic: Claude Code version rejected as too old, retrying with required version", {
 							model: model.id,
-							version: getClaudeCodeVersion(),
+							version: getClaudeCodeVersion(servedClaudeCodeVersion),
 						});
-						sentClaudeCodeVersion = getClaudeCodeVersion();
+						sentClaudeCodeVersion = getClaudeCodeVersion(servedClaudeCodeVersion);
 						client = createClient(model, { ...clientArgs, disableStrictTools }).client;
 						// The version only changes client headers; a redemption keeps its frozen body.
 						if (!usingFallbackCredit) params = await prepareParams();
-						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.model = sourceModel.id;
-						output.responseId = undefined;
-						output.upstreamModel = undefined;
-						output.errorMessage = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetStreamOutputState();
 						continue;
 					}
 					if (
@@ -3435,17 +3576,7 @@ const streamAnthropicOnce = (
 						prefixMismatchBehavior = undefined;
 						dropAllThinking = !rememberPrefixBindingFailure(params, streamFailureMessage, providerSessionState);
 						params = await rebuildParams(streamFailure);
-						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.model = sourceModel.id;
-						output.responseId = undefined;
-						output.upstreamModel = undefined;
-						output.errorMessage = undefined;
-						output.inputTransformations = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetStreamOutputState();
 						continue;
 					}
 					if (
@@ -3478,17 +3609,7 @@ const streamAnthropicOnce = (
 								dropAllThinking = true;
 							}
 							params = await rebuildParams(streamFailure);
-							providerRetryAttempt = 0;
-							output.content.length = 0;
-							output.model = sourceModel.id;
-							output.responseId = undefined;
-							output.upstreamModel = undefined;
-							output.errorMessage = undefined;
-							output.inputTransformations = undefined;
-							output.providerPayload = undefined;
-							output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-							output.stopReason = "stop";
-							firstTokenTime = undefined;
+							resetStreamOutputState();
 							continue;
 						}
 					}
@@ -3500,7 +3621,7 @@ const streamAnthropicOnce = (
 						isInvalidThinkingSignatureError(streamFailureMessage)
 					) {
 						logger.warn(
-							"anthropic: signing proxy detected (thinking signature rejected), demoting unsigned thinking and retrying",
+							"anthropic: signing proxy detected (thinking signature rejected), disabling unsigned thinking replay and retrying",
 							{
 								provider: model.provider,
 								model: model.id,
@@ -3513,16 +3634,7 @@ const streamAnthropicOnce = (
 						}
 						forceDemoteUnsignedThinking = true;
 						params = await rebuildParams(streamFailure);
-						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.model = sourceModel.id;
-						output.responseId = undefined;
-						output.upstreamModel = undefined;
-						output.errorMessage = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetStreamOutputState();
 						continue;
 					}
 					if (
@@ -3555,16 +3667,7 @@ const streamAnthropicOnce = (
 						droppedAllThinkingForSignature = true;
 						dropAllThinking = true;
 						params = await rebuildParams(streamFailure);
-						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.model = sourceModel.id;
-						output.responseId = undefined;
-						output.errorMessage = undefined;
-						output.inputTransformations = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetStreamOutputState();
 						continue;
 					}
 					if (
@@ -3582,16 +3685,7 @@ const streamAnthropicOnce = (
 						}
 						dropFastMode = true;
 						params = await rebuildParams(streamFailure);
-						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.model = sourceModel.id;
-						output.responseId = undefined;
-						output.upstreamModel = undefined;
-						output.errorMessage = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						resetStreamOutputState();
 						continue;
 					}
 					// First rung, and only when the failing request carried an option a
@@ -3619,19 +3713,13 @@ const streamAnthropicOnce = (
 						);
 						cacheControlOptionRejectionReplayed = true;
 						dropCacheControlOptions = true;
-						// Rebuild the client too: the retry must stop advertising the
-						// extended-cache-ttl beta, and that lives in the default headers.
-						({ client, isOAuthToken } = resolveClient());
-						params = await prepareParams();
-						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.model = sourceModel.id;
-						output.responseId = undefined;
-						output.errorMessage = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						// A fresh body cannot carry a redemption's credit token, so it
+						// forfeits the credit, or surfaces the failure once server tools
+						// ran. Then the client: the retry must stop advertising the cache
+						// betas, and a forfeited redemption its frozen ones.
+						params = await rebuildParams(streamFailure);
+						({ client, isOAuthToken } = resolveClient(usingFallbackCredit));
+						resetStreamOutputState();
 						continue;
 					}
 					if (
@@ -3683,19 +3771,13 @@ const streamAnthropicOnce = (
 						});
 						cacheControlRejectionReplayed = true;
 						dropCacheControl = true;
-						// Rebuild the client too: the retry must stop advertising the
-						// extended-cache-ttl beta, and that lives in the default headers.
-						({ client, isOAuthToken } = resolveClient());
-						params = await prepareParams();
-						providerRetryAttempt = 0;
-						output.content.length = 0;
-						output.model = sourceModel.id;
-						output.responseId = undefined;
-						output.errorMessage = undefined;
-						output.providerPayload = undefined;
-						output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-						output.stopReason = "stop";
-						firstTokenTime = undefined;
+						// A fresh body cannot carry a redemption's credit token, so it
+						// forfeits the credit, or surfaces the failure once server tools
+						// ran. Then the client: the retry must stop advertising the cache
+						// betas, and a forfeited redemption its frozen ones.
+						params = await rebuildParams(streamFailure);
+						({ client, isOAuthToken } = resolveClient(usingFallbackCredit));
+						resetStreamOutputState();
 						continue;
 					}
 					// Undocumented thread rejections arrive as plain 400s; resend once
@@ -3741,15 +3823,7 @@ const streamAnthropicOnce = (
 					}
 					const delayMs = headerDelayMs !== undefined ? Math.max(headerDelayMs, backoffDelayMs) : backoffDelayMs;
 					await waitForRetry(options?.providerRetryWait, delayMs, options?.signal);
-					output.content.length = 0;
-					output.model = sourceModel.id;
-					output.responseId = undefined;
-					output.errorMessage = undefined;
-					output.stopDetails = undefined;
-					output.providerPayload = undefined;
-					output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
-					output.stopReason = "stop";
-					firstTokenTime = undefined;
+					clearStreamOutput();
 				}
 			}
 			const retained = settleFallbackHandoff();
@@ -3857,6 +3931,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (model, con
 		retryEmptyCompletion: true,
 	});
 
+/** Whether a request defers tools; only then can a tool search's references resolve. */
+function usesToolSearch(context: Context): boolean {
+	return context.tools?.some(tool => tool.deferLoading === true) === true;
+}
+
 /** Whether Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` applies to this model's provider. */
 function experimentalBetasDisabled(model: Model<"anthropic-messages">): boolean {
 	return model.compat.honorsClaudeCodeBetaKillSwitch === true && $flag("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS");
@@ -3890,6 +3969,17 @@ function withholdKillSwitchFields(params: MessageCreateParamsStreaming): void {
 		if ("strict" in tool) delete tool.strict;
 		if ("defer_loading" in tool) delete tool.defer_loading;
 		if ("eager_input_streaming" in tool) delete tool.eager_input_streaming;
+	}
+	// Without `defer_loading` every tool is declared in full, so a tool search's
+	// references only name tools the model already has.
+	for (const message of params.messages) {
+		if (!Array.isArray(message.content)) continue;
+		for (const block of message.content) {
+			if (block.type !== "tool_result" || !Array.isArray(block.content)) continue;
+			block.content = block.content.map(part =>
+				part.type === "tool_reference" ? { type: "text", text: `Loaded ${part.tool_name}.` } : part,
+			);
+		}
 	}
 	for (const message of params.messages) {
 		// Per-message `output_config` (mid-conversation effort) may carry the same controls.
@@ -3955,6 +4045,8 @@ type SystemBlockOptions = {
 	extraInstructions?: string[];
 	/** Text of the first conversational wire user turn, used as the billing fingerprint seed. */
 	firstUserMessageText?: string;
+	/** Served claude-code capture's `clientVersion`, which the billing header's `cc_version` claims. */
+	servedClaudeCodeVersion?: string;
 	/**
 	 * Cache lifetime shared by the OAuth system breakpoint and later message
 	 * breakpoints. Omitted → the identity block keeps its default `ephemeral`
@@ -3976,12 +4068,13 @@ export function buildAnthropicSystemBlocks(
 		includeClaudeCodeInstruction = false,
 		extraInstructions = [],
 		firstUserMessageText,
+		servedClaudeCodeVersion,
 		cacheControl,
 		dropCacheControl = false,
 	} = options;
 	const sanitizedPrompts = normalizeSystemPrompts(systemPrompt);
 	const trimmedInstructions = extraInstructions.map(instruction => instruction.trim()).filter(Boolean);
-	const hasBillingHeader = sanitizedPrompts.some(prompt => prompt.startsWith(CLAUDE_BILLING_HEADER_PREFIX));
+	const hasBillingHeader = sanitizedPrompts.some(prompt => prompt.startsWith(claudeCodeBillingHeaderPrefix));
 
 	if (includeClaudeCodeInstruction && !hasBillingHeader) {
 		const identityBlock: AnthropicSystemBlock = { type: "text", text: claudeCodeSystemInstruction };
@@ -3989,7 +4082,7 @@ export function buildAnthropicSystemBlocks(
 			identityBlock.cache_control = cacheControl ? cloneAnthropicCacheControl(cacheControl) : { type: "ephemeral" };
 		}
 		const blocks: AnthropicSystemBlock[] = [
-			{ type: "text", text: createClaudeBillingHeader(firstUserMessageText ?? "") },
+			{ type: "text", text: createClaudeBillingHeader(firstUserMessageText ?? "", servedClaudeCodeVersion) },
 			identityBlock,
 		];
 
@@ -4029,6 +4122,8 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		omitClaudeCodeAppHeaders,
 		maxRetryDelayMs,
 		sessionId,
+		servedClaudeCodeVersion,
+		workspaceId,
 		disableStrictTools: disableStrictToolsOverride,
 		dropPromptCacheBetas = false,
 		copilotCacheKey,
@@ -4167,6 +4262,8 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		isCloudflareAiGateway: model.provider === "cloudflare-ai-gateway",
 		allowAnthropicHeaderOverrides: model.compat.allowAnthropicHeaderOverrides,
 		claudeCodeSessionId: sessionId,
+		servedClaudeCodeVersion,
+		workspaceId,
 		claudeCodeBetas: oauthToken
 			? buildClaudeCodeBetas({
 					agentRequest: hasTools || thinkingEnabled,
@@ -4551,10 +4648,20 @@ function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?:
  */
 const VOLATILE_SYSTEM_SEGMENT_MARKERS = ["<memories>", "<project-context>"];
 
-function volatileSystemSuffixStart(systemBlocks: readonly AnthropicSystemBlock[]): number {
-	const start = systemBlocks.findIndex(block =>
-		VOLATILE_SYSTEM_SEGMENT_MARKERS.some(marker => block.text.startsWith(marker)),
-	);
+/**
+ * The `claude-code` profile keeps the captured client's two system breakpoints:
+ * its identity block and its last system block (`cachedSystemSlots` in the
+ * claude-code golden). Working-directory context therefore stays inside the
+ * anchored head under the profile, which forgoes sharing that head across
+ * directories; only per-turn recall, which the client never sends, sits behind
+ * the breakpoint so a refresh re-bills just the suffix. A subagent's per-spawn
+ * block (`<subagent-context>`, see {@link SUBAGENT_CONTEXT_TAG}) sits behind it
+ * too, so siblings share the vendor prompt, footer and project context.
+ */
+const CLAUDE_CODE_VOLATILE_SYSTEM_SEGMENT_MARKERS = ["<memories>", `<${SUBAGENT_CONTEXT_TAG}>`];
+
+function volatileSystemSuffixStart(systemBlocks: readonly AnthropicSystemBlock[], markers: readonly string[]): number {
+	const start = systemBlocks.findIndex(block => markers.some(marker => block.text.startsWith(marker)));
 	return start === -1 ? systemBlocks.length : start;
 }
 
@@ -4589,17 +4696,35 @@ function volatileSystemSuffixStart(systemBlocks: readonly AnthropicSystemBlock[]
  * 2 message breakpoints while the agent's static system prompt, not just the
  * identity line, becomes a cached prefix of its own.
  *
+ * The `claude-code` harness profile is the one exception on the system side:
+ * the captured client anchors both its identity block and its last system
+ * block (see the vendorFraming of the claude-code golden), so the profile keeps
+ * the identity breakpoint and anchors the last block before any recall suffix
+ * or per-spawn subagent block. It anchors no tool, so its head is still two
+ * breakpoints.
+ *
  * Runs on the fresh system blocks and wire tools built for this request, after
  * the declared tool list was derived from the transcript's request controls.
  */
 function applyHeadCaching(
 	systemBlocks: AnthropicSystemBlock[] | undefined,
 	tools: AnthropicWireTool[] | undefined,
-	cacheControl?: AnthropicCacheControl,
+	cacheControl: AnthropicCacheControl | undefined,
+	harnessProfile: HarnessProfile | undefined,
 ): void {
 	if (!cacheControl) return;
 
-	if (tools && tools.length > 0 && !tools.some(tool => tool.cache_control != null)) {
+	// The captured Claude Code client anchors its identity block and its last
+	// system block, never a tool, so anchoring one here would add a declaration
+	// shape the vendor never sends (caught by the claude-code golden's
+	// declarationForms). Fidelity wins under the profile; every other path keeps
+	// the tool anchor, whose stable prefix siblings share byte for byte.
+	if (
+		harnessProfile !== "claude-code" &&
+		tools &&
+		tools.length > 0 &&
+		!tools.some(tool => tool.cache_control != null)
+	) {
 		// Deferred tools are not part of the checked prefix until referenced, so
 		// anchor the last tool that actually sits in the stable prefix.
 		for (let index = tools.length - 1; index >= 0; index--) {
@@ -4619,11 +4744,19 @@ function applyHeadCaching(
 		// and keeping both would take a rolling message breakpoint from
 		// `applyPromptCaching` (4 minus head breakpoints). All-volatile falls
 		// back to tail anchoring.
-		const suffixStart = volatileSystemSuffixStart(systemBlocks);
+		const claudeCode = harnessProfile === "claude-code";
+		const suffixStart = volatileSystemSuffixStart(
+			systemBlocks,
+			claudeCode ? CLAUDE_CODE_VOLATILE_SYSTEM_SEGMENT_MARKERS : VOLATILE_SYSTEM_SEGMENT_MARKERS,
+		);
 		const anchorIndex = suffixStart === 0 ? systemBlocks.length - 1 : suffixStart - 1;
 		const anchor = systemBlocks[anchorIndex];
 		if (anchor && anchor.cache_control == null) {
-			for (const block of systemBlocks) delete block.cache_control;
+			// The profile's identity breakpoint takes the tool anchor's place
+			// in the budget, so it stays.
+			if (!claudeCode) {
+				for (const block of systemBlocks) delete block.cache_control;
+			}
 			anchor.cache_control = cloneAnthropicCacheControl(cacheControl);
 		}
 	}
@@ -4701,19 +4834,33 @@ function resolveAnthropicAdaptiveEffort(
 	return mapEffortToAnthropicAdaptiveEffort(model, requestedEffort);
 }
 
-function extractClaudeCodeFirstWireUserMessageText(messages: readonly Message[]): string {
+const LEADING_SYSTEM_REMINDER = /^\s*<system-reminder>[\s\S]*?<\/system-reminder>\s*/;
+
+/**
+ * Seed of the billing-header fingerprint: the first conversational turn sent
+ * as a wire user turn, a developer-first session's developer message included,
+ * so a later user message or a side turn's extra turns cannot change it.
+ * Claude Code hashes the user's own words: the `<system-reminder>` blocks it
+ * puts ahead of them are not part of the seed (2.1.284 captures: `hello` →
+ * `.b93`). `skipReminders` (the claude-code profile) seeds omp's fingerprint
+ * the same way, so the date/cwd reminder omp prepends stops pinning every
+ * session to one suffix; other profiles keep hashing the turn as sent.
+ */
+function extractClaudeCodeFirstWireUserMessageText(messages: readonly Message[], skipReminders = false): string {
 	for (const message of messages) {
 		if ((message.role !== "user" && message.role !== "developer") || anthropicControlOf(message)) continue;
 		const { content } = message;
-		if (typeof content === "string") {
-			if (content.trim()) return content;
-			continue;
+		const texts =
+			typeof content === "string"
+				? [content]
+				: Array.isArray(content)
+					? content.flatMap(block => (block.type === "text" ? [block.text] : []))
+					: [];
+		for (let text of texts) {
+			if (skipReminders) while (LEADING_SYSTEM_REMINDER.test(text)) text = text.replace(LEADING_SYSTEM_REMINDER, "");
+			if (text.trim()) return text;
 		}
-		if (!Array.isArray(content)) continue;
-		for (const block of content) {
-			if (block.type === "text" && block.text.trim()) return block.text;
-		}
-		if (content.some(block => block.type === "image")) return "";
+		if (Array.isArray(content) && content.some(block => block.type === "image")) return "";
 	}
 	return "";
 }
@@ -4842,7 +4989,10 @@ function planAnthropicToolControls(
 	for (const tool of context.inactiveTools ?? []) {
 		if (!definitions.has(tool.name)) definitions.set(tool.name, tool);
 	}
-	const activeNames = context.tools.map(tool => tool.name);
+	// A tool that defers itself (tool search's deferred tools) is declared but never
+	// active: only a tool search's reference loads it, so no control ever adds it.
+	const selfDeferred = new Set(context.tools.filter(tool => tool.deferLoading === true).map(tool => tool.name));
+	const activeNames = context.tools.filter(tool => !selfDeferred.has(tool.name)).map(tool => tool.name);
 
 	const toolRecords: { index: number; live: boolean; tools: AnthropicToolControls }[] = [];
 	for (const record of records) {
@@ -4851,8 +5001,8 @@ function planAnthropicToolControls(
 		}
 	}
 	const inserts: AnthropicControlInsert[] = [];
-	let declared = activeNames;
-	const deferred = new Set<string>();
+	let declared = context.tools.map(tool => tool.name);
+	const deferred = new Set(selfDeferred);
 	const latest = toolRecords.at(-1);
 	if (latest) {
 		// A declared name without a definition cannot be re-sent: accepted cache miss (e.g. after a resume).
@@ -4861,7 +5011,7 @@ function planAnthropicToolControls(
 		for (const name of latest.tools.deferred) {
 			if (declaredSet.has(name)) deferred.add(name);
 		}
-		for (const name of activeNames) {
+		for (const { name } of context.tools) {
 			if (declaredSet.has(name)) continue;
 			declared.push(name);
 			declaredSet.add(name);
@@ -4877,18 +5027,25 @@ function planAnthropicToolControls(
 		let previous = declared.filter(name => !deferred.has(name));
 		for (const record of toolRecords) {
 			if (!record.live) continue;
-			const toolChanges = diffAnthropicActiveTools(previous, record.tools.active, declaredSet);
+			// Records written before self-deferred tools left the active set list them
+			// active; read every record by today's rule so no control ever adds them.
+			const active = record.tools.active.filter(name => !selfDeferred.has(name));
+			const toolChanges = diffAnthropicActiveTools(previous, active, declaredSet);
 			if (toolChanges.length > 0) inserts.push({ index: record.index, spec: { toolChanges } });
-			previous = record.tools.active;
+			previous = active;
 		}
 		const toolChanges = ownChange ? diffAnthropicActiveTools(previous, activeNames, declaredSet) : [];
 		if (toolChanges.length > 0) inserts.push({ index: context.messages.length, spec: { toolChanges } });
 	}
 
+	// The deferred set alone decides each declaration's `defer_loading`, so the
+	// declaration and the active chain above describe the same tools.
 	const tools: Tool[] = [];
 	for (const name of declared) {
 		const tool = definitions.get(name);
-		if (tool) tools.push(deferred.has(name) ? { ...tool, deferLoading: true } : tool);
+		if (!tool) continue;
+		const deferLoading = deferred.has(name);
+		tools.push(deferLoading === (tool.deferLoading === true) ? tool : { ...tool, deferLoading });
 	}
 	return {
 		tools,
@@ -5036,12 +5193,13 @@ function anthropicToolChangeBlocks(
 	changes: readonly AnthropicToolChange[],
 	isOAuthToken: boolean,
 	model: Model<"anthropic-messages">,
+	toolNames: HarnessToolNames | undefined,
 ): ContentBlockParam[] {
 	return changes.map((change): ContentBlockParam => ({
 		type: change.type,
 		tool: {
 			type: "tool_reference",
-			name: encodeAnthropicToolName(change.name, isOAuthToken, model.compat.escapeBuiltinToolNames),
+			name: encodeAnthropicToolName(change.name, isOAuthToken, model.compat.escapeBuiltinToolNames, toolNames),
 		},
 	}));
 }
@@ -5083,6 +5241,8 @@ type AnthropicParamBuildOptions = {
 	 */
 	dropCacheControlOptions?: boolean;
 	droppedThinkingBlocks?: ReadonlySet<string>;
+	harnessToolNames?: HarnessToolNames;
+	harnessProfile?: HarnessProfile | null;
 	/** Control records of `context.messages`, when the caller already collected them. */
 	controlRecords?: readonly AnthropicControlRecord[];
 	/** Sanitized server-side fallback entries; defaults to `options?.fallbacks` when omitted. */
@@ -5195,6 +5355,8 @@ function buildParams(
 		dropCacheControl = false,
 		dropCacheControlOptions = false,
 		droppedThinkingBlocks,
+		harnessToolNames,
+		harnessProfile,
 		controlRecords,
 		fallbacks = options?.fallbacks,
 		compactionSupported = supportsAnthropicCompaction(model),
@@ -5204,26 +5366,37 @@ function buildParams(
 	// A session-scoped auto-demote (learned from a live signing 400) clones the
 	// resolved compat with `replayUnsignedThinking: false` so every subsequent
 	// downstream read (convertAnthropicMessages, transformMessages) sees the
-	// demoted default without mutating the shared `model` reference.
+	// demoted default without mutating the shared `model` reference. Unsigned
+	// blocks then demote to text — or, for Claude targets, are dropped
+	// (`dropsUnreplayableThinking`).
 	const effectiveModel =
 		forceDemoteUnsignedThinking && model.compat.replayUnsignedThinking
 			? { ...model, compat: { ...model.compat, replayUnsignedThinking: false } }
 			: model;
 	const resolvedCacheControl = dropCacheControl
 		? undefined
-		: getCacheControl(model, options?.cacheRetention, isOAuthToken).cacheControl;
-	const cacheControl =
-		dropCacheControlOptions && resolvedCacheControl ? { type: resolvedCacheControl.type } : resolvedCacheControl;
+		: getCacheControl(model, options?.cacheRetention, isOAuthToken);
+	// A refused `ttl`/`scope` keeps the breakpoints but sends them bare.
+	const withoutOptions = (control: AnthropicCacheControl | undefined): AnthropicCacheControl | undefined =>
+		dropCacheControlOptions && control ? { type: control.type } : control;
+	const headCacheControl = withoutOptions(resolvedCacheControl?.headCacheControl);
+	const tailCacheControl = withoutOptions(resolvedCacheControl?.tailCacheControl);
+	// A null override forces the native profile (harness.mode native); only an
+	// absent one falls back to the model's catalog profile.
+	const harnessOverride = harnessProfile !== undefined ? harnessProfile : options?.harnessProfile;
+	const effectiveHarness =
+		harnessOverride === undefined ? resolveHarnessProfile(model) : (harnessOverride ?? undefined);
 
 	// Pre-compute system blocks so they occupy the right slot in the serialized body.
 	const shouldInjectClaudeCodeInstruction = isOAuthToken && model.compat.injectClaudeCodeInstruction !== false;
 	const firstUserMessageText = shouldInjectClaudeCodeInstruction
-		? extractClaudeCodeFirstWireUserMessageText(context.messages)
+		? extractClaudeCodeFirstWireUserMessageText(context.messages, effectiveHarness === "claude-code")
 		: "";
 	const systemBlocks = buildAnthropicSystemBlocks(context.systemPrompt, {
 		includeClaudeCodeInstruction: shouldInjectClaudeCodeInstruction,
 		firstUserMessageText,
-		cacheControl,
+		servedClaudeCodeVersion: resolveServedClaudeCodeVersion(model, harnessOverride, options?.harnessClientVersion),
+		cacheControl: headCacheControl,
 		dropCacheControl,
 	});
 
@@ -5241,16 +5414,13 @@ function buildParams(
 	);
 
 	// Pre-compute tools.
+	const declaredToolName = (name: string): string =>
+		shouldUseUmansGatewayWebSearch(name, useUmansGatewayWebSearch)
+			? name
+			: encodeAnthropicToolName(name, isOAuthToken, model.compat.escapeBuiltinToolNames, harnessToolNames);
 	let tools: AnthropicWireTool[] | undefined;
 	if (toolPlan.tools) {
-		tools = convertTools(
-			toolPlan.tools,
-			isOAuthToken,
-			disableStrictTools,
-			supportsEagerToolInputStreaming,
-			model.compat.escapeBuiltinToolNames,
-			useUmansGatewayWebSearch,
-		);
+		tools = convertTools(toolPlan.tools, declaredToolName, disableStrictTools, supportsEagerToolInputStreaming);
 	} else if (isOAuthToken) {
 		tools = [];
 	}
@@ -5259,7 +5429,7 @@ function buildParams(
 	// credential owns the device identity: a caller resolves metadata once per
 	// model call, so a rotation inside one stream would otherwise pair the new
 	// account's bearer with the previous account's `account_uuid`/`device_id`.
-	const servingAccountId = model.provider === "anthropic" ? options?.oauthIdentity?.accountId : undefined;
+	const servingAccountId = model.provider === "anthropic" ? options?.credentialScope?.accountId : undefined;
 	const metadataAccountId = readAnthropicMetadataAccountId(options?.metadata) ?? servingAccountId;
 	const metadataUserId = resolveAnthropicMetadataUserId(
 		rebindAnthropicMetadataUserId(
@@ -5448,6 +5618,12 @@ function buildParams(
 		droppedThinkingBlocks,
 		omitDemotedReasoning: options?.omitDemotedReasoning,
 		credentialId: options?.credentialId,
+		harnessToolNames,
+		// Facade replay checks the declaration this request sends, which the
+		// tool plan may extend past the active set with withdrawn tools.
+		declaredNames: declaredToolNames(toolPlan.tools),
+		deferredToolNames: new Set(toolPlan.tools?.filter(tool => tool.deferLoading === true).map(tool => tool.name)),
+		...(harnessOverride !== undefined ? { harnessProfile: harnessOverride } : {}),
 		compactionRequest,
 	};
 	const { messages: wireMessages, demotedReasoningBlocks } = encodeAnthropicMessages(
@@ -5459,7 +5635,7 @@ function buildParams(
 
 	// Anchor the stable tools+system head so it stays cached across turns; the
 	// moving message tail is anchored separately in applyPromptCaching below.
-	applyHeadCaching(systemBlocks, tools, cacheControl);
+	applyHeadCaching(systemBlocks, tools, headCacheControl, effectiveHarness);
 	const requestControls: AnthropicRequestControls | undefined =
 		toolPlan.record || effortPlan.record
 			? {
@@ -5569,12 +5745,7 @@ function buildParams(
 		} else if (options.toolChoice.name) {
 			params.tool_choice = {
 				...options.toolChoice,
-				name: encodeAnthropicToolName(
-					options.toolChoice.name,
-					isOAuthToken,
-					model.compat.escapeBuiltinToolNames,
-					useUmansGatewayWebSearch,
-				),
+				name: declaredToolName(options.toolChoice.name),
 			};
 		}
 		// Claude Fable/Mythos 5 reject forced tool use outright ("tool_choice forces
@@ -5592,7 +5763,7 @@ function buildParams(
 
 	disableThinkingIfToolChoiceForced(params, model);
 	ensureMaxTokensForThinking(params, maxOutputTokens);
-	applyPromptCaching(params, cacheControl);
+	applyPromptCaching(params, tailCacheControl);
 
 	return {
 		params,
@@ -5657,19 +5828,19 @@ export function streamBedrockAnthropicCompaction(
 	});
 }
 
+/** A tool result's wire content: converted blocks, or a tool search's references. */
+type ToolResultContent = NonNullable<ToolResultBlockParam["content"]>;
+
 const EMPTY_ERROR_TOOL_RESULT_TEXT = "Tool failed with no output.";
 
-function isEmptyToolResultWireContent(content: AnthropicToolResultContent): boolean {
+function isEmptyToolResultWireContent(content: ToolResultContent): boolean {
 	if (typeof content === "string") {
 		return content.trim().length === 0;
 	}
 	return content.length === 0;
 }
 
-function ensureErrorToolResultWireContent(
-	content: AnthropicToolResultContent,
-	isError: boolean | undefined,
-): AnthropicToolResultContent {
+function ensureErrorToolResultWireContent(content: ToolResultContent, isError: boolean | undefined): ToolResultContent {
 	if (!isError || !isEmptyToolResultWireContent(content)) {
 		return content;
 	}
@@ -5682,8 +5853,13 @@ function buildToolResultBlock(
 	model: Model<"anthropic-messages">,
 	msg: ToolResultMessage,
 	hoistedImages: ContentBlockParam[],
+	trailingText: ContentBlockParam[],
+	toolName: (name: string) => string,
+	deferredToolNames: ReadonlySet<string>,
 ): ContentBlockParam {
-	let content = convertContentBlocks(msg.content, { supportsImages: model.input.includes("image") });
+	let content: ToolResultContent =
+		toolSearchResultContent(msg, trailingText, toolName, deferredToolNames) ??
+		convertContentBlocks(msg.content, { supportsImages: model.input.includes("image") });
 	// Anthropic rejects images inside error tool results ("all content must be
 	// type `text` if `is_error` is true") — keep the text in the block and
 	// hoist the images after the message's tool_result run.
@@ -5711,6 +5887,34 @@ function buildToolResultBlock(
 		(block as unknown as Record<string, unknown>).id = msg.toolCallId;
 	}
 	return block;
+}
+
+/**
+ * A tool search's result as Claude Code sends it: references to the tools it
+ * loads, with its own text after the run. A reference resolves only against a
+ * tool this request declares deferred; a tool it no longer defers (another
+ * endpoint, a server that left) is named in text instead. Undefined for any
+ * other result, which converts as usual.
+ */
+function toolSearchResultContent(
+	msg: ToolResultMessage,
+	trailingText: ContentBlockParam[],
+	toolName: (name: string) => string,
+	deferredToolNames: ReadonlySet<string>,
+): ToolResultContent | undefined {
+	if (msg.providerMetadata?.type !== "toolSearch" || msg.isError) return undefined;
+	const loaded = msg.providerMetadata.toolNames;
+	if (loaded.length === 0) return undefined;
+	const named = loaded.filter(name => !deferredToolNames.has(name)).map(name => `Loaded ${toolName(name)}.`);
+	const references = loaded.filter(name => deferredToolNames.has(name));
+	if (references.length === 0) return named.map(text => ({ type: "text", text }));
+	for (const block of msg.content) {
+		if (block.type === "text" && block.text.trim().length > 0) trailingText.push({ type: "text", text: block.text });
+	}
+	return [
+		...references.map(name => ({ type: "tool_reference" as const, tool_name: toolName(name) })),
+		...named.map(text => ({ type: "text" as const, text })),
+	];
 }
 
 /**
@@ -5792,6 +5996,11 @@ export type AnthropicConversionOptions = {
 	droppedThinkingBlocks?: ReadonlySet<string>;
 	omitDemotedReasoning?: boolean;
 	credentialId?: number;
+	harnessToolNames?: HarnessToolNames;
+	declaredNames?: ReadonlySet<string>;
+	/** Tools this request declares with `defer_loading`: the ones a tool search's reference can resolve to. */
+	deferredToolNames?: ReadonlySet<string>;
+	harnessProfile?: HarnessProfile | null;
 	/** On-demand compaction request: it ends inside the conversation, so it gets nothing live requests lack there. */
 	compactionRequest?: AnthropicCompactionRequest;
 };
@@ -5838,6 +6047,10 @@ function encodeAnthropicMessages(
 	opts?: AnthropicConversionOptions,
 ): { messages: AnthropicMessageParam[]; demotedReasoningBlocks: number } {
 	let demotedReasoningBlocks = 0;
+	const harnessToolNames = opts?.harnessToolNames;
+	const declaredNames = opts?.declaredNames;
+	const deferredToolNames = opts?.deferredToolNames ?? new Set<string>();
+	const harnessOverride = opts?.harnessProfile;
 	// Indices of params emitted from agent-owned `developer` messages. After the
 	// main pass, the ones whose placement satisfies Anthropic's mid-conversation
 	// rules are upgraded from the `user` role to the authoritative `system` role.
@@ -5940,7 +6153,7 @@ function encodeAnthropicMessages(
 		if (control) {
 			const controlParam: AnthropicMessageParam = {
 				role: "system",
-				content: anthropicToolChangeBlocks(control.toolChanges, isOAuthToken, model),
+				content: anthropicToolChangeBlocks(control.toolChanges, isOAuthToken, model, harnessToolNames),
 				...(control.effort ? { output_config: { effort: control.effort } } : {}),
 			};
 			controlParams.add(controlParam);
@@ -6011,7 +6224,7 @@ function encodeAnthropicMessages(
 			if (payload?.toolChanges && model.compat.supportsMidConversationToolChanges) {
 				const blocks: ContentBlockParam[] =
 					typeof content === "string" ? [{ type: "text", text: content }] : content;
-				blocks.push(...anthropicToolChangeBlocks(payload.toolChanges, isOAuthToken, model));
+				blocks.push(...anthropicToolChangeBlocks(payload.toolChanges, isOAuthToken, model, harnessToolNames));
 				content = blocks;
 			}
 			// User-attributed developer turns (text `@file` mentions, hidden extension
@@ -6082,10 +6295,10 @@ function encodeAnthropicMessages(
 					if (hasSignedThinking) {
 						if (!block.thinkingSignature || block.thinkingSignature.trim().length === 0) {
 							if (block.thinking.trim().length === 0) continue;
-							blocks.push({
-								type: "text",
-								text: renderDemotedThinking(model.id, block.thinking),
-							});
+							// Demoted to text, except for Claude targets, which drop it:
+							// `renderDemotedThinking` renders nothing for them.
+							const demoted = renderDemotedThinking(model.id, block.thinking);
+							if (demoted) blocks.push({ type: "text", text: demoted });
 							continue;
 						}
 						blocks.push({
@@ -6104,11 +6317,12 @@ function encodeAnthropicMessages(
 								signature: "",
 							});
 						} else if (!opts?.omitDemotedReasoning) {
-							demotedReasoningBlocks++;
-							blocks.push({
-								type: "text",
-								text: renderDemotedThinking(model.id, block.thinking),
-							});
+							// Claude targets drop it, as above.
+							const demoted = renderDemotedThinking(model.id, block.thinking);
+							if (demoted) {
+								demotedReasoningBlocks++;
+								blocks.push({ type: "text", text: demoted });
+							}
 						}
 					} else {
 						blocks.push({
@@ -6134,16 +6348,19 @@ function encodeAnthropicMessages(
 						to: block.to,
 					});
 				} else if (block.type === "toolCall") {
+					const replay = replayAnthropicToolCall(
+						block,
+						model,
+						isOAuthToken,
+						harnessToolNames,
+						declaredNames,
+						harnessOverride,
+					);
 					blocks.push({
 						type: "tool_use",
 						id: block.id,
-						name: encodeAnthropicToolName(block.name, isOAuthToken, model.compat.escapeBuiltinToolNames),
-						// Always sanitize: the model itself can emit lone-surrogate escapes
-						// in tool-argument JSON (streamed out fine, rejected with a 400 on
-						// replay by Anthropic's strict UTF-8 validation). toWellFormedDeep
-						// is identity-preserving, so well-formed arguments stay
-						// byte-identical and prompt-cache prefixes are unaffected.
-						input: toWellFormedDeep(block.arguments ?? {}),
+						name: replay.name,
+						input: toWellFormedDeep(replay.input),
 					});
 				}
 			}
@@ -6213,26 +6430,36 @@ function encodeAnthropicMessages(
 			const toolResults: ContentBlockParam[] = [];
 			// Images stripped out of error tool results, re-attached after the run.
 			const hoistedImages: ContentBlockParam[] = [];
+			// Text of tool-search results, which carry references in the result itself.
+			const trailingText: ContentBlockParam[] = [];
 			const toolResultParam: AnthropicMessageParam = {
 				role: "user",
 				content: toolResults,
 			};
+			const referencedToolName = (name: string): string =>
+				encodeAnthropicToolName(name, isOAuthToken, model.compat.escapeBuiltinToolNames, harnessToolNames);
 
 			// Add the current tool result
-			toolResults.push(buildToolResultBlock(model, msg, hoistedImages));
+			toolResults.push(
+				buildToolResultBlock(model, msg, hoistedImages, trailingText, referencedToolName, deferredToolNames),
+			);
 			copyPerCallContextMessage(toolResultParam, msg);
 
 			// Look ahead for consecutive toolResult messages
 			let j = i + 1;
 			while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
 				const nextMsg = transformedMessages[j] as ToolResultMessage; // We know it's a toolResult
-				toolResults.push(buildToolResultBlock(model, nextMsg, hoistedImages));
+				toolResults.push(
+					buildToolResultBlock(model, nextMsg, hoistedImages, trailingText, referencedToolName, deferredToolNames),
+				);
 				copyPerCallContextMessage(toolResultParam, nextMsg);
 				j++;
 			}
 
 			// Skip the messages we've already processed
 			i = j - 1;
+
+			toolResults.push(...trailingText);
 
 			if (hoistedImages.length > 0) {
 				toolResults.push(
@@ -6363,18 +6590,18 @@ function encodeAnthropicMessages(
 	// dropped, or compaction file metadata was flushed after it — it moves to
 	// the next assistant turn, the first response that saw the change. Every
 	// later request derives the same slot, so continuations stay cache-stable.
-	for (let i = 0; i < params.length; i++) {
+	// Walking backwards relocates later controls first, so every control already
+	// waiting at a slot came from a later request and an earlier one goes before it.
+	for (let i = params.length - 1; i >= 0; i--) {
 		const control = params[i];
 		if (!controlParams.has(control) || control.content.length === 0) continue;
 		const next = skipControls(i, 1);
 		if (params[next]?.role !== "user") continue;
 		let slot = next;
 		while (slot < params.length && params[slot].role !== "assistant") slot++;
-		// Controls already waiting for that turn came from later requests.
 		while (controlParams.has(params[slot - 1])) slot--;
 		params.splice(slot, 0, control);
 		params.splice(i, 1);
-		i--;
 	}
 	if (opts?.compactionRequest) return { messages: params, demotedReasoningBlocks };
 	const last = skipControls(params.length, -1);
@@ -7022,11 +7249,9 @@ function buildAnthropicToolSchemaPlans(tools: Tool[], disableStrictTools = false
 
 function convertTools(
 	tools: Tool[],
-	isOAuthToken: boolean,
+	declaredToolName: (name: string) => string,
 	disableStrictTools = false,
 	supportsEagerToolInputStreaming = true,
-	escapeBuiltinToolNames = false,
-	useUmansGatewayWebSearch = false,
 ): AnthropicWireTool[] {
 	if (!tools) return [];
 	const schemaPlans = buildAnthropicToolSchemaPlans(tools, disableStrictTools);
@@ -7034,7 +7259,7 @@ function convertTools(
 	return tools.map((tool, index) => {
 		const plan = schemaPlans[index];
 		const baseTool = {
-			name: encodeAnthropicToolName(tool.name, isOAuthToken, escapeBuiltinToolNames, useUmansGatewayWebSearch),
+			name: declaredToolName(tool.name),
 			description: tool.description || "",
 			input_schema: plan.inputSchema,
 		};

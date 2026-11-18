@@ -16,8 +16,12 @@ export type AnthropicHeaderOptions = {
 	isCloudflareAiGateway?: boolean;
 	claudeCodeSessionId?: string;
 	claudeCodeBetas?: readonly string[];
+	/** Served claude-code capture's `clientVersion`; see {@link getClaudeCodeVersion}. */
+	servedClaudeCodeVersion?: string;
 	/** Allow explicit fingerprint headers to replace OAuth defaults on non-official endpoints. */
 	allowAnthropicHeaderOverrides?: boolean;
+	/** API key only: the workspace a key not scoped to one names (`anthropic-workspace-id`). */
+	workspaceId?: string;
 	/** Leave Claude Code's `x-app` and browser-access headers off API-key requests. */
 	omitClaudeCodeAppHeaders?: boolean;
 };
@@ -54,6 +58,8 @@ export function mergeAnthropicBetaHeader(callerHeaders: Record<string, string>, 
 const oauthAuthBeta = "oauth-2025-04-20";
 export const midConversationSystemClearAtBeta = "mid-conversation-system-clear-at-2026-08-21";
 export const midConversationToolChangesBeta = "mid-conversation-tool-changes-2026-07-01";
+/** Tool search: `defer_loading` declarations and `tool_reference` tool results. */
+export const advancedToolUseBeta = "advanced-tool-use-2025-11-20";
 export const midConversationOutputConfigBeta = "mid-conversation-output-config-2026-07-01";
 export const contextManagementBeta = "context-management-2025-06-27";
 export const structuredOutputsBeta = "structured-outputs-2025-12-15";
@@ -225,7 +231,9 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 	}
 
 	if (oauthToken) {
-		const userAgent = isClaudeCodeClientUserAgent(incomingUserAgent) ? incomingUserAgent : getClaudeCodeUserAgent();
+		const userAgent = isClaudeCodeClientUserAgent(incomingUserAgent)
+			? incomingUserAgent
+			: getClaudeCodeUserAgent(options.servedClaudeCodeVersion);
 		const headers = {
 			...modelHeaders,
 			Accept: acceptHeader,
@@ -243,7 +251,12 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 			...(incomingApiKey ? { "X-Api-Key": incomingApiKey } : {}),
 		};
 		return allowAnthropicHeaderOverrides ? mergeHeaders(headers, anthropicHeaderOverrides) : headers;
-	} else if (!isOfficialAnthropicApiUrl(options.baseUrl)) {
+	}
+	// The key's own workspace outranks a configured one in any casing: it is what that key needs.
+	const workspaceHeader: Record<string, string> = options.workspaceId
+		? { "anthropic-workspace-id": options.workspaceId }
+		: {};
+	if (!isOfficialAnthropicApiUrl(options.baseUrl)) {
 		// A keyless provider (`auth: none`) resolves to the `N/A` sentinel
 		// rather than a real key; custom endpoints that authenticate via their
 		// own headers may reject a bogus bearer, so send no Authorization —
@@ -251,18 +264,22 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 		// Authorization in `model.headers` still wins.
 		const bearer =
 			incomingAuthorization ?? (options.apiKey !== NO_AUTH_SENTINEL ? `Bearer ${options.apiKey}` : undefined);
-		return {
-			...modelHeaders,
-			Accept: acceptHeader,
-			...(bearer ? { Authorization: bearer } : {}),
-			...apiKeyHeaders,
-			"anthropic-version": apiVersion,
-			...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
-			...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
-			...(incomingApiKey ? { "X-Api-Key": incomingApiKey } : {}),
-		};
-	} else {
-		return {
+		return mergeHeaders(
+			{
+				...modelHeaders,
+				Accept: acceptHeader,
+				...(bearer ? { Authorization: bearer } : {}),
+				...apiKeyHeaders,
+				"anthropic-version": apiVersion,
+				...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
+				...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
+				...(incomingApiKey ? { "X-Api-Key": incomingApiKey } : {}),
+			},
+			workspaceHeader,
+		);
+	}
+	return mergeHeaders(
+		{
 			...modelHeaders,
 			Accept: acceptHeader,
 			...apiKeyHeaders,
@@ -271,8 +288,9 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 			...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
 			...(incomingAuthorization ? { Authorization: incomingAuthorization } : {}),
 			"X-Api-Key": incomingApiKey ?? options.apiKey,
-		};
-	}
+		},
+		workspaceHeader,
+	);
 }
 
 /** Maps Node's platform identifier to the Stainless wire value. */

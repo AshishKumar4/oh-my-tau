@@ -50,6 +50,7 @@ export function createCodexProviderSessionState(): CodexProviderSessionState {
 			if (!normalizedSessionId) return;
 			for (const [key, session] of state.webSocketSessions) {
 				if (session.sessionId !== normalizedSessionId) continue;
+				session.lifetime.abort();
 				session.connection?.close("session_disposed");
 				state.webSocketSessions.delete(key);
 				for (const [publicKey, privateKey] of state.webSocketPublicToPrivate) {
@@ -61,6 +62,7 @@ export function createCodexProviderSessionState(): CodexProviderSessionState {
 		},
 		close: () => {
 			for (const session of state.webSocketSessions.values()) {
+				session.lifetime.abort();
 				session.connection?.close("session_disposed");
 			}
 			state.webSocketSessions.clear();

@@ -16,10 +16,11 @@
  * request plans against a copy of its parent conversation's state (see
  * {@link resolveOpenAIEffortControlState}), so it sends the parent's prefix.
  *
- * Wire constraints (OpenAI reasoning guide): the GPT-6 family supports the item
- * in standard (not `pro`) reasoning mode, adjacent updates are rejected, and
- * `/responses/compact` rejects histories containing them — compaction
- * requests are built outside this planner and never carry the items.
+ * Wire constraints (OpenAI reasoning guide, verified against the Codex
+ * backend): the GPT-6 family supports the item in standard (not `pro`)
+ * reasoning mode, adjacent updates are rejected, and `/responses/compact`
+ * rejects histories containing them — compaction requests are built outside
+ * this planner and never carry the items.
  */
 
 /** `configuration_update` input item; only `reasoning.effort` is updatable. */

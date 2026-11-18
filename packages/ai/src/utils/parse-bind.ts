@@ -54,3 +54,16 @@ export function parseBind(raw: string): ParsedBind {
 	}
 	return { hostname: hostPart, port: parsePort(portPart, raw) };
 }
+
+function isIpv6Loopback(host: string): boolean {
+	const significant = host.split(":").filter(group => group.length > 0 && Number.parseInt(group, 16) !== 0);
+	return significant.length === 1 && Number.parseInt(significant[0] ?? "", 16) === 1;
+}
+
+export function isLoopbackBind(hostname: string): boolean {
+	const host = hostname.trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "");
+	if (host === "localhost" || host.endsWith(".localhost")) return true;
+	if (host.startsWith("::ffff:")) return host.slice(7).startsWith("127.");
+	if (host.includes(":")) return isIpv6Loopback(host);
+	return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}

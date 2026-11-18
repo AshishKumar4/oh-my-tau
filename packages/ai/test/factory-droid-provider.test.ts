@@ -46,12 +46,12 @@ describe("Factory Droid completions wire (Droid Core)", () => {
 							? {
 									apiKey: "global-token",
 									credentialId: 2,
-									oauthIdentity: { orgId: "org-global", region: "global", inferenceRegion },
+									credentialScope: { orgId: "org-global", region: "global", inferenceRegion },
 								}
 							: {
 									apiKey: "eu-token",
 									credentialId: 1,
-									oauthIdentity: { orgId: "org-eu", region: "eu", inferenceRegion: "global" },
+									credentialScope: { orgId: "org-eu", region: "eu", inferenceRegion: "global" },
 								},
 					fetch: async (url, init) => {
 						const response = await capture(url, init);
@@ -91,7 +91,7 @@ describe("Factory Droid completions wire (Droid Core)", () => {
 			{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
 			{
 				apiKey: workosJwt({ external_org_id: "org-global" }),
-				oauthIdentity: { orgId: "org-global", region: "global", inferenceRegion: "global" },
+				credentialScope: { orgId: "org-global", region: "global", inferenceRegion: "global" },
 				fetch: captureFetch(captured, completionsChunks("OK", "kimi-k3")),
 			},
 		).result();
@@ -118,10 +118,10 @@ describe("Factory Droid completions wire (Droid Core)", () => {
 			{
 				apiKey: async context =>
 					context.error
-						? { apiKey: "eu-token", oauthIdentity: { orgId: "org-eu", region: "eu", inferenceRegion: "eu" } }
+						? { apiKey: "eu-token", credentialScope: { orgId: "org-eu", region: "eu", inferenceRegion: "eu" } }
 						: {
 								apiKey: "global-token",
-								oauthIdentity: { orgId: "org-global", region: "global", inferenceRegion: "global" },
+								credentialScope: { orgId: "org-global", region: "global", inferenceRegion: "global" },
 							},
 				fetch: async (url, init) => {
 					await captureFetch(captured, completionsChunks("UNEXPECTED", model.id))(url, init);
@@ -160,7 +160,7 @@ describe("Factory Droid completions wire (Droid Core)", () => {
 				{ messages: [{ role: "user", content: "hello", timestamp: 1 }] },
 				{
 					apiKey: "eu-token",
-					oauthIdentity: { orgId: "org-eu", region: "eu", inferenceRegion: "eu" },
+					credentialScope: { orgId: "org-eu", region: "eu", inferenceRegion: "eu" },
 					maxTokens,
 					fetch: captureFetch(captured, completionsChunks("EU_OK", model.id)),
 				},
@@ -184,7 +184,7 @@ describe("Factory Droid completions wire (Droid Core)", () => {
 				{ messages: [{ role: "user", content: "hello", timestamp: 1 }] },
 				{
 					apiKey: "new-token",
-					oauthIdentity: {},
+					credentialScope: {},
 					fetch: captureFetch(captured, completionsChunks("UNEXPECTED", model.id)),
 				},
 			).result();
@@ -204,7 +204,7 @@ describe("Factory Droid completions wire (Droid Core)", () => {
 			{ messages: [{ role: "user", content: "hi", timestamp: 1 }] },
 			{
 				apiKey: "token",
-				oauthIdentity: {},
+				credentialScope: {},
 				fetch: captureFetch(captured, completionsChunks("OK", model.id)),
 			},
 		).result();

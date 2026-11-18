@@ -162,6 +162,14 @@ describe("anthropic drop_block replay after reported thinking drops", () => {
 			expect(replayedReasoning(secondPayload)).toEqual(replayedReasoning(firstPayload));
 			expect(secondPayload.messages).toEqual(firstPayload.messages);
 			expect(secondPayload.thinking?.block_binding?.prefix_mismatch_behavior).toBe("drop_block");
+
+			// A closed session forgets the warned drops; the reopened replay stays verbatim.
+			for (const state of providerSessionState.values()) state.close();
+			const reopened = await run();
+			expect(reopened.stopReason).toBe("stop");
+			expect(payloads[2]?.messages).toEqual(firstPayload.messages);
+			// One warning per request that reports the drops: the first and the reopened one.
+			expect(dropWarnings()).toHaveLength(2);
 		});
 	}
 });
