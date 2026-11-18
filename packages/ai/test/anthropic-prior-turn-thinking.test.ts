@@ -457,6 +457,46 @@ describe("Anthropic prior-turn thinking preservation (#2257, #2265)", () => {
 			]);
 		});
 
+		// The owner's rule: Claude never receives another model's reasoning, signed or not.
+		it("drops a non-Claude model's signed anthropic-messages reasoning from before a compaction on a gateway", () => {
+			const gatewayTarget = makeAnthropicModel({ provider: "openrouter", id: "anthropic/claude-fable-5-1" });
+			expect(gatewayTarget.thinking?.prefixBinding).toBe(true);
+			const messages: Message[] = [
+				{ role: "user", content: "Compacted session summary", historyRewriteAt: 100, timestamp: 100 },
+				kimiTurn({ timestamp: 50 }),
+				makeUser("Continue"),
+			];
+			const params = convertAnthropicMessages(messages, gatewayTarget, false);
+			expect(params.find(param => param.role === "assistant")?.content).toEqual([
+				{ type: "text", text: "Kimi answer" },
+			]);
+		});
+
+		it("drops a non-Claude model's signed reasoning with no boundary on a non-signing Claude gateway", () => {
+			const gatewayTarget = makeAnthropicModel({ provider: "openrouter", id: "anthropic/claude-fable-5-1" });
+			expect(gatewayTarget.compat.signingEndpoint).toBeFalsy();
+			const params = convertAnthropicMessages(conversation(kimiTurn({})), gatewayTarget, false);
+			expect(JSON.stringify(params)).not.toContain("kimi private plan");
+			expect(JSON.stringify(params)).not.toContain("kimi-redacted");
+			expect(params.find(param => param.role === "assistant")?.content).toEqual([
+				{ type: "text", text: "Kimi answer" },
+			]);
+		});
+
+		it("still replays another Claude model's signed reasoning on the same deployment", () => {
+			const opusTurn = makeAssistant(
+				[
+					{ type: "thinking", thinking: "opus signed plan", thinkingSignature: "sig_opus" },
+					{ type: "text", text: "Opus answer" },
+				],
+				{ provider: "anthropic", model: "claude-opus-4-5", stopReason: "stop", credentialId: TARGET_CREDENTIAL },
+			);
+			expect(assistantBlocks(conversation(opusTurn))).toEqual([
+				{ type: "thinking", thinking: "opus signed plan", signature: "sig_opus" },
+				{ type: "text", text: "Opus answer" },
+			]);
+		});
+
 		it("still drops Claude's reasoning from another provider under another credential", () => {
 			const claudeTurn = makeAssistant(
 				[

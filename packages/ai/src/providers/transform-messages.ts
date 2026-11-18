@@ -1049,11 +1049,20 @@ export function transformMessages<TApi extends Api>(
 			// host or account, and an unclassified model's (an opaque proxy may serve
 			// Claude), keep being dropped.
 			const thinkingBound = foreignCredential || invalidBoundThinkingAssistantIndexes.has(index);
-			const sourceClass = thinkingBound
-				? classifyModel(assistantMsg.provider, assistantMsg.upstreamModel ?? assistantMsg.model, { lenient: true })
-						.class
-				: undefined;
+			const sourceClass =
+				thinkingBound || dropsUnreplayable
+					? classifyModel(assistantMsg.provider, assistantMsg.upstreamModel ?? assistantMsg.model, {
+							lenient: true,
+						}).class
+					: undefined;
 			const keepsBoundThinking = thinkingBound && sourceClass !== "anthropic" && sourceClass !== "unknown";
+			// Claude never receives another model's reasoning, signed or not: only
+			// Claude's own (verifiable) reasoning replays to a Claude target. Gated on
+			// the source's class, since a foreign model can sign its blocks too
+			// (kimi-code/k3 over anthropic-messages). An unclassified source keeps the
+			// signature rules below: an opaque proxy may serve Claude.
+			const foreignReasoningForClaude =
+				dropsUnreplayable && sourceClass !== "anthropic" && sourceClass !== "unknown";
 			const signingAnthropicInvolved = isOfficialAnthropicSource || isSigningAnthropicTarget;
 			// Compatible Anthropic-messages reasoning targets that accept
 			// unsigned thinking natively (Z.AI, DeepSeek, the generic
@@ -1119,6 +1128,9 @@ export function transformMessages<TApi extends Api>(
 				!assistantMsg.content.some(anthropicVisibleThinkingSurvivesReplay);
 
 			const transformedContent = assistantMsg.content.flatMap((block, blockIndex) => {
+				if (foreignReasoningForClaude && (block.type === "thinking" || block.type === "redactedThinking")) {
+					return [];
+				}
 				if (
 					thinkingBound &&
 					(block.type === "redactedThinking" || (block.type === "thinking" && !keepsBoundThinking))
