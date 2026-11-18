@@ -16,6 +16,23 @@ const stdinIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isT
 const stdoutIsTtyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 const stdinSetRawModeDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
 let previousHeadless = false;
+// Inside a multiplexer (session markers, a tmux TERM, or its TERM_PROGRAM) the
+// terminal prefixes output with a bracketed-paste re-arm; these tests assert exact
+// writes, so they run as a plain terminal outside any multiplexer.
+const PLAIN_TERMINAL_ENV: Record<string, string | undefined> = {
+	TMUX: undefined,
+	TMUX_PANE: undefined,
+	STY: undefined,
+	ZELLIJ: undefined,
+	TERM: "xterm-256color",
+	TERM_PROGRAM: undefined,
+};
+const originalTerminalEnv = Object.keys(PLAIN_TERMINAL_ENV).map(key => [key, Bun.env[key]] as const);
+
+function setEnv(key: string, value: string | undefined): void {
+	if (value === undefined) delete Bun.env[key];
+	else Bun.env[key] = value;
+}
 
 function restoreProperty(target: object, key: string, descriptor: PropertyDescriptor | undefined): void {
 	if (descriptor) {
@@ -51,9 +68,11 @@ function startCapturedTerminal() {
 describe("ProcessTerminal cursor-visibility dedupe", () => {
 	beforeEach(() => {
 		previousHeadless = setTerminalHeadless(false);
+		for (const [key, value] of Object.entries(PLAIN_TERMINAL_ENV)) setEnv(key, value);
 	});
 
 	afterEach(() => {
+		for (const [key, value] of originalTerminalEnv) setEnv(key, value);
 		setTerminalHeadless(previousHeadless);
 		vi.restoreAllMocks();
 		restoreProperty(process.stdin, "isTTY", stdinIsTtyDescriptor);

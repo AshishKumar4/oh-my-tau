@@ -1,9 +1,10 @@
 import type { AgentMessage, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import type { CompactionSettings } from "@oh-my-pi/pi-agent-core/compaction";
 import { effectiveReserveTokens, resolveThresholdTokens } from "@oh-my-pi/pi-agent-core/compaction";
-import type { Tool as AiTool, Model } from "@oh-my-pi/pi-ai";
+import type { Tool as AiTool, Model, Usage } from "@oh-my-pi/pi-ai";
 import { renderToolExamples } from "@oh-my-pi/pi-ai/dialect";
 import { stripSchemaDescriptions, toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import type { PromptCacheHealthText } from "./host";
 
 type ContextTool = Pick<AiTool, "name" | "description" | "parameters" | "examples">;
 
@@ -431,6 +432,100 @@ function nonMessageTokenCacheEntry(
 	};
 	cachedSession[NON_MESSAGE_TOKEN_CACHE] = entry;
 	return entry;
+}
+
+// Alpha 0.3 tracks a step change to ~83% within 5 turns while a single cold
+// miss moves the readout by less than a third, so the legitimately-low first
+// request stops dominating after a handful of turns without hiding re-writes.
+const PROMPT_CACHE_HEALTH_EMA_ALPHA = 0.3;
+// Below 5 samples the EMA is still turn-1 dominated and nearest-rank P95 is
+// provably the max, so the gauge holds a placeholder instead of a number.
+const PROMPT_CACHE_HEALTH_MIN_SAMPLES = 5;
+// P95 ranks the last 100 per-request ratios. Nearest-rank P95 needs at least
+// 20 samples to resolve below the max (ceil(0.95N) < N), so 100 ranks a full
+// window on its 6th-largest ratio instead of an outlier, and bounds the sort
+// however long the session grows. The EMA has forgotten older requests by then
+// (a sample 20 back weighs 0.3*0.7^19, under a tenth of a percent), so the
+// window covers the horizon the EMA still responds to.
+const PROMPT_CACHE_HEALTH_WINDOW = 100;
+
+/**
+ * Per-request prompt-cache health: an EMA over every request with prompt
+ * tokens, and the nearest-rank P95 of the last {@link PROMPT_CACHE_HEALTH_WINDOW}.
+ * Each request counts once whatever its size, unlike the token-weighted hit
+ * rate of the `cache_hit` segment and `/stats`.
+ */
+class PromptCacheHealthTracker {
+	#ema: number | undefined;
+	#samples = 0;
+	readonly #window: number[] = [];
+	#next = 0;
+
+	add(sample: Usage): void {
+		const total = sample.cacheRead + sample.cacheWrite + sample.input;
+		if (!(total > 0)) return;
+		const ratio = sample.cacheRead / total;
+		this.#ema =
+			this.#ema === undefined
+				? ratio
+				: PROMPT_CACHE_HEALTH_EMA_ALPHA * ratio + (1 - PROMPT_CACHE_HEALTH_EMA_ALPHA) * this.#ema;
+		this.#samples++;
+		if (this.#window.length < PROMPT_CACHE_HEALTH_WINDOW) this.#window.push(ratio);
+		else {
+			this.#window[this.#next] = ratio;
+			this.#next = (this.#next + 1) % PROMPT_CACHE_HEALTH_WINDOW;
+		}
+	}
+
+	text(): PromptCacheHealthText | undefined {
+		if (this.#ema === undefined) return undefined;
+		if (this.#samples < PROMPT_CACHE_HEALTH_MIN_SAMPLES) return { full: "cache …" };
+		const sorted = this.#window.toSorted((a, b) => a - b);
+		const p95 = Math.round(sorted[Math.ceil(0.95 * sorted.length) - 1] * 100);
+		const ema = Math.round(this.#ema * 100);
+		return { full: `cache ${ema}% ema / ${p95}% p95`, compact: `cache ${ema}/${p95}` };
+	}
+}
+
+/** How far a tracker has read a message feed; see {@link promptCacheHealthTextOfMessages}. */
+interface PromptCacheFeedCursor {
+	read: number;
+	tail: AgentMessage | undefined;
+	tailUsage: Usage | undefined;
+	tracker: PromptCacheHealthTracker;
+}
+
+const PROMPT_CACHE_FEED_CURSORS = new WeakMap<readonly AgentMessage[], PromptCacheFeedCursor>();
+
+function assistantUsage(message: AgentMessage | undefined): Usage | undefined {
+	return message?.role === "assistant" ? message.usage : undefined;
+}
+
+/**
+ * Prompt-cache health text for the status-line gauge, from a session's
+ * messages. The gauge renders every frame, so a feed is read once: later calls
+ * read only the messages appended since, and start over when the messages
+ * already read changed (a replaced last message, a shorter feed).
+ */
+export function promptCacheHealthTextOfMessages(messages: readonly AgentMessage[]): PromptCacheHealthText | undefined {
+	let cursor = PROMPT_CACHE_FEED_CURSORS.get(messages);
+	if (
+		cursor === undefined ||
+		cursor.read > messages.length ||
+		(cursor.read > 0 &&
+			(messages[cursor.read - 1] !== cursor.tail || assistantUsage(cursor.tail) !== cursor.tailUsage))
+	) {
+		cursor = { read: 0, tail: undefined, tailUsage: undefined, tracker: new PromptCacheHealthTracker() };
+		PROMPT_CACHE_FEED_CURSORS.set(messages, cursor);
+	}
+	for (let index = cursor.read; index < messages.length; index++) {
+		const usage = assistantUsage(messages[index]);
+		if (usage) cursor.tracker.add(usage);
+	}
+	cursor.read = messages.length;
+	cursor.tail = messages.at(-1);
+	cursor.tailUsage = assistantUsage(cursor.tail);
+	return cursor.tracker.text();
 }
 
 export function computeNonMessageTokens(

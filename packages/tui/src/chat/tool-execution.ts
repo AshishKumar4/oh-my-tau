@@ -71,7 +71,7 @@ import { compactRows, presentNative, TranscriptPresentationState } from "./trans
 
 /** Resolves the canonical renderer key while retaining the provider's wire name in message history. */
 export function toolRenderName(wireName: string, tool: AgentTool | undefined): string {
-	return tool?.name ?? wireName;
+	return tool?.persistAs ?? tool?.name ?? wireName;
 }
 type DisplaceableToolName = "wait" | "todo";
 
@@ -765,6 +765,10 @@ export class ToolExecutionComponent extends Container {
 		});
 		this.#ui.setFocus?.(inspector);
 		this.#ui.requestRender();
+	}
+
+	get toolName(): string {
+		return this.#toolName;
 	}
 
 	updateArgs(args: unknown, _toolCallId?: string): void {

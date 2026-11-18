@@ -50,7 +50,7 @@ export type CoordinationOp = "send" | "wait" | "cancel";
 /** Background-job row surfaced by `wait`/`cancel` results and `proc://` listings. */
 export interface JobSnapshot {
 	id: string;
-	type: "bash" | "task" | "eval";
+	type: "bash" | "task" | "eval" | "monitor";
 	status: "running" | "completed" | "failed" | "cancelled";
 	label: string;
 	/** What the job is for, in the model's words (a process job's `label` is its command line). */
@@ -62,6 +62,11 @@ export interface JobSnapshot {
 	 * from an earlier, never-delivered completion (#16052).
 	 */
 	settledAtMs?: number;
+	/**
+	 * When the job started, in epoch ms. Recovery tells runs of one agent apart by it:
+	 * a settled row that started before a later run was requested belongs to an older run.
+	 */
+	startedAt?: number;
 	/** Process exit status when the job reports one. */
 	exitCode?: number;
 	/** Effective task model selector, including an explicit reasoning suffix when configured. */

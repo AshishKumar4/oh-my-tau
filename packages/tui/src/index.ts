@@ -72,6 +72,7 @@ export * from "./native/state";
 export * from "./stdin-buffer";
 export type * from "./symbols";
 // Terminal interface and implementations
+export * from "./host-stdin";
 export * from "./terminal";
 // Terminal image support
 export * from "./terminal-capabilities";

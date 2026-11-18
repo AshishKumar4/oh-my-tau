@@ -11,6 +11,7 @@ import {
 	normalizePathForComparison,
 	relativePathWithinNormalizedRoot,
 } from "@oh-my-pi/pi-utils";
+import { parseModelString } from "../overlays/model-selector";
 import { type SymbolKey, type Theme, type ThemeColor, theme } from "../theme";
 import { SYMBOL_PRESETS } from "../theme/symbols";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../render/render-utils";
@@ -287,8 +288,22 @@ const statusSegment: StatusLineSegment = {
 /** Display name of the active model (`Claude ` prefix dropped). */
 function modelDisplayName(ctx: SegmentContext): string {
 	const state = ctx.session.state;
-	const modelName = state.model?.name || state.model?.id || "no-model";
-	return modelName.startsWith("Claude ") ? modelName.slice(7) : modelName;
+	let modelName = state.model?.name || state.model?.id || "no-model";
+	if (modelName.startsWith("Claude ")) {
+		modelName = modelName.slice(7);
+	}
+
+	// Fusion pairs the lead with a sidekick: "<lead> ⚡ <sidekick-id>".
+	// The host resolves fusionSidekick (a "provider/model-id" selector; only
+	// the id is shown) from the session's settings on every render while
+	// Fusion is enabled with a sidekick model. Absent otherwise, and for
+	// hosts without Fusion, which render the plain lead.
+	const sidekickSelector = ctx.fusionSidekick;
+	if (sidekickSelector !== undefined) {
+		const sidekickId = parseModelString(sidekickSelector)?.id ?? sidekickSelector;
+		modelName = `${modelName} ${theme.symbol("tab.fusion")} ${sidekickId}`;
+	}
+	return modelName;
 }
 
 /**

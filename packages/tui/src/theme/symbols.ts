@@ -269,6 +269,7 @@ export type SymbolKey =
 	| "tab.tools"
 	| "tab.memory"
 	| "tab.tasks"
+	| "tab.fusion"
 	| "tab.providers"
 	// Tool identity icons
 	| "tool.write"
@@ -660,6 +661,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"tab.tools": "🔧",
 	"tab.memory": "🧠",
 	"tab.tasks": "📦",
+	"tab.fusion": "⚡",
 	"tab.providers": "🌐",
 	// Tool identity icons (per-tool signature glyph on the success header)
 	"tool.write": "✎",
@@ -1140,6 +1142,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"tab.tools": "󰠭",
 	"tab.memory": "󰧑",
 	"tab.tasks": "󰐱",
+	// pick: nf-md-flash
+	"tab.fusion": "\u{f0241}",
 	"tab.providers": "󰖟",
 	// Tool identity icons (per-tool signature glyph on the success header)
 	"tool.write": "\uEA7F",
@@ -1456,6 +1460,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"tab.tools": "[T]",
 	"tab.memory": "[Y]",
 	"tab.tasks": "[K]",
+	"tab.fusion": "[U]",
 	"tab.providers": "[P]",
 	// Tool identity icons (per-tool signature glyph on the success header)
 	"tool.write": "+f",

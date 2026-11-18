@@ -9,6 +9,7 @@
  */
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
+import { modelPerfKey } from "@oh-my-pi/pi-catalog/identity/metrics";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	getEffectiveTokenCost,
@@ -1517,8 +1518,9 @@ export class ModelBrowser implements Component {
 	#perfFor(item: ModelBrowserItem): MeasuredPerf | undefined {
 		if (this.#perf.size === 0) return undefined;
 		const tier = this.#settings.serviceTierFor?.(item.model);
-		if (tier) {
-			const tiered = this.#perf.get(`${item.selector}@${tier}`);
+		const key = modelPerfKey(item.selector, tier);
+		if (key !== item.selector) {
+			const tiered = this.#perf.get(key);
 			if (tiered) return { perf: tiered, tier };
 		}
 		const standard = this.#perf.get(item.selector);
@@ -1662,7 +1664,9 @@ export class ModelBrowser implements Component {
 		if (intelligence) facts.push(intelligence);
 		const measured = this.#perfFor(selected);
 		if (measured) {
-			facts.push(`~${formatTps(measured.perf.tps)}${measured.tier ? ` ${measured.tier}` : ""}`);
+			const speed = `~${formatTps(measured.perf.tps)}${measured.tier ? ` ${measured.tier}` : ""}`;
+			if (measured.tier) facts.splice(1, 0, speed);
+			else facts.push(speed);
 			if (measured.perf.ttftMs !== null) facts.push(`${formatTtft(measured.perf.ttftMs)} ttft`);
 		} else if (model.tps != null && Number.isFinite(model.tps) && model.tps > 0) {
 			facts.push(`~${formatTps(model.tps)}`);
@@ -1969,7 +1973,9 @@ export class ModelBrowser implements Component {
 			if (intelligence) facts.push(intelligence);
 			const measured = this.#perfFor(selected);
 			if (measured) {
-				facts.push(`~${formatTps(measured.perf.tps)}${measured.tier ? ` ${measured.tier}` : ""}`);
+				const speed = `~${formatTps(measured.perf.tps)}${measured.tier ? ` ${measured.tier}` : ""}`;
+				if (measured.tier) facts.unshift(speed);
+				else facts.push(speed);
 				if (measured.perf.ttftMs !== null) facts.push(`${formatTtft(measured.perf.ttftMs)} ttft`);
 			} else if (model.tps != null && Number.isFinite(model.tps) && model.tps > 0) {
 				facts.push(`~${formatTps(model.tps)}`);
