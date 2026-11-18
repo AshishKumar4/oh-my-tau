@@ -5,7 +5,6 @@ import { glyphSetupScene } from "./scenes/glyph";
 import { modelSetupScene } from "./scenes/model";
 import { providersSetupScene } from "./scenes/sign-in";
 import { themeSetupScene } from "./scenes/theme";
-import { updatesSetupScene } from "./scenes/updates";
 import type { SetupScene } from "./scenes/types";
 import { SetupWizardComponent, setupSceneApplies } from "./wizard-overlay";
 
@@ -21,7 +20,6 @@ export const ALL_SCENES = [
 	glyphSetupScene,
 	composerSetupScene,
 	themeSetupScene,
-	updatesSetupScene,
 ] as const satisfies readonly SetupScene[];
 
 /** Environment and invocation gates for onboarding scene selection. */

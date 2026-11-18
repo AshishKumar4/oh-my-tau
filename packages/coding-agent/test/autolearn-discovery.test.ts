@@ -57,6 +57,32 @@ describe("managed-skills discovery", () => {
 		expect(foo?.source).toBe("omp-managed:user");
 	});
 
+	// Managed skills were the one source with no per-source toggle, so a caller
+	// that switched every other source off still got them (and a test asserting
+	// "no sources" silently read the developer's real ~/.omp/agent).
+	it("hides managed skills when enableManagedUser is off", async () => {
+		await writeSkill(managedDir, "foo", "A managed skill.");
+		const { skills } = await loadSkills({ cwd: tempCwd, enableManagedUser: false });
+		expect(skills.some(s => s.name === "foo")).toBe(false);
+	});
+
+	// The third-party CLI toggles must not reach the OMP-native managed source
+	// (cf. #2401): only `enableManagedUser` turns it off.
+	it("keeps managed skills when only the third-party toggles are off", async () => {
+		await writeSkill(managedDir, "foo", "A managed skill.");
+		const { skills } = await loadSkills({
+			cwd: tempCwd,
+			enableCodexUser: false,
+			enableClaudeUser: false,
+			enableClaudeProject: false,
+			enablePiUser: false,
+			enablePiProject: false,
+			enableAgentsUser: false,
+			enableAgentsProject: false,
+		});
+		expect(skills.some(s => s.name === "foo" && s.source === "omp-managed:user")).toBe(true);
+	});
+
 	it("lets an authored skill win a name collision and drops the managed one", async () => {
 		await writeSkill(authoredDir, "bar", "Authored bar.");
 		await writeSkill(managedDir, "bar", "Managed bar.");

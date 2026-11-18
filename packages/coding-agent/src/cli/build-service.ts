@@ -1,18 +1,15 @@
 /**
- * Client for Stencil's build service, the source of omp's standalone binaries
- * ({@link OMP_BUILD}) and of the engine its WebKit browser downloads (ABKit).
- *
- * `omp update` on a standalone binary install, the binary takeover of a
- * package-manager install, and the startup update check of a compiled binary
- * all ask the service which build to install ({@link fetchBuild}), as does the
- * browser's engine install:
+ * Client for Stencil's build service, the source of the engine omp's WebKit
+ * browser downloads (ABKit). This fork never self-updates, so the browser's
+ * engine install is the only caller that asks the service which build to
+ * install ({@link fetchBuild}):
  *
  * - `GET {origin}/api/products/{product}/latest/{target}?channel=stable|canary`
  *   for the newest build on a channel;
  * - `GET {origin}/api/products/{product}/versions/{version}/{target}` for one
  *   exact version.
  *
- * Both products are public, so no token is sent. The origin is `PI_BUILD_URL`
+ * Products are public, so no token is sent. The origin is `PI_BUILD_URL`
  * ({@link DEFAULT_BUILD_URL} when unset). `{target}` is
  * `{macos|linux|linux-musl|windows}-{arm64|x86_64}` ({@link resolveBuildHost}).
  * Requests carry `User-Agent: omp/<version>`, which the service counts in its
@@ -76,12 +73,6 @@ export interface BuildProduct {
 	fileName(host: BuildHost, version: string): string;
 }
 
-/** omp's standalone binary, named like its GitHub release asset: `omp-darwin-arm64`, `omp-windows-x64.exe`. */
-export const OMP_BUILD: BuildProduct = {
-	id: "omp",
-	fileName: host => `${APP_NAME}-${host.asset}${host.windows ? ".exe" : ""}`,
-};
-
 /** The build service target and release file platform for a platform, architecture, and libc. */
 export function resolveBuildHost(platform: NodeJS.Platform, arch: string, musl: boolean): BuildHost {
 	let targetOs: string;
@@ -117,9 +108,8 @@ export function resolveBuildHost(platform: NodeJS.Platform, arch: string, musl: 
 }
 
 /**
- * Detect a musl-libc Linux host (Alpine, Void-musl) so self-update replaces a
- * musl binary with the musl build instead of the glibc one, which would fail
- * to start on the next run. The loader file alone is not sufficient: glibc
+ * Detect a musl-libc Linux host (Alpine, Void-musl) so a download picks the
+ * musl build instead of the glibc one, which would fail to start. The loader file alone is not sufficient: glibc
  * hosts may have musl installed for cross-compilation.
  */
 interface MuslDetectionOptions {
@@ -267,8 +257,7 @@ export function parseBuildAnswer(
 export type BuildSelector = { channel: UpdateChannel } | { version: string };
 
 export interface FetchBuildOptions {
-	/** Defaults to {@link OMP_BUILD}. */
-	product?: BuildProduct;
+	product: BuildProduct;
 	/** Installed version to ask a patch from (`from_version`). */
 	fromVersion?: string;
 	timeoutMs?: number;
@@ -278,8 +267,8 @@ export interface FetchBuildOptions {
 }
 
 /** Ask the build service for a build of this host's target ({@link BuildSelector}). */
-export async function fetchBuild(selector: BuildSelector, options: FetchBuildOptions = {}): Promise<BuildAnswer> {
-	const product = options.product ?? OMP_BUILD;
+export async function fetchBuild(selector: BuildSelector, options: FetchBuildOptions): Promise<BuildAnswer> {
+	const product = options.product;
 	const host = options.host ?? (await currentBuildHost());
 	const origin = buildServiceUrl();
 	const timeoutMs = options.timeoutMs ?? BUILD_CHECK_TIMEOUT_MS;
@@ -320,11 +309,7 @@ export async function fetchBuild(selector: BuildSelector, options: FetchBuildOpt
 	}
 
 	if (response.status === 404 && isRecord(body) && body.error === "no_build") {
-		const hint =
-			product === OMP_BUILD && "channel" in selector && selector.channel === "canary"
-				? ` Try \`${APP_NAME} update --stable\`.`
-				: "";
-		throw new Error(`No ${what} is published on ${origin} yet.${hint}`);
+		throw new Error(`No ${what} is published on ${origin} yet.`);
 	}
 	if (!response.ok) {
 		throw new Error(`${origin} answered ${response.status} ${response.statusText} for the ${what}`);

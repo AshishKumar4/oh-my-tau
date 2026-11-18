@@ -84,11 +84,8 @@ Most FS/bash tools resolve these; path selectors: `read` docs.{{#has tools "read
 {{/if}}
 {{/if}}
 
-{{#if xdevTools.length}}
-# xd:// Tool Devices
-Write JSON args as `content` to xd://<tool> via `{{toolRefs.write}}`. Invalid args return schema in error → fix/retry.
-{{xdevDocs}}
-{{/if}}
+{{> xdevDevices}}
+{{> fusionLead}}
 
 {{#has tools "think"}}
 ⁂ Scratchpad
@@ -169,7 +166,7 @@ Delegation preferred. Once design settles, SHOULD fan substantial work to `{{too
 Inline first. Fan out only when 2+ independent slices each cost more than a handful of your own calls, or the read set would flood context; decide after your own first {{#has tools "find"}}`{{toolRefs.find}}`/{{/has}}`grep`/`read`, never before it.
 - NEVER open with a scout. Scope with {{#has tools "find"}}`{{toolRefs.find}}`/{{/has}}`grep`/`read`/`glob` yourself; a scout is for a genuinely unmapped subsystem after inline scoping stalls.
 - NEVER delegate one slice. One subagent for one job, a slice you already have open, cleanup (comment trims, changelog lines, formatting, sub-30-line edits), or a direct question: do it yourself.
-- NEVER babysit. Spawn → keep working → read the auto-delivered result{{#has tools "wait"}}; use `wait` only when completely blocked{{/has}}.
+- NEVER babysit. Spawn → keep working → read the auto-delivered result{{#has tools "wait"}}; use `{{toolRefs.wait}}` only when completely blocked{{/has}}.
 {{else}}
 {{#when delegationTier "==" "balanced"}}
 - Unfamiliar subsystem? Explore it with {{#if scoutAvailable}}a read-only `scout`{{else}}a `{{toolRefs.task}}` subagent{{/if}} while you keep working; read known files yourself.
@@ -201,7 +198,7 @@ Inline first. Fan out only when 2+ independent slices each cost more than a hand
 
 {{#if subagent}}
 # 2. Hand-off
-- NEVER run builds, tests, linters, formatters or smoke runs unless your assignment says to; the main agent verifies once all subagents land.
+- NEVER run builds, tests, linters, formatters or smoke runs unless your assignment or your Role says to; the main agent verifies once all subagents land.
 - Done → yield, naming the checks to run.
 {{else}}
 # 2. Verify

@@ -156,6 +156,7 @@ describe("tiny-model client shutdown on session dispose", () => {
 			worker.emit({ type: "text", id: thirdRequest.id, text: "after" });
 			expect(await third).toBe("after");
 		} finally {
+			for (const session of sessions.splice(0).reverse()) await session.dispose();
 			close();
 		}
 	});

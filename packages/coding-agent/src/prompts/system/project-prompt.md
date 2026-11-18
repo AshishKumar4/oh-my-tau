@@ -24,7 +24,11 @@ Before changes in these directories, MUST read:
 {{/if}}
 
 {{#ifAny contextFiles.length agentsMdSearch.files.length}}
+{{#if claudeCodeVendorPrompt}}
+Context files above auto-loaded. NEVER search for `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, or similar agent/context files: relevant files already in context; others noise.
+{{else}}
 Context files above auto-loaded. NEVER `grep`/`glob` for `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, or similar agent/context files: relevant files already in context; others noise.
+{{/if}}
 {{/ifAny}}
 
 {{#if includeWorkspaceTree}}
@@ -33,7 +37,11 @@ Context files above auto-loaded. NEVER `grep`/`glob` for `AGENTS.md`, `CLAUDE.md
 Working-directory layout: newest mtime first; depth ≤ 3.
 {{workspaceTree.rendered}}
 {{#if workspaceTree.truncated}}
+{{#if claudeCodeVendorPrompt}}
+{{#has tools "read"}}Some entries elided to shorten tree — use {{#has tools "glob"}}`{{toolRefs.glob}}`/{{/has}}`{{toolRefs.read}}` to drill in.{{/has}}
+{{else}}
 {{#has tools "glob"}}{{#has tools "read"}}Some entries elided to shorten tree — use `{{toolRefs.glob}}`/`{{toolRefs.read}}` to drill in.{{/has}}{{/has}}
+{{/if}}
 {{/if}}
 </workspace-tree>
 {{/if}}
@@ -51,15 +59,23 @@ Additional workspace directories. This CURRENT workspace state supersedes worksp
 {{/if}}
 </project-context>
 
+{{#unless vendorPrompt}}
 <critical>
 - Each response MUST advance the task; completion only stopping condition.
 - MUST default to informed action; do not ask for confirmation when tools or repo context can answer.
 {{#if subagent}}
-- Changes complete → yield; verification is main agent's job. NEVER run it yourself unless your assignment explicitly instructs it.
+- Changes complete → yield; verification is main agent's job. NEVER run it yourself unless your assignment or your Role explicitly requires it.
 {{else}}
 - Before yielding, MUST verify significant behavioral changes: run the specific test, command, or scenario covering the change.
 {{/if}}
 </critical>
+{{else}}
+{{#if subagent}}
+<critical>
+- Changes complete → yield; verification is main agent's job. NEVER run it yourself unless your assignment or your Role explicitly requires it.
+</critical>
+{{/if}}
+{{/unless}}
 
 {{#if appendPrompt}}
 {{appendPrompt}}

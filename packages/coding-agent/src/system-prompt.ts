@@ -8,6 +8,7 @@ import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample, TSchema } from "@oh-my-pi/pi-ai";
 import { renderToolInventory } from "@oh-my-pi/pi-ai/dialect";
 import type { DelegationBias } from "@oh-my-pi/pi-catalog/compat/delegation";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import {
 	$env,
 	getAgentDir,
@@ -28,14 +29,18 @@ import { expandAtImports } from "./discovery/at-imports";
 import type { EvalPreludeDefinition } from "./eval/preludes";
 import { SkillDescriptionCatalog } from "./extensibility/skill-descriptions";
 import { loadSkills, type Skill } from "./extensibility/skills";
+import { buildFusionPromptData, SIDEKICK_TOOL_NAME } from "./fusion/config";
+import { type HarnessPrompt, loadHarnessPrompt } from "./harness/capture";
 import { InternalUrlRouter } from "./internal-urls/router";
 import type { SchemeHost } from "./internal-urls/types";
 import activeRepoContextTemplate from "./prompts/system/active-repo-context.md" with { type: "text" };
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
+import fusionLeadTemplate from "./prompts/system/fusion-lead.md" with { type: "text" };
 import defaultPersonality from "./prompts/system/personalities/default.md" with { type: "text" };
 import friendlyPersonality from "./prompts/system/personalities/friendly.md" with { type: "text" };
 import pragmaticPersonality from "./prompts/system/personalities/pragmatic.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
+import xdevDevicesTemplate from "./prompts/system/xdev-devices.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
 import userAppendPromptTemplate from "./prompts/system/user-append.md" with { type: "text" };
 import type { SystemPromptSource, SystemPromptSources } from "@oh-my-pi/pi-tui/status-line/context-usage";
@@ -246,7 +251,7 @@ function renderActiveRepoContextPrompt(activeRepoContext: ActiveRepoContext | nu
 		.trim();
 }
 
-const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 5000;
+export const SYSTEM_PROMPT_PREP_TIMEOUT_MS = 5000;
 /** Workstation facts the model needs to pick commands and paths: platform/release and CPU architecture. */
 function getEnvironmentInfo(): Array<{ label: string; value: string }> {
 	return [
@@ -539,6 +544,13 @@ export interface BuildSystemPromptOptions {
 	tools?: Map<string, SystemPromptToolMetadata>;
 	/** Tool names to include in prompt. */
 	toolNames?: string[];
+	/**
+	 * Names actually exposed as provider-callable tools. Defaults to `toolNames`.
+	 * Code Mode passes its direct keep-set so the rendered tool inventory matches
+	 * the wire surface while capability and safety gates still see every
+	 * bridge-reachable tool in `toolNames`.
+	 */
+	directToolNames?: readonly string[];
 	/** Text to append to system prompt. */
 	appendSystemPrompt?: string;
 	/** Already-loaded append prompt text; bypasses path resolution. */
@@ -635,12 +647,22 @@ export interface BuildSystemPromptOptions {
 	xdevTools?: Array<{ name: string; summary: string; dynamic?: boolean }>;
 	/** Full docs + JSON schema for every `xd://`-mounted tool, inlined into the protocol section so no discovery `read` is needed. */
 	xdevDocs?: string;
+	/** Deferred tools under a tool-search harness, in place of `xd://`: the client's announcement naming them, and their omp names. */
+	toolSearch?: { readonly announcement: string; readonly names: readonly string[] };
 	/** Whether Auto-QA grievance reporting is enabled; renders the `xd://report_issue` note. */
 	autoQaEnabled?: boolean;
 	/** ovnfs command when its binary is found (`ovnfsCommand`); renders the separate-checkout guidance. */
 	ovnfs?: string;
 	/** Whether active `write` is restricted to xd:// dispatch and the plan artifact sandbox. */
 	writeTransportOnly?: boolean;
+	harnessProfile?: HarnessProfile;
+	/**
+	 * `toolRefs` of the surface the harness profile presents (see
+	 * `harnessSurface`): wire names of the reachable tools and the mounted
+	 * facades. Under `claude-code` they override the tool-name refs, so the
+	 * footer names Skill, TaskOutput-for-`wait` and the like only while mounted.
+	 */
+	harnessToolRefs?: Readonly<Record<string, string>>;
 	/**
 	 * Whether this prompt is for a subagent session. Replaces the Verify workflow with a hand-off:
 	 * the main agent verifies once after all subagents land, so parallel children don't storm the CPU.
@@ -664,6 +686,8 @@ export interface BuildSystemPromptResult {
 	xdevCatalogNames?: readonly string[];
 }
 
+prompt.registerPartial("xdevDevices", xdevDevicesTemplate);
+prompt.registerPartial("fusionLead", fusionLeadTemplate);
 /** Static wrapper; compiled (not rendered) so user-authored Markdown passes through byte-for-byte. */
 const renderUserAppend = prompt.compile(userAppendPromptTemplate.trimEnd());
 
@@ -733,6 +757,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		nativeTools = true,
 		skillsSettings,
 		toolNames: providedToolNames,
+		directToolNames,
 		cwd,
 		additionalWorkspaceRoots = [],
 		contextFiles: providedContextFiles,
@@ -769,11 +794,14 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		encourageEdits = true,
 		xdevTools = [],
 		xdevDocs = "",
+		toolSearch,
 		autoQaEnabled = false,
 		ovnfs,
 		writeTransportOnly = false,
 		subagent = false,
 		activeRepoContext: providedActiveRepoContext,
+		harnessProfile,
+		harnessToolRefs,
 	} = options;
 	const inlineToolDescriptors = providedInlineToolDescriptors ?? false;
 	const resolvedCwd = cwd ?? getProjectDir();
@@ -882,6 +910,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const systemPromptCustomizationPromise: Promise<string | null> = callerControlsCustomPrompt
 		? Promise.resolve(null)
 		: logger.time("loadSystemPromptFiles", loadSystemPromptFiles, { cwd: resolvedCwd });
+	const harnessPromptPromise: Promise<HarnessPrompt | null> =
+		harnessProfile === undefined || callerControlsCustomPrompt
+			? Promise.resolve(null)
+			: logger.time("loadHarnessPrompt", loadHarnessPrompt, harnessProfile, model);
 	const contextFilesPromise = (async () => {
 		const primary = providedContextFiles
 			? providedContextFiles
@@ -947,6 +979,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		workspaceTree,
 		activeRepoContext,
 		personalityBlock,
+		harnessPrompt,
 	] = await Promise.all([
 		withDeadline(
 			"customPrompt",
@@ -970,6 +1003,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		withDeadline("buildWorkspaceTree", workspaceTreePromise, prepDefaults.workspaceTree),
 		withDeadline("resolveActiveRepoContext", activeRepoContextPromise, prepDefaults.activeRepoContext),
 		withDeadline("loadPersonalityOverride", personalityPromise, bundledPersonality),
+		withDeadline("loadHarnessPrompt", harnessPromptPromise, null),
 	]);
 	clearTimeout(deadlineTimer);
 	const agentsMdFiles = noContextFiles
@@ -1022,12 +1056,27 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	for (const mounted of xdevTools) {
 		if (!toolPromptNames.has(mounted.name)) toolPromptNames.set(mounted.name, `${XD_URL_PREFIX}${mounted.name}`);
 	}
-	const toolRefs = Object.fromEntries(toolPromptNames.entries());
+	const toolRefs: Record<string, string> = Object.fromEntries(toolPromptNames.entries());
+	// Under Claude Code the presented surface names the tools: renamed built-ins
+	// and the facades that mounted (Skill, SendMessage, TaskOutput for `wait`).
+	if (harnessProfile === "claude-code" && harnessToolRefs) Object.assign(toolRefs, harnessToolRefs);
+	// The sidekick tool mounts only for a Fusion lead, so its presence IS the
+	// Fusion signal: the lead section renders with the same presented names the
+	// rest of the prompt uses.
+	const fusion = toolPromptNames.has(SIDEKICK_TOOL_NAME)
+		? buildFusionPromptData({ profile: harnessProfile, toolRefs })
+		: undefined;
 	const xdevToolNames = new Set(xdevTools.map(mounted => mounted.name));
 	// A direct custom tool can share a name with a retained built-in device.
 	// Presence in both toolNames and tools proves it still has a top-level definition.
+	// Bridge-only Code Mode tools stay out of the callable inventory: the eval
+	// description documents their `tool.*` access path instead.
+	const directSet = directToolNames === undefined ? undefined : new Set(directToolNames);
+	const directInventoryNames = directSet === undefined ? toolNames : toolNames.filter(name => directSet.has(name));
 	const inventoryToolNames =
-		xdevToolNames.size === 0 ? toolNames : toolNames.filter(name => tools?.has(name) || !xdevToolNames.has(name));
+		xdevToolNames.size === 0
+			? directInventoryNames
+			: directInventoryNames.filter(name => tools?.has(name) || !xdevToolNames.has(name));
 	const toolInfo = inventoryToolNames.map(name => ({
 		name: toolPromptNames.get(name) ?? name,
 		internalName: name,
@@ -1071,15 +1120,27 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		hasSkillReader ? skills.filter(skill => skill.hide !== true) : [],
 	);
 
+	// The bundled pi prompt carries a `{{cwd}}` placeholder — the one
+	// per-environment scalar its vendor prompt injects — while recorded
+	// captures arrive fully materialized. Render only when the placeholder is
+	// literally present so capture text passes through byte-identical.
+	const harnessPromptText =
+		harnessPrompt?.text === undefined
+			? undefined
+			: harnessPrompt.text.includes("{{cwd}}")
+				? prompt.render(harnessPrompt.text, { cwd: promptCwd })
+				: harnessPrompt.text;
 	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
 		resolvedCustomPrompt,
 		resolvedAppendPrompt,
+		harnessPromptText,
 	]);
 	const contextPromptSources = contextFiles.map(file => file.content);
 	const promptSources = [
 		effectiveSystemPromptCustomization,
 		resolvedCustomPrompt,
 		resolvedAppendPrompt,
+		harnessPromptText,
 		...contextPromptSources,
 	];
 	const injectedAlwaysApplyRules = dedupeAlwaysApplyRules(alwaysApplyRules, promptSources);
@@ -1101,7 +1162,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			path: skill.filePath,
 		})),
 	];
-	const selectedTemplate = resolvedCustomPrompt
+	// A served vendor prompt renders the footer-only template too, so the harness
+	// case takes the same branch as a literal custom prompt.
+	const usesCustomTemplate = Boolean(resolvedCustomPrompt) || harnessPromptText !== undefined;
+	const selectedTemplate = usesCustomTemplate
 		? customSystemPromptTemplate
 		: (resolvedSystemPromptTemplate ?? systemPromptTemplate);
 	const environment = getEnvironmentInfo();
@@ -1115,6 +1179,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		inlineToolDescriptors,
 		toolListMode,
 		toolRefs,
+		fusion,
 		environment,
 		contextFiles: promptContextFiles,
 		agentsMdSearch: { files: agentsMdFiles },
@@ -1153,9 +1218,19 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		xdevTools,
 		hasDynamicXdevTools: xdevTools.some(mounted => mounted.dynamic === true),
 		xdevDocs,
+		deferredToolsAnnouncement: toolSearch?.announcement,
 		autoQaEnabled,
 		ovnfs,
 		writeTransportOnly,
+		// A served vendor prompt carries its own operating directives; the footer
+		// then keeps environment facts only.
+		vendorPrompt: harnessPromptText !== undefined,
+		// Codex-profiled turns send `parallel_tool_calls: false`, so guidance that
+		// pairs calls in one response cannot be followed there.
+		serialToolCalls: harnessProfile === "codex",
+		// Claude Code's own prompt is served, so the footer names only the tools that
+		// surface serves. Without a capture the native prompt is served, byte for byte.
+		claudeCodeVendorPrompt: harnessPromptText !== undefined && harnessProfile === "claude-code",
 		subagent,
 	};
 	let rendered: prompt.TrackedRender;
@@ -1172,8 +1247,14 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		resolvedSystemPromptTemplate = undefined;
 		rendered = prompt.renderTracked(systemPromptTemplate, data, sourceItems);
 	}
-	const systemPrompt = [rendered.text];
-	const sources = trackedSources(rendered, 0, sourceIdentities);
+	// The vendor prompt owns block 0 so the wire matches the impersonated
+	// harness; our own render follows it as the environment footer.
+	const systemPrompt: string[] = harnessPromptText === undefined ? [] : [harnessPromptText];
+	const sources =
+		harnessPromptText === undefined || rendered.text.trim()
+			? trackedSources(rendered, systemPrompt.length, sourceIdentities)
+			: [];
+	if (harnessPromptText === undefined || rendered.text.trim()) systemPrompt.push(rendered.text);
 	for (const prelude of evalPreludes) {
 		const guidance = prelude.guidance?.trim();
 		if (guidance) systemPrompt.push(guidance);
@@ -1191,12 +1272,15 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		systemPrompt.push(projectPrompt.text);
 	}
 
-	// Claim delivery only when the rendered block 0 actually carries the xd://
-	// section, so a template that references {{xdevDocs}} keeps mount-notice
-	// dedupe while one that omits it stays honest.
+	// Claim delivery only when the render actually carries the xd:// section, so
+	// a template that references {{xdevDocs}} keeps mount-notice dedupe while one
+	// that omits it stays honest. Under a harness prompt the render is block 1
+	// rather than block 0, but it is still delivered whenever it is non-empty.
 	const xdevCatalogNames =
 		!resolvedCustomPrompt && xdevTools.length > 0 && rendered.text.includes("xd://")
 			? xdevTools.map(mounted => mounted.name)
-			: undefined;
+			: toolSearch !== undefined && rendered.text.includes(toolSearch.announcement)
+				? [...toolSearch.names]
+				: undefined;
 	return { systemPrompt, xdevCatalogNames, sources: { blocks: systemPrompt.slice(), sources } };
 }

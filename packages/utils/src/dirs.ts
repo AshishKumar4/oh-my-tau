@@ -654,15 +654,6 @@ export function getReportsDir(): string {
 }
 
 /**
- * Get the self-update state directory (~/.omp/update): the background
- * auto-update's status file and worker log, and the lock that keeps two
- * installs (`omp update`, auto-update) from running at once.
- */
-export function getUpdateStateDir(): string {
-	return dirs.rootSubdir("update", "state");
-}
-
-/**
  * Return a per-user directory (`<tmpdir>/<prefix>-<uid>`) under the OS temp dir
  * so `bun test` state never collides across accounts sharing `/tmp`.
  */
@@ -922,6 +913,12 @@ export function getAvatarCacheDir(): string {
 /** Get the local FastEmbed model cache directory (~/.omp/cache/fastembed). */
 export function getFastembedCacheDir(): string {
 	return dirs.rootSubdir(path.join("cache", "fastembed"), "cache");
+}
+
+export function getHarnessCacheDir(): string {
+	const override = process.env.OMP_HARNESS_CACHE_DIR;
+	if (override) return override;
+	return dirs.rootSubdir(path.join("cache", "harness"), "cache");
 }
 
 /** Get the on-demand fastembed runtime install root (~/.omp/cache/fastembed-runtime). */

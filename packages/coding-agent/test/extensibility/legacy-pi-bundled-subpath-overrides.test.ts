@@ -34,6 +34,26 @@ async function runRegistryProbe(entries: BundledPiEntry[], source: string): Prom
 // the same `omp-legacy-pi-bundled:` virtual namespace as package roots without
 // a generated registry or duplicate key list.
 describe("legacy pi compat compiled-mode subpath overrides (issue #3442)", () => {
+	it("loads root catalog subpaths and native UI builders through the generated binary module registry", async () => {
+		const required = [
+			"@oh-my-pi/pi-catalog/models",
+			"@oh-my-pi/pi-catalog/build",
+			"@oh-my-pi/pi-tui/native/describe",
+		];
+		const entries = bundledEntries.filter(entry => required.includes(entry.key));
+		const observed = await runRegistryProbe(
+			entries,
+			`
+const models = await BUNDLED_PI_MODULE_LOADERS["@oh-my-pi/pi-catalog/models"]();
+const build = await BUNDLED_PI_MODULE_LOADERS["@oh-my-pi/pi-catalog/build"]();
+const ui = await BUNDLED_PI_MODULE_LOADERS["@oh-my-pi/pi-tui/native/describe"]();
+const model = models.getBundledModel("openai-codex", "gpt-5.6-sol");
+if (!model) throw new Error("Expected bundled model");
+export const observed = { id: build.buildModel(model).id, node: ui.text([ui.span(model.name)]) };
+`,
+		);
+		expect(observed).toMatchObject({ id: "gpt-5.6-sol", node: { k: "text" } });
+	});
 	it("does not evaluate unrelated host modules while loading the registry", async () => {
 		using tempDir = TempDir.createSync("@omp-legacy-pi-loaders-");
 		const alphaPath = path.join(tempDir.path(), "alpha.ts");

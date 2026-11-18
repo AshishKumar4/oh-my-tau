@@ -27,8 +27,6 @@ export interface SetupHost extends SetupUiHost {
 	readonly symbolPreset: SymbolPreset;
 	readonly colorBlindMode: boolean;
 	readonly disabledProviders: readonly string[];
-	/** Whether background self-update (`update.auto`) is on. */
-	readonly autoUpdate: boolean;
 	readonly authStorage: AuthStorage;
 	readonly modelSource: ModelBrowserSource;
 	/** Available and catalog models of every kind; role chips resolve over all of them, rows list chat models. */
@@ -44,8 +42,6 @@ export interface SetupHost extends SetupUiHost {
 	 * Whether this omp can install its own updates; false where something else
 	 * owns them: Tern (which updates its omp itself), Nix, a source checkout.
 	 */
-	canAutoUpdate(): Promise<boolean>;
-	saveAutoUpdate(enabled: boolean): Promise<void>;
 	captureBrowserSession(request: OAuthBrowserSessionRequest, signal?: AbortSignal): Promise<string>;
 	openInBrowser(url: string): void;
 	markComplete(version: number): Promise<void>;

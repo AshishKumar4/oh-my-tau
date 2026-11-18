@@ -2,14 +2,20 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import {
 	type BuildHost,
+	type BuildProduct,
 	downloadBuildFile,
 	fetchBuild,
 	isMuslLinuxForTest,
-	OMP_BUILD,
 	parseBuildAnswer,
 	resolveBuildHost,
 } from "@oh-my-pi/pi-coding-agent/cli/build-service";
 import { TempDir, VERSION } from "@oh-my-pi/pi-utils";
+
+/** A product named like a standalone binary release asset: `omp-darwin-arm64`, `omp-windows-x64.exe`. */
+const OMP_BUILD: BuildProduct = {
+	id: "omp",
+	fileName: host => `omp-${host.asset}${host.windows ? ".exe" : ""}`,
+};
 
 const fileName = "omp-darwin-arm64";
 const host: BuildHost = { target: "macos-arm64", asset: "darwin-arm64", windows: false };
@@ -121,6 +127,7 @@ describe("fetchBuild", () => {
 		const build = await fetchBuild(
 			{ channel: "canary" },
 			{
+				product: OMP_BUILD,
 				host,
 				fromVersion: "18.8.8",
 				fetchImpl: async (input, init) => {
@@ -150,6 +157,7 @@ describe("fetchBuild", () => {
 		await fetchBuild(
 			{ version: "18.8.9" },
 			{
+				product: OMP_BUILD,
 				host,
 				fetchImpl: async input => {
 					url = String(input);
@@ -165,7 +173,7 @@ describe("fetchBuild", () => {
 		await expect(
 			fetchBuild(
 				{ channel: "stable" },
-				{ host, fetchImpl: async () => Response.json({ error: "no_build" }, { status: 404 }) },
+				{ product: OMP_BUILD, host, fetchImpl: async () => Response.json({ error: "no_build" }, { status: 404 }) },
 			),
 		).rejects.toThrow("No omp stable build for macos-arm64 is published");
 	});
