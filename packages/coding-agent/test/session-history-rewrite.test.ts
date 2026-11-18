@@ -6,12 +6,14 @@ import type { ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { EVAL_STATE_CONTEXT_TYPE } from "@oh-my-pi/pi-coding-agent/eval/state";
 import type { SessionBeforeCompactResult } from "@oh-my-pi/pi-coding-agent/extensibility/shared-events";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 /**
  * `session_before_compact` handlers may answer with `rewrite`: kept entries
@@ -103,6 +105,12 @@ describe("AgentSession extension history rewrite", () => {
 			}),
 			modelRegistry,
 			extensionRunner: extensionRunner as never,
+			// Enough for a context rebuild to append an `eval-state-context` snapshot
+			// once the history holds an `eval` call.
+			evalToolSession: {
+				cwd: process.cwd(),
+				getEvalSessionId: () => "history-rewrite-eval",
+			} as unknown as ToolSession,
 		});
 		session.subscribe(event => events.push(event));
 	});
@@ -265,6 +273,44 @@ describe("AgentSession extension history rewrite", () => {
 			expect(end.type === "auto_compaction_end" && end.result).toBeUndefined();
 			expect(end.type === "auto_compaction_end" && end.skipped).toBeFalsy();
 			expect(end.type === "auto_compaction_end" && end.errorMessage).toBeUndefined();
+		});
+
+		it("persists the eval snapshot the rewrite's rebuild sends, so a from-disk rebuild matches the live context", async () => {
+			// An `eval` call in history makes every context rebuild append an eval-state snapshot.
+			const evalCallId = "call_eval";
+			sessionManager.appendMessage({ role: "user", content: [{ type: "text", text: "compute" }], timestamp: 1 });
+			sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "toolCall", id: evalCallId, name: "eval", arguments: { code: "1 + 1" } }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				stopReason: "toolUse",
+				usage: usage(16),
+				timestamp: 2,
+			});
+			sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId: evalCallId,
+				toolName: "eval",
+				content: [{ type: "text", text: "2" }],
+				isError: false,
+				timestamp: 3,
+			});
+			const { toolResultId } = seedToolTurn(90_000);
+			hookAnswer = () => prunedToolResult(toolResultId);
+			mockNativeSummary();
+
+			await triggerThreshold(190_000);
+
+			expect(hookCalls.length).toBe(1);
+			const live = session.agent.state.messages;
+			const tail = live.at(-1);
+			expect(tail?.role === "custom" ? tail.customType : undefined).toBe(EVAL_STATE_CONTEXT_TYPE);
+			// The snapshot the live request sends is on disk at the same slot.
+			const persisted = buildSessionContext(sessionManager.getBranch()).messages;
+			expect(persisted.at(-1)).toMatchObject({ role: "custom", customType: EVAL_STATE_CONTEXT_TYPE });
+			expect(persisted.map(message => message.role)).toEqual(live.map(message => message.role));
 		});
 
 		it("frees the visible text a rewrite cuts from a Claude turn that replays its signed thinking", async () => {
