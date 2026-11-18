@@ -5,7 +5,6 @@ import {
 	type AgentToolResult,
 	TOOL_INTERRUPT_ABORT_REASON,
 } from "@oh-my-pi/pi-agent-core";
-import type { Message } from "@oh-my-pi/pi-ai";
 import { buildJobResult } from "@oh-my-pi/pi-coding-agent/async/job-control";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -39,13 +38,6 @@ function session(
 	} as unknown as ToolSession;
 }
 
-/** A caller context whose latest turn made `elapse`'s wait call plus one call to each of `otherTools`. */
-function latestTurn(...otherTools: string[]): () => Message[] {
-	const calls = [{ id: "idle-wait", name: "wait" }, ...otherTools.map((name, i) => ({ id: `${name}-${i}`, name }))];
-	const message = { role: "assistant", content: calls.map(call => ({ type: "toolCall", ...call, arguments: {} })) };
-	return () => [message as unknown as Message];
-}
-
 // Lets every pending continuation run, so the wait reaches its next block before the test acts.
 async function flushMicrotasks(): Promise<void> {
 	for (let i = 0; i < 100; i++) await Promise.resolve();
@@ -68,11 +60,6 @@ async function elapse(tool: WaitTool, windowMs: number) {
 /** The progress reminder an elapsed wait appends after its own report, if any. */
 function notice(result: { content: Array<{ type: string; text?: string }> }): string | undefined {
 	return result.content.slice(1).find(block => block.type === "text")?.text;
-}
-
-/** An elapsed wait's own report: the snapshot and its timeout line. */
-function report(result: { content: Array<{ type: string; text?: string }> }): string | undefined {
-	return result.content.find(block => block.type === "text")?.text;
 }
 
 /** Whether `promise` is still pending once already-queued work has run. */
@@ -158,81 +145,48 @@ describe("wait", () => {
 		expect(result.details?.jobs?.[0]).toMatchObject({ id, status: "completed" });
 	});
 
-	test("back-to-back idle waits climb the ladder and, from the 10s rung on, send the agent back to work", async () => {
+	test("an idle wait blocks until just before the prompt cache expires, so the wake's request keeps it warm", async () => {
 		vi.useFakeTimers();
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		const build = Promise.withResolvers<string>();
 		const id = manager.register("bash", "build", async () => build.promise, { ownerId: "Main" });
-		const tool = new WaitTool(session(manager, "Main", false, { getContextMessages: latestTurn("read") }));
-		const first = await elapse(tool, 5_000);
-		expect(first.useless).toBe(true);
-		expect(first.details?.jobs?.[0]).toMatchObject({ id, status: "running" });
-		expect(notice(first)).toBeUndefined();
-		expect(report(first)).toContain("within 5.0s");
-		expect(report(first)).toContain("Call `wait` right away with no other tool call: it then blocks up to 4m.");
-		expect(notice(await elapse(tool, 10_000))).toContain("15.0s");
-		expect(notice(await elapse(tool, 30_000))).toContain("45.0s");
-		await elapse(tool, 60_000);
-		await elapse(tool, 240_000);
-		const capped = await elapse(tool, 240_000);
-		expect(report(capped)).toContain("within 4m");
-		expect(report(capped)).toContain("up to 4m");
-		expect(notice(capped)).toContain("9m45s");
+		const touchedAt = Date.now();
+		const tool = new WaitTool({
+			...session(manager),
+			getPromptCacheStatus: () => ({ state: "warm", tier: "long", touchedAt, ttlMs: 3_600_000 }),
+		} as unknown as ToolSession);
+		// The warmer's refresh point for a one-hour entry: 90% of its lifetime.
+		const result = await elapse(tool, 3_240_000);
+		expect(result.useless).toBe(true);
+		expect(result.details?.jobs?.[0]).toMatchObject({ id, status: "running" });
+		expect(notice(result)).toContain("54m");
 		build.resolve("done");
 	});
 
-	test("news or a minute away from wait restarts the ladder at the floor", async () => {
+	test("with no prompt cache to keep warm, an idle wait blocks for 25 minutes", async () => {
 		vi.useFakeTimers();
 		const manager = new AsyncJobManager({ onJobComplete: () => {} });
 		const build = Promise.withResolvers<string>();
 		manager.register("bash", "build", async () => build.promise, { ownerId: "Main" });
-		const tool = new WaitTool(session(manager));
-		await elapse(tool, 5_000);
-		vi.advanceTimersByTime(60_000);
-		expect(notice(await elapse(tool, 5_000))).toBeUndefined();
-		await elapse(tool, 10_000);
-		const lint = Promise.withResolvers<string>();
-		manager.register("bash", "lint", async () => lint.promise, { ownerId: "Main" });
-		const woke = tool.execute("wait-news", {});
+		expect(notice(await elapse(new WaitTool(session(manager)), 1_500_000))).toContain("25m");
+		build.resolve("done");
+	});
+
+	test("a refresh point already past wakes at once, before the entry expires", async () => {
+		vi.useFakeTimers();
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const build = Promise.withResolvers<string>();
+		manager.register("bash", "build", async () => build.promise, { ownerId: "Main" });
+		// A five-minute entry written 280s ago has 20s left; its refresh point passed at 270s.
+		const touchedAt = Date.now() - 280_000;
+		const tool = new WaitTool({
+			...session(manager),
+			getPromptCacheStatus: () => ({ state: "warm", tier: "short", touchedAt, ttlMs: 300_000 }),
+		} as unknown as ToolSession);
+		const waiting = tool.execute("wait", {});
 		await flushMicrotasks();
-		lint.resolve("clean");
-		await flushMicrotasks();
-		vi.advanceTimersByTime(1_500);
-		expect((await woke).useless).toBeUndefined();
-		expect(notice(await elapse(tool, 5_000))).toBeUndefined();
-		build.resolve("done");
-	});
-
-	test("a back-to-back wait that is the only call of its turn takes the top rung at once", async () => {
-		vi.useFakeTimers();
-		const manager = new AsyncJobManager({ onJobComplete: () => {} });
-		const build = Promise.withResolvers<string>();
-		manager.register("bash", "build", async () => build.promise, { ownerId: "Main" });
-		const tool = new WaitTool(session(manager, "Main", false, { getContextMessages: latestTurn() }));
-		// The first wait of a streak keeps the floor: the agent has not yet shown it has nothing else to do.
-		expect(notice(await elapse(tool, 5_000))).toBeUndefined();
-		const top = await elapse(tool, 240_000);
-		expect(report(top)).toContain("within 4m");
-		expect(notice(top)).toContain("4m5s");
-		build.resolve("done");
-	});
-
-	test("only the top-level interactive session is told to end its turn instead of waiting again", async () => {
-		vi.useFakeTimers();
-		const manager = new AsyncJobManager({ onJobComplete: () => {} });
-		const build = Promise.withResolvers<string>();
-		manager.register("bash", "build", async () => build.promise, { ownerId: "Main" });
-		const interactive = new WaitTool(session(manager, "Main", false, { tuiTranscript: true }));
-		expect(interactive.description).toContain("End your turn instead");
-		expect(report(await elapse(interactive, 5_000))).toContain(
-			"End your turn: results and messages start your next one.",
-		);
-		// Print mode exits and cancels the jobs when the turn ends; ACP holds results until the client's next prompt.
-		const headless = new WaitTool(session(manager));
-		expect(headless.description).not.toContain("End your turn");
-		const headlessReport = report(await elapse(headless, 5_000));
-		expect(headlessReport).not.toContain("End your turn");
-		expect(headlessReport).toContain("Call `wait` right away with no other tool call");
+		vi.advanceTimersByTime(1);
+		expect((await waiting).useless).toBe(true);
 		build.resolve("done");
 	});
 
@@ -318,6 +272,77 @@ describe("wait", () => {
 		expect(text).toContain("Delivery: not auto-delivered; recovered by this snapshot");
 		expect(text).toMatch(/already finished \d+(ms|\.\ds) before this call/);
 		expect(text).not.toContain("delivered by this wait");
+	});
+
+	describe("a caller with open items", () => {
+		function startEntry(id: string, toolName: string) {
+			return {
+				type: "custom",
+				customType: "tool_execution_start",
+				id,
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				data: { toolCallId: `call-${id}`, toolName },
+			};
+		}
+
+		function caller(branch: Array<Record<string, unknown>>, manager: AsyncJobManager) {
+			return new WaitTool({
+				...session(manager),
+				getTodoPhases: () => [
+					{
+						name: "Work",
+						tasks: [
+							{ content: "Write the parser", status: "in_progress" },
+							{ content: "Ship it", status: "completed" },
+						],
+					},
+				],
+				sessionManager: { getBranch: () => branch },
+			} as unknown as ToolSession);
+		}
+
+		const offered = (result: { details?: { jobs?: unknown[] } }) => result.details?.jobs?.length === 0;
+
+		test("gets them back once, and blocks on every wait after it until it does other work", async () => {
+			vi.useFakeTimers();
+			const manager = new AsyncJobManager({ onJobComplete: () => {} });
+			const build = Promise.withResolvers<string>();
+			const id = manager.register("bash", "build", async () => build.promise, { ownerId: "Main" });
+			const branch = [startEntry("w1", "wait")];
+			const tool = caller(branch, manager);
+
+			const first = await tool.execute("wait-1", {});
+			const text = first.content.map(block => (block.type === "text" ? block.text : "")).join("");
+			expect(text).toContain(`\`${id}\``);
+			expect(text).toContain("- Write the parser");
+			expect(text).not.toContain("Ship it");
+
+			// Straight back to wait, twice: everything left needs the result, so both block.
+			branch.push(startEntry("w2", "wait"));
+			expect(offered(await elapse(tool, 1_500_000))).toBe(false);
+			branch.push(startEntry("w3", "wait"));
+			expect(offered(await elapse(tool, 1_500_000))).toBe(false);
+
+			// Other work in between: the items come back.
+			branch.push(startEntry("b1", "bash"), startEntry("w4", "wait"));
+			expect(offered(await tool.execute("wait-4", {}))).toBe(true);
+			build.resolve("done");
+		});
+
+		test("does not count a tool started before the offer, however close in time", async () => {
+			vi.useFakeTimers();
+			const manager = new AsyncJobManager({ onJobComplete: () => {} });
+			const build = Promise.withResolvers<string>();
+			manager.register("bash", "build", async () => build.promise, { ownerId: "Main" });
+			// A sibling started in the same batch, the same millisecond, just before the wait.
+			const branch = [startEntry("b1", "bash"), startEntry("w1", "wait")];
+			const tool = caller(branch, manager);
+			expect(offered(await tool.execute("wait-1", {}))).toBe(true);
+			branch.push(startEntry("w2", "wait"));
+			expect(offered(await elapse(tool, 1_500_000))).toBe(false);
+			build.resolve("done");
+		});
 	});
 
 	test("finds nothing to wait for in a subagent whose only running work is its parent's job on it", async () => {
@@ -922,13 +947,12 @@ describe("wait", () => {
 			expect(await idleText(childWait())).toContain("no agent you messaged this run owes a reply");
 		});
 
-		test("hands the turn back at the ladder floor while the agent asked has not answered", async () => {
+		test("blocks for the whole window while the agent asked has not answered", async () => {
 			registerParentAndChild();
 			await ask();
 			vi.useFakeTimers();
 			const tool = new WaitTool(session(new AsyncJobManager({}), "Child"));
-			expect(await idleText(elapse(tool, 5_000))).toContain("No reply within 5.0s");
-			expect(notice(await elapse(tool, 10_000))).toContain("15.0s");
+			expect(await idleText(elapse(tool, 1_500_000))).toContain("No reply within 25m");
 		});
 
 		test("returns at once while the agent asked waits on the user, and blocks again once they answer", async () => {
