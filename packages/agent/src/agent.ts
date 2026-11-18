@@ -32,6 +32,7 @@ import {
 	agentLoop,
 	agentLoopContinue,
 	createSyntheticToolResultMessage,
+	injectsIntent,
 	normalizeMessagesForProvider,
 	normalizeTools,
 	resolveOwnedDialectFromEnv,
@@ -932,8 +933,8 @@ export class Agent {
 	/**
 	 * Swap the tokenizer only when the encoding, image or thinking-replay
 	 * pricing, replayed-reasoning reader or native-history replay state
-	 * actually changes, so the warm
-	 * per-message memo survives same-pricing model switches.
+	 * actually changes, so the warm per-message memo survives same-pricing
+	 * model switches.
 	 */
 	#syncTokenizer(model: Model | null | undefined): void {
 		const options = { nativeHistoryReplay: openAIResponsesReplaysNativeHistory(model, this.#providerSessionState) };
@@ -980,6 +981,7 @@ export class Agent {
 	async buildSideRequestContext(
 		llmMessages: Message[],
 		systemPrompt: string[] = this.#state.systemPrompt,
+		opts?: { harnessProfile?: import("@oh-my-pi/pi-catalog/compat/harness").HarnessProfile | null },
 	): Promise<Context> {
 		const model = this.#state.model;
 		if (!model) throw new Error("No active model on agent");
@@ -988,7 +990,7 @@ export class Agent {
 		const tools = ownedDialect
 			? []
 			: (normalizeTools(this.#toolsForModel(model), {
-					injectIntent: this.#intentTracing,
+					injectIntent: injectsIntent(this.#intentTracing, model, opts?.harnessProfile),
 					intentDescription: this.#intentDescription,
 					pruneDescriptions: this.#pruneToolDescriptions,
 				}) ?? []);

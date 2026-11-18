@@ -24,6 +24,7 @@ import type { AssistantMessage, AssistantMessageEvent, Context, Message, ToolRes
 import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { kCursorExecResolved, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import type { HarmonyDetection } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import * as harmonyLeak from "@oh-my-pi/pi-ai/utils/harmony-leak";
@@ -77,6 +78,52 @@ function makeEchoTool(executions: string[]) {
 const harmonyMitigationModel = createHarmonyMitigationModel();
 
 describe("agentLoop with AgentMessage", () => {
+	it("executes a tool-owned intent-named parameter unchanged while deriving trace intent separately", async () => {
+		const parameters = type({ value: "string", i: "number" }).onUndeclaredKey("reject");
+		const executed: Array<{ value: string; i: number }> = [];
+		const tool: AgentTool<typeof parameters> = {
+			name: "indexed",
+			label: "Indexed",
+			description: "Uses an integer index",
+			parameters,
+			intent: args => `Read ${args.value} at ${args.i}`,
+			async execute(_id, args) {
+				executed.push(args);
+				return { content: [{ type: "text", text: `${args.value}:${args.i}` }] };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [{ type: "toolCall", id: "call-index", name: "indexed", arguments: { value: "record", i: 7 } }],
+				},
+				{ content: ["Done"] },
+			],
+		});
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const stream = agentLoop(
+			[createUserMessage("Read index 7")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter, intentTracing: true },
+			undefined,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			/* drain actual execution */
+		}
+		const messages = await stream.result();
+		expect(executed).toEqual([{ value: "record", i: 7 }]);
+		const assistant = messages.find(message => message.role === "assistant");
+		const call =
+			assistant?.role === "assistant" ? assistant.content.find(block => block.type === "toolCall") : undefined;
+		expect(call).toMatchObject({ arguments: { value: "record", i: 7 }, intent: "Read record at 7" });
+		expect(messages.find(message => message.role === "toolResult")).toMatchObject({
+			toolCallId: "call-index",
+			isError: false,
+			content: [{ type: "text", text: "record:7" }],
+		});
+		expect(mock.calls).toHaveLength(2);
+	});
 	it("should emit events with AgentMessage types", async () => {
 		const context: AgentContext = {
 			systemPrompt: ["You are helpful."],
@@ -1443,6 +1490,173 @@ describe("agentLoop with AgentMessage", () => {
 		);
 	});
 
+	it("persists a persistAs tool call under its target name while dispatching by its own name", async () => {
+		const writeSchema = type({ path: "string", content: "string" });
+		const facadeSchema = type({ to: "string", message: "string" });
+		const writeCalls: unknown[] = [];
+		const write: AgentTool<typeof writeSchema> = {
+			name: "write",
+			label: "Write",
+			description: "write",
+			parameters: writeSchema,
+			async execute(_id, params) {
+				writeCalls.push(params);
+				return { content: [{ type: "text", text: "delivered" }] };
+			},
+		};
+		const facade: AgentTool<typeof facadeSchema> = {
+			name: "SendMessage",
+			persistAs: "write",
+			label: "Write",
+			description: "send",
+			parameters: facadeSchema,
+			execute: (id, params, signal, onUpdate, ctx) =>
+				write.execute(id, { path: `agent://${params.to}`, content: params.message }, signal, onUpdate, ctx),
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [write, facade] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "SendMessage", arguments: { to: "Main", message: "hi" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const messages = await agentLoop(
+			[createUserMessage("ping main")],
+			context,
+			config,
+			undefined,
+			mock.stream,
+		).result();
+
+		expect(writeCalls).toEqual([{ path: "agent://Main", content: "hi" }]);
+		const assistant = messages[1] as AssistantMessage;
+		const call = assistant.content.find(block => block.type === "toolCall");
+		expect(call).toMatchObject({ name: "write", wireName: "SendMessage", arguments: { to: "Main", message: "hi" } });
+		const result = messages.find((m): m is ToolResultMessage => m.role === "toolResult");
+		expect(result?.toolName).toBe("write");
+		expect(result?.content).toContainEqual({ type: "text", text: "delivered" });
+	});
+
+	it("emits persistAs event args in the target shape while persisting the wire shape", async () => {
+		const writeSchema = type({ path: "string", content: "string" });
+		const facadeSchema = type({ to: "string", message: "string" });
+		const write: AgentTool<typeof writeSchema> = {
+			name: "write",
+			label: "Write",
+			description: "write",
+			parameters: writeSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "delivered" }] };
+			},
+		};
+		const facade: AgentTool<typeof facadeSchema> = {
+			name: "SendMessage",
+			persistAs: "write",
+			label: "Write",
+			description: "send",
+			parameters: facadeSchema,
+			toNativeArgs: args => ({ path: `agent://${args.to}`, content: args.message }),
+			execute: (id, params, signal, onUpdate, ctx) =>
+				write.execute(id, { path: `agent://${params.to}`, content: params.message }, signal, onUpdate, ctx),
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [write, facade] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "SendMessage", arguments: { to: "Main", message: "hi" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("ping main")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const messages = await stream.result();
+
+		const start = events.find(event => event.type === "tool_execution_start");
+		expect(start?.type === "tool_execution_start" ? [start.toolName, start.args] : undefined).toEqual([
+			"write",
+			{ path: "agent://Main", content: "hi" },
+		]);
+		const assistant = messages[1] as AssistantMessage;
+		const call = assistant.content.find(block => block.type === "toolCall");
+		expect(call).toMatchObject({
+			name: "write",
+			wireName: "SendMessage",
+			arguments: { to: "Main", message: "hi" },
+			nativeArguments: { path: "agent://Main", content: "hi" },
+		});
+	});
+
+	it("falls back to the raw args when a persistAs event projection throws", async () => {
+		const writeSchema = type({ path: "string", content: "string" });
+		const facadeSchema = type({ to: "string", message: "string" });
+		const write: AgentTool<typeof writeSchema> = {
+			name: "write",
+			label: "Write",
+			description: "write",
+			parameters: writeSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "delivered" }] };
+			},
+		};
+		const facade: AgentTool<typeof facadeSchema> = {
+			name: "SendMessage",
+			persistAs: "write",
+			label: "Write",
+			description: "send",
+			parameters: facadeSchema,
+			toNativeArgs: () => {
+				throw new Error("no native shape for this payload");
+			},
+			execute: (id, params, signal, onUpdate, ctx) =>
+				write.execute(id, { path: `agent://${params.to}`, content: params.message }, signal, onUpdate, ctx),
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [write, facade] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-1", name: "SendMessage", arguments: { to: "Main", message: "hi" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("ping main")], context, config, undefined, mock.stream);
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const messages = await stream.result();
+
+		const start = events.find(event => event.type === "tool_execution_start");
+		expect(start?.type === "tool_execution_start" ? start.args : undefined).toEqual({
+			to: "Main",
+			message: "hi",
+		});
+		const assistant = messages[1] as AssistantMessage;
+		const call = assistant.content.find(block => block.type === "toolCall");
+		expect(call).toMatchObject({ name: "write", wireName: "SendMessage", arguments: { to: "Main", message: "hi" } });
+		expect(call?.type === "toolCall" ? "nativeArguments" in call : undefined).toBe(false);
+		const result = messages.find((m): m is ToolResultMessage => m.role === "toolResult");
+		expect(result?.isError).toBeFalsy();
+	});
+
 	it("records fallback-resolved alias calls under the resolved tool's name", async () => {
 		// Providers reject `xd://recall` as a replayed function-call name, so the
 		// alias must not reach history, persistence, or the next request.
@@ -1480,6 +1694,67 @@ describe("agentLoop with AgentMessage", () => {
 		// The follow-up request replays the canonical name.
 		const replayed = mock.calls[1]?.context.messages.find((m): m is AssistantMessage => m.role === "assistant");
 		expect(replayed?.content).toContainEqual(expect.objectContaining({ type: "toolCall", name: "recall" }));
+	});
+
+	it("records a fallback-resolved facade alias under its target with the facade's own wire name", async () => {
+		// The wire name is what claude-code replay re-emits, so the alias must be
+		// canonicalized before the facade rewrite captures it.
+		const writeSchema = type({ path: "string", content: "string" });
+		const facadeSchema = type({ to: "string", message: "string" });
+		const write: AgentTool<typeof writeSchema> = {
+			name: "write",
+			label: "Write",
+			description: "write",
+			parameters: writeSchema,
+			async execute() {
+				return { content: [{ type: "text", text: "delivered" }] };
+			},
+		};
+		const facade: AgentTool<typeof facadeSchema> = {
+			name: "SendMessage",
+			persistAs: "write",
+			label: "Write",
+			description: "send",
+			parameters: facadeSchema,
+			execute: (id, params, signal, onUpdate, ctx) =>
+				write.execute(id, { path: `agent://${params.to}`, content: params.message }, signal, onUpdate, ctx),
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [write] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tool-1",
+							name: "xd://SendMessage",
+							arguments: { to: "Main", message: "hi" },
+						},
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			resolveFallbackTool: name => (name === "xd://SendMessage" ? facade : undefined),
+		};
+
+		const messages = await agentLoop(
+			[createUserMessage("ping main")],
+			context,
+			config,
+			undefined,
+			mock.stream,
+		).result();
+
+		const assistant = messages.find((m): m is AssistantMessage => m.role === "assistant");
+		expect(assistant?.content).toContainEqual(
+			expect.objectContaining({ type: "toolCall", id: "tool-1", name: "write", wireName: "SendMessage" }),
+		);
+		const result = messages.find((m): m is ToolResultMessage => m.role === "toolResult");
+		expect(result).toMatchObject({ toolCallId: "tool-1", toolName: "write", isError: false });
 	});
 
 	it("hands resolveFallbackTool the request's advertised snapshot", async () => {
@@ -1746,6 +2021,35 @@ describe("agentLoop with AgentMessage", () => {
 		if (tracedToolCall?.type === "toolCall") {
 			expect(tracedToolCall.intent).toBe("Read one file");
 		}
+	});
+
+	it("leaves vendor schemas untouched by intent tracing under a harness profile", async () => {
+		const toolSchema = type({ value: "string" });
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: params.value }] };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const config: AgentLoopConfig = {
+			model: getBundledModel("anthropic", "claude-opus-5"),
+			convertToLlm: identityConverter,
+			intentTracing: true,
+		};
+
+		const stream = agentLoop([createUserMessage("run")], context, config, undefined, mock.stream);
+		await stream.result();
+
+		const wireSchema = mock.calls[0]?.context.tools?.[0]?.parameters as
+			| { properties?: Record<string, unknown>; required?: string[] }
+			| undefined;
+		expect(Object.keys(wireSchema?.properties ?? {})).toEqual(["value"]);
+		expect(wireSchema?.required ?? []).not.toContain(INTENT_FIELD);
 	});
 
 	it("normalizes trailing periods from intent at extraction site", async () => {

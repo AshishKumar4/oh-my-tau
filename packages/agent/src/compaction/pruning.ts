@@ -380,12 +380,13 @@ function collectSupersededResults(
 	const newerByKey = new Map<string, NewerResults>();
 	for (let i = entries.length - 1; i >= start; i--) {
 		const entry = entries[i];
+		if (entry.type !== "message") continue;
 		const message = getToolResultMessage(entry);
 		if (!message || message.prunedAt !== undefined) continue;
 		const toolCall = toolCalls.get(message.toolCallId);
 		if (!toolCall) continue;
 		if (isProtectedToolResult(message, toolCall, protectedTools)) continue;
-		const key = supersedeKey(toolCall.name, toolCall.arguments as Record<string, unknown>);
+		const key = supersedeKey(toolCall.name, toolCall.arguments);
 		if (key === undefined) continue;
 		const separator = key.indexOf("\u0000");
 		const sameKey = newerByKey.get(key);
@@ -401,10 +402,10 @@ function collectSupersededResults(
 		newerByKey.set(key, newer);
 		if (!superseded) continue;
 		candidates.push({
-			entry: entry as SessionMessageEntry,
+			entry,
 			message,
 			index: i,
-			tokens: tokenizer.countMessage(message as AgentMessage),
+			tokens: tokenizer.countMessage(message),
 			notice: SUPERSEDED_NOTICE,
 		});
 	}

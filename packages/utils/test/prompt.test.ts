@@ -3,6 +3,20 @@ import * as prompt from "@oh-my-pi/pi-utils/prompt";
 
 const FULL = { renderPhase: "pre-render", replaceAsciiSymbols: true, normalizeRfc2119: true } as const;
 
+describe("argument-expanded template turnover", () => {
+	it("preserves live helper behavior and caller-held renderers across template turnover", () => {
+		prompt.registerHelper("roundTwoLabel", () => "first");
+		const render = prompt.compile("retained {{roundTwoLabel}}");
+		expect(render({})).toBe("retained first");
+		for (let index = 0; index < 600; index++) {
+			expect(prompt.render(`request ${index}: {{value}}`, { value: "payload" })).toBe(`request ${index}: payload`);
+		}
+		prompt.registerHelper("roundTwoLabel", () => "next");
+		expect(render({})).toBe("retained next");
+		expect(prompt.render("retained {{roundTwoLabel}}")).toBe("retained next");
+	});
+});
+
 describe("format: ascii symbol replacement", () => {
 	it("replaces all seven symbols in one line", () => {
 		expect(prompt.format("a -> b <- c <-> d != e <= f >= g ... h", FULL)).toBe("a → b ← c ↔ d ≠ e ≤ f ≥ g … h");

@@ -21,7 +21,14 @@ import {
 	USELESS_NOTICE,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ProtectedToolContext } from "@oh-my-pi/pi-agent-core/compaction/tool-protection";
-import type { AssistantMessage, ImageContent, Message, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type {
+	AssistantMessage,
+	ImageContent,
+	Message,
+	TextContent,
+	ToolCall,
+	ToolResultMessage,
+} from "@oh-my-pi/pi-ai";
 import { convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
@@ -153,6 +160,38 @@ const anthropicModel = buildModel({
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	contextWindow: 200_000,
 	maxTokens: 8_192,
+});
+
+describe("supersede view isolation", () => {
+	test.each(["raw", "conflicts", "2-4:raw"])(
+		"retains %s through a bare read and replaces it only on the same view",
+		selector => {
+			const [oldCall, oldResult] = readPair(`src/foo.ts:${selector}`, FILE_CONTENT, T0);
+			const [plainCall, plainResult] = readPair("src/foo.ts", FILE_CONTENT, T0 + 1000);
+			const history: SessionEntry[] = [oldCall, oldResult, plainCall, plainResult];
+			const retained = resultText(oldResult);
+			expect(pruneSupersededToolResults(history, tokenizer, cfg({ now: T0 + 1000 })).prunedCount).toBe(0);
+			expect(resultText(oldResult)).toBe(retained);
+			const [newCall, newResult] = readPair(`src/foo.ts:${selector}`, FILE_CONTENT, T0 + 2000);
+			history.push(newCall, newResult);
+			const changed = pruneSupersededToolResults(history, tokenizer, cfg({ now: T0 + 2000 }));
+			expect(changed.prunedCount).toBe(1);
+			expect(resultMessage(oldResult).prunedAt).toBeDefined();
+			expect(resultMessage(plainResult).prunedAt).toBeUndefined();
+			changed.undo();
+			expect(resultText(oldResult)).toBe(retained);
+		},
+	);
+
+	test.each(["skill://react", "https://example.com/page"])("does not supersede repeated resource %s", resource => {
+		const [oldCall, oldResult] = readPair(resource, FILE_CONTENT, T0);
+		const [newCall, newResult] = readPair(resource, FILE_CONTENT, T0 + 1000);
+		expect(
+			pruneSupersededToolResults([oldCall, oldResult, newCall, newResult], tokenizer, cfg({ now: T0 + 1000 }))
+				.prunedCount,
+		).toBe(0);
+		expect(resultMessage(oldResult).prunedAt).toBeUndefined();
+	});
 });
 
 describe("readToolSupersedeKey", () => {
@@ -967,7 +1006,7 @@ describe("warm-cache guard — prompt-cache lookback window", () => {
 
 	/** Lookback positions the Anthropic request converter emits for `entries`. */
 	function wirePositions(entries: SessionEntry[], nextInput?: Message): number {
-		const messages = entries.map(entry => (entry as SessionMessageEntry).message as Message);
+		const messages = defaultConvertToLlm(entries.flatMap(entry => (entry.type === "message" ? [entry.message] : [])));
 		if (nextInput) messages.push(nextInput);
 		let positions = 0;
 		let later: string | undefined;
@@ -983,7 +1022,7 @@ describe("warm-cache guard — prompt-cache lookback window", () => {
 	test("counts the issuing assistant turn: [text, tool_use] + result + 16 positions + prompt is out of reach", () => {
 		// The newest cache entry surviving the rewrite ends the message before the
 		// issuing turn, so its two blocks count too: 2 + 1 + 16 + 1 = 20 positions.
-		const text = { type: "text" as const, text: "Reading it." };
+		const text: TextContent = { type: "text", text: "Reading it." };
 		for (const pass of guardedPasses) {
 			const outOfReach = staleReadAround([text], smallTurns(7, T0 + 1_000));
 			expect(wirePositions(outOfReach.entries)).toBe(19);
@@ -1003,7 +1042,7 @@ describe("warm-cache guard — prompt-cache lookback window", () => {
 			],
 			timestamp: T0 + 3_000,
 		};
-		const text = { type: "text" as const, text: "Reading it." };
+		const text: TextContent = { type: "text", text: "Reading it." };
 		for (const pass of guardedPasses) {
 			const { stale, entries } = staleReadAround([text], [...smallTurns(6, T0 + 1_000), userEntry()]);
 			expect(wirePositions(entries, nextInput)).toBe(20);
@@ -1014,7 +1053,7 @@ describe("warm-cache guard — prompt-cache lookback window", () => {
 	});
 
 	test("13 stored positions prune and 14 do not, leaving room for input and unmodelled projections", () => {
-		const text = { type: "text" as const, text: "Reading it." };
+		const text: TextContent = { type: "text", text: "Reading it." };
 		for (const pass of guardedPasses) {
 			const inReach = staleReadAround([text], smallTurns(4, T0 + 1_000));
 			expect(wirePositions(inReach.entries)).toBe(13);
@@ -1077,8 +1116,8 @@ describe("warm-cache guard — prompt-cache lookback window", () => {
 					assistantMessage(
 						[
 							{ type: "text", text: "Checking everything at once." },
-							...callIds.map(id => ({
-								type: "toolCall" as const,
+							...callIds.map((id): ToolCall => ({
+								type: "toolCall",
 								id,
 								name: "bash",
 								arguments: { command: "true" },

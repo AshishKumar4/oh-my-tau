@@ -210,6 +210,23 @@ describe("fitOutputTokensToContextWindow", () => {
 		);
 	});
 
+	test("fits the output cap over a reference-backed image a GPT-6 reader cannot size", () => {
+		// Lazy frames and URL or provider-file images carry no bytes to read a size
+		// from; GPT-6 sizes `original` images without a pixel limit.
+		const gpt = getBundledModel("openai", "gpt-6.1-sol");
+		if (!gpt) throw new Error("Expected bundled openai/gpt-6.1-sol");
+		const context: Context = {
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "image", data: "", mimeType: "image/png", url: "https://example.com/frame.png" }],
+					timestamp: 0,
+				},
+			],
+		};
+		expect(fitOutputTokensToContextWindow(gpt, context, 32_000, new Tokenizer(gpt))).toBe(32_000);
+	});
+
 	test("never requests less than the floor, leaving a full window to compaction", () => {
 		expect(fitOutputTokensToContextWindow(deepseek, promptOf(990_000), undefined, tokenizer)).toBe(
 			MIN_FITTED_OUTPUT_TOKENS,
