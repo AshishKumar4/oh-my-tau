@@ -59,6 +59,7 @@ export function parseBind(raw: string): ParsedBind {
 function ipv6Groups(host: string): number[] | undefined {
 	const halves = host.split("::");
 	if (halves.length > 2) return undefined;
+	const [headText = "", tailText] = halves;
 	const parse = (part: string): number[] | undefined => {
 		if (part.length === 0) return [];
 		const groups: number[] = [];
@@ -68,10 +69,10 @@ function ipv6Groups(host: string): number[] | undefined {
 		}
 		return groups;
 	};
-	const head = parse(halves[0]!);
-	const tail = halves.length === 2 ? parse(halves[1]!) : [];
+	const head = parse(headText);
+	const tail = tailText === undefined ? [] : parse(tailText);
 	if (!head || !tail) return undefined;
-	if (halves.length === 1) return head.length === 8 ? head : undefined;
+	if (tailText === undefined) return head.length === 8 ? head : undefined;
 	const zeros = 8 - head.length - tail.length;
 	return zeros >= 1 ? [...head, ...Array<number>(zeros).fill(0), ...tail] : undefined;
 }
