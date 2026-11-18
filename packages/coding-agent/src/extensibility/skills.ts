@@ -312,6 +312,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		enablePiProject = true,
 		enableAgentsUser = true,
 		enableAgentsProject = true,
+		enableManagedUser = true,
 		customDirectories = [],
 		ignoredSkills = [],
 		manualSkills = [],
@@ -326,10 +327,11 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	}
 	function isSourceEnabled(source: SourceMeta): boolean {
 		const { provider, level } = source;
-		// Managed skills (auto-learn) are OMP-native and discovered unconditionally
-		// — third-party CLI toggles must never silently hide them (cf. #2401). The
-		// master `enabled` flag above still gates them.
-		if (provider === MANAGED_SKILLS_PROVIDER_ID) return true;
+		// Managed skills (auto-learn) are OMP-native and carry their own toggle —
+		// the third-party CLI toggles must never silently hide them (cf. #2401),
+		// but a caller that disables every source has to be able to disable this
+		// one too. The master `enabled` flag above still gates them.
+		if (provider === MANAGED_SKILLS_PROVIDER_ID) return enableManagedUser;
 		if (provider === "codex" && level === "user") return enableCodexUser || isUserSourceEnabled("codex");
 		if (provider === "claude" && level === "user") return enableClaudeUser || isUserSourceEnabled("claude");
 		if (provider === "claude" && level === "project") return enableClaudeProject;
@@ -551,13 +553,15 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// Managed (auto-learn) skills resolve dead-last with first-wins. Source from
 	// result.all (pre-dedup): capability-level dedup runs BEFORE isSourceEnabled,
 	// so a managed skill can be shadowed by a higher-priority authored skill that
-	// is itself disabled here — managed must stay visible regardless of toggles.
+	// is itself disabled here — managed must stay visible regardless of the OTHER
+	// providers' toggles. Its own `enableManagedUser` toggle still applies.
 	// Validate the on-disk name (a hand-placed managed file could carry an unsafe
 	// frontmatter name) and re-sanitize the description on read. Descriptions and
 	// names both render unescaped into the system prompt.
 	const managedCandidates = result.all.filter(
 		capSkill =>
 			capSkill._source.provider === MANAGED_SKILLS_PROVIDER_ID &&
+			isSourceEnabled(capSkill._source) &&
 			isValidManagedSkillName(capSkill.name) &&
 			!disabledSkillNames.has(capSkill.name) &&
 			!matchesIgnorePatterns(capSkill.name) &&

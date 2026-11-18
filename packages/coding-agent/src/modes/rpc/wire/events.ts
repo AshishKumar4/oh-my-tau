@@ -10,7 +10,7 @@ const MESSAGE_ID = doc("string", "Shared by the start, updates, and end of one m
 
 export const eventDefs = {
 	AutoCompactionReason: "'threshold' | 'overflow' | 'idle' | 'incomplete'",
-	AutoCompactionAction: "'context-full' | 'remote' | 'handoff' | 'shake' | 'snapcompact'",
+	AutoCompactionAction: "'context-full' | 'remote' | 'handoff' | 'shake' | 'snapcompact' | 'rewrite'",
 	CacheWarmingPhase: "'streaming' | 'idle'",
 	CacheWarmingOutcome: "'hit' | 'miss' | 'error' | 'aborted'",
 	NotifyType: "'info' | 'warning' | 'error'",
@@ -102,6 +102,10 @@ export const eventDefs = {
 			"result?": doc("CompactionResult", "Present when the compaction committed."),
 			aborted: doc("boolean", "The compaction was cancelled (abort, or a `session_before_compact` hook)."),
 			"skipped?": doc("boolean", "There was nothing to compact; `errorMessage` says why."),
+			"rewritten?": doc(
+				"boolean",
+				"A `session_before_compact` hook rewrote history in place and no boundary was needed.",
+			),
 			"errorMessage?": "string",
 		},
 		"Outcome of the compaction announced by the matching `manual_compaction_start`.",

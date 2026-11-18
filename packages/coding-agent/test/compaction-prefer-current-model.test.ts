@@ -164,6 +164,7 @@ describe("compaction prefers the current session model over modelRoles.default",
 		});
 
 		const result = await session.compact();
+		if (!result) throw new Error("expected a compaction result");
 
 		expect(result.summary).toBe("fallback summary");
 		expect(compactSpy).toHaveBeenCalledTimes(2);
@@ -225,7 +226,7 @@ describe("compaction prefers the current session model over modelRoles.default",
 			};
 		});
 
-		expect((await session.compact()).summary).toBe("fallback");
+		expect((await session.compact())?.summary).toBe("fallback");
 		expect(compactSpy.mock.calls.map(([, model]) => `${model.provider}/${model.id}`)).toEqual([
 			`${currentModel.provider}/${currentModel.id}`,
 			`${sameProvider.provider}/${sameProvider.id}`,

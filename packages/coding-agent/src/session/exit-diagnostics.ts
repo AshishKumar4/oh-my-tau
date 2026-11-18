@@ -1,9 +1,27 @@
 import { createSyntheticToolResultMessage, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { ASYNC_RESULT_MESSAGE_TYPE } from "./async-job-delivery";
 import type { SessionEntry } from "./session-entries";
 
 export const TOOL_EXECUTION_START_CUSTOM_TYPE = "tool_execution_start";
 export const SESSION_EXIT_CUSTOM_TYPE = "session_exit";
+export const SESSION_OPEN_CUSTOM_TYPE = "session_open";
+
+/**
+ * Marker a live session writes when it takes over a session file that already
+ * has history. A crash writes no `session_exit`, so this is what separates one
+ * process's entries from the next.
+ */
+export interface SessionOpenData {
+	pid: number;
+	/** `performance.timeOrigin` of the writing process; with `pid`, identifies it across reboots. */
+	processStartedAt: number;
+	recordedAt: string;
+}
+
+export function createSessionOpenData(): SessionOpenData {
+	return { pid: process.pid, processStartedAt: performance.timeOrigin, recordedAt: new Date().toISOString() };
+}
 
 /**
  * Compact projection of tool-call arguments persisted with the start marker.
@@ -110,19 +128,48 @@ export interface InterruptedTurnOptions {
 	assumeExit?: boolean;
 }
 
-/** A turn its process left unfinished: the branch's last message and when the process ended. */
+/** Custom messages that start a model turn when they arrive: a peer's message and a background job's result. */
+const TURN_PROMPT_CUSTOM_TYPES: Readonly<Record<string, true>> = {
+	"irc:incoming": true,
+	[ASYNC_RESULT_MESSAGE_TYPE]: true,
+};
+
+/**
+ * Whether `entry` asks the model for an answer: a user or developer message, or a
+ * model-visible custom message that starts a turn ({@link TURN_PROMPT_CUSTOM_TYPES}).
+ */
+export function isTurnPrompt(entry: SessionEntry): boolean {
+	if (entry.type === "message") return entry.message.role === "user" || entry.message.role === "developer";
+	return entry.type === "custom_message" && Object.hasOwn(TURN_PROMPT_CUSTOM_TYPES, entry.customType);
+}
+
+/**
+ * Whether the agent loop samples again after a reply with no tool calls: a
+ * `pause_turn` stop ends the provider's response, not the turn (agent-loop
+ * resamples it). Every other tool-free reply ends the loop.
+ */
+export function isPausedReply(message: AgentMessage): boolean {
+	return (
+		message.role === "assistant" &&
+		message.stopReason === "stop" &&
+		message.stopDetails?.type === "pause_turn" &&
+		!message.content.some(isToolCallContent)
+	);
+}
+
+/** A turn its process left unfinished: the assistant turn before its tail, and when the process ended. */
 interface UnfinishedTurn {
-	tail: AgentMessage;
 	previousAssistant: AssistantMessage | undefined;
 	recordedAt: string;
 }
 
 /**
- * The turn a branch's last process left unfinished: a non-terminal message tail
- * (a prompt or tool results the model never answered, tool calls without results)
- * followed by a process exit, recorded or (with `assumeExit`) assumed. A recorded
- * normal exit with nothing pending, a terminal assistant tail, and tool results that
- * close an aborted or failed turn leave nothing unfinished.
+ * The turn a branch's last process left unfinished: a tail that awaits the model
+ * (a prompt or tool results it never answered, tool calls without results, a
+ * paused reply; see {@link isTurnPrompt} and {@link isPausedReply}) followed by a
+ * process exit, recorded or (with `assumeExit`) assumed. A recorded normal exit
+ * with nothing pending, a terminal assistant reply, and tool results that close an
+ * aborted or failed turn leave nothing unfinished.
  */
 function findUnfinishedTurn(
 	entries: readonly SessionEntry[],
@@ -139,22 +186,23 @@ function findUnfinishedTurn(
 	}
 
 	let tailIndex = -1;
-	let tail: AgentMessage | undefined;
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index]!;
-		if (entry.type !== "message") continue;
+		if (entry.type !== "message" && !isTurnPrompt(entry)) continue;
 		tailIndex = index;
-		tail = entry.message;
 		break;
 	}
-	if (!tail) return undefined;
+	if (tailIndex < 0) return undefined;
+	const tailEntry = entries[tailIndex]!;
+	// A custom-message prompt tail awaits an answer like a user prompt.
+	const tail = tailEntry.type === "message" ? tailEntry.message : undefined;
 	if (!exit || tailIndex > exitIndex) {
 		if (!options?.assumeExit) return undefined;
 		exit = { reason: "restore", kind: "process_exit", recordedAt: new Date().toISOString() };
 	} else if (exit.kind === "normal" && !exit.pendingToolCalls?.length) {
 		return undefined;
 	}
-	if (tail.role === "assistant" && !tail.content.some(isToolCallContent)) return undefined;
+	if (tail?.role === "assistant" && !tail.content.some(isToolCallContent) && !isPausedReply(tail)) return undefined;
 
 	let previousAssistant: AssistantMessage | undefined;
 	for (let index = tailIndex; index >= 0; index--) {
@@ -164,12 +212,12 @@ function findUnfinishedTurn(
 		break;
 	}
 	if (
-		tail.role === "toolResult" &&
+		tail?.role === "toolResult" &&
 		(previousAssistant?.stopReason === "error" || previousAssistant?.stopReason === "aborted")
 	) {
 		return undefined;
 	}
-	return { tail, previousAssistant, recordedAt: exit.recordedAt };
+	return { previousAssistant, recordedAt: exit.recordedAt };
 }
 
 /** Whether `message` is the record exit recovery closed an unfinished turn with. */
@@ -182,16 +230,21 @@ export function isInterruptedTurnAbort(message: AgentMessage): boolean {
 }
 
 /**
- * Whether `omp --restore` has a turn to go on with on this branch: one its last
- * process left unfinished ({@link findUnfinishedTurn}, the exit assumed), or one exit
- * recovery already closed that nothing followed, not even a normal exit.
+ * Whether `/recover` (and so `omp --restore`) has a turn to go on with on this branch:
+ * one its last process left unfinished ({@link findUnfinishedTurn}, the exit assumed),
+ * or one exit recovery already closed that nothing followed, not even a normal exit.
+ * A normal exit only rules that out when no message or prompt ({@link isTurnPrompt})
+ * came after it.
  */
 export function hasRestorableTurn(entries: readonly SessionEntry[]): boolean {
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index]!;
 		const exit = readSessionExit(entry);
 		if (exit?.kind === "normal") return false;
-		if (entry.type !== "message") continue;
+		if (entry.type !== "message") {
+			if (isTurnPrompt(entry)) break;
+			continue;
+		}
 		if (isInterruptedTurnAbort(entry.message)) return true;
 		break;
 	}
@@ -232,6 +285,42 @@ export function createInterruptedTurnAbortMessage(
 		errorMessage: INTERRUPTED_TURN_ERROR,
 		timestamp: Number.isFinite(recordedAt) ? recordedAt : Date.now(),
 	};
+}
+
+/** Result text for a tool call a stopped OMP process left without a result. */
+export const INTERRUPTED_TOOL_RESULT_TEXT =
+	"The OMP process stopped before this tool call returned, so its outcome is unknown: it may have partially run. Check the current state, then re-run it if it is still needed.";
+
+/**
+ * Details of the result recorded for a tool call that a stopped OMP process
+ * left without one. The result pairs the call for the provider; the marker
+ * tells `/recover` that the call was cut off, not answered.
+ */
+export interface InterruptedToolResultDetails {
+	__processInterrupted: true;
+}
+
+/** The one result recorded for a tool call a stopped OMP process cut off, by resume and `/recover` alike. */
+export function createInterruptedToolResult(
+	call: { id: string; name: string },
+	timestamp = Date.now(),
+): ToolResultMessage<InterruptedToolResultDetails> {
+	return {
+		role: "toolResult",
+		toolCallId: call.id,
+		toolName: call.name,
+		content: [{ type: "text", text: INTERRUPTED_TOOL_RESULT_TEXT }],
+		details: { __processInterrupted: true },
+		isError: true,
+		timestamp,
+	};
+}
+
+/** Whether `message` is an {@link createInterruptedToolResult} placeholder rather than the call's real answer. */
+export function isInterruptedToolResult(
+	message: AgentMessage,
+): message is ToolResultMessage<InterruptedToolResultDetails> {
+	return message.role === "toolResult" && isObject(message.details) && message.details.__processInterrupted === true;
 }
 
 /**
@@ -278,18 +367,17 @@ export function createInterruptedToolResults(
 			results.push(createSyntheticToolResultMessage(call, "length"));
 			continue;
 		}
+		if (context === "process-exit") {
+			results.push(createInterruptedToolResult(call));
+			continue;
+		}
+		// A fork's parent may still finish the call, so the result is no `/recover` placeholder.
 		results.push({
 			role: "toolResult",
 			toolCallId: call.id,
 			toolName: call.name,
 			content: [
-				{
-					type: "text",
-					text:
-						context === "fork"
-							? "The parent session may still be running this tool; its outcome is unknown."
-							: "Previous OMP process exited before this tool returned; its outcome is unknown.",
-				},
+				{ type: "text", text: "The parent session may still be running this tool; its outcome is unknown." },
 			],
 			isError: true,
 			timestamp: Date.now(),
@@ -328,7 +416,8 @@ export function summarizeToolArguments(args: unknown): ToolArgumentSummary | und
 	return summary.command !== undefined || summary.path !== undefined ? summary : undefined;
 }
 
-function readToolExecutionStart(entry: SessionEntry): ToolExecutionStartData | undefined {
+/** The `tool_execution_start` marker `entry` records, if it is one. */
+export function readToolExecutionStart(entry: SessionEntry): ToolExecutionStartData | undefined {
 	if (entry.type !== "custom" || entry.customType !== TOOL_EXECUTION_START_CUSTOM_TYPE) return undefined;
 	const data = entry.data;
 	if (!isObject(data)) return undefined;

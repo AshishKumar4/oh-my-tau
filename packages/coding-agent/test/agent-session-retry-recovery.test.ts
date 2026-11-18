@@ -706,16 +706,22 @@ describe("AgentSession retry recovery", () => {
 		expect(errors[0].message.retryRecovery).toMatchObject({ recovery: "plain" });
 	});
 
-	it("still consults the fallback chain for a Codex steering rejection when no same-model retry is left", async () => {
-		// With `retry.maxRetries: 0` the chain is the only recovery left.
-		const { primary, fallback, requestedModels, fallbackEvents } = await runFallbackChainRecovery(
+	it("does not walk the fallback chain for a Codex steering rejection even when no same-model retry is left", async () => {
+		// The refusal classifies as a stale Responses replay (fork 6f422a4765): it
+		// resets the provider session and retries the same model, and never walks
+		// the fallback chain. With `retry.maxRetries: 0` the turn ends on the primary.
+		// Deliberately differs from upstream 1979aea2dc (#14242), whose chain takes a
+		// last-resort consult once the budget is spent: the refusal is session state,
+		// not a model failure, and a fallback that pins the session to another model
+		// is the bug 6f422a4765 fixed. Keep this when merging upstream.
+		const { primary, requestedModels, fallbackEvents } = await runFallbackChainRecovery(
 			[steerRejectedAfterThinking, { content: ["recovered on fallback"], stopReason: "stop" }],
 			0,
 			codexModels,
 		);
 
-		expect(requestedModels).toEqual([primary, fallback]);
-		expect(fallbackEvents).toHaveLength(1);
+		expect(requestedModels).toEqual([primary]);
+		expect(fallbackEvents).toEqual([]);
 	});
 
 	it("maps assistant error presentation for recovered, unrecovered, and silent abort turns", () => {

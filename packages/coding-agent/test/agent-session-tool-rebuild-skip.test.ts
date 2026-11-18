@@ -21,6 +21,7 @@ import { listXdevTools, XDEV_EXTERNAL_DESCRIPTION_CAP, type XdevState } from "@o
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { logger } from "@oh-my-pi/pi-utils";
+import { createInMemoryModelRegistry } from "./helpers/agent-session-setup";
 
 import { cfgSkillful } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { cfgStartupQuiet } from "@oh-my-pi/pi-coding-agent/modes/settings";
@@ -29,6 +30,8 @@ import {
 	cfgToolsXdevInlineDevices,
 	cfgToolsXdevNotices,
 } from "@oh-my-pi/pi-coding-agent/tools/settings";
+
+const registries: Array<ReturnType<typeof createInMemoryModelRegistry>> = [];
 
 // Cache-stability invariant: when MCP servers reconnect with byte-identical tool
 // definitions, `refreshMCPTools` must not rebuild the system prompt. A rebuild
@@ -107,6 +110,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 			await session.dispose();
 		}
 		vi.restoreAllMocks();
+		for (const registry of registries.splice(0)) registry.authStorage.close();
 	});
 
 	interface NewSessionOptions {
@@ -187,11 +191,13 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 				: undefined,
 		});
 		const activeToolNames = new Set(agent.state.tools.map(tool => tool.name));
+		const registry = createInMemoryModelRegistry(createModel().provider);
+		registries.push(registry);
 		const session = new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { getApiKey: async () => "test-key" } as never,
+			modelRegistry: registry,
 			toolRegistry,
 			createVibeTools: options.createVibeTools,
 			builtInToolNames: options.xdev && !options.lazyWrite ? ["read", "write"] : ["read"],

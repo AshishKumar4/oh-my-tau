@@ -472,6 +472,10 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 				providerTimed: true,
 				baseUrl: model.baseUrl,
 				modelId: model.id,
+				// The pools the model routes to, the failure text, and the row that served it (none in this fixture).
+				accountIds: undefined,
+				errorMessage: failed.errorMessage,
+				credentialId: undefined,
 				signal: expect.any(AbortSignal),
 			});
 		} finally {

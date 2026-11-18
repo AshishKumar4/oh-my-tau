@@ -2,7 +2,7 @@ import type { AgentEvent, AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort } from "@oh-my-pi/pi-ai";
 import type { Rule } from "../capability/rule";
-import type { RetryErrorUpdate } from "../extensibility/shared-events";
+import type { AutoCompactionAction, RetryErrorUpdate } from "../extensibility/shared-events";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import type { GoalModeState } from "../goals/state";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
@@ -44,11 +44,11 @@ export type AgentSessionEvent =
 	| {
 			type: "auto_compaction_start";
 			reason: "threshold" | "overflow" | "idle" | "incomplete";
-			action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
+			action: AutoCompactionAction;
 	  }
 	| {
 			type: "auto_compaction_end";
-			action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
+			action: AutoCompactionAction;
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
@@ -72,6 +72,8 @@ export type AgentSessionEvent =
 			aborted: boolean;
 			/** True when there was nothing to compact; `errorMessage` says why. */
 			skipped?: boolean;
+			/** True when a `session_before_compact` hook rewrote history in place and no boundary was needed. */
+			rewritten?: boolean;
 			errorMessage?: string;
 	  }
 	| {

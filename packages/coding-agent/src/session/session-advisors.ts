@@ -76,6 +76,7 @@ import {
 } from "../advisor";
 import { evictStaleToolResults } from "../advisor/tool-result-eviction";
 import { cfgOffline } from "../config/auxiliary-model-policy";
+import { candidateApiKey } from "../config/account-pools";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
@@ -2126,7 +2127,9 @@ export class SessionAdvisors {
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		if (!primaryModel || !this.#canReplayAdvisorHistory(advisor, primaryModel)) return;
-		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, advisor.providerSessionId, { signal });
+		const apiKey = await candidateApiKey(this.#host.modelRegistry, primaryModel, advisor.providerSessionId, {
+			signal,
+		});
 		if (!apiKey) return;
 		signal.throwIfAborted();
 
@@ -2187,7 +2190,13 @@ export class SessionAdvisors {
 			const rotation = await this.#host.modelRegistry.authStorage.limits.rotate(
 				currentModel.provider,
 				advisor.providerSessionId,
-				{ error: message, modelId: currentModel.id, signal },
+				{
+					error: message,
+					modelId: currentModel.id,
+					baseUrl: currentModel.baseUrl,
+					accountIds: this.#host.modelRegistry.accountIdsForModel(currentModel.provider, currentModel.id),
+					signal,
+				},
 			);
 			if (rotation.switched && this.#spendCredentialSwitch(advisor, currentModel.provider)) return true;
 		}
@@ -2211,6 +2220,8 @@ export class SessionAdvisors {
 					providerTimed: retryAfterMs !== undefined,
 					baseUrl: currentModel.baseUrl,
 					modelId: currentModel.id,
+					accountIds: this.#host.modelRegistry.accountIdsForModel(currentModel.provider, currentModel.id),
+					errorMessage: message,
 					signal,
 				},
 			);
@@ -2286,7 +2297,9 @@ export class SessionAdvisors {
 				if (cfgOffline.get(this.#host.settings) && candidate.provider !== this.#host.agent.state.model?.provider)
 					continue;
 				if (!this.#canReplayAdvisorHistory(advisor, candidate)) continue;
-				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, { signal });
+				const apiKey = await candidateApiKey(this.#host.modelRegistry, candidate, advisor.providerSessionId, {
+					signal,
+				});
 				if (!apiKey) continue;
 				signal.throwIfAborted();
 
@@ -2621,7 +2634,9 @@ export class SessionAdvisors {
 		});
 
 		for (const candidate of candidates) {
-			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisorProviderSessionId, { signal });
+			const apiKey = await candidateApiKey(this.#host.modelRegistry, candidate, advisorProviderSessionId, {
+				signal,
+			});
 			if (!apiKey) continue;
 			if (
 				nativeCompactionFailure &&

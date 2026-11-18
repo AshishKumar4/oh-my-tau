@@ -217,7 +217,7 @@ describe("switch after an OpenAI remote compaction", () => {
 
 		const result = await session.compact(undefined, { readerModel: claude });
 
-		expect(result.summary).toBe("portable summary by openai");
+		expect(result?.summary).toBe("portable summary by openai");
 		expect(compactSpy).toHaveBeenCalledTimes(1);
 		// Soft summarization re-expands the history behind the remote boundary.
 		expect(countFacts(JSON.stringify(compactSpy.mock.calls[0]![0].messagesToSummarize))).toBeGreaterThan(0);

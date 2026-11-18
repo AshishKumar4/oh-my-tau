@@ -26,7 +26,8 @@ import { fallbackCreditTargets } from "@oh-my-pi/pi-catalog/compat/fallback-cred
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
-import { isUnexpectedSocketCloseMessage, logger, prompt, sleepLong, sleepUntil } from "@oh-my-pi/pi-utils";
+import { APP_NAME, isUnexpectedSocketCloseMessage, logger, prompt, sleepLong, sleepUntil } from "@oh-my-pi/pi-utils";
+import { candidateApiKey } from "../config/account-pools";
 import { cfgOffline } from "../config/auxiliary-model-policy";
 import type { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
@@ -885,6 +886,11 @@ export class TurnRecovery {
 							providerTimed: parsedRetryAfterMs !== undefined,
 							baseUrl: activeModel.baseUrl,
 							modelId: activeModel.id,
+							accountIds: this.#host.modelRegistry.accountIdsForModel(activeModel.provider, activeModel.id),
+							errorMessage,
+							// The row that served the failed turn, not the session's current pin:
+							// cross-pool fallback can move the pin between the request and recovery.
+							credentialId: message.provider === activeModel.provider ? message.credentialId : undefined,
 							signal: bookkeepingTimeout,
 						},
 					);
@@ -913,6 +919,29 @@ export class TurnRecovery {
 			this.#usageLimitOutcomes.set(message, recorded);
 		}
 		return (await recorded).switchedCredential;
+	}
+
+	/**
+	 * Final error for a credential failure that no credential or model could absorb.
+	 * An Anthropic key rejected for its workspace gets the fix. A usage limit, when
+	 * the provider holds more than one pooled credential, names each pool, how many
+	 * members are exhausted, and when the earliest becomes usable again.
+	 */
+	#credentialFailureError(errorMessage: string, id: number): string {
+		const model = this.#host.model();
+		if (model?.provider === "anthropic" && AIError.isAnthropicWorkspaceDenial(errorMessage)) {
+			return `${errorMessage}\nAn API key in the anthropic key pool is not scoped to a workspace. Re-add it with /login anthropic › Add API key, or \`${APP_NAME} auth keys add anthropic\`, to set the workspace its requests use.`;
+		}
+		if (!model || !AIError.is(id, AIError.Flag.UsageLimit)) return errorMessage;
+		const pools = this.#host.modelRegistry.authStorage.limits.pools(model.provider, model.id, this.#host.sessionId());
+		const members = pools.reduce((total, pool) => total + pool.members, 0);
+		if (members < 2 || pools.some(pool => pool.retryAtMs === undefined)) return errorMessage;
+		const label = { oauth: "subscription", api_key: "API key" } as const;
+		const summary = pools
+			.map(pool => `${pool.members} ${label[pool.kind]}${pool.members === 1 ? "" : "s"}`)
+			.join(" and ");
+		const retryAt = new Date(Math.min(...pools.map(pool => pool.retryAtMs ?? Number.POSITIVE_INFINITY)));
+		return `Every ${model.provider} credential is exhausted (${summary}). The earliest becomes usable again at ${retryAt.toLocaleString()}. Last error: ${errorMessage}`;
 	}
 
 	/** Prompts after transient overlap with a prior agent run. `onClaimed` fires synchronously
@@ -2262,10 +2291,13 @@ export class TurnRecovery {
 		options?: { pinFallback?: boolean; apiKey?: string; signal?: AbortSignal; reason?: string },
 	): Promise<boolean> {
 		const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
-		const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
-		if (!candidate) {
+		const found = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+		if (!found) {
 			throw new Error(`Retry fallback model not found: ${selector.raw}`);
 		}
+		// The row this session adopts: the agent fits every model to the session's own
+		// window settings, so the swap below lands on this, not on the registry's row.
+		const candidate = this.#host.modelRegistry.fitContextWindow(found, this.#host.settings);
 		if (cfgOffline.get(this.#host.settings) && candidate.provider !== this.#host.model()?.provider) return false;
 		const apiKey =
 			options?.apiKey ??
@@ -2464,15 +2496,7 @@ export class TurnRecovery {
 				if (!this.#host.contextFitsModel(candidate, options?.preserveFailedTurn ? undefined : failedMessage)) {
 					continue;
 				}
-				// A session restricted to an OAuth account pool throws for a provider
-				// none of its pooled accounts can serve; that candidate is unavailable,
-				// exactly like one without a credential.
-				let apiKey: string | undefined;
-				try {
-					apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
-				} catch (error) {
-					if (!(error instanceof AIError.MissingApiKeyError)) throw error;
-				}
+				const apiKey = await candidateApiKey(this.#host.modelRegistry, candidate, this.#host.sessionId());
 				if (!apiKey) continue;
 				const previousEditMode = this.#host.resolveActiveEditMode();
 				const previousSystemPrompt = [...this.#host.agent.state.systemPrompt];
@@ -2622,7 +2646,7 @@ export class TurnRecovery {
 		if (!model) return false;
 		const baseModel = this.#host.modelRegistry.find("fireworks", toFireworksBaseModelId(model.id));
 		if (!baseModel) return false;
-		const apiKey = await this.#host.modelRegistry.getApiKey(baseModel, this.#host.sessionId());
+		const apiKey = await candidateApiKey(this.#host.modelRegistry, baseModel, this.#host.sessionId());
 		if (!apiKey) return false;
 		const baseSelector = formatModelStringWithRouting(baseModel);
 		const previousEditMode = this.#host.resolveActiveEditMode();
@@ -2684,7 +2708,7 @@ export class TurnRecovery {
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		if (!primaryModel) return false;
 		if (cfgOffline.get(this.#host.settings) && primaryModel.provider !== currentModel.provider) return false;
-		const apiKey = await this.#host.modelRegistry.getApiKey(primaryModel, this.#host.sessionId());
+		const apiKey = await candidateApiKey(this.#host.modelRegistry, primaryModel, this.#host.sessionId());
 		if (!apiKey) return false;
 
 		const currentThinkingLevel = this.#host.configuredThinkingLevel();
@@ -2990,6 +3014,7 @@ export class TurnRecovery {
 						error: errorMessage,
 						modelId: currentModel.id,
 						baseUrl: currentModel.baseUrl,
+						accountIds: this.#host.modelRegistry.accountIdsForModel(currentModel.provider, currentModel.id),
 						signal: rotateAbortController.signal,
 						waitForSibling: rotationsRemaining > 0,
 					})
@@ -3189,9 +3214,10 @@ export class TurnRecovery {
 		} else if (retryBudgetExhausted) {
 			if (!switchedModel && !switchedCredential) {
 				const attempt = this.#retryAttempt - 1;
-				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
+				const finalError = this.#credentialFailureError(errorMessage, id);
+				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${finalError}`;
 				await this.#closeRetrySaga(
-					{ success: false, attempt, finalError: errorMessage },
+					{ success: false, attempt, finalError },
 					{ terminalTurn: message, retryErrors: { status: "superseded" } },
 				);
 				return false;
@@ -3258,10 +3284,11 @@ export class TurnRecovery {
 					success: false,
 					attempt,
 					// A billing cap has no wait to report — the account is out of
-					// money — so the message the user acts on is the provider's own.
+					// money — so the message the user acts on is the provider's own
+					// (with every exhausted pool named when several are spent).
 					finalError: billingCap
-						? errorMessage
-						: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
+						? this.#credentialFailureError(errorMessage, id)
+						: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${this.#credentialFailureError(errorMessage, id)}`,
 				},
 				{ terminalTurn: message },
 			);
@@ -3587,7 +3614,6 @@ export class TurnRecovery {
 			} else {
 				// Remove the failed/aborted assistant message plus its synthetic tool
 				// results (same as auto-retry does before re-attempting), keeping the
-				// trailing context deliveries the continuation is sent with.
 				this.#host.agent.replaceMessages([
 					...messages.slice(0, activeTurnEnd - 1),
 					...messages.slice(conversationEnd(messages)),

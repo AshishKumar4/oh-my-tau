@@ -29,7 +29,7 @@ import ttsrProseNoticeTemplate from "../prompts/system/ttsr-prose-notice.md" wit
 import ttsrToolReminderTemplate from "../prompts/system/ttsr-tool-reminder.md" with { type: "text" };
 import ttsrWarningTemplate from "../prompts/system/ttsr-warning.md" with { type: "text" };
 import type { AgentSessionEvent } from "./agent-session-events";
-import { escapeHarnessTags } from "./harness-tags";
+import { escapeHarnessText } from "../harness/content";
 import type { SessionManager } from "./session-manager";
 import { TtsrToolInspector } from "./ttsr-outputs";
 
@@ -234,7 +234,7 @@ export class TtsrCoordinator {
 					name: rule.name,
 					path: this.#displayRulePath(rule.path),
 					matched:
-						matched[rule.name] === undefined ? undefined : escapeHarnessTags(JSON.stringify(matched[rule.name])),
+						matched[rule.name] === undefined ? undefined : escapeHarnessText(JSON.stringify(matched[rule.name])),
 					content: rule.content,
 				}),
 			)
@@ -372,7 +372,7 @@ export class TtsrCoordinator {
 					name: rule.name,
 					path: this.#displayRulePath(rule.path),
 					matched:
-						matched[rule.name] === undefined ? undefined : escapeHarnessTags(JSON.stringify(matched[rule.name])),
+						matched[rule.name] === undefined ? undefined : escapeHarnessText(JSON.stringify(matched[rule.name])),
 					content: rule.content,
 				}),
 			)

@@ -330,7 +330,8 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		// model's reasoning policy: an Anthropic reader gets no `¶think:` scope.
 		await createSession({ frameCount: SEEDED_FRAME_COUNT });
 		const isCompaction = (entry: { type: string }): entry is CompactionEntry => entry.type === "compaction";
-		const stale = sessionManager.getBranch().findLast(isCompaction)!;
+		const stale = sessionManager.getBranch().findLast(isCompaction);
+		if (!stale) throw new Error("Expected the seeded compaction entry");
 		const text = Array.from(
 			{ length: 40 },
 			(_, i) => `¶user: turn ${i}\n¶think: private plan ${i}\n\nstill planning ${i}\n¶ai: reply ${i}`,
@@ -355,10 +356,12 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 
 		await triggerMaintenance();
 
-		const rebuilt = sessionManager.getBranch().findLast(isCompaction)!;
+		const rebuilt = sessionManager.getBranch().findLast(isCompaction);
+		const rebuiltArchive = snapcompact.getPreservedArchive(rebuilt?.preserveData);
+		if (!rebuilt || !rebuiltArchive) throw new Error("Expected a rebuilt snapcompact archive");
 		expect(rebuilt.id).not.toBe(stale.id);
 		expect(rebuilt.summary).not.toContain("¶think:");
-		const rebuiltText = snapcompact.archiveSourceText(snapcompact.getPreservedArchive(rebuilt.preserveData)!);
+		const rebuiltText = snapcompact.archiveSourceText(rebuiltArchive);
 		expect(rebuiltText).toContain("reply 39");
 		expect(rebuiltText).not.toContain("planning");
 	});
@@ -417,6 +420,7 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		expect(atPrice.frames).toBeGreaterThan(atCeiling.frames);
 		expect(atPrice.frames).toBeLessThan(SEEDED_FRAME_COUNT);
 	});
+
 	it("rebuilds the just-written archive when a completed pass dead-ends on its own frames", async () => {
 		// POST-PASS shape (observed live on 17.0.8): compaction ran and wrote a
 		// frame archive, but the archive itself is the over-budget cost — each

@@ -125,7 +125,9 @@ describe("AgentSession.resume", () => {
 
 	it("returns an uncredentialed prompt for retry and refuses context-free resume", async () => {
 		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		// No credential at all: none resolves, and none is configured to retry on the request path.
 		const getApiKey = spyOn(registry, "getApiKey").mockResolvedValue(undefined);
+		const configured = spyOn(registry, "hasConfiguredAuth").mockReturnValue(false);
 		try {
 			const { session, mock } = createSession([{ content: ["answer"] }], { registry });
 			const dropped: string[] = [];
@@ -137,6 +139,7 @@ describe("AgentSession.resume", () => {
 			expect(mock.calls).toHaveLength(0);
 			expect(session.agent.state.messages).toEqual([]);
 			getApiKey.mockResolvedValue("test-key");
+			configured.mockRestore();
 			await session.prompt(dropped[0]);
 			await session.waitForIdle();
 			expect(session.agent.state.messages.map(message => [message.role, textOf(message)])).toEqual([
