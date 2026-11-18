@@ -25,6 +25,7 @@ import {
 	getOAuthProviders,
 	isSameOAuthAccount,
 	listProvidersWithEnvKey,
+	maskApiKey,
 	matchesReplacementCredential,
 	type OAuthCredential,
 	type OAuthProvider,
@@ -550,7 +551,7 @@ interface MigrateSkip {
 }
 
 function credentialIdentity(provider: string, credential: AuthCredential): string {
-	if (credential.type === "api_key") return "(api key)";
+	if (credential.type === "api_key") return `(api key ${maskApiKey(credential.key)})`;
 	const base = credential.email ?? credential.accountId ?? credential.projectId ?? `<${provider} oauth>`;
 	return credential.orgId ? `${base} (${credential.orgName ?? credential.orgId})` : base;
 }
@@ -560,7 +561,8 @@ function credentialIdentity(provider: string, credential: AuthCredential): strin
  * An OAuth row is held when uploading it would replace a broker row (the store's
  * own identity match), so no upload overwrites the broker's newer refresh token,
  * or when a broker row is the same account stored under another identity key, so
- * no upload duplicates it. API keys collapse to a single one per provider.
+ * no upload duplicates it. For an API key the key bytes are the identity: a
+ * provider may pool several distinct keys.
  */
 function brokerAlreadyHas(
 	existing: readonly AuthCredentialSnapshotEntry[],
@@ -569,7 +571,9 @@ function brokerAlreadyHas(
 ): boolean {
 	return existing.some(entry => {
 		if (entry.provider !== provider) return false;
-		if (credential.type === "api_key") return entry.credential.type === "api_key";
+		if (credential.type === "api_key") {
+			return entry.credential.type === "api_key" && entry.credential.key === credential.key;
+		}
 		return (
 			entry.credential.type === "oauth" &&
 			(matchesReplacementCredential(provider, entry.credential, entry.identityKey, credential) ||
@@ -602,7 +606,7 @@ async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> 
 	// 1. Local SQLite rows.
 	const localDbPath = getAgentDbPath();
 	const localStore = await SqliteAuthCredentialStore.open(localDbPath);
-	const plannedApiKeyProviders = new Set<string>();
+	const plannedApiKeys = new Set<string>();
 	try {
 		for (const row of localStore.listAuthCredentials()) {
 			// Skip placeholder sentinels that pi-ai treats as "authenticated via
@@ -613,7 +617,7 @@ async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> 
 				skipped.push({
 					source: "local-sqlite",
 					provider: row.provider,
-					identity: "(api key)",
+					identity: credentialIdentity(row.provider, row.credential),
 					reason: "placeholder sentinel '<authenticated>' is not a real key",
 				});
 				continue;
@@ -637,16 +641,19 @@ async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> 
 				});
 				continue;
 			}
-			if (row.credential.type === "api_key" && plannedApiKeyProviders.has(row.provider)) {
-				skipped.push({
-					source: "local-sqlite",
-					provider: row.provider,
-					identity,
-					reason: "another local api_key for this provider already planned",
-				});
-				continue;
+			if (row.credential.type === "api_key") {
+				const plannedKey = `${row.provider}\0${row.credential.key}`;
+				if (plannedApiKeys.has(plannedKey)) {
+					skipped.push({
+						source: "local-sqlite",
+						provider: row.provider,
+						identity,
+						reason: "the same api_key is already planned",
+					});
+					continue;
+				}
+				plannedApiKeys.add(plannedKey);
 			}
-			if (row.credential.type === "api_key") plannedApiKeyProviders.add(row.provider);
 			plan.push({ source: "local-sqlite", provider: row.provider, credential: row.credential, identity });
 		}
 	} finally {
@@ -660,26 +667,22 @@ async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> 
 			if (!envValue) continue;
 			if (envValue === "<authenticated>") continue; // Bedrock/Vertex sentinels — not literal keys.
 			const credential: AuthCredential = { type: "api_key", key: envValue };
+			const identity = credentialIdentity(provider, credential);
 			if (brokerAlreadyHas(existing, provider, credential)) {
-				skipped.push({
-					source: "env",
-					provider,
-					identity: "(api key)",
-					reason: "already on broker (provider has an api_key)",
-				});
+				skipped.push({ source: "env", provider, identity, reason: "already on broker" });
 				continue;
 			}
-			// Also skip if local SQLite already produced an entry for this provider in this batch.
+			// A provider that already migrates stored keys does not also need its env key.
 			if (plan.some(p => p.provider === provider && p.credential.type === "api_key")) {
 				skipped.push({
 					source: "env",
 					provider,
-					identity: "(api key)",
+					identity,
 					reason: "local SQLite already supplied an api_key for this provider",
 				});
 				continue;
 			}
-			plan.push({ source: "env", provider, credential, identity: "(api key)" });
+			plan.push({ source: "env", provider, credential, identity });
 		}
 	}
 

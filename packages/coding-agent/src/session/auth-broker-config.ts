@@ -46,6 +46,7 @@ import {
 	cfgAuthAccountPolicies,
 	cfgAuthBrokerToken,
 	cfgAuthBrokerUrl,
+	cfgAuthPoolOrder,
 	cfgOperatorUnpausedProviders,
 } from "../config/model-settings";
 import { cfgRetryUsageReservePct } from "./settings";
@@ -82,7 +83,10 @@ export async function resolveEffectiveSettings({
 	return Settings.loadReadOnly({ cwd, agentDir });
 }
 
-/** Resolve `auth.accountPolicies` + `retry.usageReservePct` from effective settings (SDK discovery, auth-gateway). */
+/**
+ * Resolve `auth.accountPolicies`, `retry.usageReservePct`, and `auth.poolOrder` from
+ * effective settings (SDK discovery, auth-gateway).
+ */
 export async function loadEffectiveAuthAccountPolicyConfig(
 	scope: EffectiveSettingsScope = {},
 ): Promise<AuthAccountPolicyConfig> {
@@ -90,6 +94,7 @@ export async function loadEffectiveAuthAccountPolicyConfig(
 	return loadAuthAccountPolicyConfig({
 		accountPolicies: cfgAuthAccountPolicies.get(settings),
 		usageReservePct: cfgRetryUsageReservePct.get(settings),
+		poolOrder: cfgAuthPoolOrder.get(settings),
 	});
 }
 
@@ -138,6 +143,7 @@ const cfgAuthStorageSettings = combine({
 	accountPolicies: cfgAuthAccountPolicies,
 	usageReservePct: cfgRetryUsageReservePct,
 	unpausedProviders: cfgOperatorUnpausedProviders,
+	poolOrder: cfgAuthPoolOrder,
 });
 
 /**
@@ -163,7 +169,7 @@ export interface AuthStorageSettingsSync {
 
 /**
  * Keeps a long-lived `authStorage` in step with the auth settings of `scope`:
- * - `auth.accountPolicies` / `retry.usageReservePct` re-apply account routing policy.
+ * - `auth.accountPolicies` / `retry.usageReservePct` / `auth.poolOrder` re-apply account routing policy.
  * - `auth.unpausedProviders` (operator layers only) re-applies which paused providers are back
  *   on — loaded credential pools refilter on their next read — and refreshes `modelRegistry`'s
  *   catalog for each newly unpaused provider, as a login does.
@@ -232,7 +238,8 @@ export function createAuthStorageSettingsSync(
 		const brokerChanged = next.brokerUrl !== previous.brokerUrl || next.brokerToken !== previous.brokerToken;
 		const policiesChanged =
 			next.usageReservePct !== previous.usageReservePct ||
-			!Bun.deepEquals(next.accountPolicies, previous.accountPolicies);
+			!Bun.deepEquals(next.accountPolicies, previous.accountPolicies) ||
+			!Bun.deepEquals(next.poolOrder, previous.poolOrder);
 		const unpausedChanged = !Bun.deepEquals(next.unpausedProviders, previous.unpausedProviders);
 		const unpausedAdded = next.unpausedProviders.filter(provider => !previous.unpausedProviders.includes(provider));
 		pending = pending.then(async () => {

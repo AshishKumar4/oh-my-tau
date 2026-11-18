@@ -1,26 +1,30 @@
 /**
- * Copy stored provider credentials between machines.
+ * `omp auth` — provider credentials.
+ *
+ * `omp auth keys <add|list|remove> <provider> [id]` manages pooled API keys.
  *
  * `omp auth export` prints every active credential in the local credential
  * store (`agent.db`) as JSON — API keys and OAuth logins, refresh tokens
  * included. `omp auth import <file>` merges such a file into the local store:
  * an imported OAuth login replaces the stored login of the same provider
- * account, an imported API key replaces the provider's stored API key, and
- * everything else is kept.
+ * account, an imported pooled API key replaces the same pooled key, an
+ * imported static API key replaces the provider's static key, and everything
+ * else is kept.
  */
+import { type } from "@oh-my-pi/omptype";
 import {
 	type AuthCredential,
 	type AuthCredentialStore,
 	isSameOAuthAccount,
 	matchesReplacementCredential,
-	type OAuthCredential,
-	REMOTE_REFRESH_SENTINEL,
 	resolveCredentialIdentityKey,
 	SqliteAuthCredentialStore,
 } from "@oh-my-pi/pi-ai";
-import { getAgentDbPath, isEnoent, isRecord } from "@oh-my-pi/pi-utils";
+import { writableAuthCredentialSchema } from "@oh-my-pi/pi-ai/auth-broker/wire-schemas";
+import { APP_NAME, getAgentDbPath, isEnoent, isRecord } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
-import { Args, CliUsageError, Command } from "@oh-my-pi/pi-utils/cli";
+import { Args, CliUsageError, Command, Flags } from "@oh-my-pi/pi-utils/cli";
+import { AUTH_KEYS_ACTIONS, runAuthKeysCommand } from "../cli/auth-keys-cli";
 import { authHelp as commandHelp } from "../cli/command-help";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 
@@ -65,32 +69,15 @@ export function exportAuthCredentials(store: Pick<AuthCredentialStore, "listAuth
 	};
 }
 
+/**
+ * One credential of an export, validated by the schema the auth broker applies
+ * to credential uploads: a writable API key or OAuth login (never a broker
+ * snapshot's refresh sentinel), with its provider-specific fields kept.
+ */
 function parseCredential(value: unknown, where: string): AuthCredential {
-	if (!isRecord(value)) throw new AuthTransferError(`${where}: credential is not an object.`);
-	if (value.type === "api_key") {
-		if (typeof value.key !== "string" || value.key.length === 0) {
-			throw new AuthTransferError(`${where}: API key credential has no key.`);
-		}
-		return value.source === "login"
-			? { type: "api_key", key: value.key, source: "login" }
-			: { type: "api_key", key: value.key };
-	}
-	if (value.type === "oauth") {
-		if (typeof value.access !== "string" || typeof value.refresh !== "string" || typeof value.expires !== "number") {
-			throw new AuthTransferError(
-				`${where}: OAuth credential needs string access/refresh tokens and a numeric expires.`,
-			);
-		}
-		if (value.refresh === REMOTE_REFRESH_SENTINEL) {
-			throw new AuthTransferError(
-				`${where}: OAuth credential has no refresh token (it comes from an auth-broker snapshot).`,
-			);
-		}
-		// Required fields are checked above; the optional identity fields are
-		// carried as stored so the target store derives the same account identity.
-		return value as OAuthCredential;
-	}
-	throw new AuthTransferError(`${where}: unknown credential type ${JSON.stringify(value.type)}.`);
+	const credential = writableAuthCredentialSchema(value);
+	if (credential instanceof type.errors) throw new AuthTransferError(`${where}: ${credential.summary}`);
+	return credential;
 }
 
 /**
@@ -126,11 +113,15 @@ export function parseAuthExport(text: string, source = "credential file"): AuthE
 
 /**
  * Whether importing `incoming` for `provider` replaces the stored `existing`
- * credential: an API key replaces the provider's API key; an OAuth login
- * replaces the stored login of the same account.
+ * credential. Pooled API keys rotate together, so a pooled key replaces only
+ * the same key; a static API key replaces the provider's static key; an OAuth
+ * login replaces the stored login of the same account.
  */
 function replacesCredential(provider: string, existing: AuthCredential, incoming: AuthCredential): boolean {
-	if (incoming.type === "api_key") return existing.type === "api_key";
+	if (incoming.type === "api_key") {
+		if (existing.type !== "api_key") return false;
+		return existing.source === "login" || incoming.source === "login" ? existing.key === incoming.key : true;
+	}
 	if (existing.type !== "oauth") return false;
 	return (
 		matchesReplacementCredential(provider, existing, resolveCredentialIdentityKey(provider, existing), incoming) ||
@@ -168,93 +159,134 @@ export default class Auth extends Command {
 	static description = commandHelp.description;
 
 	static args = {
-		action: Args.string({
-			description: "export or import",
+		command: Args.string({
+			description: "keys, export, or import",
 			required: true,
-			options: ["export", "import"],
+			options: ["keys", "export", "import"],
 		}),
-		file: Args.string({
-			description: "File written by `omp auth export`, or - for stdin (import)",
+		action: Args.string({
+			description: "keys: add, list, or remove; import: file written by `omp auth export`, or - for stdin",
 			required: false,
+		}),
+		provider: Args.string({ description: "keys: provider id (e.g. anthropic)", required: false }),
+		id: Args.string({ description: "keys remove: stored key id", required: false }),
+	};
+
+	static flags = {
+		json: Flags.boolean({ description: "Output JSON (keys)" }),
+		workspace: Flags.string({
+			description: "Anthropic workspace ID for a key not scoped to one (keys add; asked for when omitted)",
 		}),
 	};
 
 	static examples = [
-		"# Write every stored credential to a file (keep it secret)\n  omp auth export > credentials.json",
-		"# Merge them into this machine's credential store\n  omp auth import credentials.json",
-		"# Copy credentials to another machine over SSH\n  omp auth export | ssh host omp auth import -",
+		`# Add a key to the anthropic pool (hidden prompt; or pipe it on stdin)\n  ${APP_NAME} auth keys add anthropic`,
+		`# Add a key that is not scoped to a workspace, naming the workspace its requests use\n  ${APP_NAME} auth keys add anthropic --workspace wrkspc_01Jw…`,
+		`# List pooled keys (masked) and the serving order\n  ${APP_NAME} auth keys list anthropic`,
+		`# Remove a pooled key by its id\n  ${APP_NAME} auth keys remove anthropic 12`,
+		`# Serve pooled API keys before subscriptions\n  ${APP_NAME} config set auth.poolOrder '{"anthropic":"api-keys-first"}'`,
+		`# Write every stored credential to a file (keep it secret)\n  ${APP_NAME} auth export > credentials.json`,
+		`# Merge them into this machine's credential store\n  ${APP_NAME} auth import credentials.json`,
+		`# Copy credentials to another machine over SSH\n  ${APP_NAME} auth export | ssh host ${APP_NAME} auth import -`,
 	];
 
 	async run(): Promise<void> {
-		const { args, argv } = await this.parse(Auth);
-		const action = args.action;
-		if (action === "export" && argv.length > 1) {
-			throw new CliUsageError(`Unexpected argument "${argv[1]}". Usage: omp auth export`);
-		}
-		if (action === "import" && !args.file) {
-			throw new CliUsageError("Missing credential file. Usage: omp auth import <file|->");
-		}
-		if (action === "import" && argv.length > 2) {
-			throw new CliUsageError(`Unexpected argument "${argv[2]}". Usage: omp auth import <file|->`);
-		}
-
-		const broker = await resolveAuthBrokerConfig();
-		if (broker) {
-			process.stderr.write(
-				`${chalk.red(`error: omp uses the auth broker at ${broker.url}; credentials live there, not in this machine's agent.db.`)}\n` +
-					"Run this on the broker host, or disable the broker (`omp config reset auth.broker.url`) first.\n",
-			);
-			process.exitCode = 1;
-			return;
-		}
-
-		if (action === "export") {
-			const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
-			let data: AuthExport;
-			try {
-				data = exportAuthCredentials(store);
-			} finally {
-				store.close();
+		const { args, flags, argv } = await this.parse(Auth);
+		if (args.command === "keys") {
+			const action = AUTH_KEYS_ACTIONS.find(candidate => candidate === args.action);
+			if (!action) {
+				throw new CliUsageError(`Usage: ${APP_NAME} auth keys <${AUTH_KEYS_ACTIONS.join("|")}> <provider> [id]`);
 			}
-			const oauthCount = data.credentials.filter(entry => entry.credential.type === "oauth").length;
-			if (oauthCount > 0) {
-				process.stderr.write(
-					`${chalk.yellow(`warning: this output holds live secrets, including ${oauthCount} OAuth refresh token(s). Providers that rotate refresh tokens on use accept only the newest one: once the importing machine refreshes, this machine may be signed out of those accounts.`)}\n`,
-				);
+			if (!args.provider) throw new CliUsageError(`Usage: ${APP_NAME} auth keys ${action} <provider>`);
+			let id: number | undefined;
+			if (args.id !== undefined) {
+				id = Number(args.id);
+				if (!Number.isSafeInteger(id) || id <= 0) throw new Error(`Invalid key id '${args.id}'`);
 			}
-			process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
+			await runAuthKeysCommand({
+				action,
+				provider: args.provider,
+				id,
+				workspace: flags.workspace,
+				json: flags.json,
+			});
 			return;
 		}
+		await runAuthTransfer(args.command === "export" ? "export" : "import", args.action, argv);
+	}
+}
 
-		const file = args.file ?? "";
-		let text: string;
-		try {
-			text = file === "-" ? await Bun.stdin.text() : await Bun.file(file).text();
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
-			process.stderr.write(`${chalk.red(`error: credential file not found: ${file}`)}\n`);
-			process.exitCode = 1;
-			return;
-		}
+/** `omp auth export` / `omp auth import <file|->` against the local credential store. */
+async function runAuthTransfer(
+	action: "export" | "import",
+	fileArg: string | undefined,
+	argv: readonly string[],
+): Promise<void> {
+	if (action === "export" && argv.length > 1) {
+		throw new CliUsageError(`Unexpected argument "${argv[1]}". Usage: ${APP_NAME} auth export`);
+	}
+	if (action === "import" && !fileArg) {
+		throw new CliUsageError(`Missing credential file. Usage: ${APP_NAME} auth import <file|->`);
+	}
+	if (action === "import" && argv.length > 2) {
+		throw new CliUsageError(`Unexpected argument "${argv[2]}". Usage: ${APP_NAME} auth import <file|->`);
+	}
+	const broker = await resolveAuthBrokerConfig();
+	if (broker) {
+		process.stderr.write(
+			`${chalk.red(`error: omp uses the auth broker at ${broker.url}; credentials live there, not in this machine's agent.db.`)}\n` +
+				"Run this on the broker host, or disable the broker (`omp config reset auth.broker.url`) first.\n",
+		);
+		process.exitCode = 1;
+		return;
+	}
+
+	if (action === "export") {
+		const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 		let data: AuthExport;
 		try {
-			data = parseAuthExport(text, file === "-" ? "stdin" : file);
-		} catch (error) {
-			if (!(error instanceof AuthTransferError)) throw error;
-			process.stderr.write(`${chalk.red(`error: ${error.message}`)}\n`);
-			process.exitCode = 1;
-			return;
-		}
-		const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
-		try {
-			const summary = await importAuthCredentials(store, data);
-			process.stderr.write(
-				summary.imported === 0
-					? "No credentials to import.\n"
-					: `Imported ${summary.imported} credential(s) for ${summary.providers.join(", ")}.\n`,
-			);
+			data = exportAuthCredentials(store);
 		} finally {
 			store.close();
 		}
+		const oauthCount = data.credentials.filter(entry => entry.credential.type === "oauth").length;
+		if (oauthCount > 0) {
+			process.stderr.write(
+				`${chalk.yellow(`warning: this output holds live secrets, including ${oauthCount} OAuth refresh token(s). Providers that rotate refresh tokens on use accept only the newest one: once the importing machine refreshes, this machine may be signed out of those accounts.`)}\n`,
+			);
+		}
+		process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
+		return;
+	}
+
+	const file = fileArg ?? "";
+	let text: string;
+	try {
+		text = file === "-" ? await Bun.stdin.text() : await Bun.file(file).text();
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		process.stderr.write(`${chalk.red(`error: credential file not found: ${file}`)}\n`);
+		process.exitCode = 1;
+		return;
+	}
+	let data: AuthExport;
+	try {
+		data = parseAuthExport(text, file === "-" ? "stdin" : file);
+	} catch (error) {
+		if (!(error instanceof AuthTransferError)) throw error;
+		process.stderr.write(`${chalk.red(`error: ${error.message}`)}\n`);
+		process.exitCode = 1;
+		return;
+	}
+	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
+	try {
+		const summary = await importAuthCredentials(store, data);
+		process.stderr.write(
+			summary.imported === 0
+				? "No credentials to import.\n"
+				: `Imported ${summary.imported} credential(s) for ${summary.providers.join(", ")}.\n`,
+		);
+	} finally {
+		store.close();
 	}
 }

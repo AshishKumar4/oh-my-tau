@@ -1,4 +1,5 @@
 import type { AuthApiKeyOptions, AuthStorage, SessionRestrictionLease } from "@oh-my-pi/pi-ai/auth-storage";
+import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
 import type { Api, Model } from "@oh-my-pi/pi-ai/types";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { type ApiKeyResolverModel, type ApiKeyResolverOptions, createApiKeyResolver } from "./api-key-resolver";
@@ -51,8 +52,29 @@ export function validateAgentAccountPools(value: unknown): Record<string, OAuthA
 	return pools;
 }
 
-/** Unscoped registry behind each registry {@link SessionAccountPoolScope.registry} returned. */
-const scopedRegistryTargets = new WeakMap<ModelRegistry, ModelRegistry>();
+/**
+ * `registry.getApiKey` for one candidate of a fallback or maintenance walk:
+ * undefined when no credential the session may use can serve it. A session
+ * restricted to an OAuth account pool rejects with `MissingApiKeyError` for a
+ * provider its pool cannot serve; to a walk that is an unavailable candidate,
+ * like one with no credential at all, not a reason to stop before the next.
+ */
+export async function candidateApiKey(
+	registry: Pick<ModelRegistry, "getApiKey">,
+	model: Model<Api>,
+	sessionId: string | undefined,
+	options?: { signal?: AbortSignal },
+): Promise<string | undefined> {
+	try {
+		return await registry.getApiKey(model, sessionId, options);
+	} catch (error) {
+		if (error instanceof MissingApiKeyError) return undefined;
+		throw error;
+	}
+}
+
+/** What each registry {@link SessionAccountPoolScope.registry} returned wraps: the unscoped registry, and its scope. */
+const scopedRegistries = new WeakMap<ModelRegistry, { target: ModelRegistry; scope: SessionAccountPoolScope }>();
 
 /**
  * One agent session's OAuth account pools, enforced at its key lookups.
@@ -81,6 +103,35 @@ export class SessionAccountPoolScope {
 		this.#pools = pools;
 		this.#primarySessionId = primarySessionId;
 		this.restrict(primarySessionId);
+	}
+
+	/**
+	 * A scope of its own over the pools `registry` enforces, for a nested agent
+	 * that inherits its parent's pool-scoped registry and has no pools of its
+	 * own. Its ids, the ones its tools resolve raw credentials under included,
+	 * are restricted under its own leases, and its lookups without an id resolve
+	 * under `primarySessionId`, not the parent's. Undefined for a registry no
+	 * scope returned.
+	 */
+	static inherited(registry: ModelRegistry, primarySessionId: string): SessionAccountPoolScope | undefined {
+		const parent = scopedRegistries.get(registry)?.scope;
+		return parent && new SessionAccountPoolScope(parent.#authStorage, parent.#pools, primarySessionId);
+	}
+
+	/**
+	 * The provider session id `registry`'s key lookups for `provider` resolve
+	 * under: for a pool-scoped registry, the scope's (its primary id when
+	 * `sessionId` is omitted), restricted first; otherwise `sessionId`. A caller
+	 * holding a key of its own for the provider checks this id's restriction
+	 * before using that key.
+	 */
+	static credentialSessionId(
+		registry: ModelRegistry,
+		provider: string,
+		sessionId: string | undefined,
+	): string | undefined {
+		const scope = scopedRegistries.get(registry)?.scope;
+		return scope ? scope.#sessionIdFor(provider, sessionId) : sessionId;
 	}
 
 	/** Restrict `sessionId` to the pools, once per id until {@link release}. */
@@ -126,7 +177,7 @@ export class SessionAccountPoolScope {
 	 * them, not its parent's.
 	 */
 	registry(registry: ModelRegistry): ModelRegistry {
-		const target = scopedRegistryTargets.get(registry) ?? registry;
+		const target = scopedRegistries.get(registry)?.target ?? registry;
 		const getApiKey = (model: Model<Api>, sessionId?: string, options?: { signal?: AbortSignal }) =>
 			target.getApiKey(model, this.#sessionIdFor(model.provider, sessionId), options);
 		const getApiKeyWithCredentialForProvider = (provider: string, sessionId?: string, options?: AuthApiKeyOptions) =>
@@ -183,7 +234,7 @@ export class SessionAccountPoolScope {
 				return method;
 			},
 		});
-		scopedRegistryTargets.set(proxy, target);
+		scopedRegistries.set(proxy, { target, scope: this });
 		return proxy;
 	}
 }

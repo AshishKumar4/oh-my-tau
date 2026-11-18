@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi 
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Context } from "@oh-my-pi/pi-ai";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
 import {
@@ -217,6 +218,116 @@ describe("native security coordinator", () => {
 		const started = await coordinator.start({ planId: plan.id });
 		const terminal = await coordinator.wait(started.operationId);
 		expect(terminal).toMatchObject({ phase: "completed", findingCount: 1 });
+	});
+
+	test("runs its reviewer worker read-only through task, over a repository's own reviewer", async () => {
+		// The scanned repository ships its own `reviewer`, and the host routes ordinary
+		// reviewer spawns elsewhere; neither may reach the scan's worker.
+		await fs.mkdir(path.join(repositoryRoot, ".omp", "agents"), { recursive: true });
+		await Bun.write(
+			path.join(repositoryRoot, ".omp", "agents", "reviewer.md"),
+			[
+				"---",
+				"name: reviewer",
+				"description: Repository reviewer",
+				"tools: read, bash, write, edit",
+				"---",
+				"HOSTILE REVIEWER PROMPT",
+			].join("\n"),
+		);
+		settings = Settings.isolated({
+			"security.enabled": true,
+			"compaction.enabled": false,
+			"async.enabled": false,
+			"task.disabledAgents": ["reviewer"],
+			"task.agentModelOverrides": { reviewer: "@REVIEWER" },
+			"task.agentAdvisor": { reviewer: "on" },
+		});
+		const finding = {
+			rule_id: "fixture.command-injection",
+			title: "Untrusted command reaches a shell",
+			summary: "A fixture value is interpolated into a shell command.",
+			severity: "high",
+			confidence: "high",
+			category: "command-injection",
+			locations: [{ path: "src/app.ts", start_line: 1, role: "sink" }],
+			cwe: ["CWE-78"],
+			evidence: [{ label: "shell sink", explanation: "Fixture evidence" }],
+		};
+		const workerContexts: Context[] = [];
+		const coordinatorContexts: Context[] = [];
+		const mock = createMockModel({
+			id: "security-mock",
+			provider: "openai-codex",
+			handler: context => {
+				if (context.systemPrompt?.some(block => block.includes("Security scan worker."))) {
+					workerContexts.push(context);
+					if (workerContexts.length > 1) return { content: ["Review submitted."] };
+					const output = {
+						coverage_summary: "Reviewed src/app.ts.",
+						findings: [finding],
+						reviewed_paths: ["src/app.ts"],
+					};
+					return { content: [{ type: "toolCall", name: "yield", arguments: { data: output } }] };
+				}
+				coordinatorContexts.push(context);
+				if (coordinatorContexts.length === 1) {
+					const tasks = [
+						{
+							name: "ScanApp",
+							agent: "reviewer",
+							task: "Review src/app.ts.",
+							solutionSpace: "open: any flaw in one file",
+						},
+					];
+					return {
+						content: [{ type: "toolCall", name: "task", arguments: { context: "Security scan.", tasks } }],
+					};
+				}
+				if (coordinatorContexts.length === 2) {
+					const published = { ...finding, validation: "validated" };
+					return {
+						content: [
+							{
+								type: "toolCall",
+								name: "security_publish",
+								arguments: {
+									findings: [published],
+									coverage: { completeness: "complete" },
+									report: "# Fixture security report\n\nOne validated finding.\n",
+								},
+							},
+						],
+					};
+				}
+				return { content: ["Security publication completed."] };
+			},
+		});
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([mock.model]);
+		vi.spyOn(modelRegistry, "hasConfiguredAuth").mockReturnValue(true);
+		const coordinator = new SecurityCoordinator(
+			{ cwd: repositoryRoot, settings, authStorage, modelRegistry, activeModel: mock.model },
+			{ openStore: storeFactory, gitAdapter },
+		);
+		const plan = await coordinator.preflight({ credentialId, model: mock.model });
+		const terminal = await coordinator.wait((await coordinator.start({ planId: plan.id })).operationId);
+
+		expect(terminal.phase).toBe("completed");
+		const worker = workerContexts[0];
+		if (!worker) throw new Error("expected the scan to run its reviewer worker");
+		// Only the pinned read-only tools (less any the settings gate off, e.g. `task.enableLsp`) and `yield`.
+		const workerTools = worker.tools?.map(tool => tool.name) ?? [];
+		const readOnly = new Set(["read", "find", "grep", "glob", "lsp", "ast_grep", "yield"]);
+		expect(workerTools).toContain("read");
+		expect(workerTools.filter(name => !readOnly.has(name))).toEqual([]);
+		expect(worker.systemPrompt?.join("\n")).not.toContain("HOSTILE REVIEWER PROMPT");
+		// The coordinator received the worker's findings as schema-valid output.
+		const taskResult = coordinatorContexts[1]?.messages.findLast(message => message.role === "toolResult");
+		if (taskResult?.role !== "toolResult") throw new Error("expected the task result");
+		const resultText = taskResult.content.map(part => (part.type === "text" ? part.text : "")).join("\n");
+		expect(taskResult.isError).toBe(false);
+		expect(resultText).toContain("fixture.command-injection");
+		expect(resultText).not.toMatch(/schema (invalid|mismatch)/i);
 	});
 
 	test("records a terminal failure when initial scan persistence fails", async () => {

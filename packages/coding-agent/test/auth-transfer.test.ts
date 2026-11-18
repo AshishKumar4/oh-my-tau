@@ -86,4 +86,47 @@ describe("omp auth export/import", () => {
 		expect(() => parseAuthExport(document)).toThrow(AuthTransferError);
 		expect(() => parseAuthExport(document)).toThrow(/credentials\[0\] \(anthropic\).*refresh token/);
 	});
+
+	it("rejects a credential whose identity fields have the wrong type, naming the entry", () => {
+		const document = JSON.stringify({
+			version: 1,
+			credentials: [
+				{ provider: "openai", credential: API_KEY },
+				{ provider: "anthropic", credential: { ...OAUTH, email: 42 } },
+			],
+		});
+		expect(() => parseAuthExport(document)).toThrow(AuthTransferError);
+		expect(() => parseAuthExport(document)).toThrow(/credentials\[1\] \(anthropic\).*email/);
+	});
+
+	it("merges pooled API keys by key and keeps an Anthropic key's workspace", async () => {
+		using dir = TempDir.createSync("@omp-auth-transfer-");
+		const store = await SqliteAuthCredentialStore.open(path.join(dir.path(), "agent.db"));
+		try {
+			const pooled = (key: string, workspaceId?: string): AuthCredential => ({
+				type: "api_key",
+				key,
+				source: "login",
+				...(workspaceId ? { workspaceId } : {}),
+			});
+			await store.replaceAuthCredentials("anthropic", [pooled("sk-ant-a"), pooled("sk-ant-b")]);
+
+			const document = JSON.stringify({
+				version: 1,
+				credentials: [
+					{ provider: "anthropic", credential: pooled("sk-ant-b", "wrkspc_01b") },
+					{ provider: "anthropic", credential: pooled("sk-ant-c") },
+				],
+			});
+			await importAuthCredentials(store, parseAuthExport(document));
+
+			const anthropic = stored(store, "anthropic");
+			expect(anthropic).toHaveLength(3);
+			expect(anthropic).toContainEqual(pooled("sk-ant-a"));
+			expect(anthropic).toContainEqual(pooled("sk-ant-b", "wrkspc_01b"));
+			expect(anthropic).toContainEqual(pooled("sk-ant-c"));
+		} finally {
+			store.close();
+		}
+	});
 });

@@ -56,7 +56,7 @@ async function plan(target: SecurityTargetRequest = { kind: "repository" }) {
 			model: { provider: "openai-codex", modelId: "gpt-5.6-sol", thinkingLevel: "xhigh" },
 			account: { provider: "openai-codex", credentialId: 17, accountId: "workspace_fixture" },
 			config: { security: { enabled: true } },
-			workflowFingerprint: "security-reviewer@fixture",
+			workflowFingerprint: "security-scan@fixture",
 			createdAt: "2026-07-29T00:00:00.000Z",
 		},
 		adapter,
@@ -95,7 +95,7 @@ describe("security preflight", () => {
 		await expect(
 			assertSecurityScanPlanFresh(
 				created,
-				{ config: { security: { enabled: true } }, workflowFingerprint: "security-reviewer@fixture" },
+				{ config: { security: { enabled: true } }, workflowFingerprint: "security-scan@fixture" },
 				adapter,
 			),
 		).rejects.toBeInstanceOf(StaleSecurityScanPlanError);
@@ -153,7 +153,7 @@ describe("security preflight", () => {
 		await expect(
 			assertSecurityScanPlanFresh(
 				created,
-				{ config: { security: { enabled: true } }, workflowFingerprint: "security-reviewer@fixture" },
+				{ config: { security: { enabled: true } }, workflowFingerprint: "security-scan@fixture" },
 				adapter,
 			),
 		).rejects.toBeInstanceOf(StaleSecurityScanPlanError);
@@ -164,7 +164,7 @@ describe("security preflight", () => {
 		await expect(
 			assertSecurityScanPlanFresh(
 				created,
-				{ config: { changed: true }, workflowFingerprint: "security-reviewer@fixture" },
+				{ config: { changed: true }, workflowFingerprint: "security-scan@fixture" },
 				adapter,
 			),
 		).rejects.toBeInstanceOf(StaleSecurityScanPlanError);
