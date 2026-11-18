@@ -24,6 +24,7 @@ import { type RecoverHost, resumeInterruptedWork } from "@oh-my-pi/pi-coding-age
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { readStepProgress, recordStepsSent } from "@oh-my-pi/pi-coding-agent/task/steps";
 import * as executor from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EVAL_STATE_CONTEXT_TYPE, isEvalStateContext } from "@oh-my-pi/pi-coding-agent/eval/state";
@@ -1144,6 +1145,84 @@ describe("/recover", () => {
 		expect(delivered).toHaveLength(1);
 		expect(delivered[0]?.id).toBe("Silent");
 		expect(delivered[0]?.text).toContain("The reviewer approved the fix; nothing is left.");
+		await jobs.dispose();
+	});
+
+	it("resumes a stepped subagent with its next step when the crash fell between steps, and a failed step ends it", async () => {
+		// Each lane delivered its first step (a clean final message) and recorded only that one prompt as sent.
+		const stepped = (answer: string): SessionManager => {
+			const lane = laneSession();
+			recordStepsSent(lane, 1, ["Step 1: survey the module.", "Step 2: fix the bug."]);
+			lane.appendMessage({
+				role: "user",
+				content: "Step 1: survey the module.",
+				attribution: "agent",
+				timestamp: Date.now(),
+			});
+			lane.appendMessage(createAssistantMessage(answer));
+			return lane;
+		};
+		manager.appendMessage(toolTurn({ id: "spawn", name: "task", args: { tasks: [] } }));
+		manager.appendMessage(
+			toolResult("spawn", "task", {
+				async: { state: "running", jobId: "Between", type: "task" },
+				progress: [
+					{ id: "Between", status: "running", description: "stepped fix" },
+					{ id: "Failed", status: "running", description: "stepped fix" },
+				],
+			}),
+		);
+		// The runs' work follows their spawn.
+		await tick();
+		const between = stepped("Survey done: the bug is in parse().");
+		const failed = laneSession();
+		recordStepsSent(failed, 1, ["Step 1: survey the module.", "Step 2: fix the bug."]);
+		failed.appendMessage({
+			role: "user",
+			content: "Step 1: survey the module.",
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		// The first step failed: an aborting yield ends the chain, as it does live.
+		failed.appendMessage(toolTurn({ id: "y_fail", name: "yield", args: { error: "cannot read the module" } }));
+		failed.appendMessage(toolResult("y_fail", "yield", { status: "aborted", error: "cannot read the module" }));
+		manager.appendMessage(createAssistantMessage("steps running"));
+		const betweenFile = await parked("Between", between);
+		await parked("Failed", failed);
+		openedBy(manager, "this");
+		// This agent's live session receives the step report as a progress note.
+		const notes: string[] = [];
+		AgentRegistry.global().register({
+			id: "Main",
+			displayName: "Main",
+			kind: "main",
+			status: "running",
+			session: {
+				deliverIrcMessage: async (message: { from: string; body: string }) => {
+					if (message.from === "Between") notes.push(message.body);
+				},
+			} as never,
+		});
+		const jobs = new AsyncJobManager({ retentionMs: 0 });
+		const followUp = vi.spyOn(executor, "runSubagentFollowUpTurn").mockResolvedValue(singleResult("fixed"));
+
+		const outcome = await resumeInterruptedWork(host(jobs));
+		await jobs.waitForAll();
+
+		if (outcome.status !== "resumed") throw new Error(`expected resumed, got ${outcome.status}`);
+		expect(outcome.restarted.map(agent => agent.jobId)).toEqual(["Between"]);
+		expect(followUp).toHaveBeenCalledTimes(1);
+		const call = followUp.mock.calls[0]![0];
+		// The next step goes out as the run's message, with nothing left after it.
+		expect(call.message).toBe("Step 2: fix the bug.");
+		expect(call.steps).toEqual({ prompts: ["Step 1: survey the module.", "Step 2: fix the bug."], sent: 2 });
+		// Its progress is on disk before the prompt goes out, and the delivered step reached the parent.
+		const reopened = await SessionManager.open(betweenFile);
+		expect(readStepProgress(reopened.getEntries())?.sent).toBe(2);
+		await reopened.close();
+		expect(notes.join("\n")).toContain("Survey done: the bug is in parse().");
+		// A failed step ended its run: its failure is delivered, not resumed.
+		expect(outcome.recovered.map(agent => agent.jobId)).toEqual(["Failed"]);
 		await jobs.dispose();
 	});
 

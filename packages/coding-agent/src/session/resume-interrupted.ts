@@ -18,7 +18,7 @@ import { getBundledAgent, resolveRetiredAgentName } from "../task/agents";
 import { discoverAgents, getAgent } from "../task/discovery";
 import { runSubagentFollowUpTurn, softRequestBudgetFor } from "../task/executor";
 import { cfgTaskMaxRuntimeMs } from "../task/settings";
-import { readStepProgress, type StepProgress } from "../task/steps";
+import { readStepProgress, recordStepsSent, sendStepReport, type StepProgress } from "../task/steps";
 import type { AgentDefinition } from "../task/types";
 import type { EventBus } from "../utils/event-bus";
 import type { AgentSession } from "./agent-session";
@@ -68,7 +68,11 @@ function jobLine(job: InterruptedJob): string {
 /**
  * Open a parked subagent's transcript and judge it ({@link inspectSubagent}).
  * One the previous process cut off gets its interrupted tool calls repaired,
- * and the resume prompt describing what else it lost.
+ * and the resume prompt describing what else it lost. A stepped run that
+ * delivered a step before the crash but had not sent the next one is not
+ * finished: it resumes with that next step prompt (recorded as sent first),
+ * and the delivered step's report rides along as `stepReport`. A step that
+ * failed ends the run, as it does live.
  */
 async function prepareSubagent(
 	sessionFile: string,
@@ -77,7 +81,7 @@ async function prepareSubagent(
 	startedAt: number,
 	contract: OutputContract,
 ): Promise<
-	| { status: "interrupted"; message: string; steps: StepProgress | undefined }
+	| { status: "interrupted"; message: string; steps: StepProgress | undefined; stepReport?: SubagentReport }
 	| { status: "finished"; report: SubagentReport | undefined }
 > {
 	const manager = await SessionManager.open(sessionFile, undefined, undefined, {
@@ -93,9 +97,21 @@ async function prepareSubagent(
 			contract,
 			agentId => registry.get(agentId)?.parentId === id,
 		);
-		if (state.status === "finished") return state;
 		// A stepped run goes on with the prompts it had not sent once this one is delivered.
 		const steps = readStepProgress(manager.getEntries());
+		if (state.status === "finished") {
+			const { report } = state;
+			if (!steps || steps.sent >= steps.prompts.length || !report || report.error) return state;
+			const next = steps.sent;
+			recordStepsSent(manager, next + 1);
+			await manager.flush();
+			return {
+				status: "interrupted",
+				message: steps.prompts[next]!,
+				steps: { prompts: steps.prompts, sent: next + 1 },
+				stepReport: report,
+			};
+		}
 		const scan = findInterruptedWork(manager.getBranch());
 		if (scan.handled) return { status: "interrupted", message: SUBAGENT_RESUME_MESSAGE, steps };
 		if (scan.toolCallsRepairable) appendInterruptedToolResults(manager, scan.toolCalls);
@@ -276,7 +292,15 @@ export async function resumeInterruptedWork(host: RecoverHost): Promise<RecoverO
 					notResumed.push(`${jobName(interrupted)}: its agent definition was not found.`);
 					continue;
 				}
-				const { message, steps } = prepared;
+				const { message, steps, stepReport } = prepared;
+				// What the crash cut between: a delivered step whose report may not have reached this agent.
+				if (
+					stepReport &&
+					ownerId &&
+					!reachedParent(sessionManager.getBranch(), interrupted.jobId, stepReport, interrupted.requestedAt)
+				) {
+					await sendStepReport({ from: interrupted.jobId, to: ownerId }, stepReport.text);
+				}
 				manager.register(
 					"task",
 					interrupted.jobId,
