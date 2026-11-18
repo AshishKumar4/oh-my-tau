@@ -207,6 +207,41 @@ describe("Anthropic controls derived from the transcript", () => {
 		expect(referencesTool(next.payload, grep)).toBe(false);
 	});
 
+	it("emits no control for a self-deferred tool a record from before the fix listed active", async () => {
+		const deferredTool = { ...tool("web"), deferLoading: true };
+		const tools = [tool("read"), deferredTool];
+		const turn0 = [user("start")];
+		const first = await capture(turn0, Effort.High, { tools });
+		const controls = first.message.requestControls;
+		if (!controls?.tools) throw new Error("expected a tool record");
+		// The shape earlier builds recorded: every declared tool active, self-deferred ones too.
+		const legacy = {
+			...first.message,
+			requestControls: { ...controls, tools: { ...controls.tools, active: [...controls.tools.declared] } },
+		};
+		const turn1 = [...turn0, answering(reply("ready"), { ...first, message: legacy }), user("continue")];
+		const next = await capture(turn1, Effort.High, { tools });
+
+		expect(next.payload.tools?.map(declared => declared.defer_loading)).toEqual([undefined, true]);
+		expect(referencesTool(next.payload, wireName(first, 1))).toBe(false);
+		const after = await capture([...turn1, answering(reply("done"), next), user("again")], Effort.High, { tools });
+		expect(referencesTool(after.payload, wireName(first, 1))).toBe(false);
+		expectCacheStableContinuation(next.payload, after.payload);
+	});
+
+	it("still activates an ordinary tool added mid-conversation beside a self-deferred one", async () => {
+		const deferredTool = { ...tool("web"), deferLoading: true };
+		const turn0 = [user("start")];
+		const first = await capture(turn0, Effort.High, { tools: [tool("read"), deferredTool] });
+		const turn1 = [...turn0, answering(reply("ready"), first), user("continue")];
+		const gained = await capture(turn1, Effort.High, { tools: [tool("read"), deferredTool, tool("grep")] });
+
+		const grep = gained.payload.tools?.find(declared => declared.name.endsWith("grep"));
+		expect(grep?.defer_loading).toBe(true);
+		expect(referencesTool(gained.payload, grep?.name ?? "")).toBe(true);
+		expect(referencesTool(gained.payload, wireName(first, 1))).toBe(false);
+	});
+
 	it("loads the tools a tool-less conversation gains instead of deferring all of them", async () => {
 		const turn0 = [user("start")];
 		const first = await capture(turn0, Effort.Low, { tools: [] });
@@ -271,6 +306,33 @@ describe("Anthropic controls derived from the transcript", () => {
 			withdrawn,
 		);
 		expectCacheStableContinuation(steered.payload, next.payload);
+		expectValidSystemPlacement(next.payload);
+	});
+
+	it("keeps two interrupted requests' tool changes in the order they were made", async () => {
+		const turn0 = [user("start")];
+		const first = await capture(turn0, Effort.Low, { tools: [tool("read"), tool("grep")] });
+		const grep = wireName(first, 1);
+		const history: Message[] = [...turn0, answering(reply("ready"), first), user("drop grep")];
+		const withdrawn = { tools: [tool("read")], inactiveTools: [tool("grep")] };
+		const removal = await capture(history, Effort.Low, withdrawn);
+		history.push(answering(assistant([], "aborted"), removal), user("actually keep grep", true));
+		const restored = { tools: [tool("read"), tool("grep")] };
+		const addition = await capture(history, Effort.Low, restored);
+		history.push(answering(assistant([], "aborted"), addition), user("go on", true));
+
+		// Both interrupted replies are dropped; their changes replay in order, so grep ends up active.
+		const next = await capture(history, Effort.Low, restored);
+		const grepChanges = next.payload.messages.flatMap(message =>
+			Array.isArray(message.content)
+				? message.content.flatMap((block: { type?: string; tool?: { name?: string } }) =>
+						block.tool?.name === grep && (block.type === "tool_removal" || block.type === "tool_addition")
+							? [block.type]
+							: [],
+					)
+				: [],
+		);
+		expect(grepChanges).toEqual(["tool_removal", "tool_addition"]);
 		expectValidSystemPlacement(next.payload);
 	});
 });

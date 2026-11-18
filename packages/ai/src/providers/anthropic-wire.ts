@@ -61,10 +61,16 @@ export type ToolUseBlockParam = {
 	cache_control?: CacheControlEphemeral | null;
 };
 
+/** A deferred tool a tool search loads; the API expands it into the tool's definition. */
+export type ToolResultReferenceParam = {
+	type: "tool_reference";
+	tool_name: string;
+};
+
 export type ToolResultBlockParam = {
 	type: "tool_result";
 	tool_use_id: string;
-	content?: string | Array<TextBlockParam | ImageBlockParam>;
+	content?: string | Array<TextBlockParam | ImageBlockParam | ToolResultReferenceParam>;
 	is_error?: boolean;
 	cache_control?: CacheControlEphemeral | null;
 };
