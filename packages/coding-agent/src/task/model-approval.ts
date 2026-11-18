@@ -71,6 +71,18 @@ export interface PerCallModelGrants {
 
 type ApprovalRegistry = Pick<ModelRegistry, "getAll" | "getAvailable">;
 
+/** Grants for a new spawn, with the operator's match preferences snapshotted now so a later model use cannot move them. */
+export function spawnModelGrants(
+	settings: Settings,
+	grants: Omit<PerCallModelGrants, "settings" | "matchPreferences">,
+): PerCallModelGrants {
+	return {
+		settings,
+		...grants,
+		matchPreferences: structuredClone(getModelMatchPreferences(settings.grantAuthority())),
+	};
+}
+
 /**
  * The one model an exact entry names: a literal catalog id wins over a `:level`
  * split, and an `@upstream` pin stays part of the identity. Undefined when the
@@ -317,12 +329,11 @@ const decisionCache = new WeakMap<
 	ApprovalCacheKey & { catalog: Model<Api>[]; decisions: Map<string, boolean> }
 >();
 
-/** Throw {@link PerCallModelError} unless `model` is an available chat model the configuration approves. */
-export function assertPerCallModelApproved(
-	model: Model<Api>,
-	grants: PerCallModelGrants,
-	registry: ApprovalRegistry,
-): void {
+/**
+ * Whether the configuration approves `model`. Throws {@link PerCallModelUnavailableError} when it
+ * is not an available chat model.
+ */
+function isPerCallModelApproved(model: Model<Api>, grants: PerCallModelGrants, registry: ApprovalRegistry): boolean {
 	const target = formatModelStringWithRouting(model);
 	let cache = decisionCache.get(grants);
 	if (!cache || !isCurrent(cache, grants.settings, registry)) {
@@ -344,11 +355,41 @@ export function assertPerCallModelApproved(
 		granted = computeGranted(model, target, grants, chat, cache.catalog);
 		cache.decisions.set(target, granted);
 	}
-	if (granted) return;
+	return granted;
+}
+
+/** Throw {@link PerCallModelError} unless `model` is an available chat model the configuration approves. */
+export function assertPerCallModelApproved(
+	model: Model<Api>,
+	grants: PerCallModelGrants,
+	registry: ApprovalRegistry,
+): void {
+	if (isPerCallModelApproved(model, grants, registry)) return;
+	const target = formatModelStringWithRouting(model);
 	const allowGuidance = perCallAllowlists(grants.settings).some(allow => allow.length > 0)
 		? " It must also be listed in task.perCallModelAllow."
 		: "";
 	throw new PerCallModelError(
 		`Per-call model ${target} is not approved for agent "${grants.agentName}": use a model named by a chat role configured outside project settings, the selected agent's own frontmatter (bundled or user-level agents only), or the parent's model.${allowGuidance} Catalog or credentials alone do not approve a model.`,
 	);
+}
+
+/**
+ * The available models these grants approve, one per granting pattern, so a pinned `@upstream`
+ * route stays pinned. Each passes {@link isPerCallModelApproved}, the check dispatch applies.
+ */
+export function approvedPerCallModels(grants: PerCallModelGrants, registry: ApprovalRegistry): Model<Api>[] {
+	const catalog = registry.getAll();
+	const chat = registry.getAvailable("chat");
+	const approved = new Map<string, Model<Api>>();
+	for (const pattern of perCallModelGrantPatterns(grants)) {
+		if (/[*?]/.test(pattern)) continue;
+		const model =
+			resolveModelOverride([pattern], { getAvailable: () => catalog }, undefined, { exactOnly: true }).model ??
+			resolveGrantPattern(pattern, chat, catalog, grants.matchPreferences).model;
+		if (!model || !chat.some(candidate => candidate.provider === model.provider && candidate.id === model.id))
+			continue;
+		if (isPerCallModelApproved(model, grants, registry)) approved.set(formatModelStringWithRouting(model), model);
+	}
+	return [...approved.values()];
 }

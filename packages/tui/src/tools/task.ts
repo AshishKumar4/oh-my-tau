@@ -59,6 +59,7 @@ import { errorText, noteText, resultText } from "./native-view";
 import { describeJsonValue } from "./json-tree";
 import { taskSummary } from "../overlays/agent-hub-renderer";
 import { agentColored } from "../overlays/agent-identity";
+import type { SpawnEffort } from "../thinking";
 import type { NativeToolView, ToolRenderResult } from "./renderer";
 
 /** Render context threaded in from `ToolExecutionComponent.#buildRenderContext`. */
@@ -2265,8 +2266,8 @@ export interface TaskItem {
 	steps?: string[];
 	/** How open-ended the work is; required by the schema and the child's sole `auto` thinking classification input. */
 	solutionSpace?: string;
-	/** Per-spawn thinking effort: lowest/middle/highest level the resolved model supports. Overrides the agent's default selector (e.g. `auto`). */
-	effort?: "lo" | "med" | "hi";
+	/** Per-spawn thinking effort: lowest/middle/highest level the resolved model supports, or an exact level from a harness facade. Overrides the agent's default selector (e.g. `auto`). */
+	effort?: SpawnEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
@@ -2296,8 +2297,8 @@ export interface TaskParams {
 	steps?: string[];
 	/** How open-ended the work is (flat form); see {@link TaskItem.solutionSpace}. */
 	solutionSpace?: string;
-	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
-	effort?: "lo" | "med" | "hi";
+	/** Per-spawn thinking effort (flat form); see {@link TaskItem.effort}. */
+	effort?: SpawnEffort;
 	/** Caller-provided output schema; its presence overrides the selected agent's schema. */
 	outputSchema?: unknown;
 	/** Validation behavior for a caller-provided or inherited output schema. */
