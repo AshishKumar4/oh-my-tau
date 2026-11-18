@@ -6,6 +6,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import type { AssistantMessage, ThinkingContent, ToolResultMessage, UserMessage } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -265,5 +266,43 @@ describe("forkMessages", () => {
 		expect(messages[4]?.role === "developer" && messages[4].content).toEqual([
 			{ type: "text", text: "extension note" },
 		]);
+	});
+});
+
+describe("forkMessages and provider-native compaction", () => {
+	/** A journal standing on an OpenAI remote compaction, with the history it replaced behind it. */
+	function remotelyCompacted(): SessionManager {
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage(user("remember the secret BLUE-HERON-42"));
+		const keptId = sessionManager.appendMessage(user("then keep going"));
+		const compactionItem = { type: "compaction", encrypted_content: "native-state" };
+		sessionManager.appendCompaction("Remote compaction placeholder", undefined, keptId, 4_000, {
+			preserveData: {
+				openaiRemoteCompaction: { provider: "openai-codex", replacementHistory: [compactionItem], compactionItem },
+			},
+		});
+		sessionManager.appendMessage(user("now spawn a worker"));
+		sessionManager.appendMessage(assistantCall(SPAWN_CALL, "task", { task: "report the secret" }));
+		return sessionManager;
+	}
+
+	it("inherits the history the parent's model reads when it cannot replay the remote compaction", () => {
+		const sessionManager = remotelyCompacted();
+		const claude = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const session = { ...sessionWith([]), sessionManager, getActiveModel: () => claude } as ToolSession;
+
+		const text = JSON.stringify(forkMessages(session, "all", SPAWN_CALL));
+		// Claude's own requests stand on the history behind the compaction, so the child must too.
+		expect(text).toContain("BLUE-HERON-42");
+		expect(text).not.toContain("Remote compaction placeholder");
+	});
+
+	it("keeps the compaction for a parent model that replays it", () => {
+		const sessionManager = remotelyCompacted();
+		const codex = getBundledModel("openai-codex", "gpt-6.1-sol");
+		const session = { ...sessionWith([]), sessionManager, getActiveModel: () => codex } as ToolSession;
+
+		const text = JSON.stringify(forkMessages(session, "all", SPAWN_CALL));
+		expect(text).not.toContain("BLUE-HERON-42");
 	});
 });

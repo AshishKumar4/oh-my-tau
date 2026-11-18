@@ -4,6 +4,7 @@
  * `spawn_agent` `fork_turns` and Claude Code's `Agent` `subagent_type: "fork"`.
  */
 import type { Message } from "@oh-my-pi/pi-ai";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import type { ForkRequestSnapshot } from "../session/fork-context";
 import {
 	convertToLlm,
@@ -39,13 +40,22 @@ export interface ForkSnapshot {
  * survive so the child can reuse it; only the canonical Copilot-bound
  * sanitizer runs on assistant messages. The snapshot is a deep clone — the
  * child may prune or rewrite its copy without mutating the parent's journal.
+ *
+ * The history is built as the parent's active model reads it (its compaction
+ * boundary and snapcompact frame budget), so the child inherits exactly what
+ * the parent's own requests carry: a model that cannot replay a
+ * provider-native compaction reads the history behind it, not its placeholder.
  */
 export function forkMessages(session: ToolSession, mode: ForkMode, spawnToolCallId: string | undefined): Message[] {
 	const manager = session.sessionManager;
 	if (!manager?.buildSessionContext) {
 		throw new ToolError("Conversation forking requires a session journal.");
 	}
-	const history = manager.buildSessionContext().messages;
+	const model = session.getActiveModel?.();
+	const history = manager.buildSessionContext({
+		model,
+		maxFrameDataBytes: snapcompact.frameDataBytesBudget(model),
+	}).messages;
 
 	const spawnIndex =
 		spawnToolCallId === undefined
