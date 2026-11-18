@@ -1,6 +1,9 @@
 auth "anthropic" {
 	name "Anthropic (Claude Pro/Max)"
 	org-scoped-identity #true
+	// Console API keys (sk-ant-api03-…) work on the same Messages API as the
+	// subscription login; /login offers adding them to the key pool.
+	accepts-api-key #true
 	// Foundry mode optionally switches Anthropic auth to enterprise gateway credentials.
 	env hook="anthropic-foundry"
 	login "oauth-code" {

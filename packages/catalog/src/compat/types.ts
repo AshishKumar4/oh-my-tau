@@ -590,6 +590,11 @@ export interface CompiledAuthProvider {
 	disabled?: string;
 	/** Account risk a user must accept (by typing "yes") before a new login starts. */
 	loginWarning?: string;
+	/**
+	 * The provider's API also accepts a plain API key alongside the OAuth login,
+	 * so `/login` offers adding one to the provider's key pool.
+	 */
+	acceptsApiKey?: boolean;
 	storeAs?: string;
 	callbackPort?: number;
 	pasteCode?: boolean;

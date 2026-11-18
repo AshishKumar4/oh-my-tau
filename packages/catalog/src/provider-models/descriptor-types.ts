@@ -10,6 +10,8 @@ export type ModelManagerConfig = AccountScope & {
 	fetch?: FetchImpl;
 	/** The supplied fetch already applies provider-specific authentication. */
 	authenticated?: boolean;
+	/** Anthropic: the stored discovery key's workspace (`anthropic-workspace-id`). */
+	workspaceId?: string;
 };
 
 /**
