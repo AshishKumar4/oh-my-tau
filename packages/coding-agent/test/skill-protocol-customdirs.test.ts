@@ -29,6 +29,7 @@ const ALL_DEFAULT_SOURCES_DISABLED = {
 	enablePiProject: false,
 	enableAgentsUser: false,
 	enableAgentsProject: false,
+	enableManagedUser: false,
 } as const;
 
 describe("skill:// resolution honors skills.customDirectories (#7190)", () => {

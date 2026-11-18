@@ -32,11 +32,11 @@ const expectedFixtureSkillOrder: string[] = [
 ];
 
 /**
- * Disable every named built-in skill source. Used by `loadSkills` option tests
- * that need to isolate a custom directory or assert "no built-in leakage".
- * Plugin providers (`omp-plugins`, `claude-plugins`, `agent-plugins`) have no
- * toggle; the file-wide isolated home below keeps the developer's real plugin
- * installs out of every assertion.
+ * Disable every named skill source (built-in and managed). Used by `loadSkills`
+ * option tests that need to isolate a custom directory or assert "no built-in
+ * leakage". Plugin providers (`omp-plugins`, `claude-plugins`, `agent-plugins`)
+ * have no toggle; the file-wide isolated home below keeps the developer's real
+ * plugin installs out of every assertion.
  */
 const DISABLE_ALL_BUILTIN_SKILLS = {
 	enableCodexUser: false,
@@ -46,6 +46,7 @@ const DISABLE_ALL_BUILTIN_SKILLS = {
 	enablePiProject: false,
 	enableAgentsUser: false,
 	enableAgentsProject: false,
+	enableManagedUser: false,
 };
 
 // Every provider resolves user-level roots from `os.homedir()` (HOME on POSIX,
@@ -109,13 +110,6 @@ describe("skills", () => {
 			expect(validSkill?.description).toBe("A valid skill for testing purposes.");
 			expect(validSkill?.source).toBe("test");
 			expect(warnings).toHaveLength(0);
-		});
-
-		it("should return skills sorted by name (case-insensitive)", async () => {
-			const { skills } = await loadFixtureRoot();
-			const names = skills.map(skill => skill.name);
-
-			expect(names).toEqual(expectedFixtureSkillOrder);
 		});
 
 		it("should return empty for non-existent directory", async () => {

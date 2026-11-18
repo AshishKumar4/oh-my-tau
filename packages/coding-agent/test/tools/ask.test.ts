@@ -4,6 +4,7 @@ import type { AgentLoopConfig } from "@oh-my-pi/pi-agent-core/types";
 import * as ai from "@oh-my-pi/pi-ai";
 import type { Api, AssistantMessage, Message, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -741,5 +742,58 @@ describe("AskTool option note images", () => {
 
 			expect(result.content.slice(1)).toEqual([image]);
 		});
+	});
+});
+
+describe("AskTool under the claude-code harness", () => {
+	const CLAUDE_CODE = getBundledModel("anthropic", "claude-opus-5");
+	const VENDOR_CALL = {
+		questions: [
+			{
+				question: "Which backend?",
+				header: "Storage",
+				options: [
+					{ label: "SQLite", description: "Single file." },
+					{ label: "PostgreSQL", description: "Server <db>." },
+				],
+				multiSelect: true,
+			},
+		],
+	};
+
+	it("declares Claude Code's AskUserQuestion shape", () => {
+		const tool = new AskTool(createSession({ getActiveModel: () => CLAUDE_CODE }));
+		const schema = ai.toolWireSchema({ name: "ask", description: "", parameters: tool.parameters }) as {
+			properties: { questions: { items: { properties: Record<string, unknown>; required: string[] } } };
+			required: string[];
+		};
+		// `answers`/`annotations`/`metadata` are host-filled in Claude Code; no omp host fills them.
+		expect(Object.keys(schema.properties)).toEqual(["questions"]);
+		expect(schema.required).toEqual(["questions"]);
+		expect(schema.properties.questions.items.required).toEqual(["question", "header", "options"]);
+		expect(tool.description).toContain("multiSelect");
+		expect(new AskTool(createSession()).description).not.toContain("multiSelect");
+	});
+
+	it("shows a vendor payload as a form with escaped labels and returns the submitted answers", async () => {
+		const formDialog = vi.fn<FormDialog>(async () => ({ data: { q1: ["SQLite", "PostgreSQL"], q1_other: "" } }));
+		const tool = new AskTool(createSession({ getActiveModel: () => CLAUDE_CODE }));
+		const result = await tool.execute(
+			"call-vendor",
+			VENDOR_CALL,
+			undefined,
+			undefined,
+			createContext({ formDialog }),
+		);
+		const html = formDialog.mock.calls[0]?.[0] ?? "";
+		expect(html).toContain('<input type="checkbox" name="q1" value="SQLite">');
+		expect(html).toContain("Server &lt;db&gt;.");
+		expect(html).toContain('name="q1_other"');
+		expect(text(result)).toContain("PostgreSQL");
+	});
+
+	it("recovers the form from a persisted vendor-shaped call for /tree re-answer", () => {
+		expect(recoverAskHtml(VENDOR_CALL)).toContain("<legend>Storage: Which backend?</legend>");
+		expect(recoverAskHtml({ questions: [{ question: "no header" }] })).toBeUndefined();
 	});
 });

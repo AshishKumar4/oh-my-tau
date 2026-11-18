@@ -249,6 +249,35 @@ describe("eval tool description", () => {
 	});
 });
 
+describe("eval wait guidance on the presented surface", () => {
+	const docsOf = (options: Parameters<typeof getEvalToolDescription>[0]) =>
+		[getEvalToolDescription(options), ...Object.values(getEvalDocTopics(options))].join("\n\n");
+
+	// The "If blocked" pointer is part of the eager-delegation guidance.
+	it("names omp's wait natively", () => {
+		const text = docsOf({ waitTool: true, eagerDelegation: true });
+		expect(text).toContain("If blocked, leave `eval` and call `wait`.");
+		expect(text).toContain("the `wait` tool (not kernel `wait()`) blocks when you have nothing else to do");
+	});
+
+	it("names TaskOutput where it stands in for wait under Claude Code", () => {
+		const text = docsOf({ waitTool: true, waitToolName: "TaskOutput", eagerDelegation: true });
+		expect(text).toContain("If blocked, leave `eval` and call `TaskOutput`.");
+		expect(text).toContain("the `TaskOutput` tool (not kernel `wait()`) blocks when you have nothing else to do");
+		expect(text).not.toContain("`wait`");
+	});
+
+	it("names no wait tool when a 2.1.284 surface serves none", () => {
+		const text = docsOf({ waitTool: false, waitToolName: null, eagerDelegation: true });
+		expect(text).not.toContain("`wait`");
+		expect(text).not.toContain("TaskOutput");
+		// An unrendered tool name shows as `undefined` in backticks; prose may say "undefined".
+		expect(text).not.toContain("`undefined`");
+		// The kernel's own wait(handles) is not a tool and stays documented.
+		expect(text).toContain("wait(handles");
+	});
+});
+
 describe("eval tool dynamic schema", () => {
 	// resolveEvalBackends lets PI_* env flags override settings; neutralize them per-test
 	// so the schema is driven purely by the isolated settings (and restore to avoid leaks).

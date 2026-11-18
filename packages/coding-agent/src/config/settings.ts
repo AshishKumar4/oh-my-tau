@@ -34,6 +34,7 @@ import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import { isLightTheme } from "@oh-my-pi/pi-tui/theme/theme";
 import { JSONC, YAML } from "bun";
 import { invalidate as invalidateCapabilityFsCache } from "../capability/fs";
+import { getCapabilityInfo } from "../capability";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
@@ -1605,18 +1606,22 @@ export class Settings {
 			clearTimeout(this.#projectSaveTimer);
 			this.#projectSaveTimer = undefined;
 		}
-		if (this.#savePromise) {
-			await this.#savePromise;
+		let globalFailure: Error | undefined;
+		try {
+			if (this.#savePromise) await this.#savePromise;
+			if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) await this.#chainSave();
+		} catch (error) {
+			globalFailure = error instanceof Error ? error : new Error(String(error), { cause: error });
 		}
-		if (this.#projectSavePromise) {
-			await this.#projectSavePromise;
+		try {
+			if (this.#projectSavePromise) await this.#projectSavePromise;
+			if (this.#modifiedProjectModelRoles.size > 0) await this.#saveProjectNow();
+		} catch (error) {
+			if (globalFailure)
+				throw new AggregateError([globalFailure, error], "Global and project settings could not be saved");
+			throw error;
 		}
-		if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) {
-			await this.#chainSave();
-		}
-		if (this.#modifiedProjectModelRoles.size > 0) {
-			await this.#saveProjectNow();
-		}
+		if (globalFailure) throw globalFailure;
 	}
 
 	/**
@@ -2410,10 +2415,11 @@ export class Settings {
 
 	async #loadYaml(filePath: string): Promise<RawSettings> {
 		const loaded = await this.#loadYamlIfPresentForStartup(filePath);
-		return loaded ?? {};
+		return this.#migrateRawSettings(loaded ?? {});
 	}
 
-	async #loadYamlIfPresent(filePath: string, captureLegacyChangelogVersion = true): Promise<YamlLoadResult> {
+	// Preserve raw aliases until their layer is merged; migrating one project source early changes precedence.
+	async #loadYamlIfPresent(filePath: string): Promise<YamlLoadResult> {
 		let content: string;
 		let generation: YamlContentGeneration;
 		try {
@@ -2441,7 +2447,7 @@ export class Settings {
 		if (parsed === null || parsed === undefined) {
 			return { kind: "loaded", settings: {}, generation };
 		}
-		if (typeof parsed !== "object" || Array.isArray(parsed)) {
+		if (!isRecord(parsed)) {
 			return {
 				kind: "invalid",
 				error: new Error("Settings YAML must contain a mapping at the document root"),
@@ -2450,7 +2456,7 @@ export class Settings {
 		}
 		return {
 			kind: "loaded",
-			settings: this.#migrateRawSettings(parsed as RawSettings, captureLegacyChangelogVersion),
+			settings: parsed,
 			generation,
 		};
 	}
@@ -2766,8 +2772,8 @@ export class Settings {
 			const configPath = path.join(this.#agentDir, filename);
 			const loaded = quarantineInvalid
 				? await this.#loadYamlIfPresentForStartup(configPath)
-				: this.#unwrapYamlLoadResult(configPath, await this.#loadYamlIfPresent(configPath, false));
-			if (loaded) return { settings: loaded, configPath };
+				: this.#unwrapYamlLoadResult(configPath, await this.#loadYamlIfPresent(configPath));
+			if (loaded) return { settings: this.#migrateRawSettings(loaded, quarantineInvalid), configPath };
 		}
 		return {
 			settings: null,
@@ -2843,14 +2849,38 @@ export class Settings {
 		// A native config this instance moved aside reads as missing until a save recreates it;
 		// keep its last good contents, as `#saveProjectNow` does.
 		const nativeProject = quarantineInvalid
-			? await this.#loadYaml(projectConfigPath)
-			: (this.#unwrapYamlLoadResult(projectConfigPath, await this.#loadYamlIfPresent(projectConfigPath, false)) ??
+			? ((await this.#loadYamlIfPresentForStartup(projectConfigPath)) ?? {})
+			: (this.#unwrapYamlLoadResult(projectConfigPath, await this.#loadYamlIfPresent(projectConfigPath)) ??
 				(this.#quarantinedYamlTargets.has(projectConfigPath) ? structuredClone(this.#projectFileSettings) : {}));
+		// Discovery cannot see a native config this instance moved aside: reinsert its last good
+		// contents at the native provider's position, so other sources still override it normally.
+		const nativePath = path.resolve(projectConfigPath);
+		if (
+			this.#quarantinedYamlTargets.has(projectConfigPath) &&
+			!projectItems.some(item => item._source.provider === "native" && item.path === nativePath)
+		) {
+			const providers = getCapabilityInfo(settingsCapability.id)?.providers ?? [];
+			const nativeIndex = providers.findIndex(provider => provider.id === "native");
+			const native = providers[nativeIndex];
+			if (native?.enabled) {
+				const position = projectItems.findIndex(
+					item => providers.findIndex(provider => provider.id === item._source.provider) > nativeIndex,
+				);
+				projectItems.splice(position < 0 ? projectItems.length : position, 0, {
+					path: nativePath,
+					data: nativeProject,
+					level: "project",
+					_source: { provider: native.id, providerName: native.displayName, path: nativePath, level: "project" },
+				});
+			}
+		}
 		return {
 			cwd,
 			quarantineInvalid,
 			items: projectItems,
-			nativeModelRoles: getByPath(nativeProject, ["modelRoles"]),
+			nativeModelRoles: getByPath(this.#migrateRawSettings(structuredClone(nativeProject), quarantineInvalid), [
+				"modelRoles",
+			]),
 			fileSettings: structuredClone(nativeProject),
 			warningsSeen,
 		};
@@ -4102,8 +4132,9 @@ export class Settings {
 				// malformed file aside, recover from its last in-memory state
 				// rather than recreating the config from only the pending path.
 				const loaded = await this.#loadYamlIfPresentForWriteLocked(configPath, writePath);
-				const current =
-					loaded.settings ?? (this.#quarantinedYamlTargets.has(configPath) ? structuredClone(this.#global) : {});
+				const current = this.#migrateRawSettings(
+					loaded.settings ?? (this.#quarantinedYamlTargets.has(configPath) ? structuredClone(this.#global) : {}),
+				);
 				let shouldWrite = false;
 				const writtenPaths: (readonly string[])[] = [];
 
@@ -4333,9 +4364,12 @@ export class Settings {
 			await fs.promises.mkdir(path.dirname(projectConfigPath), { recursive: true });
 			await this.#withYamlWriteLock(projectConfigPath, async writePath => {
 				const loaded = await this.#loadYamlIfPresentForWriteLocked(projectConfigPath, writePath);
-				const projectSettings =
+				const projectSettings = this.#migrateRawSettings(
 					loaded.settings ??
-					(this.#quarantinedYamlTargets.has(projectConfigPath) ? structuredClone(this.#projectFileSettings) : {});
+						(this.#quarantinedYamlTargets.has(projectConfigPath)
+							? structuredClone(this.#projectFileSettings)
+							: {}),
+				);
 
 				const projectRoles = getByPath(this.#project, ["modelRoles"]);
 				for (const role of modifiedModelRoles) {

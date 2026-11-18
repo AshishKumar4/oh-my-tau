@@ -70,6 +70,8 @@ export async function createCleanseAgentRuntime(options: {
 	hooks?: CleanseAgentHooks;
 }): Promise<CleanseAgentRuntime> {
 	const cwd = options.cwd ?? getProjectDir();
+	// Shared-LSP policy stays with the process owner: `omp cleanse` sets it at its
+	// CLI boundary, and an in-process /cleanse keeps its parent session's.
 	const settings = await Settings.init({ cwd });
 	const authStorage = await discoverAuthStorage(undefined, { settings });
 	const modelRegistry = new ModelRegistry(authStorage);
@@ -104,7 +106,7 @@ export async function createCleanseAgentRuntime(options: {
 		getArtifactsDir: () => sessionManager.getArtifactsDir(),
 		getArtifactManager: () => sessionManager.getArtifactManager(),
 		getAgentId: () => MAIN_AGENT_ID,
-		getSessionSpawns: () => "sonic,task",
+		getSessionSpawns: () => "task",
 		getModelString: () => modelSelector,
 		getActiveModelString: () => modelSelector,
 		getActiveModel: () => resolved.model,
@@ -117,8 +119,10 @@ export async function createCleanseAgentRuntime(options: {
 	/** Live worker number → reserved registry agent id, for follow-up steering. */
 	const workerAgentIds = new Map<number, string>();
 	// Cleanse workers are all subagents, and only a session that binds process state
-	// holds the process-wide shared-LSP mode, so the runtime holds it for them until closed.
+	// holds the process-wide shared-LSP mode, so the runtime holds it for them until closed,
+	// following `lsp.shared` changes as a session's hold does.
 	const sharedLsp = holdSharedLsp(cfgLspShared.get(settings));
+	const stopFollowingLsp = cfgLspShared.listen(settings, shared => sharedLsp.set(shared));
 
 	return {
 		model: modelDisplay,
@@ -163,7 +167,7 @@ export async function createCleanseAgentRuntime(options: {
 					session: toolSession,
 					invocationKind: "task",
 					assignment: renderAssignment(assignment, context.peers, context.worker, context.checkers),
-					agent: "sonic",
+					agent: "task",
 					model: modelSelector,
 					identity: { id: agentId, label: name },
 					index: assignment.index,
@@ -209,6 +213,7 @@ export async function createCleanseAgentRuntime(options: {
 		async close(result?: CleanseLoopResult): Promise<void> {
 			if (closed) return;
 			closed = true;
+			stopFollowingLsp();
 			sharedLsp.release();
 			sessionManager.appendCustomEntry("cleanse", {
 				status: result?.status ?? "interrupted",

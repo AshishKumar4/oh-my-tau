@@ -306,12 +306,15 @@ export interface ParsedAgentFields {
 	autoloadSkills?: string[];
 	readSummarize?: boolean;
 	blocking?: boolean;
+	pinModel?: boolean;
 	/** `true` = keep the output schema (and with it `yield`) when `task.structured` is off. */
 	structured?: boolean;
 	/** `true` = prewalk into the default target; string = prewalk into that model pattern. */
 	prewalk?: boolean | string;
 	/** `true` = advise with the default advisor-role model; string = advise with that model pattern. */
 	advisor?: boolean | string;
+	/** `true` = under Fusion, sessions of this agent lead a sidekick of their own. */
+	sidekick?: boolean;
 }
 
 /**
@@ -381,6 +384,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const blocking = parseBoolean(frontmatter.blocking);
 	const structured = parseBoolean(frontmatter.structured);
 	const readSummarize = parseBoolean(frontmatter.readSummarize);
+	const pinModel = parseBoolean(frontmatter.pinModel);
 	// prewalk: true → hand off to the default prewalk target; "<pattern>" → custom target.
 	let prewalk: boolean | string | undefined = parseBoolean(frontmatter.prewalk);
 	if (prewalk === undefined && typeof frontmatter.prewalk === "string") {
@@ -393,6 +397,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		const trimmed = frontmatter.advisor.trim();
 		if (trimmed) advisor = trimmed;
 	}
+	const sidekick = parseBoolean(frontmatter.sidekick);
 	const autoloadSkills = parseArrayOrCSV(frontmatter.autoloadSkills)
 		?.map(s => s.trim())
 		.filter(Boolean);
@@ -410,6 +415,8 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		readSummarize,
 		prewalk,
 		advisor,
+		sidekick,
+		pinModel,
 	};
 }
 

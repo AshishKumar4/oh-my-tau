@@ -442,6 +442,51 @@ describe("images purge", () => {
 		expect(stderr).toEqual([]);
 	});
 
+	test("--apply deletes an Anthropic file with the workspace of the pooled key that uploaded it", async () => {
+		const credential = "sk-ant-api03-PURGEpooledKey000000000";
+		const cache = new ProviderFileCache(resolvedConfig().providerFileCachePath, { saveDebounceMs: 60_000 });
+		cache.set("anthropic", credential, "b".repeat(64), {
+			provider: "anthropic",
+			id: "file_purge",
+			mimeType: "image/png",
+			bytes: 3,
+			delete: { method: "DELETE", url: "https://api.anthropic.com/v1/files/file_purge" },
+		});
+		cache.save();
+		routes.set("/purge", () => ({
+			applied: true,
+			purgedBlobs: 0,
+			reclaimedBytes: 0,
+			publications: [],
+			remoteDeletes: [],
+			attempted: 0,
+			deleted: 0,
+			errors: [],
+		}));
+		const deletions: Array<{ url: string; workspace: string | null }> = [];
+		const providerFetch: FetchImpl = async (input, init) => {
+			deletions.push({ url: String(input), workspace: new Headers(init?.headers).get("anthropic-workspace-id") });
+			return new Response(null, { status: 204 });
+		};
+
+		const result = await runImagesCommand(
+			args("purge", { apply: true, all: true, json: true }),
+			dependencies({
+				openAuthStorage: async () => {
+					const storage = await AuthStorage.create(":memory:");
+					await storage.credentials.addApiKey("anthropic", credential, { workspaceId: "wrkspc_01PURGEworkspace" });
+					return storage;
+				},
+				fetch: providerFetch,
+			}),
+		);
+
+		expect(result).toMatchObject({ providerFiles: { selected: 1, deleted: 1, skippedAuth: 0 } });
+		expect(deletions).toEqual([
+			{ url: "https://api.anthropic.com/v1/files/file_purge", workspace: "wrkspc_01PURGEworkspace" },
+		]);
+	});
+
 	test("keeps provider-file metadata and fails safely when the matching credential is unavailable", async () => {
 		await writeProviderFile("unavailable-secret");
 		routes.set("/purge", () => ({

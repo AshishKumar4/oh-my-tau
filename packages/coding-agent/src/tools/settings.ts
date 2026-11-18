@@ -1103,6 +1103,18 @@ export const cfgToolsXdev = register({
 	},
 });
 
+export const cfgToolsDisabled = register({
+	id: "tools.disabled",
+	type: "array",
+	default: EMPTY_STRING_ARRAY,
+	ui: {
+		tab: "tools",
+		group: "Discovery & MCP",
+		label: "Disabled Tools",
+		description: "Built-in tools never mounted, by name (e.g. glob, grep). Applies to every session and profile.",
+	},
+});
+
 export const cfgToolsXdevDocs = register({
 	id: "tools.xdevDocs",
 	type: "enum",
@@ -1217,6 +1229,7 @@ export const cfgBuiltinToolGates = combine({
 	contextManagement: cfgCompactionExperimentalContextManagement,
 	debug: cfgDebugEnabled,
 	editMode: cfgEditMode,
+	disabled: cfgToolsDisabled,
 	evalJs: cfgEvalJs,
 	evalPy: cfgEvalPy,
 	find: cfgFindEnabled,

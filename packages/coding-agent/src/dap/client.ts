@@ -530,6 +530,7 @@ export class DapClient {
 			flush = this.#writeSink.flush();
 		} catch (error) {
 			// A synchronous write/flush failure is as terminal as a rejected one.
+			this.#failConnection(error instanceof Error ? error : new Error(String(error), { cause: error }));
 			void this.dispose();
 			throw error;
 		}
@@ -559,6 +560,7 @@ export class DapClient {
 		} catch (error) {
 			// The client is now known-broken. Kick off dispose in the background;
 			// callers will see subsequent sendRequest calls fail fast.
+			this.#failConnection(error instanceof Error ? error : new Error(String(error), { cause: error }));
 			void this.dispose();
 			throw error;
 		} finally {

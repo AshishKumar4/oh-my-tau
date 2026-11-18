@@ -41,11 +41,13 @@ import type { AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { isRecord, logger, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { ExtensionUIContext, ExtensionUIDialogOptions, ExtensionUISelectItem } from "../extensibility/extensions";
+import { type HarnessBridges, type HarnessSchemaBridge, harnessParameters, harnessParams } from "../harness/bridge";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { askTimeoutMs, cfgAskNotify } from "../modes/settings";
 import askDescription from "../prompts/tools/ask.md" with { type: "text" };
 import askHeadlessForkMessage from "../prompts/tools/ask-headless-fork.md" with { type: "text" };
 import askResultTemplate from "../prompts/tools/ask-result.md" with { type: "text" };
+import claudeCodeAskDescription from "../prompts/tools/harness/claude-code-ask.md" with { type: "text" };
 import { renderAttachmentSourceNotice } from "../session/attachment-source-notice";
 import { cfgSpeechEnabled } from "../tts/settings";
 import { vocalizer } from "../tts/vocalizer";
@@ -70,11 +72,63 @@ const askSchema = arkType({
 
 export type AskParams = typeof askSchema.infer;
 
+/** Claude Code's `AskUserQuestion`: one to four multiple-choice questions. */
+const claudeCodeAskSchema = arkType({
+	questions: arkType({
+		question: arkType("string").describe("question text"),
+		header: arkType("string").describe("short display chip (max 12 chars)"),
+		options: arkType({
+			label: arkType("string").describe("display label"),
+			description: arkType("string").describe("explanatory text displayed below the label"),
+			"preview?": arkType("string").describe("optional rich preview content"),
+		})
+			.array()
+			.atLeastLength(2)
+			.atMostLength(4)
+			.describe("available options"),
+		multiSelect: arkType("boolean").describe("allow multiple selections").default(false),
+	})
+		.array()
+		.atLeastLength(1)
+		.atMostLength(4)
+		.describe("questions to ask (1-4)"),
+});
+type AskInputSchema = typeof askSchema | typeof claudeCodeAskSchema;
+
+/**
+ * The form `ask` shows for Claude Code's questions: one group per question,
+ * named `q1`…`q4` in order, so the submitted JSON answers them by position.
+ * Each group ends with a free-text `qN_other` field: Claude Code's picker
+ * always offers "Other", and its tool description promises it.
+ */
+function claudeCodeAskForm(questions: (typeof claudeCodeAskSchema.infer)["questions"]): string {
+	const groups = questions.map((question, index) => {
+		const type = question.multiSelect ? "checkbox" : "radio";
+		const options = question.options.map(option => {
+			const label = `<label><input type="${type}" name="q${index + 1}" value="${Bun.escapeHTML(option.label)}"> ${Bun.escapeHTML(option.label)}: ${Bun.escapeHTML(option.description)}</label>`;
+			return option.preview ? `${label}\n<pre>${Bun.escapeHTML(option.preview)}</pre>` : label;
+		});
+		const legend = `${Bun.escapeHTML(question.header)}: ${Bun.escapeHTML(question.question)}`;
+		const other = `<label>Other <input type="text" name="q${index + 1}_other"></label>`;
+		return `<fieldset>\n<legend>${legend}</legend>\n${options.join("\n")}\n${other}\n</fieldset>`;
+	});
+	return `<form>\n${groups.join("\n")}\n</form>`;
+}
+
+const CLAUDE_CODE_ASK: HarnessSchemaBridge<AskParams, typeof claudeCodeAskSchema> = {
+	parameters: claudeCodeAskSchema,
+	toParams: args => ({ html: claudeCodeAskForm(args.questions) }),
+};
+const ASK_BRIDGES: HarnessBridges<AskParams, typeof claudeCodeAskSchema> = { "claude-code": CLAUDE_CODE_ASK };
+
 /** The `html` of a persisted or streamed `ask` call, for `/tree` re-answer and status lines. */
 export function recoverAskHtml(toolCallArguments: unknown): string | undefined {
 	if (!isRecord(toolCallArguments)) return undefined;
 	const html = toolCallArguments.html;
-	return typeof html === "string" ? html : undefined;
+	if (typeof html === "string") return html;
+	// A call recorded under the claude-code profile carries the vendor's questions.
+	const vendor = claudeCodeAskSchema(toolCallArguments);
+	return vendor instanceof arkType.errors ? undefined : claudeCodeAskForm(vendor.questions);
 }
 
 // =============================================================================
@@ -354,12 +408,14 @@ async function askFieldByField(
 // =============================================================================
 
 /** Asks the user to fill in one HTML form and returns the submitted form data. */
-export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
+export class AskTool implements AgentTool<AskInputSchema, AskToolDetails> {
 	readonly name = "ask";
 	readonly approval = "read" as const;
 	readonly label = "Ask";
 	readonly summary = "Ask the user to fill in a form";
-	readonly parameters = askSchema;
+	get parameters(): AskInputSchema {
+		return harnessParameters(this.session, ASK_BRIDGES, askSchema);
+	}
 	readonly strict = true;
 
 	// Run alone in its tool batch. The interactive dialog is a single shared UI
@@ -372,7 +428,13 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 
 	constructor(private readonly session: ToolSession) {}
 
-	readonly description = prompt.render(askDescription);
+	readonly #nativeDescription = prompt.render(askDescription);
+	/** Claude Code's `AskUserQuestion` describes its own fields when no vendor declaration is served. */
+	get description(): string {
+		return this.parameters === claudeCodeAskSchema
+			? prompt.render(claudeCodeAskDescription)
+			: this.#nativeDescription;
+	}
 
 	static createIf(session: ToolSession): AskTool | null {
 		return (session.canPromptUser ?? session.hasUI) || session.advertiseHeadlessAsk ? new AskTool(session) : null;
@@ -435,7 +497,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 
 	async execute(
 		_toolCallId: string,
-		params: AskParams,
+		input: AskParams | typeof claudeCodeAskSchema.infer,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
@@ -450,6 +512,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 			throw new ToolAbortError("Ask tool requires interactive mode");
 		}
 
+		const params = harnessParams(this.session, ASK_BRIDGES, input);
 		const form = parseHtmlForm(params.html);
 		const questions = fieldQuestions(form);
 		const named = form.fields.filter(field => field.name);

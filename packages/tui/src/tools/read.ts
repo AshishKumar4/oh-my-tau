@@ -640,7 +640,9 @@ export const readToolRenderer = {
 			}));
 		}
 		const details = result.details;
-		const rawText = result.content?.find(c => c.type === "text")?.text ?? "";
+		// Every text block, as the model sees it: a resource warning (e.g. a superseded
+		// agent:// value) arrives as its own block ahead of the value.
+		const rawText = resultText(result);
 		// Prefer structured `displayContent` from details when available so the TUI
 		// shows clean file content (no model-only hashline anchors) without parsing the formatted text.
 		// Fall back to the raw text, but strip the LLM-facing notice so it doesn't
@@ -875,6 +877,14 @@ const BRACE_TAIL_TRAILING_RE = /^[;,)\]}]*$/;
  * (optionally followed by terminating punctuation like `;`, `,`, or further
  * closers — e.g. `};`, `})`, `]);`).
  */
+/** How plain line numbers prefix a row: `N|text`, or Claude Code's `cat -n` layout. */
+export type LineNumbering = "pipe" | "cat";
+
+/** `text` as row `line` under `numbering`. */
+export function numberedLine(line: number | string, text: string, numbering: LineNumbering): string {
+	return numbering === "cat" ? `${String(line).padStart(6)}\t${text}` : `${line}|${text}`;
+}
+
 export function canMergeBracePair(headLine: string, tailLine: string): boolean {
 	const head = headLine.trimEnd();
 	const tail = tailLine.trim();
@@ -891,9 +901,10 @@ export function formatSingleLine(
 	text: string,
 	shouldAddHashLines: boolean,
 	shouldAddLineNumbers: boolean,
+	numbering: LineNumbering = "pipe",
 ): string {
 	if (shouldAddHashLines) return formatNumberedLine(line, text);
-	if (shouldAddLineNumbers) return `${line}|${text}`;
+	if (shouldAddLineNumbers) return numberedLine(line, text, numbering);
 	return text;
 }
 
@@ -905,20 +916,21 @@ export function formatMergedBraceLine(
 	tailText: string,
 	shouldAddHashLines: boolean,
 	shouldAddLineNumbers: boolean,
+	numbering: LineNumbering = "pipe",
 ): { model: string; display: string } {
 	const merged = `${headText.trimEnd()} … ${tailText.trim()}`;
 	if (shouldAddHashLines) {
 		return { model: `${startLine}-${endLine}:${merged}`, display: merged };
 	}
 	if (shouldAddLineNumbers) {
-		return { model: `${startLine}-${endLine}|${merged}`, display: merged };
+		return { model: numberedLine(`${startLine}-${endLine}`, merged, numbering), display: merged };
 	}
 	return { model: merged, display: merged };
 }
 
 /** Format a structural summary using the supplied file-display preferences. */
 export function formatReadSummary(
-	displayMode: { hashLines: boolean; lineNumbers: boolean },
+	displayMode: { hashLines: boolean; lineNumbers: boolean; numbering?: LineNumbering },
 	summary: SummaryResult,
 ): {
 	text: string;
@@ -1001,6 +1013,7 @@ export function formatReadSummary(
 				unit.tailText,
 				shouldAddHashLines,
 				shouldAddLineNumbers,
+				displayMode.numbering,
 			);
 			modelParts.push(formatted.model);
 			displayParts.push(formatted.display);
@@ -1011,7 +1024,9 @@ export function formatReadSummary(
 			elidedLines += Math.max(0, unit.endLine - unit.startLine - 1);
 			continue;
 		}
-		modelParts.push(formatSingleLine(unit.line, unit.text, shouldAddHashLines, shouldAddLineNumbers));
+		modelParts.push(
+			formatSingleLine(unit.line, unit.text, shouldAddHashLines, shouldAddLineNumbers, displayMode.numbering),
+		);
 		displayParts.push(unit.text);
 	}
 

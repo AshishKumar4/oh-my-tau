@@ -36,11 +36,12 @@ function authHeaders(credential: string): Readonly<Record<string, string>> {
 	return isAnthropicOAuthToken(credential) ? { Authorization: `Bearer ${credential}` } : { "x-api-key": credential };
 }
 
-function requestHeaders(credential: string): Readonly<Record<string, string>> {
+function requestHeaders(credential: string, workspaceId: string | undefined): Readonly<Record<string, string>> {
 	return {
 		...authHeaders(credential),
 		"anthropic-version": resolveAnthropicApiVersion(ANTHROPIC_FILES_URL),
 		"anthropic-beta": ANTHROPIC_FILES_BETA,
+		...(workspaceId ? { "anthropic-workspace-id": workspaceId } : {}),
 	};
 }
 
@@ -94,6 +95,7 @@ export function createAnthropicFileClient(
 	model: Model,
 	credential: string,
 	fetchImpl: FetchImpl = globalThis.fetch,
+	workspaceId?: string,
 ): ProviderFileClient | null {
 	if (
 		model.provider !== "anthropic" ||
@@ -107,7 +109,7 @@ export function createAnthropicFileClient(
 	return {
 		provider: "anthropic",
 		async upload(request: ProviderFileUploadRequest): Promise<ProviderFileHandle> {
-			const headers = requestHeaders(credential);
+			const headers = requestHeaders(credential, workspaceId);
 			const form = new FormData();
 			form.append("file", uploadedFile(request));
 			const response = await expectAnthropicOk(
@@ -133,7 +135,7 @@ export function createAnthropicFileClient(
 		async delete(handle: ProviderFileHandle): Promise<void> {
 			if (handle.provider !== "anthropic" || !handle.id)
 				throw new Error("Cannot delete an invalid Anthropic file handle");
-			const headers = requestHeaders(credential);
+			const headers = requestHeaders(credential, workspaceId);
 			await expectAnthropicOk(
 				await fetchImpl(`${ANTHROPIC_FILES_URL}/${encodeURIComponent(handle.id)}`, {
 					method: "DELETE",
