@@ -46,9 +46,6 @@ function buildToolSession(
 		settings: options.settings,
 		authStorage: options.authStorage,
 		modelRegistry: options.modelRegistry,
-		// The task tool no longer takes a per-call schema; the inherited session
-		// schema drives structured output for every spawn from this session.
-		outputSchema: analyzeFileOutputSchema,
 	};
 }
 
@@ -63,7 +60,7 @@ export function createAnalyzeFileTool(options: {
 	return {
 		name: "analyze_files",
 		label: "Analyze Files",
-		description: "Spawn sonic agents to analyze files.",
+		description: "Spawn scout agents to analyze files.",
 		parameters: analyzeFileSchema,
 		async execute(toolCallId, params, _onUpdate, ctx, signal) {
 			const toolSession = buildToolSession(ctx, options);
@@ -84,8 +81,10 @@ export function createAnalyzeFileTool(options: {
 					});
 					const taskParams: TaskParams = {
 						name: `AnalyzeFile${index + 1}`,
-						agent: "sonic",
+						agent: "scout",
 						task: assignment,
+						// A caller schema replaces scout's own exploration schema.
+						outputSchema: analyzeFileOutputSchema,
 					};
 					return taskTool.execute(`${toolCallId}-${index + 1}`, taskParams, signal);
 				}),

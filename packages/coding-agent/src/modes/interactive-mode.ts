@@ -304,7 +304,6 @@ import { CodexResetFireworksController } from "@oh-my-pi/pi-tui/overlays/codex-r
 import { type ComposerNativeState, CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { DynamicBorder } from "@oh-my-pi/pi-tui/chrome/dynamic-border";
 import { EditorTopGap } from "@oh-my-pi/pi-tui/prompt/editor-top-gap";
-import type { VersionUpdate } from "@oh-my-pi/pi-tui/prompt/welcome";
 import { ErrorBannerComponent } from "@oh-my-pi/pi-tui/overlays/error-banner";
 import type { EvalExecutionComponent } from "@oh-my-pi/pi-tui/chat/eval-execution";
 import type { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
@@ -4979,12 +4978,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 		}
 		this.chatContainer.clear();
-		// Live display collapses to the compacted transcript tail unless the
-		// user opted into the full inline history; export/resume callers choose
-		// their own mode.
-		const context = this.viewSession.buildTranscriptSessionContext({
-			collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
-		});
+		const { context, omitted } = this.#uiHelpers.buildLiveTranscript();
 		const preservedLiveToolCallIds = new Set<string>();
 		// A preserved pending-tool component whose result has already landed in
 		// the replayed transcript is re-rendered by `renderSessionContext` itself
@@ -5053,6 +5047,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.renderSessionContext(context, {
 			reuseSettledComponents: options.reuseSettledComponents,
 			preservedLiveToolCallIds,
+			earlierMessages: omitted.length,
 		});
 		for (const child of liveComponents) {
 			this.chatContainer.addChild(child);
@@ -6083,9 +6078,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		// prompt, which predictably invalidates the cache.
 		this.lastAssistantUsage = undefined;
 
-		// Plan mode state must land before the tool partition: it keeps `write`
-		// active as the staging transport, and plan approval is a top-level
-		// `write` to `xd://propose`.
+		// Plan mode state must land before the tool partition: under Code Mode the
+		// direct surface keeps `write` only while a transport needs it, and plan
+		// approval is a top-level `write` to `xd://propose`.
 		const previousPlanModeState = this.session.getPlanModeState();
 		this.session.setPlanModeState({
 			enabled: true,
@@ -9042,15 +9037,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.setWorkingMessage(message);
 	}
 
-	showNewVersionNotification(newVersion: string): void {
-		this.#uiHelpers.showNewVersionNotification(newVersion);
-	}
-
-	/** Show (or with `null`, clear) background auto-update progress after the welcome banner's version. */
-	showVersionUpdate(update: VersionUpdate | null): void {
-		this.composer.updateWelcome({ versionUpdate: update });
-	}
-
 	/**
 	 * Add this launch's release notes below the welcome header. Startup calls it
 	 * after the first session-bound frame; quiet startup and hidden mode show nothing.
@@ -9622,6 +9608,10 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	showUserMessageSelector(startAt?: string): void {
 		this.#selectorController.showUserMessageSelector(startAt);
+	}
+
+	undoLastTurn(): Promise<void> {
+		return this.#selectorController.undoLastTurn();
 	}
 
 	showCopySelector(): void {

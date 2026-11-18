@@ -29,6 +29,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import { MonitorTool } from "@oh-my-pi/pi-coding-agent/tools/monitor";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
@@ -456,6 +457,46 @@ it("ACP bash uses pattern decisions and scopes persistent grants to noncritical 
 	// Critical commands ask on every call, whatever was granted.
 	expect(requests).toEqual(["echo probe-1", "rm -rf /", "rm -rf /"]);
 	expect(bashTool.executeCalls).toBe(5);
+});
+
+it("ACP monitor commands follow bash's grant scoping: Always allow never covers a critical command", async () => {
+	const settingsOverrides = { "tools.approvalMode": "always-ask", "tools.approval": { monitor: "prompt" } };
+	const settings = Settings.isolated(settingsOverrides);
+	const requests: string[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall) {
+			const input = toolCall.rawInput;
+			requests.push(input && typeof input === "object" && "command" in input ? String(input.command) : "");
+			return { outcome: "selected", optionId: "allow_always", kind: "allow_always" };
+		},
+	};
+	const monitorTool = makeFakeTool("monitor");
+	monitorTool.approval = new MonitorTool({ ...makeToolSession(bridge), settings }).approval;
+	const wrapped = new ExtensionToolWrapper(monitorTool, noUiRunner()) as unknown as AgentTool;
+	session = await createSession([wrapped], bridge, settingsOverrides);
+	await session.setActiveToolsByName(["monitor"]);
+	const gated = session.agent.state.tools.find(tool => tool.name === "monitor");
+	if (!gated) throw new Error("Missing monitor tool");
+	const ctx = { settings } as never;
+	const run = (command: string) =>
+		gated.execute(
+			`call-${command}`,
+			{ description: "x", timeout_ms: 1_000, command },
+			undefined,
+			undefined as never,
+			ctx,
+		);
+
+	await run("tail -f a.log");
+	await run("tail -f b.log");
+	// "Always allow" covers later ordinary monitors.
+	expect(requests).toEqual(["tail -f a.log"]);
+	await run("rm -rf /");
+	await run("rm -rf /");
+	// A critical command asks on every call, whatever was granted.
+	expect(requests).toEqual(["tail -f a.log", "rm -rf /", "rm -rf /"]);
+	expect(monitorTool.executeCalls).toBe(4);
 });
 
 it("always-ask: an ordinary edit without an ACP grant still faces the inner approval gate", async () => {
@@ -944,6 +985,47 @@ it("bash permission requests include execute metadata and command content", asyn
 		content: [{ type: "content", content: { type: "text", text: "$ git status --short" } }],
 	});
 	expect(bashTool.executeCalls).toBe(1);
+});
+
+it("a monitor's command asks permission like a bash command, and a WebSocket monitor does not", async () => {
+	const monitorTool = makeFakeTool("monitor");
+	const requests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall, _options, _signal) {
+			requests.push(toolCall);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	session = await createSession([monitorTool], bridge);
+
+	await session.setActiveToolsByName(["monitor"]);
+	const wrapped = session.agent.state.tools.find(t => t.name === "monitor");
+	const command = "tail -f run.log | grep --line-buffered ERROR";
+	await wrapped!.execute(
+		"call-monitor",
+		{ description: "errors", timeout_ms: 60_000, command },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+	expect(requests).toHaveLength(1);
+	expect(requests[0]).toMatchObject({
+		toolName: "monitor",
+		title: command,
+		kind: "execute",
+		content: [{ type: "content", content: { type: "text", text: `$ ${command}` } }],
+	});
+
+	await wrapped!.execute(
+		"call-monitor-ws",
+		{ description: "deploys", timeout_ms: 60_000, ws: { url: "wss://events.example.com" } },
+		undefined,
+		undefined as never,
+		undefined as never,
+	);
+	expect(requests).toHaveLength(1);
+	expect(monitorTool.executeCalls).toBe(2);
 });
 
 it("ordinary edit calls still bypass ACP permission after rejecting edit moves forever", async () => {

@@ -686,7 +686,18 @@ export interface SessionStats {
 	routedModels?: Record<string, number>;
 	/** Failed edits by the engine's `errorKind`. */
 	editRejections?: Record<string, number>;
+	/** Prompt-cache totals per harness profile that served this session's requests. */
+	promptCacheByHarness?: Record<string, HarnessCacheStats>;
 	contextUsage?: ContextUsage;
+}
+
+export interface HarnessCacheStats {
+	requests: number;
+	input: number;
+	cacheRead: number;
+	cacheWrite: number;
+	/** Cache-read tokens over all prompt tokens, as a percentage, weighted by tokens. */
+	hitPct: number;
 }
 
 export interface MessagesPage {
@@ -813,7 +824,7 @@ export interface PromptAck {
 
 export type AutoCompactionReason = "threshold" | "overflow" | "idle" | "incomplete";
 
-export type AutoCompactionAction = "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
+export type AutoCompactionAction = "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "rewrite";
 
 export type CacheWarmingPhase = "streaming" | "idle";
 
@@ -939,6 +950,8 @@ export interface ManualCompactionEndEvent {
 	result?: CompactionResult;
 	/** There was nothing to compact; `errorMessage` says why. */
 	skipped?: boolean;
+	/** A `session_before_compact` hook rewrote history in place and no boundary was needed. */
+	rewritten?: boolean;
 	errorMessage?: string;
 }
 
@@ -1980,7 +1993,7 @@ export interface RpcWireCommands {
 	set_steering_mode: { params: SetSteeringModeParams; result: undefined };
 	set_follow_up_mode: { params: SetFollowUpModeParams; result: undefined };
 	set_interrupt_mode: { params: SetInterruptModeParams; result: undefined };
-	compact: { params: CompactParams; result: CompactionResult };
+	compact: { params: CompactParams; result: CompactionResult | null };
 	set_auto_compaction: { params: SetAutoCompactionParams; result: undefined };
 	set_cache_warming: { params: SetCacheWarmingParams; result: SetCacheWarmingResult };
 	set_auto_retry: { params: SetAutoRetryParams; result: undefined };

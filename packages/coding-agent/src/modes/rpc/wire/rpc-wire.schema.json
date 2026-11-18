@@ -486,10 +486,10 @@
 			},
 			{
 				"name": "compact",
-				"doc": "Compact the conversation.",
+				"doc": "Compact the conversation; null when an extension rewrote history in place and wrote no boundary.",
 				"params": "CompactParams",
 				"result": "CompactionResult",
-				"nullable": false,
+				"nullable": true,
 				"unwrap": null,
 				"timeoutMs": null,
 				"completion": null,
@@ -3243,6 +3243,14 @@
 					},
 					"description": "Failed edits by the engine's `errorKind`."
 				},
+				"promptCacheByHarness": {
+					"type": "object",
+					"properties": {},
+					"additionalProperties": {
+						"$ref": "#/$defs/HarnessCacheStats"
+					},
+					"description": "Prompt-cache totals per harness profile that served this session's requests."
+				},
 				"contextUsage": {
 					"$ref": "#/$defs/ContextUsage"
 				}
@@ -3257,6 +3265,34 @@
 				"tokens",
 				"premiumRequests",
 				"cost"
+			]
+		},
+		"HarnessCacheStats": {
+			"type": "object",
+			"properties": {
+				"requests": {
+					"type": "integer"
+				},
+				"input": {
+					"type": "integer"
+				},
+				"cacheRead": {
+					"type": "integer"
+				},
+				"cacheWrite": {
+					"type": "integer"
+				},
+				"hitPct": {
+					"type": "number",
+					"description": "Cache-read tokens over all prompt tokens, as a percentage, weighted by tokens."
+				}
+			},
+			"required": [
+				"requests",
+				"input",
+				"cacheRead",
+				"cacheWrite",
+				"hitPct"
 			]
 		},
 		"MessagesPage": {
@@ -3688,7 +3724,8 @@
 				"remote",
 				"handoff",
 				"shake",
-				"snapcompact"
+				"snapcompact",
+				"rewrite"
 			],
 			"type": "string"
 		},
@@ -4045,6 +4082,10 @@
 				"skipped": {
 					"type": "boolean",
 					"description": "There was nothing to compact; `errorMessage` says why."
+				},
+				"rewritten": {
+					"type": "boolean",
+					"description": "A `session_before_compact` hook rewrote history in place and no boundary was needed."
 				},
 				"errorMessage": {
 					"type": "string"

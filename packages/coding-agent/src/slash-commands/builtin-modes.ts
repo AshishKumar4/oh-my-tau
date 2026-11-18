@@ -1,5 +1,6 @@
 import { clearSubmittedText, runWithDetachedDraft } from "./helpers/draft";
 import * as path from "node:path";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import { formatKeyHint } from "@oh-my-pi/pi-tui/app-keybindings";
 import { prompt } from "@oh-my-pi/pi-utils";
@@ -10,6 +11,10 @@ import {
 	type ResolveCliModelResult,
 } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
+import { describeSidekickOwner, listSidekickRefs, resolveSidekickModel } from "../fusion/config";
+import { cfgFusionEnabled, cfgFusionSidekickModel, cfgFusionSidekickThinking } from "../fusion/settings";
+import { servedHarnessPrompt } from "../harness/capture";
+import { effectiveHarnessProfile } from "../harness/effective-profile";
 import {
 	applyModelPreset,
 	deleteModelPreset,
@@ -24,8 +29,11 @@ import {
 import { describeLoopCondition } from "../modes/loop-condition";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
+import type { AgentRef } from "../registry/agent-registry";
 import ratchetKickoffPrompt from "../prompts/ratchet-kickoff.md" with { type: "text" };
+import { ratchetAskToolName } from "../ratchet/prelude-definition";
 import type { AgentSession } from "../session/agent-session";
+import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { CLI_THINKING_LEVELS, getConfiguredThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
 import { noThinkingMessage, resolveThinkingArgument } from "./helpers/effort";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
@@ -200,6 +208,73 @@ function applyComputerUseToggle(session: AgentSession, enable: boolean): string 
 		: "Computer use disabled for this session.";
 }
 
+/** One live sidekick for `/fusion status`: id, owner (top-level or the subagent lead's label), status, usage. */
+function formatSidekickRef(ref: AgentRef): string {
+	const stats = ref.session?.getSessionStats();
+	const usage = stats
+		? `${formatTokenCount(stats.tokens.total)} tokens, $${stats.cost.toFixed(4)}`
+		: ref.history?.metrics
+			? `${formatTokenCount(ref.history.metrics.tokens)} tokens, $${ref.history.metrics.cost.toFixed(4)}`
+			: "usage unavailable";
+	return `${ref.id} (${describeSidekickOwner(ref)}, ${ref.status}, ${usage})`;
+}
+
+/**
+ * `/fusion status`: lead model, sidekick model/thinking, and every live
+ * sidekick with its owner. There is one per lead: the top-level session and
+ * each subagent whose agent definition opted in with `sidekick: true`.
+ */
+function formatFusionStatus(session: AgentSession): string {
+	const { settings } = session;
+	const lead = session.model;
+	const sidekick = resolveSidekickModel(settings, session.modelRegistry);
+	const lines = [
+		`Fusion: ${cfgFusionEnabled.get(settings) ? "enabled" : "disabled"}`,
+		`lead: ${lead ? formatModelString(lead) : "none selected"}`,
+		`sidekick: ${sidekick.model ? formatModelString(sidekick.model) : `${sidekick.pattern} (${sidekick.error})`} · thinking ${cfgFusionSidekickThinking.get(settings)}`,
+	];
+	const refs = listSidekickRefs();
+	lines.push(
+		refs.length === 0
+			? "sidekick agent: not spawned"
+			: `sidekick agent${refs.length === 1 ? "" : "s"}: ${refs.map(formatSidekickRef).join(", ")}`,
+	);
+	return lines.join(" · ");
+}
+
+/**
+ * Apply a `/fusion` argument (`on`, `off`, empty = toggle, or a sidekick model
+ * selector which also enables) and remount the tool + lead prompt in place.
+ */
+async function applyFusionCommand(session: AgentSession, settings: Settings, args: string): Promise<string> {
+	const arg = args.trim();
+	const lowered = arg.toLowerCase();
+	if (lowered === "status") return formatFusionStatus(session);
+	let enable: boolean;
+	if (!arg || lowered === "toggle") {
+		enable = !cfgFusionEnabled.get(settings);
+	} else if (lowered === "on" || lowered === "off") {
+		enable = lowered === "on";
+	} else {
+		const resolved = resolveSessionModelSelector(arg, session, settings);
+		if (!resolved.model) throw new Error(resolved.error ?? `Unknown model: ${arg}`);
+		cfgFusionSidekickModel.set(settings, formatModelString(resolved.model));
+		const suffixEffort = THINKING_EFFORTS.find(effort => effort === resolved.thinkingLevel);
+		if (suffixEffort !== undefined) cfgFusionSidekickThinking.set(settings, suffixEffort);
+		enable = true;
+	}
+	cfgFusionEnabled.set(settings, enable);
+	const mounted = await session.applyFusionMode();
+	if (!enable) return "Fusion mode disabled.";
+	if (!mounted) {
+		const sidekick = resolveSidekickModel(settings, session.modelRegistry);
+		return `Fusion mode enabled, but the sidekick tool is not mounted: ${sidekick.error ?? "unavailable in this session"}`;
+	}
+	return `Fusion mode enabled. ${formatFusionStatus(session)}`;
+}
+
+const FUSION_USAGE = "Usage: /fusion [on|off|status|<sidekick model>]";
+
 /** Tools the ratchet loop needs: the eval kernel hosts `ratchet()`, `task` runs its analyzer. */
 const RATCHET_REQUIRED_TOOLS = ["eval", "task"] as const;
 
@@ -217,7 +292,13 @@ function prepareRatchet(session: AgentSession, request: string): { kickoff: stri
 		if (!previous) cfgRatchetEnabled.override(session.settings, previous);
 		return { error: "The ratchet eval prelude is unavailable in this session." };
 	}
-	const kickoff = prompt.render(ratchetKickoffPrompt, { request: request.trim() || undefined, tools }).trim();
+	const kickoff = prompt
+		.render(ratchetKickoffPrompt, {
+			request: request.trim() || undefined,
+			tools,
+			askTool: ratchetAskToolName(session.getToolRefs()),
+		})
+		.trim();
 	return { kickoff };
 }
 
@@ -443,9 +524,14 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			}
 
 			const model = runtime.session.model;
-			await runtime.output(
-				model ? `Current model: ${model.provider}/${model.id}` : "No model is currently selected.",
-			);
+			const harness = servedHarnessPrompt(model, effectiveHarnessProfile(runtime.settings, model) ?? null);
+			const lines = [model ? `Current model: ${model.provider}/${model.id}` : "No model is currently selected."];
+			if (harness !== undefined) {
+				lines.push(
+					`Harness prompt: ${harness.clientVersion} vendor capture, replacing omp's base prompt (${shortenPath(harness.path)})`,
+				);
+			}
+			await runtime.output(lines.join("\n"));
 			return commandConsumed();
 		},
 		handleTui: (_command, runtime) => {
@@ -686,6 +772,39 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			}
 			runtime.ctx.showStatus("Usage: /computer [on|off|status]");
 			clearSubmittedText(runtime);
+		},
+	},
+	{
+		name: "fusion",
+		icon: "swap",
+		description: "Toggle Fusion mode (lead plans and reviews; one persistent sidekick implements and verifies)",
+		acpDescription: "Toggle Fusion mode",
+		acpInputHint: "[on|off|status|<sidekick model>]",
+		inlineHint: "[on|off|status|<sidekick model>]",
+		subcommands: [
+			{ name: "on", description: "Enable Fusion mode and mount the sidekick tool" },
+			{ name: "off", description: "Disable Fusion mode and unmount the sidekick tool" },
+			{ name: "status", description: "Show lead and sidekick models and every live sidekick with its owner" },
+		],
+		allowArgs: true,
+		getTuiAutocompleteDescription: runtime => `Fusion: ${cfgFusionEnabled.get(runtime.ctx.settings) ? "on" : "off"}`,
+		handle: async (command, runtime) => {
+			try {
+				await runtime.output(await applyFusionCommand(runtime.session, runtime.settings, command.args));
+				await runtime.notifyConfigChanged?.();
+				return commandConsumed();
+			} catch (err) {
+				return usage(`${errorMessage(err)}\n${FUSION_USAGE}`, runtime);
+			}
+		},
+		handleTui: async (command, runtime) => {
+			clearSubmittedText(runtime);
+			try {
+				runtime.ctx.showStatus(await applyFusionCommand(runtime.ctx.session, runtime.ctx.settings, command.args));
+				refreshStatusLine(runtime.ctx);
+			} catch (err) {
+				runtime.ctx.showError(`${errorMessage(err)}\n${FUSION_USAGE}`);
+			}
 		},
 	},
 	{

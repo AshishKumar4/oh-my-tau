@@ -3391,8 +3391,24 @@ pub struct SessionStats {
 	/// Failed edits by the engine's `errorKind`.
 	#[serde(rename = "editRejections", default, skip_serializing_if = "Option::is_none")]
 	pub edit_rejections: Option<BTreeMap<String, f64>>,
+	/// Prompt-cache totals per harness profile that served this session's requests.
+	#[serde(rename = "promptCacheByHarness", default, skip_serializing_if = "Option::is_none")]
+	pub prompt_cache_by_harness: Option<BTreeMap<String, HarnessCacheStats>>,
 	#[serde(rename = "contextUsage", default, skip_serializing_if = "Option::is_none")]
 	pub context_usage: Option<ContextUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HarnessCacheStats {
+	pub requests: i64,
+	pub input: i64,
+	#[serde(rename = "cacheRead")]
+	pub cache_read: i64,
+	#[serde(rename = "cacheWrite")]
+	pub cache_write: i64,
+	/// Cache-read tokens over all prompt tokens, as a percentage, weighted by tokens.
+	#[serde(rename = "hitPct")]
+	pub hit_pct: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3627,6 +3643,8 @@ pub enum AutoCompactionAction {
 	Shake,
 	#[serde(rename = "snapcompact")]
 	Snapcompact,
+	#[serde(rename = "rewrite")]
+	Rewrite,
 }
 
 impl AutoCompactionAction {
@@ -3638,6 +3656,7 @@ impl AutoCompactionAction {
 			Self::Handoff => "handoff",
 			Self::Shake => "shake",
 			Self::Snapcompact => "snapcompact",
+			Self::Rewrite => "rewrite",
 		}
 	}
 }
@@ -3856,6 +3875,9 @@ pub struct ManualCompactionEndEvent {
 	/// There was nothing to compact; `errorMessage` says why.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub skipped: Option<bool>,
+	/// A `session_before_compact` hook rewrote history in place and no boundary was needed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rewritten: Option<bool>,
 	#[serde(rename = "errorMessage", default, skip_serializing_if = "Option::is_none")]
 	pub error_message: Option<String>,
 }
@@ -6932,7 +6954,7 @@ impl Command for SetInterruptModeCommand {
 	}
 }
 
-/// Compact the conversation.
+/// Compact the conversation; null when an extension rewrote history in place and wrote no boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CompactCommand {
 	#[serde(rename = "customInstructions", default, skip_serializing_if = "Option::is_none")]
@@ -6942,10 +6964,13 @@ pub struct CompactCommand {
 impl Command for CompactCommand {
 	const NAME: &'static str = "compact";
 	const TIMEOUT_MS: Option<u64> = None;
-	type Output = CompactionResult;
+	type Output = Option<CompactionResult>;
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
-		serde_json::from_value::<CompactionResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+		match data {
+			None | Some(Value::Null) => Ok(None),
+			Some(value) => serde_json::from_value::<CompactionResult>(value).map(Some),
+		}
 	}
 }
 

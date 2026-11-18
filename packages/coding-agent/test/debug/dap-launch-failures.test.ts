@@ -14,7 +14,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/dap/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { DebugTool } from "@oh-my-pi/pi-coding-agent/tools/debug";
-import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
+import { removeWithRetries, withTimeout, ptree } from "@oh-my-pi/pi-utils";
 
 const TEST_ADAPTER: DapResolvedAdapter = {
 	name: "lldb-dap",
@@ -29,6 +29,32 @@ const TEST_ADAPTER: DapResolvedAdapter = {
 	connectMode: "stdio",
 	acceptsDirectoryProgram: false,
 };
+
+it.each(["write-rejection", "flush-throw"])(
+	"settles a broken DAP transport and reaps its still-live adapter: %s",
+	async failure => {
+		const proc = ptree.spawn([process.execPath, "--eval", "setInterval(() => {}, 1000)"], { stdin: "pipe" });
+		const client = new DapClient(TEST_ADAPTER, process.cwd(), proc, {
+			writeSink: {
+				write: () => (failure === "write-rejection" ? Promise.reject(new Error("EPIPE fixture write")) : 0),
+				flush: () => {
+					if (failure === "flush-throw") throw new Error("EPIPE fixture flush");
+				},
+			},
+		});
+		try {
+			await expect(client.sendRequest("evaluate", {}, undefined, 60_000)).rejects.toThrow("EPIPE fixture");
+			await expect(client.sendRequest("threads", {}, undefined, 60_000)).rejects.toThrow("not running");
+			await proc.exited;
+			expect(client.isAlive()).toBe(false);
+		} finally {
+			await client.dispose();
+			proc.kill();
+			await proc.exited;
+		}
+	},
+	5000,
+);
 
 it("rejects pending DAP work and terminates an adapter with invalid framing", async () => {
 	const client = await DapClient.spawn({

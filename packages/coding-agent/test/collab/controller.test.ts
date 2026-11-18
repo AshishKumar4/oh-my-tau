@@ -52,7 +52,6 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
 	cfgMarketplaceAutoUpdate,
 	cfgStartupChangelogMode,
-	cfgStartupCheckUpdate,
 	cfgStartupSetupWizard,
 	cfgStartupShowSplash,
 } from "@oh-my-pi/pi-coding-agent/modes/settings";
@@ -299,7 +298,6 @@ describe("interactive collaboration startup", () => {
 		resetSettingsForTest();
 		await initTheme();
 		activeSettings = await Settings.init({ inMemory: true, cwd: tmp });
-		cfgStartupCheckUpdate.override(activeSettings, false);
 		cfgStartupChangelogMode.override(activeSettings, "hidden");
 		cfgStartupSetupWizard.override(activeSettings, false);
 		cfgStartupShowSplash.override(activeSettings, false);
