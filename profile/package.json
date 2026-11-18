@@ -1,0 +1,20 @@
+{
+	"name": "oh-my-tau-profile",
+	"version": "1.0.0",
+	"description": "Ashish's OMP profile: working rules, expert and debugger agents, a lane-orchestration playbook, and the review and writing skills the rules use.",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/AshishKumar4/oh-my-tau.git",
+		"directory": "profile"
+	},
+	"files": [
+		"agents",
+		"rules",
+		"skills",
+		"README.md"
+	],
+	"omp": {
+		"name": "oh-my-tau profile"
+	}
+}

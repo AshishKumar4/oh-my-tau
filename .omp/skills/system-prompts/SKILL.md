@@ -1,6 +1,7 @@
 ---
 name: system-prompts
 description: Write system prompts, tool docs, and agent definitions. Project tag conventions + RFC 2119 keywords + dense compression. Use when authoring or editing any prompt the model reads.
+disable-model-invocation: true
 ---
 
 # System Prompts
