@@ -52,7 +52,7 @@ await judgeBatch(states, questions, { intent?, concurrency?, retries?, minOk?, i
     `b.id` is an async job id:
     - completion auto-delivers a summary
 {{#if waitTool}}
-    - the `wait` tool (not kernel `wait()`) blocks when you have nothing else to do
+    - the `{{waitToolName}}` tool (not kernel `wait()`) blocks when you have nothing else to do
 {{/if}}
     - `{{#if py}}judge_batch.attach(id){{else}}await judgeBatch.attach(id){{/if}}` re-creates the ref after a reset.
 {{#ifAll py js}}

@@ -60,8 +60,8 @@ Its output under `{flow_dir}/{variant}/`:
   strict scoring (pass-on-retry is a fail unless the user decides otherwise); bounded concurrency near the rate limit; fresh state per trial.
 - Ground truth reachable by the grader only: not in the app's prompt, tools, sandbox, or anything the model under test can read.
 
-# Phase 1 — Grill (one `ask` form)
-Read the code first, then ask everything in one `ask` form with your recommendation preselected on each question:
+# Phase 1 — Grill (one `{{askTool}}` form)
+Read the code first, then ask everything in one `{{askTool}}` form with your recommendation preselected on each question:
 - Which flow and entry point; what one input carries (files, profile, conversation prefix).
 - Input source, best first:
   1. production transcripts (ask about retention/PII before pulling; if unkeepable, store ids and fetch at run time)
@@ -163,5 +163,5 @@ Include 2–3 before/after train transcript pairs, a failure taxonomy when zeros
 Then ask once whether to commit the eval (runner, cases, grader, flow dir minus `traces/`).
 
 # Headless
-Without `ask`, never build or approve.
+Without `{{askTool}}`, never build or approve.
 Continue only a flow whose `status()` shows every approval `current`; otherwise stop and say an interactive session is needed.

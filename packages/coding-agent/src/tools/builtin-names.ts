@@ -21,6 +21,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"security_scan",
 	"task",
 	"wait",
+	"monitor",
 	"todo",
 	"web_search",
 	"write",
@@ -30,6 +31,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"reflect",
 	"learn",
 	"manage_skill",
+	"sidekick",
 ] as const;
 
 export type BuiltinToolName = (typeof BUILTIN_TOOL_NAMES)[number];
@@ -61,6 +63,7 @@ export const BUILTIN_TOOL_HELP: Record<BuiltinToolName, BuiltinToolHelp> = {
 	eval: { summary: "Run Python/JS cells with browser, computer, and binary-analysis helpers", defaultState: "on" },
 	task: { summary: "Launch subagents for parallel work", defaultState: "on" },
 	wait: { summary: "Wait for background jobs", defaultState: "on" },
+	monitor: { summary: "Stream events from a long-running script or WebSocket as notifications", defaultState: "on" },
 	todo: { summary: "Track a todo list", defaultState: "on" },
 	ask: { summary: "Ask the user questions (interactive mode only)", defaultState: "on" },
 	web_search: { summary: "Search the web", defaultState: "on" },
@@ -80,6 +83,7 @@ export const BUILTIN_TOOL_HELP: Record<BuiltinToolName, BuiltinToolHelp> = {
 	learn: { summary: "Capture reusable lessons in long-term memory", defaultState: "off" },
 	manage_skill: { summary: "Create, update, or delete managed skills", defaultState: "off" },
 	security_scan: { summary: "Run security scans", defaultState: "off" },
+	sidekick: { summary: "Consult the Fusion sidekick model (Fusion leads only)", defaultState: "off" },
 };
 
 export const HIDDEN_TOOL_NAMES = ["yield", "goal", "think"] as const;

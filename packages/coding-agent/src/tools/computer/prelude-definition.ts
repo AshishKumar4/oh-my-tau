@@ -1,4 +1,6 @@
 import computerDescription from "../../prompts/tools/computer.md" with { type: "text" };
+// @ts-expect-error Bun imports this declaration source as text instead of a TypeScript module.
+import computerCodeModeDeclarations from "./declarations.d.ts" with { type: "text" };
 // @ts-expect-error Bun imports this JavaScript source as text instead of evaluating its module shape.
 import computerJavascript from "./prelude.js" with { type: "text" };
 import computerPython from "./prelude.py" with { type: "text" };
@@ -12,4 +14,5 @@ export const computerPreludeAssets = {
 		`const unknownOptionsMessage = ${unknownOptionsMessage.toString()};`,
 	),
 	python: computerPython,
+	codeModeDeclarations: computerCodeModeDeclarations,
 } as const;

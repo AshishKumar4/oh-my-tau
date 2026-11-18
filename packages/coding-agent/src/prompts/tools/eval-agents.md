@@ -50,7 +50,7 @@ await workpool(agent?, { name?, context?{{#if evalTools}}, tools?{{/if}}{{#if pe
   - {{#if py}}`.push(*items)` (strings) → item ids; `.status()`; `.peek()`; `.close()`.{{else}}`await` each of `.push(...items)` (strings) → item ids, `.status()`, `.peek()`, `.close()`.{{/if}}
   - Pool name = async job id; results auto-deliver.
   - The first full drain closes the pool: push the whole batch while it is active; next wave → new pool.
-  - {{#if waitTool}}Completely blocked? Leave `eval` and call the `wait` tool (not kernel `wait()`); {{/if}}NEVER poll.
+  - {{#if waitTool}}Completely blocked? Leave `eval` and call the `{{waitToolName}}` tool (not kernel `wait()`); {{/if}}NEVER poll.
 {{#if perCallModel}}
   - `model` selects each worker on its first turn; follow-ups reuse that session.
 {{/if}}

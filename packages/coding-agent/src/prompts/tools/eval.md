@@ -3,7 +3,7 @@ One cell per call; top-level state persists, including across compaction.{{#if s
 {{#if eagerDelegation}}
 For 2+ independent items, use a named `workpool()`; results auto-deliver.
 {{#if waitTool}}
-If blocked, leave `eval` and call `wait`.
+If blocked, leave `eval` and call `{{waitToolName}}`.
 {{/if}}
 {{/if}}
 {{/if}}
@@ -93,5 +93,6 @@ NEVER repeat successful setup. Kernel-loss notice means reload setup.
 
 {{#if autoBackgroundEnabled}}
 Long cells may auto-background and deliver later; the kernel stays busy.
+Without an explicit timeout, these runs have no cell deadline; explicit limits still apply.
 `timeout: 0` disables the cell deadline, not the foreground wait.
 {{/if}}
