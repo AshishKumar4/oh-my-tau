@@ -1,5 +1,5 @@
 import { extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
-import type { CredentialRotation, LimitsApi, OAuthAccess, OAuthApi, OAuthRequestIdentity } from "./auth/types";
+import type { CredentialRequestScope, CredentialRotation, LimitsApi, OAuthAccess, OAuthApi } from "./auth/types";
 import * as AIError from "./error";
 import { isAuthRetryableError, isInvalidatedOAuthTokenError } from "./error/auth-classify";
 import { isAccountPolicyError, isUsageLimit } from "./error/flags";
@@ -56,7 +56,7 @@ export interface ResolvedApiKey {
 	 */
 	afterSiblingWait?: boolean;
 	/** Non-secret request scope belonging to this bearer, replaced on account rotation. */
-	oauthIdentity?: OAuthRequestIdentity;
+	credentialScope?: CredentialRequestScope;
 }
 
 export type ApiKeyResolution = string | ResolvedApiKey | undefined;
@@ -361,7 +361,7 @@ async function runOAuthAttempt<T>(
  */
 export async function withAuth<T>(
 	key: ApiKey | undefined,
-	attempt: (key: string) => Promise<T>,
+	attempt: (key: string, scope: CredentialRequestScope | undefined) => Promise<T>,
 	opts?: { isAuthError?: (error: unknown) => boolean; signal?: AbortSignal; missingKeyMessage?: string },
 ): Promise<T> {
 	const isAuthError = opts?.isAuthError ?? isAuthRetryableError;
@@ -369,14 +369,19 @@ export async function withAuth<T>(
 
 	if (!isApiKeyResolver(key)) {
 		if (key === undefined) throw missingKey();
-		return attempt(key);
+		return attempt(key, undefined);
 	}
 
 	const resolver = key;
 	const signal = opts?.signal;
+	// The latest resolution always belongs to the bearer about to be attempted.
+	let scope: CredentialRequestScope | undefined;
+	const onResolved = (resolved: ApiKeyResolution) => {
+		scope = typeof resolved === "object" ? resolved.credentialScope : undefined;
+	};
 	let initialKey: string | undefined;
 	try {
-		initialKey = await resolveApiKeyOnce(resolver, signal);
+		initialKey = await resolveApiKeyOnce(resolver, signal, onResolved);
 	} catch (error) {
 		// A resolver that deliberately reports a missing key keeps that type.
 		if (error instanceof AIError.MissingApiKeyError) throw error;
@@ -393,7 +398,7 @@ export async function withAuth<T>(
 	let lastError: unknown;
 	let reportedError: unknown;
 	try {
-		return await attempt(initialKey);
+		return await attempt(initialKey, scope);
 	} catch (error) {
 		if (!isAuthError(error)) throw error;
 		lastError = error;
@@ -401,10 +406,10 @@ export async function withAuth<T>(
 	}
 
 	while (true) {
-		const nextKey = await resolveNextAuthRetryKey(state, resolver, lastError, signal);
+		const nextKey = await resolveNextAuthRetryKey(state, resolver, lastError, signal, onResolved);
 		if (nextKey === undefined) break;
 		try {
-			return await attempt(nextKey);
+			return await attempt(nextKey, scope);
 		} catch (error) {
 			if (!isAuthError(error)) throw error;
 			lastError = error;

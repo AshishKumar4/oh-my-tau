@@ -467,10 +467,11 @@ describe("auth-gateway provider session state", () => {
 				if (captured.length !== (retryAfterMs === undefined ? 1 : 2)) return response;
 				if (retryAfterMs !== undefined) {
 					const blocks = storage.blocks.list([rows[0]!.id]);
+					// A spend cap blocks the whole account, for the provider's short window.
 					expect(blocks).toEqual([
 						expect.objectContaining({
 							providerKey: "anthropic:oauth",
-							blockScope: "tier:mythos",
+							blockScope: "",
 						}),
 					]);
 					expect(blocks[0]!.blockedUntilMs).toBeGreaterThanOrEqual(usageLimitedAt + retryAfterMs);

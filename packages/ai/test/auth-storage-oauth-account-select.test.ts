@@ -186,6 +186,54 @@ describe("AuthStorage OAuth account selection", () => {
 		}
 	});
 
+	test("oauth.accessById force-refreshes only its row and reuses only an explicit recovery mint", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		const seen: string[] = [];
+		let mints = 0;
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockImplementation(async (_provider, credential) => {
+			expect(credential.accountId).toBe("acc-b");
+			return {
+				...credential,
+				access: `mint-${++mints}`,
+				refresh: `refresh-mint-${mints}`,
+				expires: Date.now() + 60 * 60_000,
+			};
+		});
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			if (!credential) return null;
+			seen.push(credential.access);
+			return { newCredentials: credential, apiKey: credential.access };
+		});
+		await storage.credentials.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		const target = storage.oauth.accounts(PROVIDER)[1];
+		if (!target) throw new Error("expected second OAuth account");
+
+		const result = await storage.oauth.accessById(PROVIDER, target.credentialId, { forceRefresh: true });
+
+		expect(result?.ok).toBe(true);
+		if (!result?.ok) throw new Error("expected ok resolution");
+		expect(result.credentialId).toBe(target.credentialId);
+		expect(result.accountId).toBe("acc-b");
+		expect(result.accessToken).toBe("mint-1");
+		expect(seen).toEqual(["mint-1"]);
+		const recovery = await storage.oauth.accessById(PROVIDER, target.credentialId, {
+			forceRefresh: true,
+			refreshReason: "auth-recovery",
+		});
+		expect(recovery).toMatchObject({ ok: true, credentialId: target.credentialId, accessToken: "mint-1" });
+		expect(mints).toBe(1);
+		const explicit = await storage.oauth.accessById(PROVIDER, target.credentialId, { forceRefresh: true });
+		expect(explicit).toMatchObject({ ok: true, credentialId: target.credentialId, accessToken: "mint-2" });
+		expect(mints).toBe(2);
+		expect(await storage.oauth.accessById(PROVIDER, target.credentialId)).toMatchObject({
+			ok: true,
+			accessToken: "mint-2",
+		});
+		expect(mints).toBe(2);
+	});
+
 	test("oauth.accessById force-refreshes only the durable requested row", async () => {
 		if (!store) throw new Error("test setup failed");
 		const refreshedIds: number[] = [];

@@ -97,7 +97,7 @@ async function probeAttempt<TApi extends Api>(
 		const result = await run(candidate, context, {
 			apiKey: options.apiKey,
 			credentialId: options.credentialId,
-			oauthIdentity: options.oauthIdentity,
+			credentialScope: options.credentialScope,
 			headers: options.headers,
 			fetch: probeFetch,
 			signal,

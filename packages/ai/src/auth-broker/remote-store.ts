@@ -13,6 +13,7 @@ import type { AuthCredentialStore } from "../auth/store";
 import {
 	type AuthCredential,
 	type AuthCredentialSnapshotEntry,
+	CREDENTIAL_HOLD_SCOPE,
 	type DisabledCredentialSummary,
 	type OAuthCredential,
 	type OAuthRefreshReason,
@@ -866,8 +867,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	deleteCredentialBlocks(credentialId: number): void {
 		this.#noteActivity();
-		for (const key of this.#pendingCredentialBlocks.keys()) {
-			if (key.startsWith(`${credentialId}\0`)) this.#pendingCredentialBlocks.delete(key);
+		for (const [key, block] of this.#pendingCredentialBlocks) {
+			if (key.startsWith(`${credentialId}\0`) && block.blockScope !== CREDENTIAL_HOLD_SCOPE) {
+				this.#pendingCredentialBlocks.delete(key);
+			}
 		}
 		this.#deleteSnapshotBlocks(credentialId);
 		for (const key of this.#credentialBlockReconcileAfter.keys()) {
@@ -959,7 +962,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	async markCredentialSuspect(credentialId: number, opts: { signal?: AbortSignal } = {}): Promise<void> {
 		this.#noteActivity();
-		await this.#refreshThroughBroker(credentialId, opts.signal, "auth-recovery");
+		// Only an OAuth row has a token the broker can refresh; for an API key the
+		// broker refuses `/refresh`, so just pick up any newer snapshot.
+		const entry = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (entry?.credential.type === "oauth") {
+			await this.#refreshThroughBroker(credentialId, opts.signal, "auth-recovery");
+		}
 		this.#maybeRefreshSnapshot("suspect credential refresh");
 	}
 
@@ -980,8 +988,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	/**
 	 * Replace-all semantics: disable every active credential for the provider,
-	 * then upload each of the new credentials. Used by API-key login so a new
-	 * key clobbers any previously stored key for the same provider.
+	 * then upload each of the new credentials (the broker upserts them; pooled
+	 * API keys survive OAuth uploads, so input order does not drop keys).
 	 */
 	async replaceAuthCredentials(provider: string, credentials: AuthCredential[]): Promise<StoredAuthCredential[]> {
 		const existing = this.listAuthCredentials(provider);
@@ -1181,7 +1189,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			? entry.blocks.filter(
 					block => block.providerKey !== target.providerKey || block.blockScope !== target.blockScope,
 				)
-			: [];
+			: // Mirror the store contract: a manual hold is not a rate-limit block and survives.
+				entry.blocks.filter(block => block.blockScope === CREDENTIAL_HOLD_SCOPE);
 		if (blocks.length === entry.blocks.length) return;
 		const next: SnapshotEntry = { ...entry };
 		if (blocks.length > 0) next.blocks = blocks;

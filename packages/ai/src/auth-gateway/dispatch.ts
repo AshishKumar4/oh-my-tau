@@ -22,7 +22,7 @@ import { getProviderDefinition } from "../registry";
 import type { Api, FetchImpl, Model, Usage } from "../types";
 import type { ClientUsageIdentity } from "../usage";
 import type { AuthGatewayClientScope } from "./clients";
-import type { AuthGatewayServerOptions } from "./types";
+import type { AuthGatewayHarnessRecorder, AuthGatewayServerOptions } from "./types";
 
 /** What a route knows about a request beyond the model id it names. */
 export interface ModelResolveOptions {
@@ -55,6 +55,8 @@ export interface AuthGatewayRouteOptions {
 	resolveModel: ModelResolver;
 	/** Optional supplier for `/v1/models` listing. Returns the full model array. */
 	listModels?: () => Iterable<Model<Api>>;
+	/** Capture each harness-shaped request so a profile's wire format can be replayed. */
+	harnessRecorder?: AuthGatewayHarnessRecorder;
 	/** Providers the host does not serve; `/v1/usage` and `/v1/credentials/check` leave their accounts out. */
 	excludeProviders?: ReadonlySet<string>;
 	/** Upstream transport for every provider call; defaults to global `fetch`. Test seam. */
@@ -170,10 +172,12 @@ async function refreshGatewayApiKeyAfterAuthError(
 	format: string,
 	peer: string,
 ): Promise<ResolvedApiKey | undefined> {
+	const keyOptions = modelKeyOptions(model, signal);
 	const rotation = await storage.limits.rotate(provider, sessionId, {
 		error,
 		modelId: model.id,
 		baseUrl: model.baseUrl,
+		accountIds: keyOptions.accountIds,
 		apiKey: oldKey,
 		signal,
 	});
@@ -186,9 +190,7 @@ async function refreshGatewayApiKeyAfterAuthError(
 		afterSiblingWait: rotation.afterSiblingWait,
 		error: error instanceof Error ? error.message : String(error),
 	});
-	return resolveAfterRotation(rotation, error, () =>
-		storage.keys.getWithCredential(provider, sessionId, modelKeyOptions(model, signal)),
-	);
+	return resolveAfterRotation(rotation, error, () => storage.keys.getWithCredential(provider, sessionId, keyOptions));
 }
 
 /** Model-scoped key options: usage ranking by model id, routing to accounts discovery saw serve it. */

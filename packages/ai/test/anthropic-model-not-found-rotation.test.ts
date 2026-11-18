@@ -183,7 +183,8 @@ describe("Anthropic OAuth model-not-found credential rotation", () => {
 		});
 		expect(result.stopReason).toBe("stop");
 		expect(bearers()).toEqual(TOKENS.map(token => `Bearer ${token}`));
-		expect(blocks(0)).toEqual(["tier:mythos"]);
+		// A spend cap stops the account for every model, so its block is account-wide.
+		expect(blocks(0)).toEqual([""]);
 		expect(blocks(1)).toEqual([`model-policy:${MODEL_ID}`]);
 		expect(blocks(2)).toEqual([]);
 	});

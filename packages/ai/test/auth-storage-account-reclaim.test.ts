@@ -175,6 +175,28 @@ describe("accountPolicies reclaimAbovePct", () => {
 		}
 	});
 
+	test("an account outside the request's entitlement never evicts a warm pin", async () => {
+		const auth = await setup(
+			A,
+			[
+				{ provider: A, account: { accountId: "b" }, priority: 20, reclaimAbovePct: 40 },
+				{ provider: A, account: { accountId: "a" }, priority: 10 },
+				{ provider: A, account: { accountId: "c" }, priority: 10, reservePct: 15 },
+			],
+			["a", "b", "c"],
+		);
+		const entitled = { accountIds: ["a", "c"] };
+		// C starts inside its reserve, so S1 lands on A.
+		setUsage(A, "a", 0.3, 0.3);
+		setUsage(A, "b", 0.1, 0.1);
+		setUsage(A, "c", 0.9, 0.2);
+		expect((await auth.keys.get(A, "S1", entitled))?.replace(/^api-/, "")).toBe("a");
+		// C recovers and ranks ahead of A; B, which the request may not use, qualifies to reclaim.
+		await advance(auth, A, 10 * MIN);
+		setUsage(A, "c", 0.05, 0.05);
+		expect((await auth.keys.get(A, "S1", entitled))?.replace(/^api-/, "")).toBe("a");
+	});
+
 	test("never moves an explicit pin", async () => {
 		const auth = await setup(A, policies(), ["a", "b"]);
 		setUsage(A, "a", 0, 0.1);

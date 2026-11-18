@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { MessageChannel } from "node:worker_threads";
-import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { AuthStorage, DEFAULT_USAGE_RESERVE_PCT, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { anthropicSlowModeLanes } from "../../src/session/anthropic-slow-mode";
@@ -187,6 +187,31 @@ describe("auth thread service", () => {
 		await storeAccounts();
 		expect(await probe.sourceKinds([PROVIDER, "unit-other"])).toEqual(["oauth", undefined]);
 		expect(batches).toHaveBeenCalledTimes(2);
+	});
+
+	it("never serves an account a worker set aside", async () => {
+		const { a } = await storeAccounts();
+		await probe.hold(PROVIDER, a);
+
+		expect(await storage.keys.get(PROVIDER, "main-session")).toBe("access-b");
+		expect(await probe.key(PROVIDER, "worker-session")).toBe("access-b");
+	});
+
+	it("reports a main pool-order change through a worker's cached key source", async () => {
+		await storeAccounts();
+		await storage.credentials.addApiKey(PROVIDER, "pooled-key");
+		const before = storage.keys.source(PROVIDER)?.kind;
+		expect(await probe.sourceKinds([PROVIDER])).toEqual([before]);
+
+		storage.setAccountPolicies({
+			accountPolicies: [],
+			defaultReservePct: DEFAULT_USAGE_RESERVE_PCT,
+			poolOrders: { [PROVIDER]: "api-keys-first" },
+		});
+		const after = storage.keys.source(PROVIDER)?.kind;
+		expect(after).not.toBe(before);
+		// The generation bump reaches the worker before this probe call (frames are ordered).
+		expect(await probe.sourceKinds([PROVIDER])).toEqual([after]);
 	});
 
 	it("resolves a worker's OAuth identity from main once main stores an account after the worker saw none", async () => {
