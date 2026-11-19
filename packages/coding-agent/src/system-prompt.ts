@@ -659,7 +659,7 @@ export interface BuildSystemPromptOptions {
 	harnessProfile?: HarnessProfile;
 	/**
 	 * Whether the model's client builds the system prompt itself (see
-	 * `clientOwnsSystemPrompt`). The render then carries only the footer:
+	 * `isAgentClient`). The render then carries only the footer:
 	 * user customization, skills, rules, and project context, never omp's
 	 * operating directives or eval prelude guidance.
 	 */
@@ -1236,6 +1236,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		// A served or client-built prompt carries its own operating directives;
 		// the footer then keeps environment facts only.
 		vendorPrompt: footerOnly,
+		// An agent client's own prompt does not know omp's internal URLs, which
+		// carry lane messaging (`agent://`) and job control (`proc://`).
+		agentClient: clientOwnsPrompt,
 		// Codex-profiled turns send `parallel_tool_calls: false`, so guidance that
 		// pairs calls in one response cannot be followed there.
 		serialToolCalls: harnessProfile === "codex",

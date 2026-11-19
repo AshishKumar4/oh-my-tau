@@ -18,6 +18,7 @@ import { createOpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai/utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { AutoLearnController, buildAutoLearnInstructions } from "@oh-my-pi/pi-coding-agent/autolearn/controller";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { createAutoLearnCaptureRunner } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -400,6 +401,32 @@ describe("isolated auto-learn capture", () => {
 		expect(primary?.options?.promptCacheKey).toBe("primary-cache");
 		expect(capture?.options?.promptCacheKey).toBe("primary-cache");
 		expect(capture?.options?.sessionId).not.toBe("primary-session");
+	});
+
+	it("starts no capture conversation behind an agent client, whose cache a side conversation cannot share", async () => {
+		const agentClientModel = getBundledModel("antigravity-cli", "gemini-4-neon");
+		if (!agentClientModel) throw new Error("antigravity-cli/gemini-4-neon is not bundled");
+		const sourceAgent = new Agent({
+			initialState: {
+				model: agentClientModel,
+				systemPrompt: ["Primary system prompt"],
+				tools: [captureTool("learn", "Remember a fact")],
+				messages: [{ role: "user", content: "Earlier task", timestamp: 0 }],
+			},
+		});
+		let started = 0;
+		const runCapture = createAutoLearnCaptureRunner({
+			sourceAgent,
+			captureTools: () => [captureTool("learn", "Remember a fact")],
+			createAgent: options => {
+				started++;
+				return new Agent(options);
+			},
+		});
+
+		await runCapture("Automated capture prompt");
+
+		expect(started).toBe(0);
 	});
 
 	it("refuses a call to a non-capture tool without running any of its code", async () => {

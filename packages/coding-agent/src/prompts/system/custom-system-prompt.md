@@ -15,6 +15,13 @@ Skills are specialized knowledge. Scan descriptions for your task domain.
 {{/each}}
 </skills>
 {{/if}}
+{{#if agentClient}}
+# Internal URLs
+Most file and bash tools resolve these:
+{{#each internalUrls}}
+- {{this}}
+{{/each}}
+{{/if}}
 {{> xdevDevices}}
 {{> fusionLead}}
 {{#if hasSkillUriAccess}}

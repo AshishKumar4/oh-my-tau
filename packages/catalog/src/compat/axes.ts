@@ -362,12 +362,7 @@ export const AXES: Readonly<Record<string, AxisDef>> = {
 		values: ["freeform", "function"],
 	},
 	"requires-native-tools": { key: "requiresNativeTools", set: "catalog", shape: "scalar", values: [true, false] },
-	"client-owns-system-prompt": {
-		key: "clientOwnsSystemPrompt",
-		set: "catalog",
-		shape: "scalar",
-		values: [true, false],
-	},
+	"agent-client": { key: "agentClient", set: "catalog", shape: "scalar", values: [true, false] },
 	"tool-schemas-in-context": { key: "toolSchemasInContext", set: "catalog", shape: "scalar", values: [true, false] },
 	"requires-tool-free-history-for-tool-opt-out": {
 		key: "requiresToolFreeHistoryForToolOptOut",

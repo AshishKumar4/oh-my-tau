@@ -35,7 +35,7 @@ import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { anthropicHostRunsTool } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
-import { clientOwnsSystemPrompt, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { isAgentClient, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import {
 	loadHarnessPrompt,
 	servedHarnessPrompt,
@@ -1931,7 +1931,9 @@ export function createAutoLearnCaptureRunner(
 		// One snapshot of the source turn before any await: the primary keeps running while a capture is built.
 		const source = options.sourceAgent.state;
 		const sourceModel = source.model;
-		if (!sourceModel) return;
+		// An agent client's capture would be a separate client conversation, paying a full
+		// uncached prompt every turn instead of sharing the primary's cache prefix.
+		if (!sourceModel || isAgentClient(sourceModel)) return;
 		const sourceSystemPrompt = [...source.systemPrompt];
 		const sourceThinkingLevel = source.thinkingLevel;
 		const sourceDisableReasoning = source.disableReasoning;
@@ -4813,7 +4815,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				activeRepoContext,
 				...(promptModel && {
 					harnessProfile: effectiveHarnessProfile(settings, promptModel),
-					clientOwnsPrompt: clientOwnsSystemPrompt(promptModel),
+					clientOwnsPrompt: isAgentClient(promptModel),
 				}),
 				harnessToolRefs: surface.toolRefs,
 			});

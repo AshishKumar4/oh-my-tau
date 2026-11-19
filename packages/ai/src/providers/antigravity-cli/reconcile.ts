@@ -42,7 +42,8 @@ export function planTurn(messages: readonly Message[], ledger: Ledger | undefine
 		messages.length > ledger.count &&
 		transcriptDigest(messages.slice(0, ledger.count)) === ledger.digest
 	) {
-		const tail = messages.slice(ledger.count);
+		// agy keeps its own record of a turn that was cancelled in place.
+		const tail = messages.slice(ledger.count).filter(message => !isCancelledReply(message));
 		const first = tail[0];
 		const toolResult =
 			ledger.pendingToolCallId !== undefined &&
@@ -82,49 +83,118 @@ export function transcriptDigest(messages: readonly Message[]): string {
 	return hash.digest("hex");
 }
 
-/** Replay earlier turns as labelled text and image blocks, then send trailing input directly. */
-export function replayPrompt(replay: readonly Message[]): ContentBlock[] {
+/**
+ * agy keeps the first ~192,000 bytes of a prompt's text and silently drops the rest
+ * (measured on 1.5.12). A replay stays under this budget, leaving room for agy's own wrapper.
+ */
+export const REPLAY_BUDGET_BYTES = 180_000;
+/** One replayed message may use at most this much text, so a huge tool result cannot crowd out the rest. */
+const REPLAYED_MESSAGE_BYTES = 24_000;
+
+/**
+ * Replay earlier turns as labelled text and image blocks, then send trailing input directly.
+ * The newest history that fits the budget is kept; `omitted` counts the earliest messages left out.
+ * Trailing input is never cut: input over the budget alone is an error, not a silent truncation.
+ */
+export function replayPrompt(replay: readonly Message[]): { blocks: ContentBlock[]; omitted: number } {
 	let split = replay.length;
 	while (split > 0 && isInputMessage(replay[split - 1]!)) split--;
-	const blocks: ContentBlock[] = [];
-	if (split > 0) {
-		blocks.push({ type: "text", text: prompt.render(transcriptTemplate, {}) });
-		for (const message of replay.slice(0, split)) {
-			const tag = message.role === "toolResult" ? "tool_result" : message.role;
-			const attrs =
-				message.role === "toolResult"
-					? ` id=${JSON.stringify(message.toolCallId)} name=${JSON.stringify(message.toolName)} error=${message.isError}`
-					: "";
-			blocks.push({ type: "text", text: `<${tag}${attrs}>` });
-			if (typeof message.content === "string") blocks.push({ type: "text", text: message.content });
-			else
-				for (const part of message.content) {
-					switch (part.type) {
-						case "text":
-							blocks.push({ type: "text", text: part.text });
-							break;
-						case "image":
-							blocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
-							break;
-						case "thinking":
-							blocks.push({ type: "text", text: `<thinking>${part.thinking}</thinking>` });
-							break;
-						case "toolCall":
-							blocks.push({
-								type: "text",
-								text: `<tool_call id=${JSON.stringify(part.id)} name=${JSON.stringify(part.name)}>${stableStringifyJson(part.arguments)}</tool_call>`,
-							});
-							break;
-					}
-				}
-			blocks.push({ type: "text", text: `</${tag}>` });
+	const input = replay.slice(split).flatMap(message => (isInputMessage(message) ? inputBlocks(message) : []));
+	const inputBytes = textBytes(input);
+	if (inputBytes > REPLAY_BUDGET_BYTES) {
+		throw new Error(
+			`This message has ${Math.ceil(inputBytes / 1000)} KB of text; Antigravity CLI accepts at most ${REPLAY_BUDGET_BYTES / 1000} KB in one prompt.`,
+		);
+	}
+	if (split === 0) return { blocks: input, omitted: 0 };
+	const history = replay.slice(0, split);
+	const header = (omitted: number): ContentBlock => ({
+		type: "text",
+		text: `${prompt.render(transcriptTemplate, { omitted }).trimEnd()}\n`,
+	});
+	const kept: ContentBlock[][] = [];
+	let used = inputBytes + textBytes([header(history.length)]) + 64;
+	for (let index = history.length - 1; index >= 0; index--) {
+		const blocks = historyBlocks(history[index]!);
+		const size = textBytes(blocks);
+		if (used + size > REPLAY_BUDGET_BYTES) break;
+		kept.unshift(blocks);
+		used += size;
+	}
+	const omitted = history.length - kept.length;
+	return {
+		blocks: [header(omitted), ...kept.flat(), { type: "text", text: "</conversation-checkpoint>" }, ...input],
+		omitted,
+	};
+}
+
+/** A reply that ended in an abort without calling a tool; agy holds its own record of it. */
+function isCancelledReply(message: Message): boolean {
+	return (
+		message.role === "assistant" &&
+		message.stopReason === "aborted" &&
+		!message.content.some(block => block.type === "toolCall")
+	);
+}
+
+function historyBlocks(message: Message): ContentBlock[] {
+	const tag = message.role === "toolResult" ? "tool_result" : message.role;
+	const attrs =
+		message.role === "toolResult"
+			? ` id=${JSON.stringify(message.toolCallId)} name=${JSON.stringify(message.toolName)} error=${message.isError}`
+			: "";
+	const body: ContentBlock[] = [];
+	if (typeof message.content === "string") body.push({ type: "text", text: message.content });
+	else
+		for (const part of message.content) {
+			switch (part.type) {
+				case "text":
+					body.push({ type: "text", text: part.text });
+					break;
+				case "image":
+					body.push({ type: "image", data: part.data, mimeType: part.mimeType });
+					break;
+				case "thinking":
+					body.push({ type: "text", text: `<thinking>${part.thinking}</thinking>` });
+					break;
+				case "toolCall":
+					body.push({
+						type: "text",
+						text: `<tool_call id=${JSON.stringify(part.id)} name=${JSON.stringify(part.name)}>${stableStringifyJson(part.arguments)}</tool_call>`,
+					});
+					break;
+			}
 		}
-		blocks.push({ type: "text", text: "</conversation-checkpoint>" });
-	}
-	for (const message of replay.slice(split)) {
-		if (isInputMessage(message)) blocks.push(...inputBlocks(message));
-	}
-	return blocks;
+	return [
+		{ type: "text", text: `<${tag}${attrs}>` },
+		...capText(body, REPLAYED_MESSAGE_BYTES),
+		{ type: "text", text: `</${tag}>` },
+	];
+}
+
+/** Keep each text block's head within `limit` bytes for the message, marking what was cut. */
+function capText(blocks: ContentBlock[], limit: number): ContentBlock[] {
+	let remaining = limit;
+	return blocks.map(block => {
+		if (block.type !== "text") return block;
+		const bytes = Buffer.byteLength(block.text);
+		if (bytes <= remaining) {
+			remaining -= bytes;
+			return block;
+		}
+		const head = Buffer.from(block.text)
+			.subarray(0, Math.max(0, remaining))
+			.toString("utf8")
+			.replace(/\uFFFD$/, "");
+		remaining = 0;
+		return { type: "text", text: `${head}\n[… ${bytes - Buffer.byteLength(head)} bytes of this message omitted …]` };
+	});
+}
+
+function textBytes(blocks: readonly ContentBlock[]): number {
+	let total = 0;
+	for (const block of blocks) if (block.type === "text") total += Buffer.byteLength(block.text);
+	return total;
 }
 
 /** Supply the actual delayed result only after agy's old prompt has confirmed cancellation. */

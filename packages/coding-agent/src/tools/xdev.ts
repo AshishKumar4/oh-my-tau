@@ -37,7 +37,7 @@ import {
 	validateAgentToolArguments,
 } from "@oh-my-pi/pi-agent-core";
 import { type Tool as AiTool, jsonSchemaToTypeScript, type Model, toolWireSchema } from "@oh-my-pi/pi-ai";
-import { clientOwnsSystemPrompt } from "@oh-my-pi/pi-catalog/compat/harness";
+import { isAgentClient } from "@oh-my-pi/pi-catalog/compat/harness";
 import { isEvalBridgeToolCall, isEvalBridgeToolCallable } from "../eval/tool-bridge-policy";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
 import { resolveToolWireName } from "../utils/tool-wire-name";
@@ -100,7 +100,7 @@ export function deferredToolPresentation(
 	model: Model | undefined,
 	toolSearchServed: boolean,
 ): DeferredToolPresentation {
-	if (model !== undefined && clientOwnsSystemPrompt(model)) return "direct";
+	if (model !== undefined && isAgentClient(model)) return "direct";
 	return toolSearchServed ? "tool-search" : "xdev";
 }
 

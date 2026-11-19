@@ -168,6 +168,9 @@ describe("a model whose client owns the system prompt", () => {
 		if (!ompPrompt) throw new Error("the regular request carries no omp prompt with xd:// devices");
 		expect(agySystem).not.toContain(ompPrompt.text.split("\n")[0]);
 		expect(agySystem).not.toContain("xd://");
+		// Lane messaging stays discoverable: the footer documents omp's internal URLs.
+		expect(agySystem).toContain("# Internal URLs");
+		expect(agySystem).toMatch(/agent:\/\/<id>: .*write = message/);
 
 		// The deferrable device is a direct tool there, runs as called, and its preview applies.
 		for (const request of agy) expect(request.tools.map(tool => tool.name)).toContain("_ast_edit");

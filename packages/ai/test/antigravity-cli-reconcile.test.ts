@@ -4,6 +4,7 @@ import {
 	inputBlocks,
 	lateToolResultPrompt,
 	planTurn,
+	REPLAY_BUDGET_BYTES,
 	replayPrompt,
 	transcriptDigest,
 } from "@oh-my-pi/pi-ai/providers/antigravity-cli/reconcile";
@@ -188,7 +189,7 @@ describe("replayPrompt", () => {
 		reply.content.push(secondImage);
 		const body = toolResult("a", "before");
 		body.content.push(thirdImage, { type: "text", text: "after" });
-		const blocks = replayPrompt([{ ...user(""), content: [firstImage] }, reply, body, user("continue")]);
+		const { blocks } = replayPrompt([{ ...user(""), content: [firstImage] }, reply, body, user("continue")]);
 		expect(blocks.filter(block => block.type === "image")).toEqual([firstImage, secondImage, thirdImage]);
 		const imageIndex = blocks.findIndex(block => block.type === "image" && block.data === thirdImage.data);
 		expect(blocks[imageIndex - 1]).toEqual({ type: "text", text: "before" });
@@ -203,7 +204,7 @@ describe("replayPrompt", () => {
 		expect(blocks.slice(1, -1)).toEqual(content);
 	});
 	it("sends trailing user input as-is and labels earlier transcript messages", () => {
-		const blocks = replayPrompt([
+		const { blocks } = replayPrompt([
 			user("read a.txt"),
 			assistant("reading", ["call-1"]),
 			toolResult("call-1", "FILE-BODY-42"),
@@ -215,5 +216,31 @@ describe("replayPrompt", () => {
 		expect(text).toContain("read a.txt");
 		expect(text).toContain('id="call-1"');
 		expect(blocks.at(-1)).toEqual({ type: "text", text: "what did it say?" });
+	});
+
+	it("fits a long history under agy's prompt limit, keeping the newest messages and the whole new input", () => {
+		const history: Message[] = [];
+		for (let index = 0; index < 120; index++) {
+			history.push(user(`question ${index} ${"q".repeat(1500)}`), assistant(`answer ${index} ${"a".repeat(1500)}`));
+		}
+		history.push(toolResult("call-big", `HUGE-${"t".repeat(100_000)}-END`));
+		const { blocks, omitted } = replayPrompt([...history, user("NEW: the code word is zebra.")]);
+
+		const text = blocks.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
+		expect(Buffer.byteLength(text)).toBeLessThanOrEqual(REPLAY_BUDGET_BYTES);
+		expect(blocks.at(-1)).toEqual({ type: "text", text: "NEW: the code word is zebra." });
+		// The earliest turns go first; the model is told how many.
+		expect(omitted).toBeGreaterThan(0);
+		expect(text).not.toContain("question 0 ");
+		expect(text).toContain("answer 119 ");
+		expect(text).toContain(`The ${omitted} earliest messages are not shown`);
+		// One oversized result is trimmed with a visible marker instead of crowding out the rest.
+		expect(text).toContain("HUGE-");
+		expect(text).not.toContain("-END");
+		expect(text).toMatch(/\[… \d+ bytes of this message omitted …\]/);
+	});
+
+	it("refuses new input larger than agy's prompt limit instead of losing its end", () => {
+		expect(() => replayPrompt([user("x".repeat(REPLAY_BUDGET_BYTES + 1))])).toThrow(/accepts at most/);
 	});
 });

@@ -72,6 +72,25 @@ describe("agy conversation checkpoints", () => {
 		expect(existsSync(state.file)).toBe(true);
 	});
 
+	it("still forks after agy rewrites an earlier generation's metadata, as it does after later turns", async () => {
+		const state = await store();
+		const checkpoint = readConversationCheckpoint(state.dir, state.id, digest);
+		// agy trims the request copy it stored with each generation once later turns arrive.
+		state.db.run("UPDATE gen_metadata SET data = 'trimmed generation' WHERE idx = 0");
+		state.db.run("UPDATE executor_metadata SET data = 'updated execution' WHERE idx = 0");
+		state.db.run("INSERT INTO steps VALUES (2, 'user'), (3, 'answer 77')");
+		const forkId = forkConversation(state.dir, state.id, checkpoint, digest);
+		const fork = new Database(conversationStorePath(state.dir, forkId), { readonly: true });
+		try {
+			expect(fork.query("SELECT data FROM steps ORDER BY idx").all()).toEqual([
+				{ data: "user" },
+				{ data: "answer 41" },
+			]);
+		} finally {
+			fork.close();
+		}
+	});
+
 	it("records index high-water marks rather than row counts", async () => {
 		const state = await store();
 		state.db.run("INSERT INTO steps VALUES (7, 'sparse step')");

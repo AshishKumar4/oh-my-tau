@@ -130,6 +130,8 @@ interface ActiveStep {
 	interrupted: PromiseWithResolvers<never>;
 	controller: AbortController;
 	aborted: boolean;
+	/** The abort cancelled agy's turn in place; the process and conversation stay live. */
+	cancelledInPlace: boolean;
 }
 
 interface PendingCall {
@@ -162,6 +164,8 @@ export class AgyHost implements ProviderSessionState {
 	#turn: Turn | undefined;
 	readonly #turns = new Set<Turn>();
 	#loading: object | undefined;
+	/** An in-place cancellation still settling; the next step waits for it. Never rejects. */
+	#cancelling: Promise<void> | undefined;
 	#contextTokens = 0;
 	#announced = new Map<string, number>();
 	#announcementWaiters = new Set<{ name: string; finish(announced: boolean): void }>();
@@ -199,6 +203,8 @@ export class AgyHost implements ProviderSessionState {
 	/** Emit one assistant step, parking at a tool call or finishing at the ACP turn end. */
 	async step(model: Model, context: Context, options: AgyStepOptions, writer: StepWriter): Promise<void> {
 		if (this.#step) throw new Error("Antigravity CLI is already running a request for this session");
+		// A request aborted before it starts changes nothing.
+		if (options.signal?.aborted) throw new Error("Request was aborted");
 		const step: ActiveStep = {
 			writer,
 			messages: context.messages,
@@ -206,33 +212,32 @@ export class AgyHost implements ProviderSessionState {
 			interrupted: Promise.withResolvers<never>(),
 			controller: new AbortController(),
 			aborted: false,
+			cancelledInPlace: false,
 		};
 		step.done.promise.catch(() => undefined);
 		step.interrupted.promise.catch(() => undefined);
 		this.#step = step;
 		const onAbort = () => {
 			step.aborted = true;
-			this.#fail(new Error("Request was aborted"));
+			this.#interrupt(step);
 		};
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		try {
-			if (options.signal?.aborted) onAbort();
-			step.controller.signal.throwIfAborted();
+			if (this.#cancelling) await this.#setup(this.#cancelling);
 			const cwd = options.cwd ?? process.cwd();
 			const tools = (context.tools ?? []).map(toMcpTool);
 			const toolsKey = stableStringifyJson(tools);
 			const system = (context.systemPrompt ?? []).join("\n\n");
 			const systemKey = system;
 			let plan = planTurn(context.messages, this.#ledger);
+			// A model or effort change never moves a parked turn: it applies from the next turn.
 			const parkedTurnMoves =
 				this.#pending?.state !== "detached" &&
 				this.#pending !== undefined &&
 				(this.#process?.toolsKey !== toolsKey ||
 					this.#process.cwd !== cwd ||
 					this.#process.credentialVersion !== options.credentialVersion ||
-					this.#conversation?.systemKey !== systemKey ||
-					this.#conversation.model !== model.id ||
-					this.#conversation.requestedEffort !== options.reasoning);
+					this.#conversation?.systemKey !== systemKey);
 			if (
 				plan.kind === "resume" &&
 				(!this.#conversation || parkedTurnMoves || (plan.toolResult && !this.#pending))
@@ -290,7 +295,8 @@ export class AgyHost implements ProviderSessionState {
 				};
 				this.#contextTokens = 0;
 			}
-			await this.#setup(this.#configure(model.id, options.reasoning));
+			// A live turn keeps the model and effort it started with.
+			if (!this.#turn) await this.#setup(this.#configure(model.id, options.reasoning));
 			step.controller.signal.throwIfAborted();
 			if (plan.kind === "resume") {
 				const pending = this.#pending;
@@ -322,13 +328,16 @@ export class AgyHost implements ProviderSessionState {
 					}
 				}
 			} else {
-				const blocks = replayPrompt(plan.replay);
+				const { blocks, omitted } = replayPrompt(plan.replay);
 				if (blocks.length === 0) throw new Error("Antigravity CLI has nothing new to send for this request");
+				if (omitted > 0) {
+					logger.warn("Antigravity CLI replay omits the earliest messages to fit its prompt limit", { omitted });
+				}
 				this.#prompt(blocks);
 			}
 			await step.done.promise;
 		} catch (error) {
-			this.#fail(error);
+			if (!step.cancelledInPlace) this.#fail(error);
 			throw step.aborted ? new Error("Request was aborted") : mapAgyError(error);
 		} finally {
 			options.signal?.removeEventListener("abort", onAbort);
@@ -610,6 +619,34 @@ export class AgyHost implements ProviderSessionState {
 		return turn.cancellation;
 	}
 
+	/**
+	 * Abort a step. While agy is answering, its turn is cancelled in place and the next request
+	 * resumes after the messages this step sent, keeping the conversation and its prompt cache.
+	 * Any other state, or a cancellation agy does not confirm, stops the process.
+	 */
+	#interrupt(step: ActiveStep): void {
+		const error = new Error("Request was aborted");
+		const turn = this.#turn;
+		if (!turn || turn.cancelling || this.#pending || turn.conversationId !== this.#conversation?.id) {
+			this.#fail(error);
+			return;
+		}
+		step.cancelledInPlace = true;
+		this.#ledger = { count: step.messages.length, digest: transcriptDigest(step.messages) };
+		const settled = this.#cancelTurn()
+			.catch(() => {
+				this.#ledger = undefined;
+				this.#stopProcess();
+			})
+			.finally(() => {
+				if (this.#cancelling === settled) this.#cancelling = undefined;
+			});
+		this.#cancelling = settled;
+		step.controller.abort(error);
+		step.interrupted.reject(error);
+		step.done.reject(error);
+	}
+
 	async #abandonTurn(): Promise<void> {
 		this.#ledger = undefined;
 		this.#pending?.expiry.cancel();
@@ -632,7 +669,12 @@ export class AgyHost implements ProviderSessionState {
 			this.#fail(new Error(`Antigravity CLI requested an unknown tool: ${shownName}`));
 			return errorOutput(`Unknown tool: ${shownName}; no execution occurred.`);
 		}
+		// A call racing a cancellation of its turn is refused; the conversation stays live.
+		const turn = this.#turn;
+		const cancelled = errorOutput("Tool call rejected: the request was cancelled; no execution occurred.");
+		if (turn?.cancelling) return cancelled;
 		const announced = await this.#awaitAnnouncement(name);
+		if (turn?.cancelling) return cancelled;
 		const step = this.#step;
 		const conversationId = this.#conversation?.id;
 		if (

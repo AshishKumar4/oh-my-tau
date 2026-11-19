@@ -152,13 +152,16 @@ function recordedFingerprint(store: string, checkpoint: AntigravityCliCheckpoint
 	return undefined;
 }
 
+/**
+ * Hash of the conversation history a checkpoint covers. Metadata tables are left out: agy
+ * rewrites earlier `gen_metadata` rows after later turns (it trims a stored request copy),
+ * so hashing them would refuse every fork once the conversation moved on.
+ */
 function prefixFingerprint(db: Database, checkpoint: AntigravityCliCheckpoint): string {
 	const hash = createHash("sha256");
 	const tables = [
 		["steps", checkpoint.steps],
 		["parent_references", checkpoint.steps],
-		["gen_metadata", checkpoint.generations],
-		["executor_metadata", checkpoint.executions],
 	] as const;
 	for (const [table, end] of tables) {
 		hash.update(table);

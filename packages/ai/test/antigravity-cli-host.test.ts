@@ -332,6 +332,63 @@ describe("AgyHost stateful steps", () => {
 		expect(state.host.hasPendingTurn).toBe(false);
 	});
 
+	it("cancels an aborted answer in place, so the next message continues the same conversation", async () => {
+		const state = await fixture();
+		const controller = new AbortController();
+		const messages = [user("first question")];
+		const first = step(state.host, messages, {}, controller.signal);
+		const fake = await state.started.next();
+		await fake.prompts.next();
+		fake.text("A partial answer");
+		controller.abort();
+		await expect(first.done).rejects.toThrow("Request was aborted");
+		await fake.cancellations.next();
+		expect(fake.closed).toBe(false);
+
+		const aborted: AssistantMessage = { ...first.writer.output, stopReason: "aborted" };
+		const second = step(state.host, [...messages, aborted, user("second question")]);
+		const prompt = await fake.prompts.next();
+		// Only the new message is sent: no replay, no new or reloaded conversation, no restart.
+		expect(textOf(prompt.request.prompt)).toBe("second question");
+		expect(state.instances).toHaveLength(1);
+		expect(fake.created).toHaveLength(1);
+		expect(fake.loads).toEqual([]);
+		fake.text("Second answer.");
+		prompt.response.resolve({ stopReason: "end_turn" });
+		await second.done;
+		expect(second.writer.output.content).toEqual([{ type: "text", text: "Second answer." }]);
+	});
+
+	it("keeps a parked turn when only the effort changes, and applies the effort from the next turn", async () => {
+		const state = await parked();
+		const toolResult = result(state.first.writer.output);
+		const second = step(state.host, [...state.messages, toolResult], {}, undefined, { reasoning: "high" });
+		// The held tool result returns into the same live ACP turn.
+		expect(await state.output).toEqual({ content: [{ type: "text", text: "actual file body" }], isError: false });
+		state.fake.text("Done with a.txt.");
+		state.prompt.response.resolve({ stopReason: "end_turn" });
+		await second.done;
+		expect(state.fake.closed).toBe(false);
+		expect(state.fake.created).toHaveLength(1);
+		expect(state.fake.promptHistory).toHaveLength(1);
+		expect(state.fake.configurations).not.toContain("thought_level:high");
+
+		const third = step(
+			state.host,
+			[...state.messages, toolResult, second.writer.output, user("now b.txt")],
+			{},
+			undefined,
+			{ reasoning: "high" },
+		);
+		const prompt = await state.fake.prompts.next();
+		expect(textOf(prompt.request.prompt)).toBe("now b.txt");
+		expect(state.fake.configurations).toContain("thought_level:high");
+		state.fake.text("Done with b.txt.");
+		prompt.response.resolve({ stopReason: "end_turn" });
+		await third.done;
+		expect(state.fake.created).toHaveLength(1);
+	});
+
 	it("accepts steering before returning the held tool result and ignores the old prompt end", async () => {
 		const state = await parked();
 		state.fake.autoSteer = false;

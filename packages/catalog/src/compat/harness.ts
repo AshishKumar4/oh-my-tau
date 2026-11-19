@@ -4,12 +4,14 @@ import { resolveCascade } from "./cascade";
 import { resolveCatalogPolicy } from "./catalog-policy";
 
 /**
- * Whether the transport's client builds the system prompt itself. The caller
- * then contributes only user and project context, and presents every tool
- * directly, so no caller-authored operating directives reach the wire.
+ * Whether the transport is an agent client that builds the system prompt and
+ * keeps the conversation itself (Antigravity CLI). The caller then contributes
+ * only user and project context, presents every tool directly, and starts no
+ * automatic side conversations: each would be a separate client conversation
+ * that cannot share the primary's prompt cache.
  */
-export function clientOwnsSystemPrompt(model: Model): boolean {
-	return resolveCatalogPolicy(model).clientOwnsSystemPrompt === true;
+export function isAgentClient(model: Model): boolean {
+	return resolveCatalogPolicy(model).agentClient === true;
 }
 
 export type HarnessProfile = (typeof HARNESS_PROFILES)[number];

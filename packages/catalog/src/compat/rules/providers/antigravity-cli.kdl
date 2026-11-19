@@ -10,10 +10,11 @@ provider "antigravity-cli" {
 	preserves-max-output-tokens #false
 	// agy executes its control tools internally alongside the IDE MCP tools.
 	requires-native-tools #true
-	// agy composes the system prompt from its own components; omp adds only
-	// project context. Code Assist answers omp's own directives with a false
-	// 429 RESOURCE_EXHAUSTED, while agy's prompt is served.
-	client-owns-system-prompt #true
+	// agy composes the system prompt from its own components and keeps the
+	// conversation; omp adds only project context. Code Assist answers omp's
+	// own directives with a false 429 RESOURCE_EXHAUSTED, while agy's prompt is
+	// served.
+	agent-client #true
 
 	// The roster `agy acp` 1.5.12 advertises in `session/new` config options
 	// (orchestrators omitted: they drive agy's own subagents, which this
