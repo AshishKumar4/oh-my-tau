@@ -1,6 +1,16 @@
 import type { Model } from "../types";
 import { HARNESS_PROFILES } from "./axes";
 import { resolveCascade } from "./cascade";
+import { resolveCatalogPolicy } from "./catalog-policy";
+
+/**
+ * Whether the transport's client builds the system prompt itself. The caller
+ * then contributes only user and project context, and presents every tool
+ * directly, so no caller-authored operating directives reach the wire.
+ */
+export function clientOwnsSystemPrompt(model: Model): boolean {
+	return resolveCatalogPolicy(model).clientOwnsSystemPrompt === true;
+}
 
 export type HarnessProfile = (typeof HARNESS_PROFILES)[number];
 

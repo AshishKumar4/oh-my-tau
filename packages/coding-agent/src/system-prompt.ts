@@ -658,6 +658,13 @@ export interface BuildSystemPromptOptions {
 	writeTransportOnly?: boolean;
 	harnessProfile?: HarnessProfile;
 	/**
+	 * Whether the model's client builds the system prompt itself (see
+	 * `clientOwnsSystemPrompt`). The render then carries only the footer:
+	 * user customization, skills, rules, and project context, never omp's
+	 * operating directives or eval prelude guidance.
+	 */
+	clientOwnsPrompt?: boolean;
+	/**
 	 * `toolRefs` of the surface the harness profile presents (see
 	 * `harnessSurface`): wire names of the reachable tools and the mounted
 	 * facades. Under `claude-code` they override the tool-name refs, so the
@@ -802,6 +809,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		subagent = false,
 		activeRepoContext: providedActiveRepoContext,
 		harnessProfile,
+		clientOwnsPrompt = false,
 		harnessToolRefs,
 	} = options;
 	const inlineToolDescriptors = providedInlineToolDescriptors ?? false;
@@ -912,7 +920,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		? Promise.resolve(null)
 		: logger.time("loadSystemPromptFiles", loadSystemPromptFiles, { cwd: resolvedCwd });
 	const harnessPromptPromise: Promise<HarnessPrompt | null> =
-		harnessProfile === undefined || callerControlsCustomPrompt
+		harnessProfile === undefined || callerControlsCustomPrompt || clientOwnsPrompt
 			? Promise.resolve(null)
 			: logger.time("loadHarnessPrompt", loadHarnessPrompt, harnessProfile, model);
 	const contextFilesPromise = (async () => {
@@ -1164,9 +1172,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 			path: skill.filePath,
 		})),
 	];
-	// A served vendor prompt renders the footer-only template too, so the harness
-	// case takes the same branch as a literal custom prompt.
-	const usesCustomTemplate = Boolean(resolvedCustomPrompt) || harnessPromptText !== undefined;
+	// A served vendor prompt, or one the client builds itself, renders the
+	// footer-only template too: the same branch as a literal custom prompt.
+	const footerOnly = harnessPromptText !== undefined || clientOwnsPrompt;
+	const usesCustomTemplate = Boolean(resolvedCustomPrompt) || footerOnly;
 	const selectedTemplate = usesCustomTemplate
 		? customSystemPromptTemplate
 		: (resolvedSystemPromptTemplate ?? systemPromptTemplate);
@@ -1224,9 +1233,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		autoQaEnabled,
 		ovnfs,
 		writeTransportOnly,
-		// A served vendor prompt carries its own operating directives; the footer
-		// then keeps environment facts only.
-		vendorPrompt: harnessPromptText !== undefined,
+		// A served or client-built prompt carries its own operating directives;
+		// the footer then keeps environment facts only.
+		vendorPrompt: footerOnly,
 		// Codex-profiled turns send `parallel_tool_calls: false`, so guidance that
 		// pairs calls in one response cannot be followed there.
 		serialToolCalls: harnessProfile === "codex",
@@ -1253,14 +1262,16 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	// The vendor prompt owns block 0 so the wire matches the impersonated
 	// harness; our own render follows it as the environment footer.
 	const systemPrompt: string[] = harnessPromptText === undefined ? [] : [harnessPromptText];
-	const sources =
-		harnessPromptText === undefined || rendered.text.trim()
-			? trackedSources(rendered, systemPrompt.length, sourceIdentities)
-			: [];
-	if (harnessPromptText === undefined || rendered.text.trim()) systemPrompt.push(rendered.text);
-	for (const prelude of evalPreludes) {
-		const guidance = prelude.guidance?.trim();
-		if (guidance) systemPrompt.push(guidance);
+	const keepRender = !footerOnly || rendered.text.trim().length > 0;
+	const sources = keepRender ? trackedSources(rendered, systemPrompt.length, sourceIdentities) : [];
+	if (keepRender) systemPrompt.push(rendered.text);
+	// Prelude guidance is omp's own direction for eval, which a client-built
+	// prompt never carries; the eval tool's description still documents it.
+	if (!clientOwnsPrompt) {
+		for (const prelude of evalPreludes) {
+			const guidance = prelude.guidance?.trim();
+			if (guidance) systemPrompt.push(guidance);
+		}
 	}
 	// Working-directory content (context files with their paths, workspace
 	// tree/roots, active repo) and session append text form one trailing

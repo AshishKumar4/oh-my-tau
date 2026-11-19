@@ -35,7 +35,7 @@ import type { Dialect } from "@oh-my-pi/pi-ai/dialect";
 import { anthropicHostRunsTool } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { prewarmModelConnection } from "@oh-my-pi/pi-ai/providers/connection-prewarm";
 import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/openai-codex-transport";
-import { resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import { clientOwnsSystemPrompt, resolveHarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import {
 	loadHarnessPrompt,
 	servedHarnessPrompt,
@@ -4810,7 +4810,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(settings),
 				encourageEdits: cfgEncourageEdits.get(settings),
 				activeRepoContext,
-				...(promptModel && { harnessProfile: effectiveHarnessProfile(settings, promptModel) }),
+				...(promptModel && {
+					harnessProfile: effectiveHarnessProfile(settings, promptModel),
+					clientOwnsPrompt: clientOwnsSystemPrompt(promptModel),
+				}),
 				harnessToolRefs: surface.toolRefs,
 			});
 			// `systemPrompt` may now also be a literal string or template, which the
