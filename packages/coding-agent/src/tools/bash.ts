@@ -509,12 +509,26 @@ const claudeCodeBashSchema = type({
 	"run_in_background?": type("boolean").describe("Set to true to run this command in the background"),
 });
 
-type BashToolSchema = BashNativeSchema | typeof claudeCodeBashSchema;
+// Gemini CLI's own `run_shell_command` shape, the schema while no capture is served.
+const geminiCliShellSchema = type({
+	command: type("string").describe("The shell command to run"),
+	"description?": type("string").describe("A short description of the command for the user"),
+	"dir_path?": type("string").describe("The directory to run the command in; defaults to the project root"),
+});
 
-const BASH_BRIDGES: HarnessBridges<BashToolInput, typeof claudeCodeBashSchema> = {
+type BashToolSchema = BashNativeSchema | typeof claudeCodeBashSchema | typeof geminiCliShellSchema;
+
+const BASH_BRIDGES: HarnessBridges<BashToolInput, typeof claudeCodeBashSchema | typeof geminiCliShellSchema> = {
+	"gemini-cli": {
+		parameters: geminiCliShellSchema,
+		toParams: (args: typeof geminiCliShellSchema.infer) => ({
+			command: args.command,
+			...(args.dir_path !== undefined ? { cwd: args.dir_path } : {}),
+		}),
+	},
 	"claude-code": {
 		parameters: claudeCodeBashSchema,
-		toParams: args => ({
+		toParams: (args: typeof claudeCodeBashSchema.infer) => ({
 			command: args.command,
 			// Vendor milliseconds to omp seconds; the clamp floor keeps a sub-second value alive.
 			...(args.timeout !== undefined ? { timeout: Math.ceil(args.timeout / 1000) } : {}),
@@ -947,7 +961,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (this.#launchEnabled) return asyncEnabled ? bashSchemaWithAsyncAndService : bashSchemaWithService;
 		return asyncEnabled ? bashSchemaWithAsync : bashSchemaBase;
 	}
-	readonly intent = (args: Partial<BashToolInput | typeof claudeCodeBashSchema.infer>): string | undefined =>
+	readonly intent = (
+		args: Partial<BashToolInput | typeof claudeCodeBashSchema.infer | typeof geminiCliShellSchema.infer>,
+	): string | undefined =>
 		"description" in args && typeof args.description === "string" ? args.description : undefined;
 	// Non-pty calls run alongside each other (the executor isolates overlapping
 	// runs on the same shell session); pty takes over the terminal UI and must
@@ -1449,7 +1465,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 	async execute(
 		toolCallId: string,
-		input: BashToolInput | typeof claudeCodeBashSchema.infer,
+		input: BashToolInput | typeof claudeCodeBashSchema.infer | typeof geminiCliShellSchema.infer,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,

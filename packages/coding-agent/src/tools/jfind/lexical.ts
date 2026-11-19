@@ -15,8 +15,8 @@ export interface GrepIndex {
 	filesScanned: number;
 }
 
-/** Regex-escape a literal keyword for the native grep alternation. */
-function escapeRegex(keyword: string): string {
+/** Regex-escape a literal for the native grep's regex syntax. */
+export function escapeRegex(keyword: string): string {
 	return keyword.replace(/[\\.+*?()|[\]{}^$#&\-~]/g, "\\$&");
 }
 

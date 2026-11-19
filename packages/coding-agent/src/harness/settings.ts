@@ -7,7 +7,7 @@ import { register } from "../config/registry";
 export const cfgHarnessMode = register({
 	id: "harness.mode",
 	type: "enum",
-	values: ["auto", "native", "claude-code", "codex", "pi"] as const,
+	values: ["auto", "native", "claude-code", "codex", "pi", "gemini-cli"] as const,
 	default: "auto",
 	ui: {
 		tab: "model",
@@ -40,6 +40,11 @@ export const cfgHarnessMode = register({
 				value: "pi",
 				label: "Pi",
 				description: "Apply the pi surface (lowercase renames, bundled prompt) to any model",
+			},
+			{
+				value: "gemini-cli",
+				label: "Gemini CLI",
+				description: "Apply the Gemini CLI surface (renames, facades, prompt) to any model",
 			},
 		],
 	},

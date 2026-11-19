@@ -233,11 +233,21 @@ const claudeCodeWriteSchema = type({
 	content: type("string").describe("file content"),
 });
 
-type WriteInputSchema = typeof writeSchema | typeof claudeCodeWriteSchema;
+// Gemini CLI's `write_file` takes the same two fields as Claude Code's `Write`.
+const geminiCliWriteSchema = type({
+	file_path: type("string").describe("The path to the file to write to"),
+	content: type("string").describe("The content to write to the file"),
+});
 
-const WRITE_BRIDGES: HarnessBridges<WriteToolInput, typeof claudeCodeWriteSchema> = {
+type WriteInputSchema = typeof writeSchema | typeof claudeCodeWriteSchema | typeof geminiCliWriteSchema;
+
+const WRITE_BRIDGES: HarnessBridges<WriteToolInput, typeof claudeCodeWriteSchema | typeof geminiCliWriteSchema> = {
 	"claude-code": {
 		parameters: claudeCodeWriteSchema,
+		toParams: args => ({ path: args.file_path, content: args.content }),
+	},
+	"gemini-cli": {
+		parameters: geminiCliWriteSchema,
 		toParams: args => ({ path: args.file_path, content: args.content }),
 	},
 };

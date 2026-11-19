@@ -3,7 +3,13 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentTool,
+	AgentToolContext,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ToolTier,
+} from "@oh-my-pi/pi-agent-core";
 import { type EditStore, type GrepMatch, GrepOutputMode, type GrepResult, grep } from "@oh-my-pi/pi-natives";
 import { prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
@@ -14,6 +20,7 @@ import {
 	parseArchivePathCandidates,
 } from "@oh-my-pi/pi-utils/ar";
 import { getEditStore, NO_FULL_LINE, recordFullySeenRows } from "../edit/store";
+import { type HarnessBridges, harnessParameters, harnessParams, nativeParams } from "../harness/bridge";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlRouter } from "../internal-urls/router";
 import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
@@ -34,6 +41,7 @@ import { createFileRecorder, formatResultPath, resultSnapshotPath } from "./file
 import { type FileMatchSection, formatFileMatches } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
 import { formatMatchLine } from "@oh-my-pi/pi-tui/tools/match-line-format";
 import { isFindEnabled } from "./jfind";
+import { escapeRegex } from "./jfind/lexical";
 import {
 	expandDelimitedPathEntries,
 	formatPathRelativeToCwd,
@@ -78,6 +86,38 @@ const searchSchema = type({
 });
 
 export type GrepToolInput = typeof searchSchema.infer;
+
+// Gemini CLI's ripgrep-backed `search_file_content`, the schema while no capture
+// is served. Its non-ripgrep variant declares a subset of these fields.
+const geminiCliSearchSchema = type({
+	pattern: type("string").describe("The regular expression to search for"),
+	"dir_path?": type("string").describe("Directory or file to search; defaults to the project root"),
+	"include?": type("string").describe("Glob that filters the files searched, such as `*.ts`"),
+	"case_sensitive?": type("boolean").describe("Whether the search is case-sensitive; defaults to false"),
+	"fixed_strings?": type("boolean").describe("Treat pattern as a literal string"),
+	"no_ignore?": type("boolean").describe("Also search files that .gitignore excludes"),
+});
+
+/**
+ * Gemini CLI's search ignores case unless asked, and its bare `include` glob
+ * (`*.ts`) matches at any depth, which omp spells as a `**` glob under the directory. Its
+ * context-line fields have no per-call counterpart and are ignored.
+ */
+const GREP_BRIDGES: HarnessBridges<GrepToolInput, typeof geminiCliSearchSchema> = {
+	"gemini-cli": {
+		parameters: geminiCliSearchSchema,
+		toParams: args => {
+			const include = args.include?.includes("/") ? args.include : args.include && `**/${args.include}`;
+			const searchPath = include === undefined ? args.dir_path : path.join(args.dir_path ?? ".", include);
+			return {
+				pattern: args.fixed_strings ? escapeRegex(args.pattern) : args.pattern,
+				case: args.case_sensitive ?? false,
+				...(searchPath !== undefined ? { path: searchPath } : {}),
+				...(args.no_ignore !== undefined ? { gitignore: !args.no_ignore } : {}),
+			};
+		},
+	},
+};
 
 /** Maximum number of distinct files surfaced in a single response. The
  * agent paginates further pages via `skip`. */
@@ -548,9 +588,9 @@ export interface GrepToolOptions {
 	totalMatchLimit?: number;
 }
 
-export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails> {
+export class GrepTool implements AgentTool<typeof searchSchema | typeof geminiCliSearchSchema, GrepToolDetails> {
 	readonly name = "grep";
-	readonly approval = searchPathTier;
+	readonly approval = (args: unknown): ToolTier => searchPathTier(harnessParams(this.session, GREP_BRIDGES, args));
 	/**
 	 * `always-ask-cached` keys: every file and folder this grep searches, so a
 	 * folder grant recorded by a `read` covers a search of it and a search of one
@@ -560,7 +600,10 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 	 * {@link searchApprovalCacheTargets}.
 	 */
 	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
-		const a = args as { path?: string | string[]; paths?: string | string[] } | null | undefined;
+		const a = harnessParams(this.session, GREP_BRIDGES, args) as
+			| { path?: string | string[]; paths?: string | string[] }
+			| null
+			| undefined;
 		const cwd = this.session.cwd;
 		const splitBase = (entry: string) => parseSearchPath(splitPathAndSel(entry).path).basePath;
 		const roots = toPathList(a?.path ?? a?.paths);
@@ -626,7 +669,9 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 		}
 		return this.#description;
 	}
-	readonly parameters = searchSchema;
+	get parameters(): typeof searchSchema | typeof geminiCliSearchSchema {
+		return harnessParameters(this.session, GREP_BRIDGES, searchSchema);
+	}
 	readonly strict = true;
 
 	readonly #contextBeforeOverride?: number;
@@ -649,11 +694,13 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 
 	async execute(
 		_toolCallId: string,
-		params: SearchParams,
+		input: SearchParams | typeof geminiCliSearchSchema.infer,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<GrepToolDetails>,
 		_toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<GrepToolDetails>> {
+		// Marked native so a tier check on these params does not bridge them a second time.
+		const params = nativeParams({ ...harnessParams(this.session, GREP_BRIDGES, input) });
 		const { pattern, path: rawPath, case: caseSensitive, gitignore, skip } = params;
 
 		return untilAborted(signal, async () => {

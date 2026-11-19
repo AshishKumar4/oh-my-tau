@@ -31,6 +31,7 @@ import { SkillDescriptionCatalog } from "./extensibility/skill-descriptions";
 import { loadSkills, type Skill } from "./extensibility/skills";
 import { buildFusionPromptData, SIDEKICK_TOOL_NAME } from "./fusion/config";
 import { type HarnessPrompt, loadHarnessPrompt } from "./harness/capture";
+import { harnessRefsFollowSurface } from "./harness/manifest";
 import { InternalUrlRouter } from "./internal-urls/router";
 import type { SchemeHost } from "./internal-urls/types";
 import activeRepoContextTemplate from "./prompts/system/active-repo-context.md" with { type: "text" };
@@ -1057,9 +1058,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		if (!toolPromptNames.has(mounted.name)) toolPromptNames.set(mounted.name, `${XD_URL_PREFIX}${mounted.name}`);
 	}
 	const toolRefs: Record<string, string> = Object.fromEntries(toolPromptNames.entries());
-	// Under Claude Code the presented surface names the tools: renamed built-ins
-	// and the facades that mounted (Skill, SendMessage, TaskOutput for `wait`).
-	if (harnessProfile === "claude-code" && harnessToolRefs) Object.assign(toolRefs, harnessToolRefs);
+	// Under Claude Code and Gemini CLI the presented surface names the tools:
+	// renamed built-ins and the facades that mounted (Skill, SendMessage,
+	// TaskOutput for `wait`; list_directory, web_fetch).
+	if (harnessRefsFollowSurface(harnessProfile) && harnessToolRefs) Object.assign(toolRefs, harnessToolRefs);
 	// The sidekick tool mounts only for a Fusion lead, so its presence IS the
 	// Fusion signal: the lead section renders with the same presented names the
 	// rest of the prompt uses.
@@ -1228,9 +1230,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		// Codex-profiled turns send `parallel_tool_calls: false`, so guidance that
 		// pairs calls in one response cannot be followed there.
 		serialToolCalls: harnessProfile === "codex",
-		// Claude Code's own prompt is served, so the footer names only the tools that
-		// surface serves. Without a capture the native prompt is served, byte for byte.
-		claudeCodeVendorPrompt: harnessPromptText !== undefined && harnessProfile === "claude-code",
+		// A vendor prompt is served under a profile whose prompts name tools as its
+		// surface presents them, so the footer names only the tools that surface
+		// serves. Without a capture the native prompt is served, byte for byte.
+		vendorToolNames: harnessPromptText !== undefined && harnessRefsFollowSurface(harnessProfile),
 		subagent,
 	};
 	let rendered: prompt.TrackedRender;

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build and install oh-my-pi with Claude Code / Codex harness impersonation,
-# then record the vendor prompt captures the feature needs.
+# Build and install oh-my-pi with Claude Code / Codex / Gemini CLI harness
+# impersonation, then record the vendor prompt captures the feature needs.
 #
 # The captures cannot ship in the repo: they are the vendor's proprietary system
 # prompt text. This script records them locally from your own licensed clients.
@@ -52,6 +52,7 @@ fi
 if [ "$DO_RECORD" = 1 ]; then
 	command -v claude >/dev/null || warn "\`claude\` not found: the Claude Code capture will be skipped"
 	command -v codex >/dev/null || warn "\`codex\` not found: the Codex capture will be skipped"
+	command -v gemini >/dev/null || warn "\`gemini\` not found: the Gemini CLI capture will be skipped"
 fi
 
 # ─── build ──────────────────────────────────────────────────────────────────
@@ -308,11 +309,37 @@ if command -v codex >/dev/null; then
 	fi
 fi
 
+# Gemini CLI records in API-key mode only: a placeholder key, its base URL on
+# the gateway, which answers locally, and a private home with no login, no
+# GEMINI.md memory, no usage statistics and no update check. Nothing reaches
+# Google and no OAuth or Code Assist path runs. Builds that do not define
+# CLI_VERSION put Node's version in the User-Agent, so pass the CLI's own.
+if command -v gemini >/dev/null; then
+	say "Recording the Gemini CLI prompt (API-key mode, answered by the gateway)"
+	touch "$RECORD_MARK"
+	GEMINI_HOME="$WORK_DIR/gemini-home"
+	mkdir -p "$GEMINI_HOME/.gemini" "$WORK_DIR/gemini-work"
+	cat >"$GEMINI_HOME/.gemini/settings.json" <<'JSON'
+{"privacy":{"usageStatisticsEnabled":false},"general":{"disableAutoUpdate":true,"disableUpdateNag":true},"security":{"auth":{"selectedType":"gemini-api-key"}}}
+JSON
+	GEMINI_VERSION="$(gemini --version 2>/dev/null | tail -1 | tr -d '[:space:]')"
+	(cd "$WORK_DIR/gemini-work" && env -u GOOGLE_API_KEY -u GOOGLE_GENAI_USE_VERTEXAI -u GOOGLE_CLOUD_PROJECT \
+		-u GOOGLE_CLOUD_LOCATION -u GOOGLE_APPLICATION_CREDENTIALS -u GOOGLE_VERTEX_BASE_URL -u GEMINI_SYSTEM_MD \
+		HOME="$GEMINI_HOME" GEMINI_API_KEY="omp-harness-recording" CLI_VERSION="$GEMINI_VERSION" \
+		GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:$GATEWAY_PORT" \
+		timeout 120 gemini --yolo --prompt "hi" >"$WORK_DIR/gemini.log" 2>&1) || true
+	if ! recorded_since_mark gemini-cli ""; then
+		warn "no Gemini CLI capture; the client's last output:"
+		client_tail "$WORK_DIR/gemini.log" >&2 || true
+		FAILED_CAPTURES+=("gemini-cli")
+	fi
+fi
+
 # ─── verify ─────────────────────────────────────────────────────────────────
 
 say "Verifying"
 FOUND=0
-for profile in claude-code codex; do
+for profile in claude-code codex gemini-cli; do
 	dir="$CACHE_DIR/$profile"
 	if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
 		for f in "$dir"/*.json; do
@@ -350,9 +377,11 @@ Done. $("$OMP" --version) installed, $FOUND capture(s) in $CACHE_DIR
 
 Models post-trained on Claude Code (Opus 5, Fable 5.1) and Codex (GPT-6 Astra,
 GPT-6.1 Sol, GPT-6 Sol, GPT-6 Luna, GPT-5.6 Sol) now receive that client's system
-prompt, tool names, and prompt-cache framing. Every other model is untouched.
+prompt, tool names, and prompt-cache framing. Gemini 2.5 and later on the Gemini
+API, Vertex and Code Assist receive Gemini CLI's prompt and tool names while its
+capture is present. Every other model is untouched.
 
-Re-run this script after upgrading Claude Code or Codex to refresh the captures;
+Re-run this script after upgrading Claude Code, Codex or Gemini CLI to refresh the captures;
 they are keyed by client version, and an older capture keeps serving until then.
 
 To disable without uninstalling: move $CACHE_DIR aside.

@@ -12,6 +12,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 
+import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
@@ -73,6 +74,42 @@ type TodoParams = TodoSchema;
 type TodoSchema = typeof todoSchema.infer;
 /** A single todo op entry (the params object itself). */
 type TodoOpEntryValue = TodoParams;
+
+// Gemini CLI's `write_todos` sends the whole list on every call, each item
+// with its status; the schema while no capture is served.
+const geminiCliWriteTodosSchema = type({
+	todos: type({
+		description: type("string").describe("The task"),
+		status: type("'pending' | 'in_progress' | 'completed' | 'cancelled'").describe("The task's status"),
+	})
+		.array()
+		.describe("The complete list; it replaces the current one"),
+});
+
+/** A whole list as one batch of ops, applied together: the bridged form of `write_todos`. */
+interface TodoListReplacement {
+	readonly replace: TodoOpEntryValue[];
+}
+
+/** `write_todos` as omp ops: rebuild the list, then set each status. An empty list clears it. */
+function writeTodosOps(args: typeof geminiCliWriteTodosSchema.infer): TodoListReplacement {
+	const { todos } = args;
+	if (todos.length === 0) return { replace: [{ op: "rm" }] };
+	const withStatus = (status: string) => todos.filter(todo => todo.status === status).map(todo => todo.description);
+	const replace: TodoOpEntryValue[] = [{ op: "init", items: todos.map(todo => todo.description) }];
+	const completed = withStatus("completed");
+	if (completed.length > 0) replace.push({ op: "done", task: completed });
+	const cancelled = withStatus("cancelled");
+	if (cancelled.length > 0) replace.push({ op: "drop", task: cancelled });
+	// omp keeps one task in progress, as Gemini CLI asks of the model.
+	const [active] = withStatus("in_progress");
+	if (active !== undefined) replace.push({ op: "start", task: active });
+	return { replace };
+}
+
+const TODO_BRIDGES: HarnessBridges<TodoParams | TodoListReplacement, typeof geminiCliWriteTodosSchema> = {
+	"gemini-cli": { parameters: geminiCliWriteTodosSchema, toParams: writeTodosOps },
+};
 
 // =============================================================================
 // State helpers
@@ -676,12 +713,14 @@ function formatSummary(phases: TodoPhase[], errors: string[], readOnly = false):
 // Tool Class
 // =============================================================================
 
-export class TodoTool implements AgentTool<typeof todoSchema, TodoToolDetails> {
+export class TodoTool implements AgentTool<typeof todoSchema | typeof geminiCliWriteTodosSchema, TodoToolDetails> {
 	readonly name = "todo";
 	readonly approval = "read" as const;
 	readonly label = "Todo";
 	readonly summary = "Write a structured todo list to track progress within a session";
-	readonly parameters = todoSchema;
+	get parameters(): typeof todoSchema | typeof geminiCliWriteTodosSchema {
+		return harnessParameters(this.session, TODO_BRIDGES, todoSchema);
+	}
 	readonly concurrency = "exclusive";
 	readonly strict = true;
 	// Raw args reach execute() on schema failure; resolveTodoParams re-validates
@@ -699,14 +738,15 @@ export class TodoTool implements AgentTool<typeof todoSchema, TodoToolDetails> {
 
 	async execute(
 		_toolCallId: string,
-		params: TodoParams,
+		input: TodoParams | typeof geminiCliWriteTodosSchema.infer,
 		_signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<TodoToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<TodoToolDetails>> {
 		const previousPhases = clonePhases(this.session.getTodoPhases?.() ?? []);
 		const storage = this.session.getSessionFile() ? "session" : "memory";
-		const resolved = resolveTodoParams(params, previousPhases.length > 0);
+		const params = harnessParams(this.session, TODO_BRIDGES, input);
+		const resolved = "replace" in params ? params : resolveTodoParams(params, previousPhases.length > 0);
 		if (typeof resolved === "string") {
 			return {
 				content: [{ type: "text", text: resolved }],
@@ -714,13 +754,15 @@ export class TodoTool implements AgentTool<typeof todoSchema, TodoToolDetails> {
 				isError: true,
 			};
 		}
-		const entry = resolved;
-		const op = entry.op;
+		// A replaced list reports as `init`: the whole list was written anew.
+		const op = "replace" in resolved ? "init" : resolved.op;
 		// Pure-view calls are reads: no normalization, no state write.
 		const readOnly = op === "view";
 		const { phases: updated, errors } = readOnly
 			? { phases: previousPhases, errors: [] as string[] }
-			: applyParams(clonePhases(previousPhases), entry);
+			: "replace" in resolved
+				? applyOpsToPhases(previousPhases, resolved.replace)
+				: applyParams(clonePhases(previousPhases), resolved);
 		// A batch with any error is discarded wholesale: persisting a
 		// half-applied batch makes the natural retry hit "already exists" for
 		// the ops that did land. State and rendered summary stay at previous.

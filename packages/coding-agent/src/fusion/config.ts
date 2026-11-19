@@ -8,6 +8,7 @@ import type { Api, Model } from "@oh-my-pi/pi-ai";
 import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
+import { harnessRefsFollowSurface } from "../harness/manifest";
 import { getModelMatchPreferences, resolveCliModel } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -26,6 +27,7 @@ const LEAD_IDENTITY_BY_PROFILE: Readonly<Record<HarnessProfile, string>> = {
 	"claude-code": "Claude Code",
 	codex: "Codex",
 	pi: "Pi",
+	"gemini-cli": "Gemini CLI",
 };
 
 /** Template data the lead prompt and the `sidekick` tool description render their slots from. */
@@ -52,9 +54,9 @@ export function buildFusionPromptData(options: {
 	const { profile, toolRefs } = options;
 	return {
 		sidekickTool: toolRefs[SIDEKICK_TOOL_NAME] ?? SIDEKICK_TOOL_NAME,
-		// Claude Code's refs carry only what the wire presents; the other
-		// surfaces always have `wait` (codex's own facade answers to that name).
-		readTool: profile === "claude-code" ? toolRefs.wait : (toolRefs.wait ?? "wait"),
+		// Claude Code's and Gemini CLI's refs carry only what the wire presents; the
+		// other surfaces always have `wait` (codex's own facade answers to that name).
+		readTool: harnessRefsFollowSurface(profile) ? toolRefs.wait : (toolRefs.wait ?? "wait"),
 		leadIdentity: profile === undefined ? "assistant" : LEAD_IDENTITY_BY_PROFILE[profile],
 		gptLead: profile === "codex",
 	};

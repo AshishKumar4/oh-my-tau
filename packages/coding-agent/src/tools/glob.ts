@@ -1,9 +1,17 @@
 import type { GlobToolDetails } from "@oh-my-pi/pi-tui/tools/glob";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentTool,
+	AgentToolContext,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ToolTier,
+} from "@oh-my-pi/pi-agent-core";
 import * as natives from "@oh-my-pi/pi-natives";
 import { formatGroupedPaths, hasFsCode, isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { type HarnessBridges, harnessParameters, harnessParams, nativeParams } from "../harness/bridge";
 import { InternalUrlRouter, sessionResolveContext } from "../internal-urls";
 import { InternalUrlFilesystem, type UrlFileStat } from "../internal-urls/url-filesystem";
 import globDescription from "../prompts/tools/glob.md" with { type: "text" };
@@ -41,6 +49,26 @@ const findSchema = type({
 });
 
 export type GlobToolInput = typeof findSchema.infer;
+
+// Gemini CLI's own `glob` shape, the schema while no capture is served.
+const geminiCliGlobSchema = type({
+	pattern: type("string").describe("The glob pattern to match, such as `**/*.ts`"),
+	"dir_path?": type("string").describe("The directory to search in; defaults to the project root"),
+	"case_sensitive?": type("boolean").describe("Whether matching is case-sensitive"),
+	"respect_git_ignore?": type("boolean").describe("Whether to skip .gitignore'd files; defaults to true"),
+	"respect_gemini_ignore?": type("boolean").describe("Accepted for compatibility; omp has no .geminiignore"),
+});
+
+/** Gemini CLI's `glob` searches `pattern` under `dir_path`, which omp's `path` spells as one glob. */
+const GLOB_BRIDGES: HarnessBridges<GlobToolInput, typeof geminiCliGlobSchema> = {
+	"gemini-cli": {
+		parameters: geminiCliGlobSchema,
+		toParams: args => ({
+			path: args.dir_path === undefined ? args.pattern : path.join(args.dir_path, args.pattern),
+			...(args.respect_git_ignore !== undefined ? { gitignore: args.respect_git_ignore } : {}),
+		}),
+	},
+};
 
 const DEFAULT_LIMIT = 200;
 const MAX_LIMIT = 200;
@@ -119,9 +147,9 @@ interface NativePreparedTarget {
 	result?: Array<{ path: string; mtime: number }>;
 }
 
-export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
+export class GlobTool implements AgentTool<typeof findSchema | typeof geminiCliGlobSchema, GlobToolDetails> {
 	readonly name = "glob";
-	readonly approval = searchPathTier;
+	readonly approval = (args: unknown): ToolTier => searchPathTier(harnessParams(this.session, GLOB_BRIDGES, args));
 	/**
 	 * `always-ask-cached` keys: the folders and files this glob searches, so a
 	 * folder grant recorded by a `read` (or by a grep) covers a search inside it
@@ -130,7 +158,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 	 * costs a single stat; see {@link searchApprovalCacheTargets}.
 	 */
 	readonly approvalCacheTargets = (args: unknown): readonly string[] | undefined => {
-		const a = args as { path?: string | string[] } | null | undefined;
+		const a: Partial<GlobToolInput> | null | undefined = harnessParams(this.session, GLOB_BRIDGES, args);
 		return searchApprovalCacheTargets(
 			toPathList(a?.path),
 			this.session.cwd,
@@ -160,7 +188,9 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 		}
 		return this.#description;
 	}
-	readonly parameters = findSchema;
+	get parameters(): typeof findSchema | typeof geminiCliGlobSchema {
+		return harnessParameters(this.session, GLOB_BRIDGES, findSchema);
+	}
 
 	readonly strict = true;
 
@@ -188,11 +218,13 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 
 	async execute(
 		_toolCallId: string,
-		params: typeof findSchema.infer,
+		input: GlobToolInput | typeof geminiCliGlobSchema.infer,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<GlobToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<GlobToolDetails>> {
+		// Marked native so the tier check below does not bridge it a second time.
+		const params = nativeParams({ ...harnessParams(this.session, GLOB_BRIDGES, input) });
 		const { path: pathInput, limit, hidden, gitignore } = params;
 
 		throwIfAborted(signal);

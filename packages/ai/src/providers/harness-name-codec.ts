@@ -8,6 +8,8 @@ const PROFILE_PROVIDER_API: Readonly<Record<HarnessProfile, Api | undefined>> = 
 	"claude-code": "anthropic-messages",
 	codex: "openai-codex-responses",
 	pi: undefined,
+	// Gemini CLI's names ride the direct Gemini, Vertex and Code Assist APIs alike.
+	"gemini-cli": undefined,
 };
 
 export interface HarnessNameCodec {

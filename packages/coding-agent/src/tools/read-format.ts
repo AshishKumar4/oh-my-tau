@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { countNewlines } from "@oh-my-pi/pi-utils";
 import { getEditStore } from "../edit/store";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
 import {
 	formatHashlineHeader,
@@ -255,27 +256,47 @@ function lineNumbersFromEntries(entries: readonly LineEntry[]): number[] {
 }
 
 /**
- * Whether the model reads through Claude Code's `Read` (`file_path`, `offset`,
- * `limit`) rather than omp's `read` with inline `path:N` selectors. That schema
- * has no selector syntax, so read hints must name its parameters instead of
- * asking for something the model cannot send.
+ * A vendor read tool a profile serves in place of omp's `read`: it pages by
+ * `offset`/`limit` and has no inline selector syntax, so read hints name its
+ * parameters instead of asking for something the model cannot send.
  */
-export function usesClaudeCodeRead(session: ToolSession): boolean {
+export interface VendorRead {
+	/** The tool's wire name, as hints name it. */
+	readonly tool: string;
+	/** The `offset` that names a file's first line: Claude Code counts from 1, Gemini CLI from 0. */
+	readonly firstOffset: 0 | 1;
+}
+
+const VENDOR_READS: Partial<Readonly<Record<HarnessProfile, VendorRead>>> = {
+	"claude-code": { tool: "Read", firstOffset: 1 },
+	"gemini-cli": { tool: "read_file", firstOffset: 0 },
+};
+
+/** The vendor read the model reads through under the active profile, if any. */
+export function vendorRead(session: ToolSession): VendorRead | undefined {
 	const model = session.getActiveModel?.();
-	return model !== undefined && effectiveHarnessProfile(session.settings, model) === "claude-code";
+	const profile = model === undefined ? undefined : effectiveHarnessProfile(session.settings, model);
+	return profile === undefined ? undefined : VENDOR_READS[profile];
+}
+
+/** The `offset` value that names 1-based `line` under `read`. */
+export function vendorOffset(read: VendorRead, line: number): number {
+	return line - 1 + read.firstOffset;
 }
 
 /** Continuation hint for the line after a window; `selectorBase` prefixes the native selector. */
 export function formatContinueHint(session: ToolSession, selectorBase: string, nextLine: number): string {
-	return usesClaudeCodeRead(session)
-		? `Use offset=${nextLine} to continue`
+	const read = vendorRead(session);
+	return read
+		? `Use offset=${vendorOffset(read, nextLine)} to continue`
 		: `Use ${selectorBase}:${nextLine} to continue`;
 }
 
 /** Recovery hint for a start line past the last of `totalLines`. */
 export function formatBeyondEndHint(session: ToolSession, selectorBase: string, totalLines: number): string {
-	return usesClaudeCodeRead(session)
-		? `Use offset=1 to read from the start, or offset=${totalLines} to read the last line.`
+	const read = vendorRead(session);
+	return read
+		? `Use offset=${vendorOffset(read, 1)} to read from the start, or offset=${vendorOffset(read, totalLines)} to read the last line.`
 		: `Use ${selectorBase}:1 to read from the start, or ${selectorBase}:${totalLines} to read the last line.`;
 }
 
@@ -289,18 +310,18 @@ const FOOTER_RANGE_SAMPLES = 2;
  * footer demonstrates the multi-range selector syntax with concrete sample
  * ranges drawn from the actual elision so the model re-reads only what it
  * needs instead of falling back to `:raw` or whole-file reads. `byOffset`
- * phrases the sample as `offset`/`limit` arguments, one range per call.
+ * `read` phrases the sample as that vendor read's `offset`/`limit` arguments, one range per call.
  */
 export function formatSummaryElisionFooter(
 	readPath: string,
 	elidedRanges: ReadonlyArray<ElidedRange>,
 	elidedLines: number,
-	byOffset = false,
+	read?: VendorRead,
 ): string {
 	if (elidedRanges.length === 0) return "";
-	if (byOffset) {
+	if (read) {
 		const first = elidedRanges[0]!;
-		const example = `offset=${first.start} limit=${first.end - first.start + 1}`;
+		const example = `offset=${vendorOffset(read, first.start)} limit=${first.end - first.start + 1}`;
 		const tail = elidedRanges.length > 1 ? `, e.g. ${example}` : ` with ${example}`;
 		return `[…${elidedLines}ln elided; re-read needed ranges${tail}]`;
 	}

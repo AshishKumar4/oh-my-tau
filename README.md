@@ -6,13 +6,13 @@ oh-my-tau builds on [Oh My Pi](https://github.com/can1357/oh-my-pi) with model p
 
 ## What is different, and why?
 
-I want supported models to feel at home in OMP. The Claude Code and Codex profiles load locally recorded client prompts and present familiar tool names and schemas. OMP executes these tools. Its tools with no native counterpart remain available.
+I want supported models to feel at home in OMP. The Claude Code, Codex and Gemini CLI profiles load locally recorded client prompts and present familiar tool names and schemas. OMP executes these tools. Its tools with no native counterpart remain available.
 
 The goal is to reduce interface differences, not to reproduce the original clients. Conversation forks and Fusion mode extend how agents share context and divide work. These changes do not guarantee identical behavior or cost savings. Provider subscriptions and usage limits still apply.
 
 ## Setup
 
-You need Bun, Rust/Cargo, Git, and Python 3 for the installer. Install and sign in to Claude Code or Codex to record the corresponding profile. Connect Devin with `/login devin` or `DEVIN_API_KEY` if you want to use the default SWE-2 sidekick.
+You need Bun, Rust/Cargo, Git, and Python 3 for the installer. Install and sign in to Claude Code or Codex to record the corresponding profile. Gemini CLI needs no sign-in: the installer records it in API-key mode against a local gateway that answers for it, so the recording never reaches Google. Connect Devin with `/login devin` or `DEVIN_API_KEY` if you want to use the default SWE-2 sidekick.
 
 1. Install the fork:
 
@@ -36,7 +36,7 @@ You need Bun, Rust/Cargo, Git, and Python 3 for the installer. Install and sign 
    omp --model anthropic/claude-opus-5
    ```
 
-The installer records profiles for the clients it finds on your PATH. Claude Code and Codex prompts load from your local profile cache; they are not bundled in this repository. Without a valid capture, the profile keeps its tool adaptations but uses OMP's prompt.
+The installer records profiles for the clients it finds on your PATH. Claude Code, Codex and Gemini CLI prompts load from your local profile cache; they are not bundled in this repository. Without a valid capture, the Claude Code and Codex profiles keep their tool adaptations but use OMP's prompt. Gemini models stay native until a Gemini CLI capture exists.
 
 ### My working setup (optional)
 
@@ -50,13 +50,16 @@ See [profile/README.md](profile/README.md) for what it contains.
 
 ## Profiles and forks
 
-`harness.mode` accepts `auto` (the default), `native`, `claude-code`, `codex`, or `pi`. Each session, including each subagent, resolves `auto` from its own active model:
+`harness.mode` accepts `auto` (the default), `native`, `claude-code`, `codex`, `gemini-cli`, or `pi`. Each session, including each subagent, resolves `auto` from its own active model:
 
 - `claude-code`: Claude Opus or Fable version 5 or later on the Anthropic Messages API.
 - `codex`: `openai-codex/gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`, or `gpt-5.6-sol` on the Codex Responses API.
+- `gemini-cli`: Gemini 2.5 or later on the `google`, `google-vertex`, or `google-gemini-cli` providers, while a valid Gemini CLI capture exists. Antigravity (`google-antigravity`, `antigravity-cli`) stays native.
 - `native`: everything else.
 
-Use `native` to disable profile prompts and tool adaptations. The other explicit values force that profile on the selected model. The `pi` profile uses a bundled prompt. Profiles do not promise the original clients' behavior or request settings. `wait` stays available in Claude Code mode; captures that declare `TaskOutput` present it under that name.
+Use `native` to disable profile prompts and tool adaptations. The other explicit values force that profile on the selected model. The `pi` profile uses a bundled prompt.
+
+Under `gemini-cli`, OMP's tools answer to Gemini CLI's names: `run_shell_command`, `read_file`, `write_file`, `replace`, `glob`, `search_file_content`, `google_web_search`, `write_todos`, and `save_memory`. `list_directory` and `web_fetch` read through `read`; `web_fetch` fetches the first URL in its prompt. Gemini CLI's `codebase_investigator` has no OMP counterpart and is not offered. Requests keep each provider's own client headers. Profiles do not promise the original clients' behavior or request settings. `wait` stays available in Claude Code mode; captures that declare `TaskOutput` present it under that name.
 
 When a capture is served, Claude Code request headers use its client version. `PI_AI_CLAUDE_CODE_VERSION` overrides it.
 
@@ -109,7 +112,7 @@ The status line can show prompt-cache health from per-request usage. Context acc
 
 ## Updates and configuration
 
-Run `./scripts/install-harness.sh` again to update the installation. After updating Claude Code or Codex, use `--record-only` to refresh local profile data. Use `--build-only` to skip recording.
+Run `./scripts/install-harness.sh` again to update the installation. After updating Claude Code, Codex or Gemini CLI, use `--record-only` to refresh local profile data. Use `--build-only` to skip recording.
 
 Set `OMP_HARNESS_CACHE_DIR` to choose a different local profile cache. The default is `~/.omp/cache/harness`. Configure Fusion through `/fusion` or the settings panel.
 

@@ -7,6 +7,7 @@ import { OPENAI_HEADERS } from "@oh-my-pi/pi-catalog/wire/codex";
 import { getHarnessCacheDir, isEexist, isRecord, logger, stringProperty } from "@oh-my-pi/pi-utils";
 import {
 	AMBIENT_CONTAINMENT_MIN_CHARS,
+	GEMINI_CLI_ENTRYPOINT,
 	HARNESS_CAPTURE_SCHEMA,
 	type HarnessCapture,
 	projectHarnessCapture,
@@ -41,7 +42,8 @@ type ToolDeclaration = NonNullable<HarnessCapture["declarations"]>[number];
 /**
  * Every tool declaration in `declarations`, flattening codex namespace groups
  * (`{ name, tools: [...] }`) to their leaves. Anthropic declares `input_schema`,
- * codex `parameters`; both are kept under one key so the reader has one shape.
+ * codex `parameters`, Gemini `parametersJsonSchema`; all are kept under one key
+ * so the reader has one shape.
  */
 function toolDeclarations(declarations: readonly unknown[]): ToolDeclaration[] {
 	return declarations.flatMap(declaration => {
@@ -50,7 +52,9 @@ function toolDeclarations(declarations: readonly unknown[]): ToolDeclaration[] {
 		const name = stringField(declaration, "name");
 		if (name === undefined) return [];
 		const description = stringField(declaration, "description") ?? "";
-		const schema = isRecord(declaration) ? (declaration.input_schema ?? declaration.parameters) : undefined;
+		const schema = isRecord(declaration)
+			? (declaration.input_schema ?? declaration.parameters ?? declaration.parametersJsonSchema)
+			: undefined;
 		return [{ name, description, ...(schema === undefined ? {} : { input_schema: schema }) }];
 	});
 }
@@ -200,12 +204,55 @@ function deriveCodex(body: unknown, headers: Headers): Derivation | undefined {
 	};
 }
 
+/**
+ * Gemini CLI names itself in `User-Agent` as `GeminiCLI/<version>`. A build
+ * that does not define `CLI_VERSION` sends Node's version there instead, which
+ * `x-goog-api-client` carries as `gl-node/<version>`: that request names no
+ * client version.
+ */
+function geminiCliIdentity(headers: Headers): { clientVersion: string; entrypoint: string } | undefined {
+	const product = headers.get("user-agent")?.trim().split(" ")[0] ?? "";
+	const [entrypoint, clientVersion] = product.split("/");
+	if (entrypoint !== GEMINI_CLI_ENTRYPOINT || clientVersion === undefined || clientVersion.length === 0)
+		return undefined;
+	const runtime = /(?:^|\s)gl-node\/(\S+)/.exec(headers.get("x-goog-api-client") ?? "")?.[1];
+	if (clientVersion === runtime) {
+		logger.warn("Harness recorder: Gemini CLI sent Node's version, not its own; set CLI_VERSION to record it", {
+			userAgent: product,
+		});
+		return undefined;
+	}
+	return { clientVersion, entrypoint };
+}
+
+function deriveGeminiCli(body: unknown, headers: Headers): Derivation | undefined {
+	const identity = geminiCliIdentity(headers);
+	if (identity === undefined) return undefined;
+	const declared = (arrayField(body, "tools") ?? []).flatMap(tool => arrayField(tool, "functionDeclarations") ?? []);
+	// Gemini CLI's side requests (model routing, next-speaker and loop checks)
+	// declare no functions; only the agent turn carries the harness surface.
+	if (declared.length === 0) return undefined;
+	const systemInstruction = isRecord(body) ? body.systemInstruction : undefined;
+	const ambient = (arrayField(body, "contents") ?? [])
+		.filter(content => stringField(content, "role") === "user")
+		.flatMap(content => stringFields(arrayField(content, "parts") ?? [], "text"));
+	return {
+		profile: "gemini-cli",
+		...identity,
+		instructions: stringFields(arrayField(systemInstruction, "parts") ?? [], "text"),
+		...toolSurface(declared),
+		ambient,
+	};
+}
+
 function derive(request: AuthGatewayHarnessRequest): Derivation | undefined {
 	switch (request.format) {
 		case "anthropic-messages":
 			return deriveClaudeCode(request.body);
 		case "openai-responses":
 			return deriveCodex(request.body, request.headers);
+		case "google-generative-ai":
+			return deriveGeminiCli(request.body, request.headers);
 	}
 }
 

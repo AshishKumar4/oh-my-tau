@@ -24,7 +24,7 @@ Before changes in these directories, MUST read:
 {{/if}}
 
 {{#ifAny contextFiles.length agentsMdSearch.files.length}}
-{{#if claudeCodeVendorPrompt}}
+{{#if vendorToolNames}}
 Context files above auto-loaded. NEVER search for `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, or similar agent/context files: relevant files already in context; others noise.
 {{else}}
 Context files above auto-loaded. NEVER `grep`/`glob` for `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, or similar agent/context files: relevant files already in context; others noise.
@@ -37,7 +37,7 @@ Context files above auto-loaded. NEVER `grep`/`glob` for `AGENTS.md`, `CLAUDE.md
 Working-directory layout: newest mtime first; depth ≤ 3.
 {{workspaceTree.rendered}}
 {{#if workspaceTree.truncated}}
-{{#if claudeCodeVendorPrompt}}
+{{#if vendorToolNames}}
 {{#has tools "read"}}Some entries elided to shorten tree — use {{#has tools "glob"}}`{{toolRefs.glob}}`/{{/has}}`{{toolRefs.read}}` to drill in.{{/has}}
 {{else}}
 {{#has tools "glob"}}{{#has tools "read"}}Some entries elided to shorten tree — use `{{toolRefs.glob}}`/`{{toolRefs.read}}` to drill in.{{/has}}{{/has}}

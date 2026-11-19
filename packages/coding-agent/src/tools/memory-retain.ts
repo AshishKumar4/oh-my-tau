@@ -3,6 +3,7 @@ import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { prompt, withLoopPhase } from "@oh-my-pi/pi-utils";
 import { isHindsightConfigured, loadHindsightConfig } from "../hindsight/config";
+import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
 import retainDescription from "../prompts/tools/retain.md" with { type: "text" };
 import type { ToolSession } from ".";
 
@@ -33,20 +34,41 @@ const memoryRetainSchemaWithScope = type({
 		.describe("memories to retain"),
 });
 
-type MemoryRetainSchema = typeof memoryRetainSchemaBase | typeof memoryRetainSchemaWithScope;
+// Gemini CLI's `save_memory` stores one fact per call; the schema while no capture is served.
+const geminiCliSaveMemorySchema = type({
+	fact: type("string").describe("The fact to remember, as one self-contained statement"),
+});
+
+type MemoryRetainSchema =
+	| typeof memoryRetainSchemaBase
+	| typeof memoryRetainSchemaWithScope
+	| typeof geminiCliSaveMemorySchema;
 
 export type MemoryRetainParams = typeof memoryRetainSchemaWithScope.infer;
+
+const RETAIN_BRIDGES: HarnessBridges<MemoryRetainParams, typeof geminiCliSaveMemorySchema> = {
+	"gemini-cli": {
+		parameters: geminiCliSaveMemorySchema,
+		toParams: args => ({ items: [{ content: args.fact }] }),
+	},
+};
+
 export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRetainDetails> {
 	readonly name = "retain";
 	/** A global item reaches every project's recall, so it needs the same approval as a file write. */
 	readonly approval = (args: unknown) =>
-		(args as Partial<MemoryRetainParams>).items?.some(item => item.scope === "global") ? "write" : "read";
+		harnessParams<Partial<MemoryRetainParams>>(this.session, RETAIN_BRIDGES, args).items?.some(
+			item => item.scope === "global",
+		)
+			? "write"
+			: "read";
 	readonly label = "Retain";
 	get description(): string {
 		return prompt.render(retainDescription, { globalScope: isGlobalMemoryScopeAvailable(this.session) });
 	}
 	get parameters(): MemoryRetainSchema {
-		return isGlobalMemoryScopeAvailable(this.session) ? memoryRetainSchemaWithScope : memoryRetainSchemaBase;
+		const native = isGlobalMemoryScopeAvailable(this.session) ? memoryRetainSchemaWithScope : memoryRetainSchemaBase;
+		return harnessParameters(this.session, RETAIN_BRIDGES, native);
 	}
 	readonly strict = true;
 	readonly loadMode = "discoverable";
@@ -61,7 +83,11 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 		return new MemoryRetainTool(session);
 	}
 
-	async execute(toolCallId: string, params: MemoryRetainParams): Promise<AgentToolResult<MemoryRetainDetails>> {
+	async execute(
+		toolCallId: string,
+		input: MemoryRetainParams | typeof geminiCliSaveMemorySchema.infer,
+	): Promise<AgentToolResult<MemoryRetainDetails>> {
+		const params = harnessParams(this.session, RETAIN_BRIDGES, input);
 		const backend = cfgMemoryBackend.get(this.session.settings);
 		if (backend === "mnemopi") {
 			const state = this.session.getMnemopiSessionState?.();

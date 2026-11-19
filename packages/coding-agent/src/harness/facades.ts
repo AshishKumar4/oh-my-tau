@@ -21,6 +21,8 @@ import codexSendMessage from "../prompts/tools/harness/codex-send-message.md" wi
 import codexSpawnAgent from "../prompts/tools/harness/codex-spawn-agent.md" with { type: "text" };
 import codexWaitAgent from "../prompts/tools/harness/codex-wait-agent.md" with { type: "text" };
 import codexWait from "../prompts/tools/harness/codex-wait.md" with { type: "text" };
+import geminiCliListDirectory from "../prompts/tools/harness/gemini-cli-list-directory.md" with { type: "text" };
+import geminiCliWebFetch from "../prompts/tools/harness/gemini-cli-web-fetch.md" with { type: "text" };
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { completeOnTier } from "../eval/completion-bridge";
 import { isIrcEnabled } from "../irc/messaging";
@@ -29,6 +31,7 @@ import { formatModelStringWithRouting } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { approvedPerCallModels, parentModelGrantPattern, spawnModelGrants } from "../task/model-approval";
 import { cfgTaskBatch, cfgTaskEnableEffort, cfgTaskIsolationEnabled, perCallModelEnabled } from "../task/settings";
+import type { ToolSession } from "../tools";
 import { cfgFetchEnabled } from "../tools/settings";
 import type { HarnessFacadeHost, HarnessFacadeSpec } from "./facade";
 import { CODEX_COLLABORATION_NAMESPACE, harnessToolRefs } from "./manifest";
@@ -283,6 +286,26 @@ function webFetchPrompt(page: string, request: string): string {
 	return `Web page content:\n---\n${page}\n---\n\n${request}\n\n${WEB_FETCH_ANSWER_RULE}`;
 }
 
+/** The session's smol model's answer to `request` over a fetched page; undefined when no smol model answers. */
+async function answerOverPage(
+	page: string,
+	request: string,
+	session: ToolSession,
+	signal: AbortSignal | undefined,
+): Promise<string | undefined> {
+	try {
+		return await completeOnTier(
+			webFetchPrompt(page, request),
+			"smol",
+			session,
+			signal ?? new AbortController().signal,
+		);
+	} catch {
+		if (signal?.aborted) throw signal.reason;
+		return undefined;
+	}
+}
+
 function resultText(result: AgentToolResult): string {
 	return result.content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("\n");
 }
@@ -315,17 +338,7 @@ const CLAUDE_CODE_WEB_FETCH: HarnessFacadeSpec<typeof claudeCodeWebFetchSchema> 
 	run: async ({ args, host, signal, forward }) => {
 		const page = await forward();
 		if (page.isError || !host.session) return page;
-		let answer: string | undefined;
-		try {
-			answer = await completeOnTier(
-				webFetchPrompt(resultText(page), args.prompt),
-				"smol",
-				host.session,
-				signal ?? new AbortController().signal,
-			);
-		} catch {
-			if (signal?.aborted) throw signal.reason;
-		}
+		const answer = await answerOverPage(resultText(page), args.prompt, host.session, signal);
 		return answer ? { content: [{ type: "text", text: answer }] } : page;
 	},
 };
@@ -577,12 +590,74 @@ const CODEX_FACADES: readonly HarnessFacadeSpec[] = [
 	CODEX_WAIT,
 ];
 
+const geminiCliListDirectorySchema = type({
+	dir_path: type("string").describe("The directory to list"),
+	"ignore?": type("string[]").describe("Glob patterns to leave out; not applied"),
+	"file_filtering_options?": type({
+		"respect_git_ignore?": "boolean",
+		"respect_gemini_ignore?": "boolean",
+	}).describe("Ignore-file options; not applied"),
+});
+
+const geminiCliWebFetchSchema = type({
+	prompt: type("string").describe("The URL to fetch and what to extract from the page"),
+});
+
+const WEB_URL = /https?:\/\/[^\s<>"'`]+/g;
+const URL_TRAILING_PUNCTUATION = /[.,;:!?)\]}]+$/;
+
+/** The `http(s)://` URLs a `web_fetch` prompt names, in order, without sentence punctuation. */
+function promptUrls(prompt: string): string[] {
+	return [...prompt.matchAll(WEB_URL)].map(match => match[0].replace(URL_TRAILING_PUNCTUATION, ""));
+}
+
+const GEMINI_CLI_LIST_DIRECTORY: HarnessFacadeSpec<typeof geminiCliListDirectorySchema> = {
+	target: "read",
+	wireName: "list_directory",
+	description: geminiCliListDirectory,
+	parameters: geminiCliListDirectorySchema,
+	toParams: args => ({ path: args.dir_path }),
+};
+
+const GEMINI_CLI_WEB_FETCH: HarnessFacadeSpec<typeof geminiCliWebFetchSchema> = {
+	target: "read",
+	wireName: "web_fetch",
+	// Gemini CLI fetches up to 20 URLs per call; this facade reads one, so it
+	// serves its own description rather than promise the vendor's.
+	ownSurface: true,
+	description: geminiCliWebFetch,
+	parameters: geminiCliWebFetchSchema,
+	mounts: host => cfgFetchEnabled.get(host.settings),
+	toParams: args => {
+		const [url] = promptUrls(args.prompt);
+		if (url === undefined) throw new ToolError("prompt names no http:// or https:// URL to fetch");
+		return { path: url };
+	},
+	// The page comes through `read`; the session's smol model answers the
+	// prompt over it, as Claude Code's WebFetch facade does.
+	run: async ({ args, host, signal, forward }) => {
+		const page = await forward();
+		if (page.isError) return page;
+		const answer = host.session
+			? await answerOverPage(resultText(page), args.prompt, host.session, signal)
+			: undefined;
+		const result: AgentToolResult = answer ? { content: [{ type: "text", text: answer }] } : page;
+		const [fetched, ...unfetched] = promptUrls(args.prompt);
+		if (unfetched.length === 0) return result;
+		const note = `Fetched only ${fetched}. Call web_fetch again for: ${unfetched.join(", ")}`;
+		return { ...result, content: [...result.content, { type: "text", text: note }] };
+	},
+};
+
+const GEMINI_CLI_FACADES: readonly HarnessFacadeSpec[] = [GEMINI_CLI_LIST_DIRECTORY, GEMINI_CLI_WEB_FETCH];
+
 // pi has no built-in subagent or multi-agent surface to facade; every omp
 // tool the profile does not rename keeps its native name.
 const FACADES: Readonly<Record<HarnessProfile, readonly HarnessFacadeSpec[]>> = {
 	"claude-code": CLAUDE_CODE_FACADES,
 	codex: CODEX_FACADES,
 	pi: [],
+	"gemini-cli": GEMINI_CLI_FACADES,
 };
 
 export function harnessFacadeSpecs(profile: HarnessProfile): readonly HarnessFacadeSpec[] {

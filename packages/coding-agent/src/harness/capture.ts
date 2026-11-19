@@ -19,12 +19,16 @@ import { TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 
 export const HARNESS_CAPTURE_SCHEMA = 1;
 
+/** The product token of Gemini CLI's `User-Agent` (`GeminiCLI/<version>…`), the entrypoint its captures record. */
+export const GEMINI_CLI_ENTRYPOINT = "GeminiCLI";
+
 // `pi` is never recorded — its prompt ships bundled, not captured — but the
 // table keys every profile so a stray hand-placed capture is still rejected.
 const HARNESS_ENTRYPOINTS: Readonly<Record<HarnessProfile, readonly string[]>> = {
 	"claude-code": [claudeCodeEntrypoint],
 	codex: ["codex_exec"],
 	pi: [],
+	"gemini-cli": [GEMINI_CLI_ENTRYPOINT],
 };
 
 interface WireOwnedLeading {
@@ -41,6 +45,7 @@ const WIRE_OWNED_LEADING: Readonly<Record<HarnessProfile, WireOwnedLeading>> = {
 	},
 	codex: { linePrefixes: [], lines: [], identityBlock: false },
 	pi: { linePrefixes: [], lines: [], identityBlock: false },
+	"gemini-cli": { linePrefixes: [], lines: [], identityBlock: false },
 };
 
 export const AMBIENT_CONTAINMENT_MIN_CHARS = 64;

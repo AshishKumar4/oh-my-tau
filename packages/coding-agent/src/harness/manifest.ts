@@ -48,10 +48,30 @@ const PI_BINDINGS: Readonly<Record<string, HarnessToolBinding>> = {
 	glob: { wireName: "find" },
 };
 
+/**
+ * Gemini CLI's built-ins under its own names. `list_directory` and `web_fetch`
+ * are facades over `read` (see `facades.ts`); Gemini CLI's
+ * `codebase_investigator` and `read_many_files` have no omp counterpart and
+ * stay unbound.
+ */
+const GEMINI_CLI_BINDINGS: Readonly<Record<string, HarnessToolBinding>> = {
+	// Same name, so nothing is renamed; the binding serves the vendor's declaration.
+	glob: { wireName: "glob" },
+	bash: { wireName: "run_shell_command" },
+	read: { wireName: "read_file" },
+	write: { wireName: "write_file" },
+	edit: { wireName: "replace" },
+	grep: { wireName: "search_file_content" },
+	web_search: { wireName: "google_web_search" },
+	todo: { wireName: "write_todos" },
+	retain: { wireName: "save_memory" },
+};
+
 const MANIFESTS: Readonly<Record<HarnessProfile, Readonly<Record<string, HarnessToolBinding>>>> = {
 	"claude-code": CLAUDE_CODE_BINDINGS,
 	codex: CODEX_BINDINGS,
 	pi: PI_BINDINGS,
+	"gemini-cli": GEMINI_CLI_BINDINGS,
 };
 
 export function harnessToolBinding(
@@ -73,6 +93,7 @@ const WIRE_RENAMES: Readonly<Record<HarnessProfile, Readonly<Record<string, stri
 	"claude-code": collectWireRenames(CLAUDE_CODE_BINDINGS),
 	codex: collectWireRenames(CODEX_BINDINGS),
 	pi: collectWireRenames(PI_BINDINGS),
+	"gemini-cli": collectWireRenames(GEMINI_CLI_BINDINGS),
 };
 
 export function harnessWireRenames(profile: HarnessProfile): Readonly<Record<string, string>> {
@@ -95,6 +116,11 @@ const NATIVE_PROMPT_TOOL_REFS: Readonly<Record<string, string>> = {
 	deviceWrite: "write",
 };
 
+/** Whether omp's prompts name tools as `profile` presents them (see {@link harnessToolRefs}). */
+export function harnessRefsFollowSurface(profile: HarnessProfile | undefined): profile is "claude-code" | "gemini-cli" {
+	return profile === "claude-code" || profile === "gemini-cli";
+}
+
 /** The tools a harness profile presents, as {@link harnessToolRefs} reads them. */
 export interface PresentedToolSurface {
 	/** omp tools the model can reach, by native name. */
@@ -107,9 +133,10 @@ export interface PresentedToolSurface {
  * Tool names for omp's own prompt templates (`toolRefs`), keyed by native tool
  * name.
  *
- * Every profile but `claude-code` keeps the literal names unconditionally, so
- * native text renders byte for byte as before. Under `claude-code` the map is
- * exactly the presented `surface`: each reachable tool under its wire name,
+ * `codex` and `pi` keep the literal names unconditionally, so native text
+ * renders byte for byte as before. Under `claude-code` and `gemini-cli`, whose
+ * core tools all answer to vendor names, the map is exactly the presented
+ * `surface`: each reachable tool under its wire name,
  * each mounted facade under its own name, and a tool a facade stands in for
  * under the facade's (`wait` → `TaskOutput`). A key is absent when nothing on
  * the wire answers to it, so a template naming a tool through `toolRefs` can
@@ -121,7 +148,7 @@ export function harnessToolRefs(
 	profile: HarnessProfile | undefined,
 	surface?: PresentedToolSurface,
 ): Readonly<Record<string, string>> {
-	if (profile !== "claude-code" || surface === undefined) return NATIVE_PROMPT_TOOL_REFS;
+	if (!harnessRefsFollowSurface(profile) || surface === undefined) return NATIVE_PROMPT_TOOL_REFS;
 	const refs: Record<string, string> = {};
 	for (const name of surface.toolNames) refs[name] = MANIFESTS[profile][name]?.wireName ?? name;
 	for (const facade of surface.facades) {

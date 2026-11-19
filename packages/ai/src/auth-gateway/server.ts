@@ -21,6 +21,7 @@
  *   POST /v1/images[/generations|/edits]   → image generation, OpenAI/OpenRouter wire (routes/images)
  *   POST /v1/audio/speech                  → text-to-speech, raw audio out (routes/speech)
  *   POST /v1/audio/transcriptions          → speech-to-text, multipart or JSON base64 in (routes/transcriptions)
+ *   POST /v1beta/models/{m}:[stream]generateContent → Gemini API, only while recording a harness (routes/gemini-harness)
  *
  * Chat routes live in this file; every other modality is a `routes/*` module
  * built on the shared plumbing in `dispatch.ts`. {@link createAuthGatewayRouter}
@@ -67,6 +68,7 @@ import {
 	withCors,
 } from "./http";
 import { handleEmbeddings } from "./routes/embeddings";
+import { GEMINI_GENERATE_PATH, handleGeminiHarnessRecording } from "./routes/gemini-harness";
 import { handleImageEdits, handleImageGenerations } from "./routes/images";
 import { handleRerank } from "./routes/rerank";
 import { handleSpeech } from "./routes/speech";
@@ -954,6 +956,12 @@ export function createAuthGatewayRouter(hostOpts: AuthGatewayRouteOptions): Auth
 			const formatRoute = FORMAT_ROUTES[pathname];
 			if (formatRoute && req.method === "POST") {
 				return await handleFormatEndpoint(formatRoute, opts, req, peer, sessionStates);
+			}
+
+			// Gemini's generate routes exist only to record a harness; nothing is forwarded.
+			const geminiGenerate = req.method === "POST" ? GEMINI_GENERATE_PATH.exec(pathname) : null;
+			if (geminiGenerate && opts.harnessRecorder) {
+				return await handleGeminiHarnessRecording(opts.harnessRecorder, req, peer, geminiGenerate[2]);
 			}
 
 			// Pi-native fast path. Same auth + provider plumbing as the

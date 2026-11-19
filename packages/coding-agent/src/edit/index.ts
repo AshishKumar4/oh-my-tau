@@ -106,16 +106,36 @@ const claudeCodeEditSchema = type({
 });
 type ClaudeCodeEditParams = typeof claudeCodeEditSchema.inferIn;
 
-const REPLACE_BRIDGES: HarnessBridges<ReplaceParams, typeof claudeCodeEditSchema> = {
+// Gemini CLI's `replace`. `instruction` only feeds Gemini CLI's own edit-repair
+// model, so omp ignores it; `expected_replacements` above 1 replaces every match.
+const geminiCliReplaceSchema = type({
+	file_path: type("string").describe("The path to the file to modify"),
+	"instruction?": type("string").describe("What the change does and why"),
+	old_string: type("string").describe("The exact text to replace"),
+	new_string: type("string").describe("The text to replace old_string with"),
+	"expected_replacements?": type("number").describe("Number of occurrences to replace; defaults to 1"),
+});
+
+const REPLACE_BRIDGES: HarnessBridges<ReplaceParams, typeof claudeCodeEditSchema | typeof geminiCliReplaceSchema> = {
 	"claude-code": {
 		parameters: claudeCodeEditSchema,
-		toParams: ({ file_path, ...rest }) => ({ path: file_path, ...rest }),
+		toParams: ({ file_path, ...rest }: ClaudeCodeEditParams) => ({ path: file_path, ...rest }),
+	},
+	"gemini-cli": {
+		parameters: geminiCliReplaceSchema,
+		toParams: (args: typeof geminiCliReplaceSchema.infer) => ({
+			path: args.file_path,
+			old_string: args.old_string,
+			new_string: args.new_string,
+			...((args.expected_replacements ?? 1) > 1 ? { replace_all: true } : {}),
+		}),
 	},
 };
 
 type TInput =
 	| typeof replaceEditSchema
 	| typeof claudeCodeEditSchema
+	| typeof geminiCliReplaceSchema
 	| typeof patchEditSchema
 	| typeof hashlineEditParamsSchema
 	| typeof applyPatchSchema
@@ -124,6 +144,7 @@ type TInput =
 type EditParams =
 	| ReplaceParams
 	| ClaudeCodeEditParams
+	| typeof geminiCliReplaceSchema.infer
 	| ReplaceBatchParams
 	| PatchParams
 	| HashlineParams
@@ -590,8 +611,8 @@ export class EditTool implements AgentTool<TInput> {
 		// A call that arrived through the custom-tool wire streams the payload
 		// verbatim; JSON function calls stream JSON text.
 		const rawInput = init.customWireName !== undefined;
-		const rename =
-			!rawInput && this.parameters === claudeCodeEditSchema ? new StreamedKeyRename("file_path", "path") : undefined;
+		const vendorReplace = this.parameters === claudeCodeEditSchema || this.parameters === geminiCliReplaceSchema;
+		const rename = !rawInput && vendorReplace ? new StreamedKeyRename("file_path", "path") : undefined;
 		const open = this.#openSession(rawInput, undefined, (error, batch) => {
 			if (error) {
 				logger.debug("Native edit preview failed", { error: error.message, toolCallId: init.toolCallId });

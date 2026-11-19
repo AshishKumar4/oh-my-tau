@@ -50,7 +50,7 @@ import {
 	renderDeferredToolsAnnouncement,
 	TOOL_SEARCH_TOOL_NAME,
 } from "./tools/tool-search";
-import { effectiveHarnessProfile } from "./harness/effective-profile";
+import { effectiveHarnessProfile, harnessProfileCandidate } from "./harness/effective-profile";
 import { type HarnessSurface, harnessSurface } from "./harness/facades";
 import { withCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
@@ -3058,7 +3058,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		 */
 		const loadServedHarnessPrompt = async (cwd: string): Promise<void> => {
 			const promptModel = toolSession.getActiveModel?.();
-			const profile = promptModel ? effectiveHarnessProfile(settings, promptModel) : undefined;
+			// The candidate, not the effective profile: `auto` serves a capture-gated
+			// profile only once this load has found its capture.
+			const profile = promptModel ? harnessProfileCandidate(settings, promptModel) : undefined;
 			if (!promptModel || profile === undefined || servedHarnessPrompt(promptModel, profile)) return;
 			if (options.customSystemPrompt !== undefined || options.systemPromptTemplate !== undefined) return;
 			if ((await discoverSystemPromptOverride(cwd)) !== undefined) return;

@@ -146,7 +146,7 @@ export interface AuthGatewayFormatModule {
 	formatError(status: number, type: string, message: string): Response;
 }
 
-export type AuthGatewayHarnessWireFormat = "anthropic-messages" | "openai-responses";
+export type AuthGatewayHarnessWireFormat = "anthropic-messages" | "openai-responses" | "google-generative-ai";
 
 export interface AuthGatewayHarnessRequest {
 	readonly format: AuthGatewayHarnessWireFormat;

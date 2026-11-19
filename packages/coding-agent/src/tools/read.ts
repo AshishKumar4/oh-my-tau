@@ -129,7 +129,9 @@ import {
 	READ_CHUNK_SIZE,
 	readHashlineHeaderContext,
 	toReadTruncationStats,
-	usesClaudeCodeRead,
+	type VendorRead,
+	vendorOffset,
+	vendorRead,
 } from "./read-format";
 import {
 	findSuffixMatchCached,
@@ -336,11 +338,13 @@ function formatOmittedRequestedLineNotice(
 	line: NonNullable<ReadLineWindow["byteLimitLine"]>,
 	maxBytes: number,
 	selectorBase: string,
-	byOffset: boolean,
+	read: VendorRead | undefined,
 ): string {
 	const lineNumber = line.index + 1;
-	// Claude Code's `Read` has no raw selector; a one-line window reads the line without context.
-	const target = byOffset ? `offset=${lineNumber} limit=1` : `${selectorBase}:raw:${lineNumber}-${lineNumber}`;
+	// A vendor read has no raw selector; a one-line window reads the line without context.
+	const target = read
+		? `offset=${vendorOffset(read, lineNumber)} limit=1`
+		: `${selectorBase}:raw:${lineNumber}-${lineNumber}`;
 	return `[Line ${lineNumber} is ${formatBytes(
 		line.byteLength,
 	)} and could not fit after preceding context in the ${formatBytes(maxBytes)} read budget. Use ${target} to read that line without context (byte-capped if it exceeds the budget), or widen the requested range to increase the budget.]`;
@@ -867,11 +871,11 @@ function formatLocatedFileNotice(
 	backingPath: string,
 	size: number,
 	rawBlocked: boolean,
-	byOffset: boolean,
+	read: VendorRead | undefined,
 ): string {
-	// Claude Code's `Read` pages by `offset`/`limit`; it has no inline selectors to name.
-	const workflows = byOffset
-		? "Use offset/limit windows (e.g. offset=1 limit=3000) for numbered exploration, and the backing file path for search/copy workflows"
+	// A vendor read pages by `offset`/`limit`; it has no inline selectors to name.
+	const workflows = read
+		? `Use offset/limit windows (e.g. offset=${vendorOffset(read, 1)} limit=3000) for numbered exploration, and the backing file path for search/copy workflows`
 		: `Use ${url}:raw:1-3000 for bounded verbatim chunks, ${url}:1-3000 for numbered exploration, and the backing file path for search/copy workflows`;
 	return rawBlocked
 		? `Unbounded raw read blocked for ${url} (${formatBytes(size)}). Reading the whole file verbatim can exhaust memory. ${workflows}: ${shortenPath(backingPath)}`
@@ -921,18 +925,35 @@ const claudeCodeReadSchema = type({
 	"limit?": type("number").describe("number of lines to read"),
 });
 
-type ReadInputSchema = typeof readSchema | typeof claudeCodeReadSchema;
+// Gemini CLI's own `read_file` shape, the schema while no capture is served.
+const geminiCliReadSchema = type({
+	file_path: type("string").describe("The path to the file to read"),
+	"offset?": type("number").describe("0-based line to start reading from; requires limit"),
+	"limit?": type("number").describe("Maximum number of lines to read"),
+});
 
-function claudeCodeReadSelector(offset: number | undefined, limit: number | undefined): string {
-	if (offset === undefined && limit === undefined) return "";
-	const start = Math.max(1, Math.trunc(offset ?? 1));
-	return limit === undefined ? `:${start}-` : `:${start}+${Math.max(1, Math.trunc(limit))}`;
+type ReadInputSchema = typeof readSchema | typeof claudeCodeReadSchema | typeof geminiCliReadSchema;
+
+/** omp's line-window selector for a 1-based `start` line and a line `limit`. */
+function lineWindowSelector(start: number | undefined, limit: number | undefined): string {
+	if (start === undefined && limit === undefined) return "";
+	const first = Math.max(1, Math.trunc(start ?? 1));
+	return limit === undefined ? `:${first}-` : `:${first}+${Math.max(1, Math.trunc(limit))}`;
 }
 
-const READ_BRIDGES: HarnessBridges<ReadToolInput, typeof claudeCodeReadSchema> = {
+const READ_BRIDGES: HarnessBridges<ReadToolInput, typeof claudeCodeReadSchema | typeof geminiCliReadSchema> = {
 	"claude-code": {
 		parameters: claudeCodeReadSchema,
-		toParams: args => ({ path: `${args.file_path}${claudeCodeReadSelector(args.offset, args.limit)}` }),
+		toParams: (args: typeof claudeCodeReadSchema.infer) => ({
+			path: `${args.file_path}${lineWindowSelector(args.offset, args.limit)}`,
+		}),
+	},
+	// Gemini CLI counts `offset` from 0.
+	"gemini-cli": {
+		parameters: geminiCliReadSchema,
+		toParams: (args: typeof geminiCliReadSchema.infer) => ({
+			path: `${args.file_path}${lineWindowSelector(args.offset === undefined ? undefined : args.offset + 1, args.limit)}`,
+		}),
 	},
 };
 
@@ -1110,14 +1131,15 @@ function repeatReadNotice(
 	}
 	entry.count++;
 	if (entry.count < REPEAT_READ_HINT_THRESHOLD) return;
-	// Under Claude Code's `Read` the tracked path carries the bridged selector,
+	// Under a vendor read the tracked path carries the bridged selector,
 	// syntax that schema cannot express, so the hint names the parameters instead.
-	const next = usesClaudeCodeRead(session)
+	const byOffset = vendorRead(session) !== undefined;
+	const next = byOffset
 		? "use a narrower `offset`/`limit` range, or proceed"
 		: acceptsLineSelector(path)
 			? "use a narrower selector (path:A-B), or proceed"
 			: "proceed";
-	const target = usesClaudeCodeRead(session) ? "it" : `'${path}'`;
+	const target = byOffset ? "it" : `'${path}'`;
 	return `[You have received this identical output ${entry.count} times. Re-reading ${target} will not change it — ${next} with the edit.]`;
 }
 
@@ -1748,6 +1770,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 		if (!question && !(this.session.getActiveModel?.()?.input.includes("image") ?? true)) {
 			const outputMime = imageMetadata?.mimeType ?? mimeType;
 			const imageQuestionPath = questionPath ?? formatPathRelativeToCwd(absolutePath, this.session.cwd);
+			const imageReader = vendorRead(this.session);
 			const metadataLines = [
 				"Image metadata:",
 				`- MIME: ${outputMime}`,
@@ -1762,8 +1785,8 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 						? "- Alpha: no"
 						: "- Alpha: unknown",
 				"",
-				usesClaudeCodeRead(this.session)
-					? `To analyze the image, call Read with \`file_path\` set to \`${imageQuestionPath}?q=<question>\` — the question is answered by a vision model and returned as text.`
+				imageReader
+					? `To analyze the image, call ${imageReader.tool} with \`file_path\` set to \`${imageQuestionPath}?q=<question>\` — the question is answered by a vision model and returned as text.`
 					: `To analyze the image, read \`${imageQuestionPath}?q=<question>\` — the question is answered by a vision model and returned as text.`,
 			];
 			return { content: [{ type: "text", text: metadataLines.join("\n") }], details: {}, sourcePath: absolutePath };
@@ -2061,7 +2084,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 
 	async execute(
 		toolCallId: string,
-		input: ReadParams | typeof claudeCodeReadSchema.infer,
+		input: ReadParams | typeof claudeCodeReadSchema.infer | typeof geminiCliReadSchema.infer,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<ReadToolDetails>,
 		toolContext?: AgentToolContext,
@@ -2124,11 +2147,14 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 				);
 		const displayTarget = InternalUrlRouter.instance().locateSync(params.path);
 		if (displayTarget && result.details) result.details.displayTarget = displayTarget;
-		// The truncation notice renders from this meta once execute returns; Claude
-		// Code's `Read` continues by its `offset` parameter, not an inline selector.
+		// The truncation notice renders from this meta once execute returns; a
+		// vendor read continues by its `offset` parameter, not an inline selector,
+		// so the offset is restated in that parameter's count.
 		const truncation = result.details?.meta?.truncation;
-		if (truncation?.nextOffset !== undefined && usesClaudeCodeRead(this.session)) {
+		const pagingRead = vendorRead(this.session);
+		if (truncation?.nextOffset !== undefined && pagingRead) {
 			truncation.nextOffsetParam = "offset";
+			truncation.nextOffset = vendorOffset(pagingRead, truncation.nextOffset);
 		}
 		appendRepeatReadHint(this.session, params.path, result);
 		return result;
@@ -2588,7 +2614,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 		// `:raw` read inlines one only below the budget; bigger ones page with ranges.
 		if (located && !located.spec.unbounded && parsed.kind === "raw" && fileSize > MAX_URL_RAW_INLINE_BYTES) {
 			return toolResult<ReadToolDetails>({ resolvedPath: absolutePath })
-				.text(formatLocatedFileNotice(located.url, absolutePath, fileSize, true, usesClaudeCodeRead(this.session)))
+				.text(formatLocatedFileNotice(located.url, absolutePath, fileSize, true, vendorRead(this.session)))
 				.done();
 		}
 
@@ -2769,7 +2795,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 				return toolResult<ReadToolDetails>({ resolvedPath: renderAbsolutePath, suffixResolution })
 					.text(
 						prependSuffixResolutionNotice(
-							usesClaudeCodeRead(this.session)
+							vendorRead(this.session)
 								? `[Cannot read binary file '${resolvedDisplayPath}' (${formatBytes(fileSize)}); not valid UTF-8 text.]`
 								: `[Cannot read binary file '${resolvedDisplayPath}' (${formatBytes(fileSize)}); not valid UTF-8 text. Use ':raw' to read bytes verbatim.]`,
 							suffixResolution,
@@ -2814,7 +2840,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 						resolvedDisplayPath,
 						renderedSummary.elidedRanges,
 						renderedSummary.elidedLines,
-						usesClaudeCodeRead(this.session),
+						vendorRead(this.session),
 					);
 					const summaryDisplayPath = formatPathRelativeToCwd(renderAbsolutePath, this.session.cwd);
 					const summaryHashContext = displayMode.hashLines
@@ -2909,9 +2935,10 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 					// return line 31 and nothing else.
 					const rawSelector = isRawSelector(sel);
 					const requestedStart = offset ? Math.max(0, offset - 1) : 0;
-					// Context padding is omp's convention; a vendor-numbered read
-					// returns exactly the window the vendor's `Read` would.
-					const padRange = !rawSelector && displayMode.numbering === "pipe";
+					// Context padding is omp's convention; a vendor read returns
+					// exactly the window the vendor's own read tool would.
+					const padRange =
+						!rawSelector && displayMode.numbering === "pipe" && vendorRead(this.session) === undefined;
 					const expandStart = padRange && offset !== undefined && offset > 1;
 					const expandEnd = padRange && limit !== undefined;
 					let leadingContext = expandStart ? Math.min(requestedStart, RANGE_LEADING_CONTEXT_LINES) : 0;
@@ -3280,7 +3307,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 								omittedSelectedLine,
 								maxBytesForRead,
 								selectorBase,
-								usesClaudeCodeRead(this.session),
+								vendorRead(this.session),
 							)}`;
 						} else if (!rawSelector || limit === undefined || userLimitedLines < limit) {
 							outputText += `\n\n[More lines in file (${formatBytes(
@@ -3296,7 +3323,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 								omittedSelectedLine,
 								maxBytesForRead,
 								selectorBase,
-								usesClaudeCodeRead(this.session),
+								vendorRead(this.session),
 							)}`;
 						}
 						details = { truncation: toReadTruncationStats(truncation) };
@@ -3441,7 +3468,7 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 						absolutePath,
 						fileSize,
 						false,
-						usesClaudeCodeRead(this.session),
+						vendorRead(this.session),
 					);
 					firstText.text += `\n\n[${notice}]`;
 				}

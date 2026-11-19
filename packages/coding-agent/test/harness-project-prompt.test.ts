@@ -32,7 +32,7 @@ function projectData(options: {
 	tools: (typeof TOOL_SETS)[number];
 	vendorPrompt: boolean;
 }): Record<string, unknown> {
-	const claudeCodeVendorPrompt = options.vendorPrompt && options.harnessProfile === "claude-code";
+	const vendorToolNames = options.vendorPrompt && options.harnessProfile === "claude-code";
 	// Tool references render the name each tool presents under the active surface.
 	const toolRefs = options.harnessProfile === "claude-code" ? options.tools.wire : undefined;
 	return {
@@ -51,7 +51,7 @@ function projectData(options: {
 		activeRepoContext: "",
 		vendorPrompt: options.vendorPrompt,
 		appendPrompt: "",
-		claudeCodeVendorPrompt,
+		vendorToolNames,
 	};
 }
 

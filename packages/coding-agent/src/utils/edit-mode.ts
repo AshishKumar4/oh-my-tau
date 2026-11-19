@@ -35,7 +35,8 @@ export function resolveEditMode(session: EditModeSessionLike): EditModeSetting {
 	if (mode === "hashline" && !$flag("PI_STRICT_EDIT_MODE")) {
 		const model = session.getActiveModel?.();
 		const profile = model && effectiveHarnessProfile(session.settings, model);
-		if (profile === "claude-code") return "replace";
+		// Claude Code's `Edit` and Gemini CLI's `replace` are string replacements.
+		if (profile === "claude-code" || profile === "gemini-cli") return "replace";
 		// Codex editing primitive is the freeform V4A apply_patch; the codex
 		// profile serves tools.apply_patch inside exec, which bridges to this
 		// tool — it must speak V4A, not hashlines.

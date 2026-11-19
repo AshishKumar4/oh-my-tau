@@ -218,3 +218,17 @@ class "gemini" {
 		}
 	}
 }
+
+// Gemini CLI is the harness these lineages are post-trained against. Its
+// surface is a system instruction plus function declarations, which the
+// direct Gemini API, Vertex and Code Assist routes all carry. Antigravity
+// (google-antigravity, antigravity-cli) runs its own harness and keeps omp's
+// native surface. Auto mode serves the profile only while a valid local
+// capture of Gemini CLI exists; without one the session stays native.
+class "gemini" {
+	on "google" "google-vertex" "google-gemini-cli" {
+		revision ">=2.5" {
+			harness-profile "gemini-cli"
+		}
+	}
+}
