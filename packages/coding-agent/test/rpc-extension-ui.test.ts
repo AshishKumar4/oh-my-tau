@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { isRecord, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
 import type { ExtensionAskDialogQuestion } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import {
@@ -678,6 +679,93 @@ export default function(pi) {
 			command: "login",
 			success: false,
 			error: "Login cancelled",
+		});
+	}, 30_000);
+
+	it("routes the stored-login choice to the host before any auth URL", async () => {
+		await using temp = await TempDir.create("@rpc-login-stored-choice-");
+		const env = {
+			PATH: Bun.env.PATH,
+			HOME: temp.join("home"),
+			PI_CODING_AGENT_DIR: temp.join("agent"),
+			XDG_CONFIG_HOME: temp.join("config"),
+			XDG_DATA_HOME: temp.join("data"),
+			XDG_CACHE_HOME: temp.join("cache"),
+			CI: "true",
+			PI_NO_TITLE: "1",
+		};
+		// The RPC process resolves its own agent.db; seed the same file with a stored google-antigravity login.
+		const dbPath = (
+			await Bun.$`${process.execPath} -e ${'import { getAgentDbPath } from "@oh-my-pi/pi-utils"; console.log(getAgentDbPath())'}`
+				.cwd(import.meta.dir)
+				.env(env)
+				.text()
+		).trim();
+		const store = await SqliteAuthCredentialStore.open(dbPath);
+		await store.upsertAuthCredential("google-antigravity", {
+			type: "oauth",
+			access: "stale-google-access",
+			refresh: "google-refresh",
+			expires: Date.now() - 60_000,
+			email: "owner@example.test",
+		});
+		store.close();
+		const child = Bun.spawn(
+			[
+				process.execPath,
+				path.join(import.meta.dir, "..", "src", "cli.ts"),
+				"--mode",
+				"rpc",
+				"--provider",
+				"anthropic",
+				"--model",
+				"claude-sonnet-4-5",
+			],
+			{ cwd: temp.path(), env, stdin: "pipe", stdout: "pipe", stderr: "pipe", timeout: 20_000 },
+		);
+		const stdout = new Response(child.stdout).body;
+		if (!stdout) throw new Error("RPC login fixture did not expose stdout");
+		const stderr = new Response(child.stderr).text();
+		const send = async (frame: object) => {
+			child.stdin.write(`${JSON.stringify(frame)}\n`);
+			await child.stdin.flush();
+		};
+		const inputTitles: string[] = [];
+		let loginResponse: unknown;
+		try {
+			await send({ type: "login", providerId: "antigravity-cli", id: "login" });
+			for await (const frame of readJsonl<unknown>(stdout)) {
+				if (!isRecord(frame)) continue;
+				if (frame.type === "extension_ui_request" && frame.method === "input") {
+					if (typeof frame.id !== "string" || typeof frame.title !== "string") {
+						throw new Error("RPC input request did not carry string id and title");
+					}
+					inputTitles.push(frame.title);
+					// Accept the risk, then name a login that does not exist: no token request leaves the process.
+					const value = inputTitles.length === 1 ? "yes" : "9";
+					await send({ type: "extension_ui_response", id: frame.id, value });
+				} else if (frame.type === "response" && frame.id === "login") {
+					loginResponse = frame;
+					break;
+				}
+			}
+		} finally {
+			child.stdin.end();
+			child.kill();
+			await child.exited;
+		}
+
+		if (!loginResponse) throw new Error(`RPC login fixture did not finish: ${await stderr}`);
+		await stderr;
+		expect(inputTitles).toEqual([
+			expect.stringContaining("use at your own risk"),
+			expect.stringContaining("1. owner@example.test (google-antigravity)"),
+		]);
+		expect(loginResponse).toMatchObject({
+			type: "response",
+			command: "login",
+			success: false,
+			error: expect.stringContaining("Type a number from 1 to 1"),
 		});
 	}, 30_000);
 });

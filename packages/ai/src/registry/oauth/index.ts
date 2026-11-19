@@ -2,10 +2,15 @@
 // High-level API
 // ============================================================================
 
-import { authPolicyFor, providerDisabledReason, providerLoginWarning } from "@oh-my-pi/pi-catalog/compat/auth";
+import {
+	authPolicyFor,
+	authProviders,
+	providerDisabledReason,
+	providerLoginWarning,
+} from "@oh-my-pi/pi-catalog/compat/auth";
 import type { OAuthRefreshReason } from "../../auth/types";
 import * as AIError from "../../error";
-import { jwtExpiryMs, NEVER_EXPIRES } from "../engine/common";
+import { jwtExpiryMs, NEVER_EXPIRES, resolveValue } from "../engine/common";
 import { getProviderDefinition, PROVIDER_REGISTRY } from "../registry";
 import type {
 	OAuthCredentials,
@@ -113,6 +118,16 @@ export function assertProviderEnabled(provider: string): void {
  */
 export function loginRiskWarning(provider: string): string | undefined {
 	return customOAuthProviders.has(provider) ? undefined : providerLoginWarning(provider);
+}
+
+/** Built-in providers whose authorization-code login issues grants to the OAuth client `clientId`. */
+export async function oauthClientProviders(clientId: string): Promise<string[]> {
+	const providers: string[] = [];
+	for (const policy of authProviders()) {
+		if (policy.login?.kind !== "oauth-code" || !policy.login.clientId) continue;
+		if ((await resolveValue(policy.login.clientId)) === clientId) providers.push(policy.id);
+	}
+	return providers;
 }
 
 /**

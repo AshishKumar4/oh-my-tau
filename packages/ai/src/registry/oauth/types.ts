@@ -66,7 +66,18 @@ export type OAuthPrompt = {
 	 * Hosts that refuse pre-auth input (RPC) must still surface it; only an answer of "yes" continues.
 	 */
 	riskAcknowledgement?: boolean;
+	/**
+	 * Offers a login already stored for the same OAuth client instead of a new sign-in, asked before any auth URL.
+	 * Hosts that refuse pre-auth input (RPC) must still surface it; an empty answer runs the normal sign-in.
+	 */
+	storedLoginChoice?: boolean;
 };
+
+/** An OAuth grant stored under `provider`, issued to the OAuth client a login asked about. */
+export interface StoredOAuthGrant {
+	provider: string;
+	credentials: OAuthCredentials;
+}
 
 export type OAuthAuthInfo = {
 	/**
@@ -116,6 +127,11 @@ export interface OAuthController {
 	onPrompt?(prompt: OAuthPrompt): Promise<string>;
 	/** Complete browser login and return one matching cookie value privately. Reject on cancellation or failure. */
 	onBrowserSession?(request: OAuthBrowserSessionRequest, signal?: AbortSignal): Promise<string>;
+	/**
+	 * Stored grants of other providers whose login issues tokens to `clientId`, paused providers included,
+	 * so a login can adopt one instead of signing in again. Supplied by `AuthStorage.oauth.login`.
+	 */
+	storedGrants?(clientId: string): Promise<StoredOAuthGrant[]>;
 	signal?: AbortSignal;
 	fetch?: FetchImpl;
 }

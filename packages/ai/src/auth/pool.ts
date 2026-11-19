@@ -169,6 +169,16 @@ export class CredentialPool implements CredentialsApi {
 	}
 
 	/**
+	 * Active OAuth rows persisted for `provider`, read from the store, paused providers included.
+	 * Only a login adopting a grant issued to its own OAuth client reads this; selection never does.
+	 */
+	persistedOAuth(provider: string): OAuthCredential[] {
+		return this.#store
+			.listAuthCredentials(provider)
+			.flatMap(row => (row.credential.type === "oauth" ? [row.credential] : []));
+	}
+
+	/**
 	 * Add one API key to the provider's key pool (`source: "login"`). Distinct keys
 	 * are appended; re-adding a stored key reuses its row and lifts its blocks.
 	 * Returns the stored row.

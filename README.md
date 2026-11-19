@@ -134,6 +134,8 @@ You can also use `model: "@review"` in an agent file or select it in `/agents`. 
 
 An Anthropic org-wide OAuth denial blocks that credential for 6 hours. Fresh usage reports, including valid cache hits, can clear recovered quota blocks. Stale reports do not extend quota blocks. Usage reports do not clear auth or policy blocks.
 
+`/login antigravity-cli` and `omp login antigravity-cli` first offer any Google login OMP already stores for the same OAuth client, such as a `google-antigravity` login. Type its number to use it, or leave the answer empty to sign in through agy. OMP checks the chosen login with one token refresh and stores it as a new `antigravity-cli` account. The original login stays as it was.
+
 Programmatic OAuth credential holds exclude an account from selection and pinning until you release it. Holds survive resets and usage-block healing. There is no slash-command or CLI hold toggle.
 
 Hindsight and Mnemopi replay saved memory recall on resume instead of recalling again when the journal matches the backend and project. `/clear` starts a new recall segment. See [memory backends](docs/mnemosyne-memory-backend.md).

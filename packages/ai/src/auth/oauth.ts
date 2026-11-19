@@ -1,8 +1,8 @@
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getProviderDefinition, PASTE_CODE_LOGIN_PROVIDERS } from "../registry";
-import { assertProviderEnabled, getOAuthProvider, loginRiskWarning } from "../registry/oauth";
-import type { OAuthProviderId } from "../registry/oauth/types";
+import { assertProviderEnabled, getOAuthProvider, loginRiskWarning, oauthClientProviders } from "../registry/oauth";
+import type { OAuthProviderId, StoredOAuthGrant } from "../registry/oauth/types";
 import { providerTypeKey } from "./blocks";
 import type { SessionAffinity } from "./affinity";
 import type { KeyOverrides } from "./cascade";
@@ -94,6 +94,7 @@ export class OAuthAccounts implements OAuthApi {
 			onPrompt: ctrl.onPrompt,
 			onManualCodeInput: ctrl.onManualCodeInput ?? manualCodeInput,
 			onBrowserSession: ctrl.onBrowserSession,
+			storedGrants: clientId => this.#storedGrants(provider, clientId),
 			signal: ctrl.signal,
 			fetch: ctrl.fetch,
 		});
@@ -125,6 +126,14 @@ export class OAuthAccounts implements OAuthApi {
 			orgId: newCredential.orgId,
 			orgName: newCredential.orgName,
 		};
+	}
+
+	/** Other providers' stored grants issued to `clientId`, read from the store so a paused provider's login counts. */
+	async #storedGrants(provider: string, clientId: string): Promise<StoredOAuthGrant[]> {
+		const owners = (await oauthClientProviders(clientId)).filter(owner => owner !== provider);
+		return owners.flatMap(owner =>
+			this.#deps.pool.persistedOAuth(owner).map(credentials => ({ provider: owner, credentials })),
+		);
 	}
 
 	/**

@@ -1,7 +1,11 @@
-/** `/login` runs agy's own sign-in, then exports its isolated consumer grant. */
+/**
+ * `/login` adopts a stored Google login issued to agy's OAuth client, or runs
+ * agy's own sign-in and exports its isolated consumer grant.
+ */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Subprocess } from "bun";
+import { REMOTE_REFRESH_SENTINEL } from "../../auth/types";
 import * as AIError from "../../error";
 import { agyGeminiDir, resolveAgyBinary } from "../../providers/antigravity-cli/binary";
 import {
@@ -10,7 +14,7 @@ import {
 	exportAgyCredentials,
 	refreshAgyCredentials,
 } from "../../providers/antigravity-cli/credentials";
-import type { OAuthController, OAuthCredentials } from "./types";
+import type { OAuthController, OAuthCredentials, StoredOAuthGrant } from "./types";
 
 const PROVIDER = "antigravity-cli";
 const START_TIMEOUT_MS = 60_000;
@@ -150,9 +154,49 @@ export async function cleanupAbandonedLoginDirectories(
 	return removed;
 }
 
+/**
+ * Offers each stored Google login issued to agy's OAuth client, by account email.
+ * A chosen grant is checked with one refresh and becomes a new antigravity-cli credential;
+ * the row it came from stays untouched. Resolves undefined to run agy's own sign-in.
+ */
+async function reuseStoredLogin(ctrl: OAuthController): Promise<OAuthCredentials | undefined> {
+	if (!ctrl.onPrompt || !ctrl.storedGrants) return undefined;
+	const accounts = new Map<string, StoredOAuthGrant & { email: string }>();
+	for (const grant of await ctrl.storedGrants(AGY_OAUTH_CLIENT_ID)) {
+		const email = grant.credentials.email?.trim();
+		const refreshable = grant.credentials.refresh && grant.credentials.refresh !== REMOTE_REFRESH_SENTINEL;
+		if (email && refreshable && !accounts.has(email.toLowerCase())) {
+			accounts.set(email.toLowerCase(), { ...grant, email });
+		}
+	}
+	if (accounts.size === 0) return undefined;
+	const choices = [...accounts.values()];
+	const listing = choices.map((grant, index) => `  ${index + 1}. ${grant.email} (${grant.provider})`).join("\n");
+	const input = ctrl.onPrompt({
+		message: `Stored Google logins that Antigravity CLI can use:\n${listing}\n\nType a number to use one, or leave this empty to sign in with Google.`,
+		placeholder: "1",
+		allowEmpty: true,
+		storedLoginChoice: true,
+	});
+	const answer = (ctrl.signal ? await bounded(input, ctrl.signal) : await input).trim();
+	if (!answer) return undefined;
+	const chosen = /^\d+$/.test(answer) ? choices[Number(answer) - 1] : undefined;
+	if (!chosen) {
+		throw new AIError.OAuthError(`Type a number from 1 to ${choices.length}, or leave the answer empty`, {
+			kind: "validation",
+			provider: PROVIDER,
+		});
+	}
+	ctrl.onProgress?.(`Checking the stored Google login for ${chosen.email}...`);
+	const { access, refresh, expires, accountId } = chosen.credentials;
+	return refreshAgyCredentials({ access, refresh, expires, email: chosen.email, accountId }, ctrl.signal, ctrl.fetch);
+}
+
 export async function loginAntigravityCli(ctrl: OAuthController): Promise<OAuthCredentials> {
 	if (!ctrl.onPrompt && !ctrl.onManualCodeInput) throw new AIError.OnPromptRequiredError("Antigravity CLI");
 	if (ctrl.signal?.aborted) throw new AIError.LoginCancelledError("Antigravity CLI sign-in cancelled");
+	const reused = await reuseStoredLogin(ctrl);
+	if (reused) return reused;
 	ctrl.onProgress?.("Preparing the Antigravity CLI...");
 	// The managed install has its own stall timeout; a slow download must not consume the sign-in deadline.
 	const install = resolveAgyBinary(ctrl.fetch ?? fetch);
