@@ -36,7 +36,8 @@ import {
 	type ToolLoadMode,
 	validateAgentToolArguments,
 } from "@oh-my-pi/pi-agent-core";
-import { type Tool as AiTool, jsonSchemaToTypeScript, toolWireSchema } from "@oh-my-pi/pi-ai";
+import { type Tool as AiTool, jsonSchemaToTypeScript, type Model, toolWireSchema } from "@oh-my-pi/pi-ai";
+import { clientOwnsSystemPrompt } from "@oh-my-pi/pi-catalog/compat/harness";
 import { isEvalBridgeToolCall, isEvalBridgeToolCallable } from "../eval/tool-bridge-policy";
 import { schemaDeclaresIntentField } from "../utils/tool-schema";
 import { resolveToolWireName } from "../utils/tool-wire-name";
@@ -87,6 +88,20 @@ export type XdevDocsMode = "inline" | "builtins" | "catalog";
 export function isMountableUnderXdev(tool: { name: string; loadMode?: ToolLoadMode }): boolean {
 	if (tool.name in XDEV_TRANSPORT_TOOLS || tool.name in XDEV_KEEP_TOP_LEVEL) return false;
 	return tool.loadMode === "discoverable";
+}
+
+/**
+ * How deferred tools reach the model: `xd://` devices, the client's tool search, or presented
+ * directly when the model's client owns the system prompt (an `xd://` catalog is omp prompt text).
+ */
+export type DeferredToolPresentation = "xdev" | "tool-search" | "direct";
+
+export function deferredToolPresentation(
+	model: Model | undefined,
+	toolSearchServed: boolean,
+): DeferredToolPresentation {
+	if (model !== undefined && clientOwnsSystemPrompt(model)) return "direct";
+	return toolSearchServed ? "tool-search" : "xdev";
 }
 
 /**

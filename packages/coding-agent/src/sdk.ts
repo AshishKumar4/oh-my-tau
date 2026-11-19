@@ -343,6 +343,7 @@ import {
 	createXdevState,
 	type DeferredDiagnosticsEntry,
 	defaultLoadModeForToolName,
+	deferredToolPresentation,
 	discoverStartupLspServers,
 	EditTool,
 	EvalTool,
@@ -4963,13 +4964,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		await loadServedHarnessPrompt(sessionManager.getCwd());
 		if (toolSession.xdev) {
 			// Under tool search the provider carries deferred tools itself; no transport is needed.
+			// A client that owns the prompt gets every tool directly.
 			const toolSearch = servedToolSearchSurface();
+			const presentsDirectly =
+				deferredToolPresentation(toolSession.getActiveModel?.(), toolSearch !== undefined) === "direct";
 			const topLevelToolNames: string[] = [];
 			const mountedNames: string[] = [];
 			for (const name of initialToolNames) {
 				const tool = toolRegistry.get(name);
 				const explicitlyRequested = presentationPinnedToolNames?.has(name) === true;
 				const defers =
+					!presentsDirectly &&
 					tool !== undefined &&
 					!explicitlyRequested &&
 					(toolSearch

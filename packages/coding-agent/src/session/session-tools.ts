@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { Agent, AgentMessage, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { resolveDelegationBias } from "@oh-my-pi/pi-catalog/compat/delegation";
-import { clientOwnsSystemPrompt, type HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
+import type { HarnessProfile } from "@oh-my-pi/pi-catalog/compat/harness";
 import { isRecord, logger, prompt, stringProperty, structuredCloneJSON, untilAborted } from "@oh-my-pi/pi-utils";
 
 import { reset as resetCapabilities } from "../capability";
@@ -65,6 +65,8 @@ import { supportsExternalThinking } from "../tools/think";
 import { ToolAbortError } from "../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import {
+	type DeferredToolPresentation,
+	deferredToolPresentation,
 	isMountableUnderXdev,
 	listXdevTools,
 	planXdevPromptDocs,
@@ -328,12 +330,6 @@ export function projectMountedMCPXdevGuidance(routes: Iterable<MountedMCPToolRou
 }
 
 const TOOL_ROSTER_NOTICE_MESSAGE_TYPE = "tool-roster-notice";
-/**
- * How deferred tools reach the model: `xd://` devices, the client's tool search, or presented
- * directly when the client owns the system prompt (an `xd://` catalog would be omp prompt text).
- */
-type DeferredToolPresentation = "xdev" | "tool-search" | "direct";
-
 /** A harness profile and how its deferred tools reach the model. */
 interface HarnessPresentation {
 	readonly profile: HarnessProfile | undefined;
@@ -1478,13 +1474,10 @@ export class SessionTools {
 	 */
 	#harnessPresentation(): HarnessPresentation {
 		const profile = this.#harnessProfile();
-		return { profile, deferral: this.#deferral(profile) };
-	}
-
-	#deferral(profile: HarnessProfile | undefined): DeferredToolPresentation {
-		const model = this.#host.model();
-		if (model !== undefined && clientOwnsSystemPrompt(model)) return "direct";
-		return this.#servedToolSearch(profile) === undefined ? "xdev" : "tool-search";
+		return {
+			profile,
+			deferral: deferredToolPresentation(this.#host.model(), this.#servedToolSearch(profile) !== undefined),
+		};
 	}
 
 	/** The tool-search surface tools are presented under; undefined keeps deferred tools `xd://` devices. */
@@ -1834,7 +1827,9 @@ export class SessionTools {
 		// Demoted tools stay reachable through the eval bridge, so nothing is
 		// mounted under xd:// while code mode restricts the direct surface. A
 		// client that owns the prompt gets every tool directly instead.
-		if (codeMode.active || this.#deferral(profile) === "direct") mountNames.clear();
+		if (codeMode.active || deferredToolPresentation(this.#host.model(), toolSearch !== undefined) === "direct") {
+			mountNames.clear();
+		}
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		for (const { name, tool } of selectedTools) {
