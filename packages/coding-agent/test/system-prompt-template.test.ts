@@ -466,3 +466,15 @@ describe("systemPromptTemplates config validation", () => {
 		expect(cfgSystemPromptTemplates.get(settings)).toEqual({ claude: "~/x.md", "openrouter/gpt": "/tmp/x.md" });
 	});
 });
+
+describe("quota-exhaustion prompt fingerprint omission", () => {
+	it("omits blocked fingerprint phrases from default system prompt", async () => {
+		await withDiscoveryHome(async ({ cwd }) => {
+			const result = await buildSystemPrompt(options(cwd));
+			const text = result.systemPrompt.join("\n\n");
+			expect(text).not.toContain("You are omp's trusted coding assistant.");
+			expect(text).not.toContain("Read xd://<tool> for full docs + JSON schema before first use.");
+			expect(text).toContain("You are omp's coding assistant.");
+		});
+	});
+});
