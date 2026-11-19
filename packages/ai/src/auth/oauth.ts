@@ -1,7 +1,7 @@
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
 import { getProviderDefinition, PASTE_CODE_LOGIN_PROVIDERS } from "../registry";
-import { assertProviderEnabled, getOAuthProvider, loginRiskWarning, oauthClientProviders } from "../registry/oauth";
+import { assertProviderEnabled, getOAuthProvider, loginRiskWarning, oauthClientLogins } from "../registry/oauth";
 import type { OAuthProviderId, StoredOAuthGrant } from "../registry/oauth/types";
 import { providerTypeKey } from "./blocks";
 import type { SessionAffinity } from "./affinity";
@@ -130,9 +130,9 @@ export class OAuthAccounts implements OAuthApi {
 
 	/** Other providers' stored grants issued to `clientId`, read from the store so a paused provider's login counts. */
 	async #storedGrants(provider: string, clientId: string): Promise<StoredOAuthGrant[]> {
-		const owners = (await oauthClientProviders(clientId)).filter(owner => owner !== provider);
-		return owners.flatMap(owner =>
-			this.#deps.pool.persistedOAuth(owner).map(credentials => ({ provider: owner, credentials })),
+		const logins = (await oauthClientLogins(clientId)).filter(login => login.provider !== provider);
+		return logins.flatMap(({ provider: owner, scopes }) =>
+			this.#deps.pool.persistedOAuth(owner).map(credentials => ({ provider: owner, credentials, scopes })),
 		);
 	}
 

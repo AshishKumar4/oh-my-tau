@@ -202,12 +202,27 @@ export async function stageAgyCredentials(apiKey: string, geminiDir: string): Pr
 	}
 }
 
+/** A refreshed grant and the scopes Google reports it carries, when it reports them. */
+export interface AgyRefreshedGrant {
+	credentials: OAuthCredentials;
+	scopes?: readonly string[];
+}
+
 /** Bounded, secret-safe refresh; only known OAuth error codes reach callers. */
 export async function refreshAgyCredentials(
 	credentials: OAuthCredentials,
 	signal?: AbortSignal,
 	fetchImpl: FetchImpl = fetch,
 ): Promise<OAuthCredentials> {
+	return (await refreshAgyGrant(credentials, signal, fetchImpl)).credentials;
+}
+
+/** {@link refreshAgyCredentials} with the granted scopes from the token response's `scope`. */
+export async function refreshAgyGrant(
+	credentials: OAuthCredentials,
+	signal?: AbortSignal,
+	fetchImpl: FetchImpl = fetch,
+): Promise<AgyRefreshedGrant> {
 	if (!nonempty(credentials.refresh) || credentials.refresh === REMOTE_REFRESH_SENTINEL) {
 		throw invalid("Antigravity CLI refresh must be performed by the credential owner");
 	}
@@ -273,11 +288,14 @@ export async function refreshAgyCredentials(
 		throw invalid("Antigravity CLI credential refresh changed account identity");
 	}
 	return {
-		...credentials,
-		access: body.access_token,
-		refresh: nonempty(body.refresh_token) ? body.refresh_token : credentials.refresh,
-		expires: Date.now() + body.expires_in * 1000 - Math.min(EXPIRY_SKEW_MS, body.expires_in * 100),
-		email: nextIdentity.email ?? credentials.email,
-		accountId: nextIdentity.accountId ?? credentials.accountId,
+		credentials: {
+			...credentials,
+			access: body.access_token,
+			refresh: nonempty(body.refresh_token) ? body.refresh_token : credentials.refresh,
+			expires: Date.now() + body.expires_in * 1000 - Math.min(EXPIRY_SKEW_MS, body.expires_in * 100),
+			email: nextIdentity.email ?? credentials.email,
+			accountId: nextIdentity.accountId ?? credentials.accountId,
+		},
+		...(nonempty(body.scope) && { scopes: body.scope.split(" ").filter(scope => scope.length > 0) }),
 	};
 }

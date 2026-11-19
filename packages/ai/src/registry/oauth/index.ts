@@ -120,14 +120,22 @@ export function loginRiskWarning(provider: string): string | undefined {
 	return customOAuthProviders.has(provider) ? undefined : providerLoginWarning(provider);
 }
 
+/** A built-in login that issues grants to an OAuth client, with the scopes it requests today. */
+export interface OAuthClientLogin {
+	provider: string;
+	scopes: readonly string[];
+}
+
 /** Built-in providers whose authorization-code login issues grants to the OAuth client `clientId`. */
-export async function oauthClientProviders(clientId: string): Promise<string[]> {
-	const providers: string[] = [];
+export async function oauthClientLogins(clientId: string): Promise<OAuthClientLogin[]> {
+	const logins: OAuthClientLogin[] = [];
 	for (const policy of authProviders()) {
 		if (policy.login?.kind !== "oauth-code" || !policy.login.clientId) continue;
-		if ((await resolveValue(policy.login.clientId)) === clientId) providers.push(policy.id);
+		if ((await resolveValue(policy.login.clientId)) === clientId) {
+			logins.push({ provider: policy.id, scopes: policy.login.scopes });
+		}
 	}
-	return providers;
+	return logins;
 }
 
 /**

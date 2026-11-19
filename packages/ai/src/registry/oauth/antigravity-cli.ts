@@ -13,6 +13,7 @@ import {
 	agyCredentialEnv,
 	exportAgyCredentials,
 	refreshAgyCredentials,
+	refreshAgyGrant,
 } from "../../providers/antigravity-cli/credentials";
 import type { OAuthController, OAuthCredentials, StoredOAuthGrant } from "./types";
 
@@ -158,6 +159,9 @@ export async function cleanupAbandonedLoginDirectories(
  * Offers each stored Google login issued to agy's OAuth client, by account email.
  * A chosen grant is checked with one refresh and becomes a new antigravity-cli credential;
  * the row it came from stays untouched. Resolves undefined to run agy's own sign-in.
+ * A grant must carry every scope its own login requests today (Antigravity's
+ * `aicode` among them): an older grant authenticates agy, but Code Assist then
+ * refuses it, and every request fails with 429.
  */
 async function reuseStoredLogin(ctrl: OAuthController): Promise<OAuthCredentials | undefined> {
 	if (!ctrl.onPrompt || !ctrl.storedGrants) return undefined;
@@ -189,7 +193,19 @@ async function reuseStoredLogin(ctrl: OAuthController): Promise<OAuthCredentials
 	}
 	ctrl.onProgress?.(`Checking the stored Google login for ${chosen.email}...`);
 	const { access, refresh, expires, accountId } = chosen.credentials;
-	return refreshAgyCredentials({ access, refresh, expires, email: chosen.email, accountId }, ctrl.signal, ctrl.fetch);
+	const refreshed = await refreshAgyGrant(
+		{ access, refresh, expires, email: chosen.email, accountId },
+		ctrl.signal,
+		ctrl.fetch,
+	);
+	const missing = chosen.scopes.filter(scope => !refreshed.scopes?.includes(scope));
+	if (missing.length > 0) {
+		throw new AIError.OAuthError(
+			`The saved Google login for ${chosen.email} predates the permissions Antigravity CLI needs (${missing.join(", ")}). Sign in again and leave the stored-login answer empty to sign in with Google.`,
+			{ kind: "validation", provider: PROVIDER },
+		);
+	}
+	return refreshed.credentials;
 }
 
 export async function loginAntigravityCli(ctrl: OAuthController): Promise<OAuthCredentials> {

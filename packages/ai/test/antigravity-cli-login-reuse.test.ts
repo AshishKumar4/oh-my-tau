@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import type { OAuthCredential } from "../src/auth/types";
 import { AGY_OAUTH_CLIENT_ID, parseAgyApiKey } from "../src/providers/antigravity-cli/credentials";
@@ -17,6 +18,11 @@ const storedGoogleLogin: OAuthCredential = {
 	email: "owner@example.test",
 	projectId: "fixture-project",
 };
+
+// The scopes google-antigravity's login requests, as the official client does; `aicode` among them.
+const loginPolicy = authPolicyFor("google-antigravity")?.login;
+const ANTIGRAVITY_SCOPES = loginPolicy?.kind === "oauth-code" ? loginPolicy.scopes : [];
+const AICODE_SCOPE = "https://www.googleapis.com/auth/aicode";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -52,7 +58,11 @@ describe("antigravity-cli login reuses a stored Google login", () => {
 			expect(body.get("client_id")).toBe(AGY_OAUTH_CLIENT_ID);
 			expect(body.get("grant_type")).toBe("refresh_token");
 			expect(body.get("refresh_token")).toBe("google-refresh");
-			return Response.json({ access_token: "agy-access", expires_in: 3600 });
+			return Response.json({
+				access_token: "agy-access",
+				expires_in: 3600,
+				scope: ["openid", ...ANTIGRAVITY_SCOPES].join(" "),
+			});
 		});
 		try {
 			const identity = await storage.oauth.login("antigravity-cli", {
@@ -79,6 +89,35 @@ describe("antigravity-cli login reuses a stored Google login", () => {
 			// The adopted credential serves antigravity-cli's own key pool.
 			const key = await storage.keys.get("antigravity-cli");
 			expect(key && parseAgyApiKey(key)).toMatchObject({ access: "agy-access", email: "owner@example.test" });
+			expect(store.listAuthCredentials("google-antigravity").map(row => row.credential)).toEqual([
+				storedGoogleLogin,
+			]);
+		} finally {
+			store.close();
+		}
+	});
+
+	it("refuses a stored login whose grant predates the aicode scope, and stores nothing", async () => {
+		expect(ANTIGRAVITY_SCOPES).toContain(AICODE_SCOPE);
+		const { store, storage } = await storageWithGoogleLogin();
+		// The grant refreshes fine, but Google reports it without `aicode`.
+		const fetchImpl = vi.fn(async () =>
+			Response.json({
+				access_token: "agy-access",
+				expires_in: 3600,
+				scope: ANTIGRAVITY_SCOPES.filter(scope => scope !== AICODE_SCOPE).join(" "),
+			}),
+		);
+		try {
+			await expect(
+				storage.oauth.login("antigravity-cli", {
+					onAuth: () => {},
+					onPrompt: answers("1", []),
+					fetch: fetchImpl,
+				}),
+			).rejects.toThrow(`predates the permissions Antigravity CLI needs (${AICODE_SCOPE})`);
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+			expect(store.listAuthCredentials("antigravity-cli")).toEqual([]);
 			expect(store.listAuthCredentials("google-antigravity").map(row => row.credential)).toEqual([
 				storedGoogleLogin,
 			]);

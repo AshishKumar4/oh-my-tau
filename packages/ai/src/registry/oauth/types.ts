@@ -77,6 +77,8 @@ export type OAuthPrompt = {
 export interface StoredOAuthGrant {
 	provider: string;
 	credentials: OAuthCredentials;
+	/** Scopes `provider`'s login requests today; a grant lacking one predates that login. */
+	scopes: readonly string[];
 }
 
 export type OAuthAuthInfo = {
