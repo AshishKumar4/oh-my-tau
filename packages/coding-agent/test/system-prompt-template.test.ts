@@ -1,6 +1,9 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
+import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import { planXdevPromptDocs, renderXdevPromptDocs, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { __resetDirsFromEnvForTests, CONFIG_DIR_NAME, getAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import {
 	buildSystemPrompt,
@@ -470,8 +473,31 @@ describe("systemPromptTemplates config validation", () => {
 describe("quota-exhaustion prompt fingerprint omission", () => {
 	it("omits blocked fingerprint phrases from default system prompt", async () => {
 		await withDiscoveryHome(async ({ cwd }) => {
-			const result = await buildSystemPrompt(options(cwd));
+			// One device deferred to the catalog, so the prompt carries the rendered device catalog.
+			const device: AgentTool = {
+				name: "fixture_device",
+				label: "Fixture device",
+				description: "Fixture device that answers fixture questions.",
+				parameters: type({ "question?": "string" }),
+				execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+			};
+			const xdev: XdevState = {
+				tools: new Map([[device.name, device]]),
+				mountedNames: new Set([device.name]),
+				builtInNames: new Set(),
+				isActive: () => false,
+			};
+			const docs = planXdevPromptDocs(xdev, "catalog");
+			const result = await buildSystemPrompt(
+				options(cwd, {
+					toolNames: ["read", "write"],
+					xdevTools: [...docs.catalog].map(([name, summary]) => ({ name, summary })),
+					xdevDocs: renderXdevPromptDocs(docs),
+				}),
+			);
 			const text = result.systemPrompt.join("\n\n");
+			expect(text).toContain("## Additional devices (docs on demand)");
+			expect(text).toContain("- fixture_device — ");
 			expect(text).not.toContain("You are omp's trusted coding assistant.");
 			expect(text).not.toContain("Read xd://<tool> for full docs + JSON schema before first use.");
 			expect(text).toContain("You are omp's coding assistant.");
