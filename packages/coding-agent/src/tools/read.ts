@@ -1,4 +1,5 @@
 import { isReadableUrlPath, type ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
+import geminiCliReadFile from "../prompts/tools/harness/gemini-cli-read-file.md" with { type: "text" };
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { type EditStore, notebookToEditableText } from "@oh-my-pi/pi-natives";
@@ -198,7 +199,7 @@ import { ToolAbortError, throwIfAborted } from "./tool-errors";
 import { getToolConversationState, ToolConversationState } from "./tool-state";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
-import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
+import { type HarnessBridges, harnessDescription, harnessParameters, harnessParams } from "../harness/bridge";
 
 import {
 	cfgFetchEnabled,
@@ -951,6 +952,7 @@ const READ_BRIDGES: HarnessBridges<ReadToolInput, typeof claudeCodeReadSchema | 
 	// Gemini CLI counts `offset` from 0.
 	"gemini-cli": {
 		parameters: geminiCliReadSchema,
+		description: geminiCliReadFile,
 		toParams: (args: typeof geminiCliReadSchema.infer) => ({
 			path: `${args.file_path}${lineWindowSelector(args.offset === undefined ? undefined : args.offset + 1, args.limit)}`,
 		}),
@@ -1330,6 +1332,8 @@ export class ReadTool implements AgentTool<ReadInputSchema, ReadToolDetails> {
 	readonly loadMode = "essential";
 	/** Rendered per access so the hashline guidance follows a live `edit.mode` change. */
 	get description(): string {
+		const bridged = harnessDescription(this.session, READ_BRIDGES);
+		if (bridged !== undefined) return bridged;
 		// With no vendor declaration to serve, Claude Code's `Read` still describes
 		// its own fields rather than omp's inline selectors.
 		if (this.parameters === claudeCodeReadSchema) return prompt.render(claudeCodeReadDescription);

@@ -431,13 +431,15 @@ export async function buildInMemoryTextResult(
 	// when offset>1, trailing context when a finite limit was set. Raw mode
 	// never expands — without line numbers the padding is indistinguishable
 	// from requested content, so `raw:31-31` must return line 31 and nothing
-	// else (verbatim-extraction contract).
+	// else (verbatim-extraction contract). A vendor read returns exactly the
+	// window its own read tool would.
+	const padRange = !rawDisplay && vendorRead(session) === undefined;
 	const expanded = expandRangeWithContext(
 		requestedStart,
 		requestedEnd,
 		totalLines,
-		!rawDisplay && offset !== undefined && offset > 1,
-		!rawDisplay && limit !== undefined,
+		padRange && offset !== undefined && offset > 1,
+		padRange && limit !== undefined,
 	);
 	let startLine = expanded.startLine;
 	const endLine = expanded.endLine;

@@ -7,12 +7,13 @@ import {
 	type TodoToolDetails,
 	todoTaskTargets,
 } from "@oh-my-pi/pi-tui/tools/todo";
+import geminiCliWriteTodos from "../prompts/tools/harness/gemini-cli-write-todos.md" with { type: "text" };
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 
-import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
+import { type HarnessBridges, harnessDescription, harnessParameters, harnessParams } from "../harness/bridge";
 import { effectiveHarnessProfile } from "../harness/effective-profile";
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
@@ -108,7 +109,7 @@ function writeTodosOps(args: typeof geminiCliWriteTodosSchema.infer): TodoListRe
 }
 
 const TODO_BRIDGES: HarnessBridges<TodoParams | TodoListReplacement, typeof geminiCliWriteTodosSchema> = {
-	"gemini-cli": { parameters: geminiCliWriteTodosSchema, toParams: writeTodosOps },
+	"gemini-cli": { parameters: geminiCliWriteTodosSchema, description: geminiCliWriteTodos, toParams: writeTodosOps },
 };
 
 // =============================================================================
@@ -732,6 +733,8 @@ export class TodoTool implements AgentTool<typeof todoSchema | typeof geminiCliW
 
 	/** Codex-profiled turns serialize tool calls, so the advice to send `todo` beside another call is left out. */
 	get description(): string {
+		const bridged = harnessDescription(this.session, TODO_BRIDGES);
+		if (bridged !== undefined) return bridged;
 		const profile = effectiveHarnessProfile(this.session.settings, this.session.getActiveModel?.());
 		return prompt.render(todoDescription, { serialToolCalls: profile === "codex" });
 	}
@@ -745,6 +748,18 @@ export class TodoTool implements AgentTool<typeof todoSchema | typeof geminiCliW
 	): Promise<AgentToolResult<TodoToolDetails>> {
 		const previousPhases = clonePhases(this.session.getTodoPhases?.() ?? []);
 		const storage = this.session.getSessionFile() ? "session" : "memory";
+		// Schema-invalid arguments reach here (lenientArgValidation); Gemini CLI's list
+		// replaces the whole list, so it is validated before anything is rebuilt.
+		if (this.parameters === geminiCliWriteTodosSchema) {
+			const checked = geminiCliWriteTodosSchema(input);
+			if (checked instanceof type.errors) {
+				return {
+					content: [{ type: "text", text: `Invalid write_todos arguments: ${checked.summary}` }],
+					details: { phases: previousPhases, storage },
+					isError: true,
+				};
+			}
+		}
 		const params = harnessParams(this.session, TODO_BRIDGES, input);
 		const resolved = "replace" in params ? params : resolveTodoParams(params, previousPhases.length > 0);
 		if (typeof resolved === "string") {

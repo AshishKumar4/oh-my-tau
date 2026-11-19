@@ -604,11 +604,31 @@ const geminiCliWebFetchSchema = type({
 });
 
 const WEB_URL = /https?:\/\/[^\s<>"'`]+/g;
-const URL_TRAILING_PUNCTUATION = /[.,;:!?)\]}]+$/;
+const CLOSERS: Readonly<Record<string, string>> = { ")": "(", "]": "[", "}": "{" };
+
+/**
+ * `url` without the sentence punctuation that follows it in prose. A closing
+ * bracket stays when the URL opens it (`.../Function_(mathematics)`).
+ */
+function trimProsePunctuation(url: string): string {
+	let end = url.length;
+	while (end > 0) {
+		const last = url.charAt(end - 1);
+		const opener = CLOSERS[last];
+		if (opener !== undefined) {
+			const head = url.slice(0, end);
+			if (head.split(opener).length > head.split(last).length - 1) break;
+		} else if (!".,;:!?".includes(last)) {
+			break;
+		}
+		end--;
+	}
+	return url.slice(0, end);
+}
 
 /** The `http(s)://` URLs a `web_fetch` prompt names, in order, without sentence punctuation. */
 function promptUrls(prompt: string): string[] {
-	return [...prompt.matchAll(WEB_URL)].map(match => match[0].replace(URL_TRAILING_PUNCTUATION, ""));
+	return [...prompt.matchAll(WEB_URL)].map(match => trimProsePunctuation(match[0]));
 }
 
 const GEMINI_CLI_LIST_DIRECTORY: HarnessFacadeSpec<typeof geminiCliListDirectorySchema> = {

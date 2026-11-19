@@ -11,7 +11,14 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import * as natives from "@oh-my-pi/pi-natives";
 import { formatGroupedPaths, hasFsCode, isEnoent, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { type HarnessBridges, harnessParameters, harnessParams, nativeParams } from "../harness/bridge";
+import geminiCliGlobDescription from "../prompts/tools/harness/gemini-cli-glob.md" with { type: "text" };
+import {
+	type HarnessBridges,
+	harnessDescription,
+	harnessParameters,
+	harnessParams,
+	nativeParams,
+} from "../harness/bridge";
 import { InternalUrlRouter, sessionResolveContext } from "../internal-urls";
 import { InternalUrlFilesystem, type UrlFileStat } from "../internal-urls/url-filesystem";
 import globDescription from "../prompts/tools/glob.md" with { type: "text" };
@@ -54,19 +61,43 @@ export type GlobToolInput = typeof findSchema.infer;
 const geminiCliGlobSchema = type({
 	pattern: type("string").describe("The glob pattern to match, such as `**/*.ts`"),
 	"dir_path?": type("string").describe("The directory to search in; defaults to the project root"),
-	"case_sensitive?": type("boolean").describe("Whether matching is case-sensitive"),
+	"case_sensitive?": type("boolean").describe("Whether matching is case-sensitive; defaults to false"),
 	"respect_git_ignore?": type("boolean").describe("Whether to skip .gitignore'd files; defaults to true"),
 	"respect_gemini_ignore?": type("boolean").describe("Accepted for compatibility; omp has no .geminiignore"),
 });
 
-/** Gemini CLI's `glob` searches `pattern` under `dir_path`, which omp's `path` spells as one glob. */
+/**
+ * `pattern` matching either case: each letter outside a `[...]` class becomes
+ * a two-letter class. omp's glob matcher is case-sensitive.
+ */
+function caseInsensitiveGlob(pattern: string): string {
+	let out = "";
+	let inClass = false;
+	for (const char of pattern) {
+		if (char === "[") inClass = true;
+		else if (char === "]") inClass = false;
+		const lower = char.toLowerCase();
+		const upper = char.toUpperCase();
+		out += !inClass && lower !== upper ? `[${lower}${upper}]` : char;
+	}
+	return out;
+}
+
+/**
+ * Gemini CLI's `glob` searches `pattern` under `dir_path`, which omp's `path`
+ * spells as one glob, and ignores case unless asked.
+ */
 const GLOB_BRIDGES: HarnessBridges<GlobToolInput, typeof geminiCliGlobSchema> = {
 	"gemini-cli": {
 		parameters: geminiCliGlobSchema,
-		toParams: args => ({
-			path: args.dir_path === undefined ? args.pattern : path.join(args.dir_path, args.pattern),
-			...(args.respect_git_ignore !== undefined ? { gitignore: args.respect_git_ignore } : {}),
-		}),
+		description: geminiCliGlobDescription,
+		toParams: args => {
+			const pattern = args.case_sensitive === true ? args.pattern : caseInsensitiveGlob(args.pattern);
+			return {
+				path: args.dir_path === undefined ? pattern : path.join(args.dir_path, pattern),
+				...(args.respect_git_ignore !== undefined ? { gitignore: args.respect_git_ignore } : {}),
+			};
+		},
 	},
 };
 
@@ -174,6 +205,8 @@ export class GlobTool implements AgentTool<typeof findSchema | typeof geminiCliG
 	readonly loadMode = "essential";
 	readonly label = "Glob";
 	get description(): string {
+		const bridged = harnessDescription(this.session, GLOB_BRIDGES);
+		if (bridged !== undefined) return bridged;
 		const hasFind = this.session.isToolActive?.("find") ?? isFindEnabled(this.session);
 		const eagerDelegation = sessionDelegationBias(this.session) === "eager";
 		const scoutAvailable = isScoutSpawnable(

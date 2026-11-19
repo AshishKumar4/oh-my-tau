@@ -1,4 +1,5 @@
 import type { WriteToolDetails } from "@oh-my-pi/pi-tui/tools/write";
+import geminiCliWriteFile from "../prompts/tools/harness/gemini-cli-write-file.md" with { type: "text" };
 import { Database } from "bun:sqlite";
 import { assertNotHeldOpen } from "@oh-my-pi/pi-utils/held-file";
 import * as fs from "node:fs/promises";
@@ -33,7 +34,7 @@ import {
 	writeArchive,
 } from "@oh-my-pi/pi-utils/ar";
 import { detectLineEnding, normalizeToLF, restoreLineEndings } from "../edit/normalize";
-import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
+import { type HarnessBridges, harnessDescription, harnessParameters, harnessParams } from "../harness/bridge";
 
 import {
 	extractUriScheme,
@@ -248,6 +249,7 @@ const WRITE_BRIDGES: HarnessBridges<WriteToolInput, typeof claudeCodeWriteSchema
 	},
 	"gemini-cli": {
 		parameters: geminiCliWriteSchema,
+		description: geminiCliWriteFile,
 		toParams: args => ({ path: args.file_path, content: args.content }),
 	},
 };
@@ -656,6 +658,8 @@ export class WriteTool implements AgentTool<WriteInputSchema, WriteToolDetails> 
 	};
 	readonly label = "Write";
 	get description(): string {
+		const bridged = harnessDescription(this.session, WRITE_BRIDGES);
+		if (bridged !== undefined) return bridged;
 		const deviceOnly = this.session.deviceOnlyWrite === true && this.session.pendingFullWriteDescription !== true;
 		// With no vendor declaration to serve, Claude Code's `Write` still names its
 		// own `file_path` and `Read`, not omp's `path` and `read`.

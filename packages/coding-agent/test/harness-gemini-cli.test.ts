@@ -6,6 +6,8 @@ import { type AuthGatewayServerHandle, startAuthGateway } from "@oh-my-pi/pi-ai/
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { harnessFacadeSpecs } from "@oh-my-pi/pi-coding-agent/harness/facades";
+import { cfgHarnessMode } from "@oh-my-pi/pi-coding-agent/harness/settings";
 import { recordHarnessRequest } from "@oh-my-pi/pi-coding-agent/harness/record";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -278,6 +280,128 @@ describe("gemini-cli harness", () => {
 		expect(text).toContain("line two");
 		expect(text).not.toContain("line one");
 		expect(text).not.toContain("line three");
+	});
+
+	/** Each functionResponse the model received, in order, by vendor name. */
+	function functionResponses(requests: readonly GeminiRequest[]): { name: string; text: string }[] {
+		const last = requests.at(-1);
+		return (last?.contents ?? [])
+			.flatMap(content => content.parts)
+			.flatMap(part => (isRecord(part.functionResponse) ? [part.functionResponse] : []))
+			.map(response => ({ name: String(response.name), text: JSON.stringify(response.response) }));
+	}
+
+	it("carries Gemini CLI's edit, glob and todo contracts onto omp's tools", async () => {
+		await recordGeminiCliTurn();
+		const { session, workDir } = await openSession(Settings.isolated({}));
+		const file = path.join(workDir, "letters.txt");
+		await Bun.write(file, "x\nx\nx\n");
+		await Bun.write(path.join(workDir, "src", "MAIN.TS"), "export {};\n");
+		const requests = scriptGemini([
+			// Two expected, three present: Gemini CLI refuses, so nothing changes.
+			[
+				{
+					functionCall: {
+						name: "replace",
+						args: { file_path: file, old_string: "x", new_string: "y", expected_replacements: 2 },
+					},
+				},
+			],
+			[
+				{
+					functionCall: {
+						name: "replace",
+						args: { file_path: file, old_string: "x", new_string: "y", expected_replacements: 3 },
+					},
+				},
+			],
+			// Gemini CLI's glob ignores case unless asked.
+			[{ functionCall: { name: "glob", args: { pattern: "**/*.ts", dir_path: workDir } } }],
+			// A status outside Gemini CLI's set is refused instead of rewriting the list.
+			[{ functionCall: { name: "write_todos", args: { todos: [{ description: "Plan", status: "complete" }] } } }],
+			[
+				{
+					functionCall: {
+						name: "write_todos",
+						args: {
+							todos: [
+								{ description: "Plan", status: "completed" },
+								{ description: "Build", status: "in_progress" },
+								{ description: "Ship", status: "cancelled" },
+							],
+						},
+					},
+				},
+			],
+			[{ text: "done" }],
+		]);
+		try {
+			await session.prompt("work");
+			expect(session.getTodoPhases().flatMap(phase => phase.tasks.map(task => [task.content, task.status]))).toEqual(
+				[
+					["Plan", "completed"],
+					["Build", "in_progress"],
+					["Ship", "abandoned"],
+				],
+			);
+		} finally {
+			await session.dispose();
+		}
+
+		expect(await Bun.file(file).text()).toBe("y\ny\ny\n");
+		const responses = functionResponses(requests);
+		expect(responses.map(response => response.name)).toEqual([
+			"replace",
+			"replace",
+			"glob",
+			"write_todos",
+			"write_todos",
+		]);
+		const [mismatch, , glob, invalidTodos] = responses;
+		expect(mismatch.text).toContain("Expected 2 occurrences of old_string");
+		expect(glob.text).toContain("MAIN.TS");
+		expect(invalidTodos.text).toContain("Invalid write_todos arguments");
+	});
+
+	it("presents the capture's surface when harness.mode turns auto before the capture has loaded", async () => {
+		await recordGeminiCliTurn();
+		// Native mode never asks for the capture, so it is on disk but not loaded.
+		const settings = Settings.isolated({ "harness.mode": "native" });
+		const { session } = await openSession(settings);
+		const requests = scriptGemini([[{ text: "first" }], [{ text: "second" }]]);
+		try {
+			await session.prompt("before");
+			cfgHarnessMode.override(settings, "auto");
+			// The setting's listener re-presents the tools in the background; a prompt does not wait for it.
+			for (let tries = 0; tries < 200; tries++) {
+				if (session.agent.state.tools.some(tool => tool.name === "read_file")) break;
+				await Bun.sleep(10);
+			}
+			await session.prompt("after");
+		} finally {
+			cfgHarnessMode.clearOverride(settings);
+			await session.dispose();
+		}
+		const [before, after] = requests;
+		expect(declaredNames(before)).toContain("read");
+		expect(declaredNames(after)).toEqual(
+			expect.arrayContaining(["read_file", "run_shell_command", "list_directory", "web_fetch"]),
+		);
+		expect(declaredNames(after)).not.toContain("read");
+		expect(after.systemInstruction?.parts?.[0]?.text).toBe(SYSTEM_INSTRUCTION);
+	});
+
+	it("fetches the URL a web_fetch prompt names, keeping brackets the URL opens", () => {
+		const webFetch = harnessFacadeSpecs("gemini-cli").find(spec => spec.wireName === "web_fetch");
+		if (!webFetch) throw new Error("gemini-cli serves no web_fetch facade");
+		const host = { settings: Settings.isolated({}) };
+		expect(
+			webFetch.toParams({ prompt: "Summarize https://en.wikipedia.org/wiki/Function_(mathematics)." }, host),
+		).toEqual({ path: "https://en.wikipedia.org/wiki/Function_(mathematics)" });
+		expect(webFetch.toParams({ prompt: "Read it (see https://example.com/a)." }, host)).toEqual({
+			path: "https://example.com/a",
+		});
+		expect(() => webFetch.toParams({ prompt: "no link here" }, host)).toThrow("names no http:// or https:// URL");
 	});
 
 	it("keeps a Gemini model native without a capture unless the profile is forced", async () => {

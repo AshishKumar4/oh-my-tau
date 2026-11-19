@@ -1,4 +1,5 @@
 import type { GrepToolDetails } from "@oh-my-pi/pi-tui/tools/grep";
+import geminiCliSearchFileContent from "../prompts/tools/harness/gemini-cli-search-file-content.md" with { type: "text" };
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -20,7 +21,13 @@ import {
 	parseArchivePathCandidates,
 } from "@oh-my-pi/pi-utils/ar";
 import { getEditStore, NO_FULL_LINE, recordFullySeenRows } from "../edit/store";
-import { type HarnessBridges, harnessParameters, harnessParams, nativeParams } from "../harness/bridge";
+import {
+	type HarnessBridges,
+	harnessDescription,
+	harnessParameters,
+	harnessParams,
+	nativeParams,
+} from "../harness/bridge";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlRouter } from "../internal-urls/router";
 import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
@@ -106,6 +113,7 @@ const geminiCliSearchSchema = type({
 const GREP_BRIDGES: HarnessBridges<GrepToolInput, typeof geminiCliSearchSchema> = {
 	"gemini-cli": {
 		parameters: geminiCliSearchSchema,
+		description: geminiCliSearchFileContent,
 		toParams: args => {
 			const include = args.include?.includes("/") ? args.include : args.include && `**/${args.include}`;
 			const searchPath = include === undefined ? args.dir_path : path.join(args.dir_path ?? ".", include);
@@ -641,6 +649,8 @@ export class GrepTool implements AgentTool<typeof searchSchema | typeof geminiCl
 	readonly loadMode = "discoverable";
 	readonly summary = "Search file contents by regex";
 	get description(): string {
+		const bridged = harnessDescription(this.session, GREP_BRIDGES);
+		if (bridged !== undefined) return bridged;
 		const displayMode = resolveFileDisplayMode(this.session);
 		const isHlMode = displayMode.hashLines;
 		const isLineNumberMode = !displayMode.hashLines && displayMode.lineNumbers;

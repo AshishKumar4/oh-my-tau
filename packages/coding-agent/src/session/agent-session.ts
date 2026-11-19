@@ -2733,6 +2733,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			ensureGoalRegistered: config.ensureGoalRegistered,
 			reconcileSettingsGatedTools: config.reconcileSettingsGatedTools,
 			rebuildSystemPrompt: config.rebuildSystemPrompt,
+			loadHarnessPrompt: config.loadHarnessPrompt,
 			getMcpServerInstructions: config.getMcpServerInstructions,
 			xdev: config.xdev,
 			setActiveToolNames: config.setActiveToolNames,

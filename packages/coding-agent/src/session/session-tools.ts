@@ -229,6 +229,12 @@ interface SessionToolsOptions {
 	 */
 	reconcileSettingsGatedTools?: (isBuiltIn: (name: string) => boolean) => Promise<SettingsGatedToolDelta>;
 	rebuildSystemPrompt?: SystemPromptRebuilder;
+	/**
+	 * Loads the capture the active model's candidate harness profile serves, so
+	 * the profile tools are presented under already counts it (a capture-gated
+	 * profile engages only once its capture has loaded). Supplied by `sdk.ts`.
+	 */
+	loadHarnessPrompt?: () => Promise<void>;
 	getMcpServerInstructions?: () => Map<string, string> | undefined;
 	xdev?: XdevState;
 	setActiveToolNames?: (names: Iterable<string>) => void;
@@ -573,6 +579,7 @@ export class SessionTools {
 	/** Harness presentation the base prompt and the presented tools were rendered for; see {@link #harnessPresentation}. */
 	#promptHarness: HarnessPresentation | undefined;
 	#rebuildSystemPrompt: SessionToolsOptions["rebuildSystemPrompt"];
+	#loadHarnessPrompt: SessionToolsOptions["loadHarnessPrompt"];
 	#getMcpServerInstructions: SessionToolsOptions["getMcpServerInstructions"];
 	/**
 	 * Session-lifetime factory shared by every custom-tool wrapper. Defining it
@@ -652,6 +659,7 @@ export class SessionTools {
 		this.#ensureGoalRegistered = options.ensureGoalRegistered;
 		this.#reconcileSettingsGatedTools = options.reconcileSettingsGatedTools;
 		this.#rebuildSystemPrompt = options.rebuildSystemPrompt;
+		this.#loadHarnessPrompt = options.loadHarnessPrompt;
 		this.#getMcpServerInstructions = options.getMcpServerInstructions;
 		this.#xdev = options.xdev;
 		if (this.#xdev && this.#xdev.tools !== this.#toolRegistry) {
@@ -1283,6 +1291,8 @@ export class SessionTools {
 	 * switch: the new model sees its own harness.
 	 */
 	async syncAfterModelChange(previousEditMode: EditModeSetting, options?: { retryFallback?: boolean }): Promise<void> {
+		// A capture-gated profile counts only once its capture has loaded, so load it before comparing presentations.
+		if (this.#loadHarnessPrompt) await this.#loadHarnessPrompt();
 		const currentEditMode = this.resolveActiveEditMode();
 		const templateChanged = this.#currentPromptTemplate() !== this.#promptTemplate;
 		const presentation = this.#harnessPresentation();
@@ -1746,6 +1756,9 @@ export class SessionTools {
 	async #applyActiveToolsByName(toolNames: string[], forcePromptRefresh = false, signal?: AbortSignal): Promise<void> {
 		signal?.throwIfAborted();
 		toolNames = normalizeToolNames(toolNames);
+		// The prompt rebuild below loads the capture too; loading it first presents
+		// the tools under the profile that prompt serves.
+		if (this.#loadHarnessPrompt) await untilAborted(signal, this.#loadHarnessPrompt());
 		const activeModel = this.#host.model();
 		const profile = this.#harnessProfile();
 		const codeMode = resolveCodeMode({

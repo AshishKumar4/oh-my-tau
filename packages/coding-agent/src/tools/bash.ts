@@ -5,6 +5,7 @@ import {
 	formatExitCodeNotice,
 	WALL_TIME_NOTICE_MIN_MS,
 } from "@oh-my-pi/pi-tui/tools/bash";
+import geminiCliRunShellCommand from "../prompts/tools/harness/gemini-cli-run-shell-command.md" with { type: "text" };
 import * as fs from "node:fs";
 import { type } from "@oh-my-pi/omptype";
 import type {
@@ -21,7 +22,7 @@ import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
-import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
+import { type HarnessBridges, harnessDescription, harnessParameters, harnessParams } from "../harness/bridge";
 import { sessionToolRefs } from "../harness/effective-profile";
 import { InternalUrlRouter } from "../internal-urls";
 import { sessionResolveContext } from "../internal-urls/context";
@@ -521,6 +522,7 @@ type BashToolSchema = BashNativeSchema | typeof claudeCodeBashSchema | typeof ge
 const BASH_BRIDGES: HarnessBridges<BashToolInput, typeof claudeCodeBashSchema | typeof geminiCliShellSchema> = {
 	"gemini-cli": {
 		parameters: geminiCliShellSchema,
+		description: geminiCliRunShellCommand,
 		toParams: (args: typeof geminiCliShellSchema.infer) => ({
 			command: args.command,
 			...(args.dir_path !== undefined ? { cwd: args.dir_path } : {}),
@@ -918,6 +920,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	readonly label = "Bash";
 	readonly loadMode = "essential";
 	get description(): string {
+		const bridged = harnessDescription(this.session, BASH_BRIDGES);
+		if (bridged !== undefined) return bridged;
 		// With no vendor declaration to serve, Claude Code's `Bash` still describes
 		// its own fields: omp's text names `cwd`, `pty` and `async`, which that
 		// schema cannot carry.

@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import geminiCliReplace from "../prompts/tools/harness/gemini-cli-replace.md" with { type: "text" };
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
@@ -28,7 +29,7 @@ import {
 } from "@oh-my-pi/pi-natives";
 import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { type FileSnapshot, readSnapshot } from "../commit/selective/journal";
-import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
+import { type HarnessBridges, harnessDescription, harnessParameters, harnessParams } from "../harness/bridge";
 import { codexExecNestedSummary } from "../harness/codex-nested";
 import { extractUriScheme, InternalUrlRouter, type ResolveContext, sessionResolveContext } from "../internal-urls";
 import { createLspWritethrough, flushLspWritethroughBatch, type WritethroughCallback, writethroughNoop } from "../lsp";
@@ -49,6 +50,7 @@ import {
 } from "../tools/file-write-fallback";
 import { outputMeta, resolveOutputMaxColumns } from "../tools/output-meta";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { resolveToCwd } from "../tools/path-utils";
 import { DEFAULT_MAX_COLUMN } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { type EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import { resolveEditMode } from "../utils/edit-mode";
@@ -123,6 +125,7 @@ const REPLACE_BRIDGES: HarnessBridges<ReplaceParams, typeof claudeCodeEditSchema
 	},
 	"gemini-cli": {
 		parameters: geminiCliReplaceSchema,
+		description: geminiCliReplace,
 		toParams: (args: typeof geminiCliReplaceSchema.infer) => ({
 			path: args.file_path,
 			old_string: args.old_string,
@@ -500,6 +503,8 @@ export class EditTool implements AgentTool<TInput> {
 		// its own fields; omp's replace prompt also claims a read-before-edit gate
 		// replace mode does not have.
 		if (this.parameters === claudeCodeEditSchema) return prompt.render(claudeCodeEditDescription);
+		const bridged = this.mode === "replace" ? harnessDescription(this.session, REPLACE_BRIDGES) : undefined;
+		if (bridged !== undefined) return bridged;
 		const mode = this.mode;
 		const model = this.session.getActiveModel?.();
 		const rendered = resolveEditToolDescription(mode, model);
@@ -652,6 +657,9 @@ export class EditTool implements AgentTool<TInput> {
 		_onUpdate?: AgentToolUpdateCallback<EditToolDetails, TInput>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
+		if ("expected_replacements" in input && input.expected_replacements !== undefined) {
+			await this.#checkExpectedReplacements(input.file_path, input.old_string, input.expected_replacements);
+		}
 		const params = this.#params(input);
 		let open = this.#sessions.get(toolCallId);
 		const argsJson = JSON.stringify(params);
@@ -764,6 +772,26 @@ export class EditTool implements AgentTool<TInput> {
 		}
 		if (tagged) tagged[kInspection] = { mode: this.mode, inspection };
 		return inspection;
+	}
+
+	/**
+	 * Gemini CLI's `replace` fails unless `old_string` occurs exactly `expected` times. omp's
+	 * replace carries no count, so the count is checked against the file before anything is applied.
+	 */
+	async #checkExpectedReplacements(filePath: string, oldString: string, expected: number): Promise<void> {
+		let text: string;
+		try {
+			text = await Bun.file(resolveToCwd(filePath, this.session.cwd)).text();
+		} catch {
+			// Unreadable or not a local file: the edit itself reports it.
+			return;
+		}
+		const found = oldString.length === 0 ? 0 : text.split(oldString).length - 1;
+		if (found !== expected) {
+			throw new ToolError(
+				`Expected ${expected} occurrence${expected === 1 ? "" : "s"} of old_string in ${filePath}, found ${found}; nothing was replaced.`,
+			);
+		}
 	}
 
 	#params(args: unknown): unknown {

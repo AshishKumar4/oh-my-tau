@@ -1,9 +1,10 @@
 import type { MemoryRetainDetails } from "@oh-my-pi/pi-tui/tools/memory";
+import geminiCliSaveMemory from "../prompts/tools/harness/gemini-cli-save-memory.md" with { type: "text" };
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { prompt, withLoopPhase } from "@oh-my-pi/pi-utils";
 import { isHindsightConfigured, loadHindsightConfig } from "../hindsight/config";
-import { type HarnessBridges, harnessParameters, harnessParams } from "../harness/bridge";
+import { type HarnessBridges, harnessDescription, harnessParameters, harnessParams } from "../harness/bridge";
 import retainDescription from "../prompts/tools/retain.md" with { type: "text" };
 import type { ToolSession } from ".";
 
@@ -49,6 +50,7 @@ export type MemoryRetainParams = typeof memoryRetainSchemaWithScope.infer;
 const RETAIN_BRIDGES: HarnessBridges<MemoryRetainParams, typeof geminiCliSaveMemorySchema> = {
 	"gemini-cli": {
 		parameters: geminiCliSaveMemorySchema,
+		description: geminiCliSaveMemory,
 		toParams: args => ({ items: [{ content: args.fact }] }),
 	},
 };
@@ -64,6 +66,8 @@ export class MemoryRetainTool implements AgentTool<MemoryRetainSchema, MemoryRet
 			: "read";
 	readonly label = "Retain";
 	get description(): string {
+		const bridged = harnessDescription(this.session, RETAIN_BRIDGES);
+		if (bridged !== undefined) return bridged;
 		return prompt.render(retainDescription, { globalScope: isGlobalMemoryScopeAvailable(this.session) });
 	}
 	get parameters(): MemoryRetainSchema {

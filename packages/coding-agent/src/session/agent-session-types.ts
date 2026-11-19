@@ -360,6 +360,8 @@ export interface AgentSessionConfig {
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	/** System prompt builder that can consider tool availability. */
 	rebuildSystemPrompt?: SystemPromptRebuilder;
+	/** Loads the active model's harness capture before tools are presented; see `SessionToolsOptions`. */
+	loadHarnessPrompt?: () => Promise<void>;
 	/** Sources of the initial base prompt, as returned by `buildSystemPrompt`. */
 	systemPromptSources?: SystemPromptSources;
 	/** Tools mounted under `xd://`, for `/tools` display. */

@@ -5,6 +5,8 @@ import { effectiveHarnessProfile } from "./effective-profile";
 
 export interface HarnessSchemaBridge<TParams, TWire extends TSchema = TSchema> {
 	readonly parameters: TWire;
+	/** The description served with `parameters` while no capture serves the vendor's own. */
+	readonly description?: string;
 	toParams(args: Static<TWire>): TParams;
 }
 
@@ -30,6 +32,14 @@ function activeBridge<TParams, TWire extends TSchema>(
 	if (model === undefined) return undefined;
 	const profile = session?.settings === undefined ? undefined : effectiveHarnessProfile(session.settings, model);
 	return profile === undefined ? undefined : bridges[profile];
+}
+
+/** The active bridge's own description, for a tool whose native text names fields its bridged schema lacks. */
+export function harnessDescription(
+	session: BridgeHost | null | undefined,
+	bridges: HarnessBridges<unknown, TSchema>,
+): string | undefined {
+	return activeBridge(session, bridges)?.description;
 }
 
 export function harnessParameters<TNative extends TSchema, TWire extends TSchema>(
