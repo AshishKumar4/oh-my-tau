@@ -160,8 +160,8 @@ export async function cleanupAbandonedLoginDirectories(
  * A chosen grant is checked with one refresh and becomes a new antigravity-cli credential;
  * the row it came from stays untouched. Resolves undefined to run agy's own sign-in.
  * A grant must carry every scope its own login requests today (Antigravity's
- * `aicode` among them): an older grant authenticates agy, but Code Assist then
- * refuses it, and every request fails with 429.
+ * `aicode` among them): agy authenticates with an older grant, but Antigravity's
+ * AICode service refuses it for insufficient scopes.
  */
 async function reuseStoredLogin(ctrl: OAuthController): Promise<OAuthCredentials | undefined> {
 	if (!ctrl.onPrompt || !ctrl.storedGrants) return undefined;
