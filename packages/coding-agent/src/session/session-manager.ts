@@ -637,7 +637,11 @@ export class SessionEntryIndex {
 
 		const usage = entryUsage(entry);
 		addUsage(this.#usage, usage);
-		if (usage && entry.type === "message" && entry.message.role === "assistant") {
+		// The session's own turns, including one discarded after billing (re-journaled as model_usage).
+		const ownTurn =
+			(entry.type === "message" && entry.message.role === "assistant") ||
+			(entry.type === "model_usage" && entry.purpose === DISCARDED_TURN_USAGE_PURPOSE);
+		if (usage && ownTurn) {
 			this.#usage.conversationInput += usage.input;
 			this.#usage.conversationCacheRead += usage.cacheRead;
 			this.#usage.conversationCacheWrite += usage.cacheWrite;
