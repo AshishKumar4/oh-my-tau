@@ -17,6 +17,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { LoginCancelledError } from "@oh-my-pi/pi-ai/error";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { $env, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
@@ -2804,7 +2805,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 									),
 								);
 							}
-							return (await uiCtx.input(prompt.message, prompt.placeholder, { timeout: 600_000 })) ?? "";
+							const answer = await uiCtx.input(prompt.message, prompt.placeholder, { timeout: 600_000 });
+							// A cancelled or timed-out prompt ends the login; "" stays an explicit blank answer,
+							// which a stored-login choice reads as "sign in again".
+							if (answer === undefined) throw new LoginCancelledError();
+							return answer;
 						},
 					});
 					// Provider-scoped online refresh so the just-persisted credential

@@ -682,8 +682,11 @@ export default function(pi) {
 		});
 	}, 30_000);
 
-	it("routes the stored-login choice to the host before any auth URL", async () => {
-		await using temp = await TempDir.create("@rpc-login-stored-choice-");
+	/** One RPC `login antigravity-cli` over a seeded google-antigravity login; `answer` replies to each host input. */
+	async function storedLoginRpc(
+		temp: TempDir,
+		answer: (title: string, index: number) => { value: string } | { cancelled: true },
+	): Promise<{ inputTitles: string[]; notices: string[]; loginResponse: unknown }> {
 		const env = {
 			PATH: Bun.env.PATH,
 			HOME: temp.join("home"),
@@ -731,6 +734,7 @@ export default function(pi) {
 			await child.stdin.flush();
 		};
 		const inputTitles: string[] = [];
+		const notices: string[] = [];
 		let loginResponse: unknown;
 		try {
 			await send({ type: "login", providerId: "antigravity-cli", id: "login" });
@@ -741,9 +745,13 @@ export default function(pi) {
 						throw new Error("RPC input request did not carry string id and title");
 					}
 					inputTitles.push(frame.title);
-					// Accept the risk, then name a login that does not exist: no token request leaves the process.
-					const value = inputTitles.length === 1 ? "yes" : "9";
-					await send({ type: "extension_ui_response", id: frame.id, value });
+					await send({
+						type: "extension_ui_response",
+						id: frame.id,
+						...answer(frame.title, inputTitles.length - 1),
+					});
+				} else if (frame.type === "extension_ui_request" && frame.method === "notify") {
+					if (typeof frame.message === "string") notices.push(frame.message);
 				} else if (frame.type === "response" && frame.id === "login") {
 					loginResponse = frame;
 					break;
@@ -754,18 +762,50 @@ export default function(pi) {
 			child.kill();
 			await child.exited;
 		}
-
 		if (!loginResponse) throw new Error(`RPC login fixture did not finish: ${await stderr}`);
 		await stderr;
-		expect(inputTitles).toEqual([
-			expect.stringContaining("use at your own risk"),
-			expect.stringContaining("1. owner@example.test (google-antigravity)"),
-		]);
-		expect(loginResponse).toMatchObject({
+		return { inputTitles, notices, loginResponse };
+	}
+
+	const RISK_TITLE = expect.stringContaining("use at your own risk");
+	const CHOICE_TITLE = expect.stringContaining("1. owner@example.test (google-antigravity)");
+
+	it("routes the stored-login choice to the host before any auth URL", async () => {
+		await using temp = await TempDir.create("@rpc-login-stored-choice-");
+		// Accept the risk, then name a login that does not exist: no token request leaves the process.
+		const run = await storedLoginRpc(temp, (_title, index) => ({ value: index === 0 ? "yes" : "9" }));
+		expect(run.inputTitles).toEqual([RISK_TITLE, CHOICE_TITLE]);
+		expect(run.loginResponse).toMatchObject({
 			type: "response",
 			command: "login",
 			success: false,
 			error: expect.stringContaining("Type a number from 1 to 1"),
+		});
+	}, 30_000);
+
+	it("cancels the login when the host cancels the stored-login choice, without starting agy", async () => {
+		await using temp = await TempDir.create("@rpc-login-stored-cancel-");
+		const run = await storedLoginRpc(temp, (_title, index) => (index === 0 ? { value: "yes" } : { cancelled: true }));
+		expect(run.inputTitles).toEqual([RISK_TITLE, CHOICE_TITLE]);
+		// A blank answer would run agy's own sign-in, which announces itself first.
+		expect(run.notices).not.toContainEqual(expect.stringContaining("Preparing the Antigravity CLI"));
+		expect(run.loginResponse).toMatchObject({
+			type: "response",
+			command: "login",
+			success: false,
+			error: "Login cancelled",
+		});
+	}, 30_000);
+
+	it("cancels the login when the host cancels the risk acknowledgement", async () => {
+		await using temp = await TempDir.create("@rpc-login-risk-cancel-");
+		const run = await storedLoginRpc(temp, () => ({ cancelled: true }));
+		expect(run.inputTitles).toEqual([RISK_TITLE]);
+		expect(run.loginResponse).toMatchObject({
+			type: "response",
+			command: "login",
+			success: false,
+			error: "Login cancelled",
 		});
 	}, 30_000);
 });
