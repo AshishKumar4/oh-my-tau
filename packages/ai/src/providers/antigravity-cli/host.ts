@@ -28,6 +28,7 @@ import { normalizeSchemaForMCP, toolWireSchema } from "../../utils/schema";
 import { type JsonSchemaValidationResult, validateJsonSchemaValue } from "../../utils/schema/json-schema-validator";
 import agentDefinition from "./agent.md" with { type: "text" };
 import { resolveAgyBinary } from "./binary";
+import { CallUsageLog } from "./call-usage";
 import {
 	conversationStorePath,
 	deleteConversation,
@@ -45,6 +46,15 @@ const ANNOUNCEMENT_TIMEOUT_MS = 2_000;
 // Leave enough time to force-stop a process that never acknowledges cancellation.
 const HOLD_LIMIT_MS = 165_000;
 const CANCEL_TIMEOUT_MS = 5_000;
+// Google's prompt cache lapses about 3.5 minutes after the last call (measured on agy: calls
+// within 180 s of the previous one stay warm, calls after 215 s mostly start cold). A tool that
+// outlives the hold limit leaves agy idle, so short check-in turns re-read the cached context.
+const CHECK_IN_INTERVAL_MS = 150_000;
+// Each check-in re-reads the whole cached context at the conversation's effort. Past two, keeping
+// a long wait warm costs more than the single cold reload it would save, so the cache lapses.
+const MAX_CHECK_INS = 2;
+const CHECK_IN_PROMPT =
+	"The earlier tool call is still running; its result will arrive in a later message. Do not call any tools. Reply with only the word: waiting";
 const MCP_TOOL_NAME = /\bmcp_ide-tools_(\S+)/;
 
 /** Per-step request settings. */
@@ -101,6 +111,8 @@ export interface AgyHostOptions {
 	cancelTimeoutMs?: number;
 	announcementTimeoutMs?: number;
 	startupTimeoutMs?: number;
+	/** Delay between check-in turns while a detached tool still runs. */
+	checkInIntervalMs?: number;
 	schedule?: AgyScheduler;
 }
 
@@ -140,6 +152,9 @@ interface PendingCall {
 	settle(output: McpToolOutput): void;
 	expiry: AgyTimer;
 	drain?: Promise<void>;
+	/** Check-in turns sent while detached, and the timer for the next one. */
+	checkIns: number;
+	checkIn?: AgyTimer;
 }
 
 interface Turn {
@@ -148,6 +163,8 @@ interface Turn {
 	stopped: PromiseWithResolvers<never>;
 	cancelling: boolean;
 	cancellation?: Promise<void>;
+	/** A cache check-in during a detached tool: no step reads it, and real work cancels it. */
+	checkIn: boolean;
 }
 
 /** Owns one ACP process and its live ledger; callers must retain it between tool steps. */
@@ -158,6 +175,8 @@ export class AgyHost implements ProviderSessionState {
 	readonly #exits = new Set<Promise<number>>();
 	#process: AgyProcess | undefined;
 	#conversation: Conversation | undefined;
+	/** Per-call usage of the attached conversation; see {@link CallUsageLog}. */
+	#callUsage: CallUsageLog | undefined;
 	#ledger: Ledger | undefined;
 	#pending: PendingCall | undefined;
 	#step: ActiveStep | undefined;
@@ -179,6 +198,7 @@ export class AgyHost implements ProviderSessionState {
 			cancelTimeoutMs: options.cancelTimeoutMs ?? CANCEL_TIMEOUT_MS,
 			announcementTimeoutMs: options.announcementTimeoutMs ?? ANNOUNCEMENT_TIMEOUT_MS,
 			startupTimeoutMs: options.startupTimeoutMs ?? STARTUP_TIMEOUT_MS,
+			checkInIntervalMs: options.checkInIntervalMs ?? CHECK_IN_INTERVAL_MS,
 			schedule: options.schedule ?? scheduleTimer,
 		};
 		if (
@@ -224,6 +244,8 @@ export class AgyHost implements ProviderSessionState {
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 		try {
 			if (this.#cancelling) await this.#setup(this.#cancelling);
+			// A check-in never delays real work.
+			if (this.#turn?.checkIn) await this.#setup(this.#cancelTurn());
 			const cwd = options.cwd ?? process.cwd();
 			const tools = (context.tools ?? []).map(toMcpTool);
 			const toolsKey = stableStringifyJson(tools);
@@ -293,6 +315,7 @@ export class AgyHost implements ProviderSessionState {
 					loaded: true,
 					defaultEffort: thoughtLevel(created.configOptions),
 				};
+				this.#callUsage = new CallUsageLog(this.#geminiDir, created.sessionId);
 				this.#contextTokens = 0;
 			}
 			// A live turn keeps the model and effort it started with.
@@ -349,6 +372,7 @@ export class AgyHost implements ProviderSessionState {
 	close(): void {
 		this.#fail(new Error("Antigravity CLI session closed"));
 		this.#conversation = undefined;
+		this.#callUsage = undefined;
 	}
 
 	/** Stop first, await process exit, then remove only conversations this host created (never fork sources). */
@@ -506,6 +530,7 @@ export class AgyHost implements ProviderSessionState {
 			if (this.#process !== agy || step !== this.#step || step?.controller.signal.aborted)
 				throw new Error("Antigravity CLI load was interrupted");
 			this.#conversation = { id, systemKey, loaded: true, defaultEffort: thoughtLevel(loaded.configOptions) };
+			this.#callUsage = new CallUsageLog(this.#geminiDir, id);
 			this.#contextTokens = 0;
 		} finally {
 			if (this.#loading === loading) this.#loading = undefined;
@@ -538,7 +563,7 @@ export class AgyHost implements ProviderSessionState {
 		conversation.requestedEffort = effort;
 	}
 
-	#prompt(blocks: ContentBlock[]): void {
+	#prompt(blocks: ContentBlock[], checkIn = false): void {
 		const conversation = this.#conversation;
 		if (!conversation) throw new Error("Antigravity CLI conversation is unavailable");
 		const turn: Turn = {
@@ -546,6 +571,7 @@ export class AgyHost implements ProviderSessionState {
 			response: Promise.withResolvers<PromptResponse>(),
 			stopped: Promise.withResolvers<never>(),
 			cancelling: false,
+			checkIn,
 		};
 		turn.stopped.promise.catch(() => undefined);
 		this.#turn = turn;
@@ -558,7 +584,14 @@ export class AgyHost implements ProviderSessionState {
 				},
 				error => {
 					this.#turns.delete(turn);
-					if (this.#turn === turn && !turn.cancelling) this.#fail(error);
+					if (this.#turn !== turn || turn.cancelling) return;
+					// A failed check-in only costs the cache; the conversation and the detached tool stay.
+					if (turn.checkIn) {
+						this.#turn = undefined;
+						logger.debug("Antigravity CLI cache check-in failed", { error: String(error) });
+						return;
+					}
+					this.#fail(error);
 				},
 			)
 			.catch(error => this.#fail(error));
@@ -575,6 +608,7 @@ export class AgyHost implements ProviderSessionState {
 		const pending = this.#pending;
 		this.#pending = undefined;
 		pending?.expiry.cancel();
+		pending?.checkIn?.cancel();
 		return pending;
 	}
 
@@ -590,8 +624,23 @@ export class AgyHost implements ProviderSessionState {
 					"Tool transport cancelled while the host continues execution; the actual result will follow in a new turn.",
 				),
 			);
+			this.#scheduleCheckIn(pending, 0);
 		});
 		void pending.drain.catch(error => this.#fail(error));
+	}
+
+	/** Keep agy's prompt cache warm while a detached tool runs; see {@link CHECK_IN_INTERVAL_MS}. */
+	#scheduleCheckIn(pending: PendingCall, delayMs: number): void {
+		if (pending.checkIns >= MAX_CHECK_INS) return;
+		pending.checkIn = this.#options.schedule(delayMs, () => {
+			pending.checkIn = undefined;
+			// Real work in flight already refreshes the cache.
+			const idle = !this.#turn && !this.#step && !this.#loading && !this.#cancelling;
+			if (this.#pending !== pending || pending.state !== "detached" || !idle) return;
+			if (!this.#process || !this.#conversation?.loaded) return;
+			pending.checkIns++;
+			this.#prompt([{ type: "text", text: CHECK_IN_PROMPT }], true);
+		});
 	}
 
 	/** cancel() writes a notification; only the outstanding prompt's cancelled response acknowledges it. */
@@ -611,7 +660,8 @@ export class AgyHost implements ProviderSessionState {
 				"Antigravity CLI did not confirm cancellation",
 				this.#options.schedule,
 			);
-			if (response.stopReason !== "cancelled" || this.#turn !== turn)
+			// A check-in may finish on its own while its cancellation is in flight.
+			if (this.#turn !== turn || (response.stopReason !== "cancelled" && !turn.checkIn))
 				throw new Error("Antigravity CLI cancellation was not acknowledged");
 			this.#turn = undefined;
 			this.#announced.clear();
@@ -671,6 +721,7 @@ export class AgyHost implements ProviderSessionState {
 		}
 		// A call racing a cancellation of its turn is refused; the conversation stays live.
 		const turn = this.#turn;
+		if (turn?.checkIn) return errorOutput(`Tool call rejected; no execution occurred. ${CHECK_IN_PROMPT}`);
 		const cancelled = errorOutput("Tool call rejected: the request was cancelled; no execution occurred.");
 		if (turn?.cancelling) return cancelled;
 		const announced = await this.#awaitAnnouncement(name);
@@ -702,10 +753,11 @@ export class AgyHost implements ProviderSessionState {
 			state: "parked",
 			settle: result.resolve,
 			expiry: this.#options.schedule(this.#options.holdLimitMs, () => this.#detach(pending)),
+			checkIns: 0,
 		};
 		this.#pending = pending;
 		step.writer.toolCall({ type: "toolCall", id, name, arguments: args });
-		step.writer.usage(this.#contextTokens);
+		step.writer.usage(this.#contextTokens, this.#callUsage?.take());
 		const digest = transcriptDigest([...step.messages, step.writer.output]);
 		step.writer.finish("toolUse", { type: "antigravityCli", conversationId, digest });
 		this.#ledger = { count: step.messages.length + 1, digest, pendingToolCallId: id };
@@ -737,6 +789,10 @@ export class AgyHost implements ProviderSessionState {
 		if (this.#loading || !this.#turn || notification.sessionId !== this.#conversation?.id || this.#turn.cancelling)
 			return;
 		const update = notification.update;
+		if (this.#turn.checkIn) {
+			if (update.sessionUpdate === "usage_update") this.#contextTokens = update.used;
+			return;
+		}
 		const writer = this.#step?.aborted ? undefined : this.#step?.writer;
 		switch (update.sessionUpdate) {
 			case "agent_message_chunk":
@@ -762,6 +818,11 @@ export class AgyHost implements ProviderSessionState {
 	#turnEnded(turn: Turn, response: PromptResponse): void {
 		if (this.#turn !== turn || turn.cancelling) return;
 		this.#turn = undefined;
+		if (turn.checkIn) {
+			const pending = this.#pending;
+			if (pending?.state === "detached") this.#scheduleCheckIn(pending, this.#options.checkInIntervalMs);
+			return;
+		}
 		const step = this.#step;
 		if (!step || step.writer.done || this.#pending) {
 			this.#fail(new Error("Antigravity CLI ended a turn while its tool was still parked"));
@@ -780,7 +841,7 @@ export class AgyHost implements ProviderSessionState {
 			this.#fail(new Error("Antigravity CLI ended the request without a usable response"));
 			return;
 		}
-		writer.usage(this.#contextTokens, response.usage);
+		writer.usage(this.#contextTokens, this.#callUsage?.take() ?? response.usage);
 		const digest = transcriptDigest([...step.messages, writer.output]);
 		let checkpoint: AntigravityCliCheckpoint | undefined;
 		if (response.stopReason === "end_turn") {

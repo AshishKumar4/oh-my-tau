@@ -1020,30 +1020,31 @@ const cacheWriteSegment: StatusLineSegment = singleStatSegment(
 	"statusLineOutput",
 );
 
+/**
+ * Hit rate of the session's own conversation: cache reads over its total prompt tokens. The
+ * prompt is cacheRead (served from cache), cacheWrite (newly cached) and input (uncached), so the
+ * denominator stays honest for Anthropic/OpenRouter, and DeepSeek's misses (input with cacheWrite
+ * 0) still yield hit/(hit+miss). Side requests (titles, captions, job widgets) and subagent
+ * results are excluded: their small prompts would describe other conversations' caches.
+ */
+function conversationCacheHitRate(stats: SegmentContext["usageStats"]): number | undefined {
+	const { conversationCacheRead: cacheRead, conversationCacheWrite: cacheWrite, conversationInput: input } = stats;
+	if (!cacheRead) return undefined;
+	return (cacheRead / (cacheRead + cacheWrite + input)) * 100;
+}
+
 const cacheHitSegment: StatusLineSegment = {
 	id: "cache_hit",
 	render(ctx) {
-		const { cacheRead, cacheWrite, input } = ctx.usageStats;
-		if (!cacheRead) return { content: "", visible: false };
-
-		// Hit rate = cacheRead / total prompt tokens. The prompt is the sum of
-		// cacheRead (served from cache), cacheWrite (newly cached this turn) and
-		// input (uncached). Including uncached input keeps the denominator honest
-		// for Anthropic/OpenRouter; DeepSeek reports its miss as input with
-		// cacheWrite 0, so this still yields hit/(hit+miss).
-		const total = cacheRead + cacheWrite + input;
-
-		const rate = (cacheRead / total) * 100;
-		const rateStr = rate.toFixed(2);
-
+		const rate = conversationCacheHitRate(ctx.usageStats);
+		if (rate === undefined) return { content: "", visible: false };
 		const parts: string[] = [theme.icon.cache];
-		parts.push(theme.fg("statusLineSpend", `${rateStr}%`));
+		parts.push(theme.fg("statusLineSpend", `${rate.toFixed(2)}%`));
 		return { content: parts.join(" "), visible: true };
 	},
 	describe(ctx) {
-		const { cacheRead, cacheWrite, input } = ctx.usageStats;
-		if (!cacheRead) return null;
-		const rate = (cacheRead / (cacheRead + cacheWrite + input)) * 100;
+		const rate = conversationCacheHitRate(ctx.usageStats);
+		if (rate === undefined) return null;
 		return segView([span(`${rate.toFixed(2)}%`, "statusLineSpend")], "cache");
 	},
 };

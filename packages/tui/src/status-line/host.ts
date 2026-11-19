@@ -107,6 +107,10 @@ export interface StatusLineSession {
 			cost: number;
 			/** Portion of `cost` carried by completed subagent task results. */
 			subagentCost?: number;
+			/** Prompt tokens of the session's own model turns, without side requests or subagent results. */
+			conversationInput: number;
+			conversationCacheRead: number;
+			conversationCacheWrite: number;
 		};
 	};
 	modelRegistry: {

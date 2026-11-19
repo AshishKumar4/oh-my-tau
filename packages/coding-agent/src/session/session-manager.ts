@@ -414,6 +414,9 @@ function emptyUsageStatistics(): UsageStatistics {
 		premiumRequests: 0,
 		cost: 0,
 		subagentCost: 0,
+		conversationInput: 0,
+		conversationCacheRead: 0,
+		conversationCacheWrite: 0,
 	};
 }
 
@@ -634,6 +637,11 @@ export class SessionEntryIndex {
 
 		const usage = entryUsage(entry);
 		addUsage(this.#usage, usage);
+		if (usage && entry.type === "message" && entry.message.role === "assistant") {
+			this.#usage.conversationInput += usage.input;
+			this.#usage.conversationCacheRead += usage.cacheRead;
+			this.#usage.conversationCacheWrite += usage.cacheWrite;
+		}
 		// Completed `task` results carry the child's spend; tracked apart so the
 		// status line can split the session's own cost from its subagents'.
 		if (usage && entry.type === "message" && entry.message.role === "toolResult") {

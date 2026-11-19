@@ -1282,7 +1282,7 @@ export class AcpAgent implements Agent {
 					settled: false,
 					errorTextDelivery: undefined,
 					cleanup: undefined,
-					usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
+					usageBaseline: record.session.sessionManager.getUsageStatistics(),
 					unsubscribe: undefined,
 					resolve: pendingPrompt.resolve,
 					reject: pendingPrompt.reject,
@@ -1491,8 +1491,7 @@ export class AcpAgent implements Agent {
 			this.#finishPrompt(record, {
 				stopReason: "end_turn",
 				usage: this.#buildTurnUsage(
-					promptTurn?.usageBaseline ??
-						this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
+					promptTurn?.usageBaseline ?? record.session.sessionManager.getUsageStatistics(),
 					record.session.sessionManager.getUsageStatistics(),
 				),
 			});
@@ -2940,22 +2939,6 @@ export class AcpAgent implements Agent {
 			this.#subagentCostHydrations.set(rootSessionFile, hydration);
 		}
 		return hydration;
-	}
-
-	#cloneUsageStatistics(usage: UsageStatistics): UsageStatistics {
-		return {
-			input: usage.input,
-			output: usage.output,
-			cacheRead: usage.cacheRead,
-			cacheWrite: usage.cacheWrite,
-			totalTokens: usage.totalTokens,
-			orchestrationInput: usage.orchestrationInput,
-			orchestrationOutput: usage.orchestrationOutput,
-			orchestrationCacheRead: usage.orchestrationCacheRead,
-			premiumRequests: usage.premiumRequests,
-			cost: usage.cost,
-			subagentCost: usage.subagentCost,
-		};
 	}
 
 	#buildTurnUsage(previous: UsageStatistics, current: UsageStatistics): Usage | undefined {

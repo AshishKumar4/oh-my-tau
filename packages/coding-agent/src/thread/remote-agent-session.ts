@@ -150,6 +150,9 @@ export function emptyMirrorState(): SessionMirrorState {
 			premiumRequests: 0,
 			cost: 0,
 			subagentCost: 0,
+			conversationInput: 0,
+			conversationCacheRead: 0,
+			conversationCacheWrite: 0,
 		},
 		sessionStats: {
 			sessionFile: undefined,

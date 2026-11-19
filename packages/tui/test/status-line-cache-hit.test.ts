@@ -8,21 +8,30 @@ beforeAll(async () => {
 	await initTheme();
 });
 
-function ctxWith(usage: Partial<SegmentContext["usageStats"]>): SegmentContext {
+interface Prompt {
+	cacheRead: number;
+	cacheWrite: number;
+	input: number;
+}
+
+/** A session whose own conversation used `conversation`, plus `side` from side requests and subagents. */
+function ctxWith(conversation: Prompt, side: Prompt = { cacheRead: 0, cacheWrite: 0, input: 0 }): SegmentContext {
 	return {
 		usageStats: {
-			input: 0,
+			input: conversation.input + side.input,
 			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
+			cacheRead: conversation.cacheRead + side.cacheRead,
+			cacheWrite: conversation.cacheWrite + side.cacheWrite,
 			totalTokens: 0,
 			orchestrationInput: 0,
 			orchestrationOutput: 0,
 			orchestrationCacheRead: 0,
 			premiumRequests: 0,
 			cost: 0,
+			conversationInput: conversation.input,
+			conversationCacheRead: conversation.cacheRead,
+			conversationCacheWrite: conversation.cacheWrite,
 			tokensPerSecond: null,
-			...usage,
 		},
 	} as unknown as SegmentContext;
 }
@@ -47,6 +56,16 @@ describe("cache_hit status-line segment", () => {
 		const result = renderSegment("cache_hit", ctxWith({ cacheRead: 600, cacheWrite: 300, input: 100 }));
 		expect(result.visible).toBe(true);
 		expect(plain(result.content)).toContain("60.00%");
+	});
+
+	it("describes the session's own conversation, not its side requests or subagents", () => {
+		// The conversation runs 97.00% warm; small uncached side calls (captions, job widgets)
+		// would drag a session-wide figure to 970 / (970 + 30 + 100) = 88.18%.
+		const result = renderSegment(
+			"cache_hit",
+			ctxWith({ cacheRead: 970, cacheWrite: 0, input: 30 }, { cacheRead: 0, cacheWrite: 0, input: 100 }),
+		);
+		expect(plain(result.content)).toContain("97.00%");
 	});
 
 	it("is hidden until there is a cache read, even with uncached input", () => {

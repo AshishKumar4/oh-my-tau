@@ -57,6 +57,9 @@ const NO_USAGE = {
 	orchestrationCacheRead: 0,
 	premiumRequests: 0,
 	cost: 0,
+	conversationInput: 0,
+	conversationCacheRead: 0,
+	conversationCacheWrite: 0,
 };
 
 /** A fresh, unnamed session on the cached model and thinking state. */

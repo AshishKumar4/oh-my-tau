@@ -16,6 +16,12 @@ export function conversationStorePath(geminiDir: string, id: string): string {
 	return path.join(geminiDir, "antigravity-cli", "conversations", `${id}.db`);
 }
 
+/** Path of agy's per-call log for a validated conversation UUID: one JSON record per line. */
+export function conversationCallLogPath(geminiDir: string, id: string): string {
+	if (!UUID.test(id)) throw new Error("Invalid Antigravity CLI conversation id");
+	return path.join(geminiDir, "antigravity-cli", "brain", id, ".system_generated", "logs", "transcript_full.jsonl");
+}
+
 /** Read and record a nonempty turn-end checkpoint bound to this exact transcript digest. */
 export function readConversationCheckpoint(geminiDir: string, id: string, digest: string): AntigravityCliCheckpoint {
 	if (!DIGEST.test(digest)) throw new Error("Invalid Antigravity CLI transcript digest");

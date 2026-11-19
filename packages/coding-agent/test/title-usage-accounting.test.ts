@@ -173,6 +173,13 @@ describe("title usage accounting", () => {
 			MAIN_USAGE.totalTokens + TITLE_USAGE.totalTokens,
 		);
 		expect(target.sessionManager.getUsageStatistics().output).toBe(MAIN_USAGE.output + TITLE_USAGE.output);
+		// The session's own conversation, which the cache hit rate reads, leaves the title request out.
+		expect(target.sessionManager.getUsageStatistics()).toMatchObject({
+			input: MAIN_USAGE.input + TITLE_USAGE.input,
+			conversationInput: MAIN_USAGE.input,
+			conversationCacheRead: MAIN_USAGE.cacheRead,
+			conversationCacheWrite: MAIN_USAGE.cacheWrite,
+		});
 	});
 
 	it("journals the tiny-model title's billed usage into session totals", async () => {

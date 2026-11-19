@@ -418,4 +418,11 @@ export interface UsageStatistics {
 	cost: number;
 	/** Portion of {@link cost} carried by completed `task` results (direct children's spend). */
 	subagentCost: number;
+	/**
+	 * Prompt tokens of the session's own model turns: no side requests (titles, captions,
+	 * job widgets) and no subagent results. The status line's cache hit rate reads these.
+	 */
+	conversationInput: number;
+	conversationCacheRead: number;
+	conversationCacheWrite: number;
 }

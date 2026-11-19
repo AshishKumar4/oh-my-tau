@@ -1,10 +1,13 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { conversationStorePath } from "@oh-my-pi/pi-ai/providers/antigravity-cli/conversation-store";
+import {
+	conversationCallLogPath,
+	conversationStorePath,
+} from "@oh-my-pi/pi-ai/providers/antigravity-cli/conversation-store";
 import {
 	AgyHost,
 	describeToolArguments,
@@ -359,6 +362,54 @@ describe("AgyHost stateful steps", () => {
 		expect(second.writer.output.content).toEqual([{ type: "text", text: "Second answer." }]);
 	});
 
+	it("reports a cancelled turn's calls from agy's call log with the next step, counting each call once", async () => {
+		const state = await fixture();
+		const controller = new AbortController();
+		const messages = [user("first question")];
+		const first = step(state.host, messages, {}, controller.signal);
+		const fake = await state.started.next();
+		await fake.prompts.next();
+		// agy's per-call log; a cancelled turn's ACP reply carries no usage at all.
+		const log = conversationCallLogPath(state.dir, fake.created[0]!);
+		await mkdir(path.dirname(log), { recursive: true });
+		const call = (input: number, cached: number, output: number) =>
+			`${JSON.stringify({ step_index: 1, type: "PLANNER_RESPONSE", created_at: new Date().toISOString(), input_tokens: input, cache_read_tokens: cached, output_tokens: output })}\n`;
+		await appendFile(log, call(70_000, 0, 900));
+		fake.text("A partial answer");
+		controller.abort();
+		await expect(first.done).rejects.toThrow("Request was aborted");
+		await fake.cancellations.next();
+
+		const aborted: AssistantMessage = { ...first.writer.output, stopReason: "aborted" };
+		const second = step(state.host, [...messages, aborted, user("second question")]);
+		const prompt = await fake.prompts.next();
+		await appendFile(log, call(2_000, 70_900, 40));
+		fake.text("Second answer.");
+		prompt.response.resolve({
+			stopReason: "end_turn",
+			usage: { inputTokens: 2_000, cachedReadTokens: 70_900, outputTokens: 40, totalTokens: 72_940 },
+		});
+		await second.done;
+
+		expect(second.writer.output.usage).toMatchObject({ input: 72_000, cacheRead: 70_900, output: 940 });
+		// Nothing logged since: the next step reports no calls again.
+		const third = step(state.host, [
+			...messages,
+			aborted,
+			user("second question"),
+			second.writer.output,
+			user("third"),
+		]);
+		const thirdPrompt = await fake.prompts.next();
+		fake.text("Third answer.");
+		thirdPrompt.response.resolve({
+			stopReason: "end_turn",
+			usage: { inputTokens: 5, outputTokens: 1, totalTokens: 6 },
+		});
+		await third.done;
+		expect(third.writer.output.usage).toMatchObject({ input: 0, cacheRead: 0, output: 0 });
+	});
+
 	it("keeps a parked turn when only the effort changes, and applies the effort from the next turn", async () => {
 		const state = await parked();
 		const toolResult = result(state.first.writer.output);
@@ -429,6 +480,73 @@ describe("AgyHost stateful steps", () => {
 		state.fake.text("Late result received.");
 		late.response.resolve({ stopReason: "end_turn" });
 		await next.done;
+	});
+
+	it("keeps a detached tool's conversation warm with at most two check-ins, then sends the late result to it", async () => {
+		const state = await parked({ holdLimitMs: 10, checkInIntervalMs: 50 });
+		state.clock.fire(10);
+		await state.fake.cancellations.next();
+		expect((await state.output).isError).toBe(true);
+		for (const delay of [0, 50]) {
+			state.clock.fire(delay);
+			const checkIn = await state.fake.prompts.next();
+			expect(textOf(checkIn.request.prompt)).toContain("Reply with only the word: waiting");
+			// A tool call during a check-in is refused and leaves the conversation live.
+			expect((await state.fake.call()).isError).toBe(true);
+			state.fake.text("waiting");
+			checkIn.response.resolve({ stopReason: "end_turn" });
+			await Bun.sleep(0);
+		}
+		// Past two check-ins a longer wait costs more to keep warm than one cold reload.
+		expect([...state.clock.timers.values()].some(timer => timer.ms === 50)).toBe(false);
+
+		const late = step(state.host, [...state.messages, result(state.first.writer.output, "late actual body")]);
+		const prompt = await state.fake.prompts.next();
+		expect(textOf(prompt.request.prompt)).toContain("late actual body");
+		state.fake.text("Late result received.");
+		prompt.response.resolve({ stopReason: "end_turn" });
+		await late.done;
+		expect(state.fake.created).toHaveLength(1);
+		expect(late.writer.output.content).toEqual([{ type: "text", text: "Late result received." }]);
+	});
+
+	it("cancels an in-flight check-in as soon as the late result arrives", async () => {
+		const state = await parked({ holdLimitMs: 10, checkInIntervalMs: 50 });
+		state.clock.fire(10);
+		await state.fake.cancellations.next();
+		await state.output;
+		state.clock.fire(0);
+		const checkIn = await state.fake.prompts.next();
+		const late = step(state.host, [...state.messages, result(state.first.writer.output, "late actual body")]);
+		await state.fake.cancellations.next();
+		expect(await checkIn.response.promise).toEqual({ stopReason: "cancelled" });
+		const prompt = await state.fake.prompts.next();
+		expect(textOf(prompt.request.prompt)).toContain("late actual body");
+		state.fake.text("Late result received.");
+		prompt.response.resolve({ stopReason: "end_turn" });
+		await late.done;
+		expect(state.fake.created).toHaveLength(1);
+		expect(state.clock.timers.size).toBe(0);
+	});
+
+	it("keeps the conversation when a check-in fails, and stops checking in", async () => {
+		const state = await parked({ holdLimitMs: 10, checkInIntervalMs: 50 });
+		state.clock.fire(10);
+		await state.fake.cancellations.next();
+		await state.output;
+		state.clock.fire(0);
+		const checkIn = await state.fake.prompts.next();
+		checkIn.response.reject(new Error("429 RESOURCE_EXHAUSTED"));
+		await Bun.sleep(0);
+		expect(state.clock.timers.size).toBe(0);
+
+		const late = step(state.host, [...state.messages, result(state.first.writer.output, "late actual body")]);
+		const prompt = await state.fake.prompts.next();
+		expect(textOf(prompt.request.prompt)).toContain("late actual body");
+		state.fake.text("Late result received.");
+		prompt.response.resolve({ stopReason: "end_turn" });
+		await late.done;
+		expect(state.fake.created).toHaveLength(1);
 	});
 
 	it("kills a turn when cancellation is not acknowledged, then reseeds instead of resuming it", async () => {

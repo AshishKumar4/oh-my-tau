@@ -152,6 +152,9 @@ const NO_USAGE = {
 	orchestrationCacheRead: 0,
 	premiumRequests: 0,
 	cost: 0,
+	conversationInput: 0,
+	conversationCacheRead: 0,
+	conversationCacheWrite: 0,
 };
 
 /** A status line over a session that reports `cacheStatus(nowMs)` as its prompt cache. */
