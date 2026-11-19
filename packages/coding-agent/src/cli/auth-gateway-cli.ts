@@ -472,7 +472,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	process.stdout.write(`upstream broker: ${brokerConfig.url}\n`);
 	if (flags.recordHarness === true) {
 		process.stdout.write(
-			`harness recording: on — point Claude Code (ANTHROPIC_BASE_URL) or Codex (model_provider base_url) here; captures land in ${path.join(getHarnessCacheDir(), "<profile>")}\n`,
+			`harness recording: on — point Claude Code (ANTHROPIC_BASE_URL), Codex (model_provider base_url) or Gemini CLI (GOOGLE_GEMINI_BASE_URL) here; captures land in ${path.join(getHarnessCacheDir(), "<profile>")}\n`,
 		);
 	}
 
