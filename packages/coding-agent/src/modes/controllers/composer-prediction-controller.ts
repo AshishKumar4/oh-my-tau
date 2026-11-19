@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { isAgentClient } from "@oh-my-pi/pi-catalog/compat/harness";
 import type { MeterProvider } from "@opentelemetry/api";
 import { logger, prompt, sanitizeText } from "@oh-my-pi/pi-utils";
 import composerPredictionPrompt from "../../prompts/system/composer-prediction-user.md" with { type: "text" };
@@ -163,7 +164,10 @@ export class ComposerPredictionController {
 		// prediction), and a compaction would rewrite the history the prediction reads: skip the
 		// billed request either way.
 		const model = session.model;
-		if (!model || session.isStreaming || session.isCompacting || this.#ctx.editor.getText()) return;
+		// An agent client would answer in a separate cold conversation, not the cached one.
+		if (!model || isAgentClient(model) || session.isStreaming || session.isCompacting || this.#ctx.editor.getText()) {
+			return;
+		}
 		const abort = new AbortController();
 		this.#abort = abort;
 		const source: PredictionSource = {

@@ -67,6 +67,7 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { replaysNativeResponsesHistory } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
+import { isAgentClient } from "@oh-my-pi/pi-catalog/compat/harness";
 import { resolvePromptCacheLookback } from "@oh-my-pi/pi-catalog/compat/prompt-cache-lookback";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
@@ -2861,11 +2862,23 @@ export class SessionMaintenance {
 
 	#estimatePrePromptContextTokens(messages: AgentMessage[], contextWindow: number): number {
 		const breakdown = this.#host.getContextBreakdown({ contextWindow, pendingMessages: messages });
-		const localEstimate = this.#estimateStoredContextTokens(messages);
 		// Floor by the local estimate: a payload-shrinking before_provider_request
 		// hook deflates the provider-anchored breakdown, which must not suppress
 		// pre-prompt compaction (see #estimateStoredContextTokens).
-		return compactionContextTokens(breakdown?.usedTokens ?? 0, localEstimate);
+		return this.#decisionContextTokens(breakdown?.usedTokens ?? 0, () => this.#estimateStoredContextTokens(messages));
+	}
+
+	/**
+	 * The context a compaction decision counts: the provider-reported context, floored by
+	 * omp's estimate of its stored conversation (see `compactionContextTokens`). An agent
+	 * client keeps its own conversation and never receives omp's transcript, so for it
+	 * only the reported context counts; the stored estimate would compact a history the
+	 * model never sees and force the client to rebuild its conversation.
+	 */
+	#decisionContextTokens(reportedTokens: number, storedEstimate: () => number): number {
+		const model = this.#host.model();
+		if (model !== undefined && isAgentClient(model)) return Math.max(0, reportedTokens);
+		return compactionContextTokens(reportedTokens, storedEstimate());
 	}
 
 	/**
@@ -3070,8 +3083,7 @@ export class SessionMaintenance {
 		// a slow message_end listener leave the TUI "generating" with no provider
 		// request or tool running.
 		const billedContextTokens = calculateContextTokens(lastAssistant.usage);
-		const storedContextTokens = this.#estimateStoredContextTokens();
-		const contextTokens = compactionContextTokens(billedContextTokens, storedContextTokens);
+		const contextTokens = this.#decisionContextTokens(billedContextTokens, () => this.#estimateStoredContextTokens());
 		const persistedDeadEnd = this.#midTurnCompactionDeadEnds.has(activeMessages);
 		if (persistedDeadEnd) {
 			if (!(await this.#host.persistTurnMessagesForMidRunCompaction(context))) return;
@@ -3671,10 +3683,10 @@ export class SessionMaintenance {
 		// last turn's billed context tokens, floored by the post-prune
 		// stored-conversation estimate so a payload-compression hook still can't
 		// deflate the trigger.
-		const contextTokens = compactionContextTokens(assistantUsageContextTokens, storedContextTokens);
-		const postMaintenanceContextTokens = compactionContextTokens(
+		const contextTokens = this.#decisionContextTokens(assistantUsageContextTokens, () => storedContextTokens);
+		const postMaintenanceContextTokens = this.#decisionContextTokens(
 			Math.max(0, assistantUsageContextTokens - maintenanceTokensFreed),
-			storedContextTokens,
+			() => storedContextTokens,
 		);
 		const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
 		const shouldThresholdCompact = shouldCompact(contextTokens, contextWindow, compactionSettings);
@@ -4529,9 +4541,9 @@ export class SessionMaintenance {
 		const contextWindow = this.#model?.contextWindow ?? 0;
 		if (contextWindow <= 0) return true;
 		const compactionSettings = this.#compactionSettings;
-		const residualTokens = compactionContextTokens(
+		const residualTokens = this.#decisionContextTokens(
 			this.#host.getContextUsage({ contextWindow })?.tokens ?? 0,
-			this.#estimateStoredContextTokens(),
+			() => this.#estimateStoredContextTokens(),
 		);
 		const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
 		const recoveryBand = Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
@@ -4637,21 +4649,22 @@ export class SessionMaintenance {
 			replayedReasoningShift =
 				tokenizer.replayedReasoningTokens(retained) - this.#tokenizer.replayedReasoningTokens(retained);
 		}
-		const residualTokens = compactionContextTokens(
+		const residualTokens = this.#decisionContextTokens(
 			Math.max(
 				0,
 				(this.#host.getContextUsage({ contextWindow })?.tokens ?? 0) -
 					providerExcludedTokens +
 					replayedReasoningShift,
 			),
-			Math.max(
-				0,
-				this.#estimateStoredContextTokens(
-					[],
-					tokenizer,
-					this.#messagesAsRead(messages, this.#host.sessionManager.getBranchView(), model),
-				) - storedExcludedTokens,
-			),
+			() =>
+				Math.max(
+					0,
+					this.#estimateStoredContextTokens(
+						[],
+						tokenizer,
+						this.#messagesAsRead(messages, this.#host.sessionManager.getBranchView(), model),
+					) - storedExcludedTokens,
+				),
 		);
 		return residualTokens <= fitBudget;
 	}

@@ -96,6 +96,7 @@ import {
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { resolveCatalogPolicy } from "@oh-my-pi/pi-catalog/compat/catalog-policy";
+import { isAgentClient } from "@oh-my-pi/pi-catalog/compat/harness";
 import { supportsOutputTokenLimit } from "@oh-my-pi/pi-catalog/compat/output-limits";
 import { requiresNativeTools, requiresToolFreeHistoryForToolOptOut } from "@oh-my-pi/pi-catalog/compat/tools";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
@@ -12136,7 +12137,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (this.#titleGenerationInFlightFor === sessionId) return false;
 		input.tried = true;
 		this.#deferredTitle = { sessionId, declined: false, replied: false, words: 0 };
-		if (this.#cardsAutoTitles() && this.model !== undefined) this.#forkTitle(input);
+		// A fork reuses the live prompt cache; an agent client would start a separate cold conversation.
+		if (this.#cardsAutoTitles() && this.model !== undefined && !isAgentClient(this.model)) this.#forkTitle(input);
 		else this.#titleWithTitleModel(input);
 		return true;
 	}

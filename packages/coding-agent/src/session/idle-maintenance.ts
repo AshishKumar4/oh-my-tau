@@ -9,6 +9,7 @@
  * a late reply can never be announced.
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { isAgentClient } from "@oh-my-pi/pi-catalog/compat/harness";
 import { isPromptCachePersistent } from "@oh-my-pi/pi-catalog/compat/prompt-cache-persistent";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { combine } from "../config/registry";
@@ -313,7 +314,8 @@ export class IdleMaintenance {
 		const run = new AbortController();
 		this.#recapRun = run;
 		try {
-			if (!session.model || !priorMessageWasGenerated(session.messages)) {
+			// An agent client would answer the recap in a separate cold conversation, not the cached one.
+			if (!session.model || isAgentClient(session.model) || !priorMessageWasGenerated(session.messages)) {
 				this.#complete(pending, "recap");
 				return;
 			}

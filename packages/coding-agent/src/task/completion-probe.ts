@@ -16,6 +16,7 @@
  * finishes, so without it the estimate stalls near 0% for minutes.
  */
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
+import { isAgentClient } from "@oh-my-pi/pi-catalog/compat/harness";
 import {
 	formatDuration,
 	isInteractiveHost,
@@ -193,6 +194,8 @@ export function startCompletionProbe(options: CompletionProbeOptions): void {
 	const probe = async (): Promise<void> => {
 		const session = options.session();
 		if (!session?.isStreaming || signal.aborted) return;
+		// An agent client would answer in a separate cold conversation with the run's whole history.
+		if (session.model !== undefined && isAgentClient(session.model)) return;
 		try {
 			const usageOwner = {
 				sessionId: session.sessionManager.getSessionId(),

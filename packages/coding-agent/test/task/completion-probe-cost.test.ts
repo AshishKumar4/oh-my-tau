@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model, Usage } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
@@ -375,6 +376,39 @@ describe("completion probe cost persistence", () => {
 		} finally {
 			await reopened?.close();
 			await original.close();
+		}
+	});
+});
+
+describe("completion probe behind an agent client", () => {
+	it("sends no probe to a run whose model keeps its own conversation", async () => {
+		const agentClient = getBundledModel("antigravity-cli", "gemini-4-neon");
+		if (!agentClient) throw new Error("Expected antigravity-cli/gemini-4-neon to be bundled");
+		const authStorage = await AuthStorage.create(":memory:");
+		using tempDir = TempDir.createSync("@omp-completion-probe-agent-client-");
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const session = new AgentSession({
+			agent: new Agent({ initialState: { model: agentClient, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		const controller = new AbortController();
+		vi.useFakeTimers();
+		try {
+			session.agent.state.isStreaming = true;
+			// A probe would answer in a separate cold client conversation with the run's whole history.
+			const probeRequest = vi.spyOn(session, "runEphemeralTurn");
+			startCompletionProbe({ session: () => session, signal: controller.signal, onEstimate: () => {} });
+			vi.advanceTimersByTime(7 * 60_000);
+			await flushMicrotasks();
+			expect(probeRequest).not.toHaveBeenCalled();
+		} finally {
+			controller.abort();
+			vi.useRealTimers();
+			session.agent.state.isStreaming = false;
+			await session.dispose();
+			authStorage.close();
 		}
 	});
 });

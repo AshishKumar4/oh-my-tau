@@ -44,17 +44,23 @@ async function createSession(
 	main: MockModel,
 	side: MockModel,
 	settings: Record<string, unknown> = {},
-	{ autoTitle = true, todo = false }: { autoTitle?: boolean; todo?: boolean } = {},
+	{
+		autoTitle = true,
+		todo = false,
+		sessionModel,
+	}: { autoTitle?: boolean; todo?: boolean; sessionModel?: ai.Model } = {},
 ): Promise<AgentSession> {
 	authStorage = await AuthStorage.create(":memory:");
 	authStorage.keys.setRuntime("anthropic", "test-key");
-	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-	if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+	const titleModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!titleModel) throw new Error("Expected claude-sonnet-4-5 model to exist");
+	const model = sessionModel ?? titleModel;
+	authStorage.keys.setRuntime(model.provider, "test-key");
 	const sessionManager = SessionManager.inMemory();
 	const sessionSettings = Settings.isolated({
 		"compaction.enabled": false,
 		"retry.enabled": false,
-		modelRoles: { tiny: `${model.provider}/${model.id}` },
+		modelRoles: { tiny: `${titleModel.provider}/${titleModel.id}` },
 		// The default `nf+emoji` follows the global theme's symbol preset, which an
 		// earlier file in the suite can leave on nerd glyphs; the card under test is emoji.
 		"title.icons": "emoji",
@@ -238,6 +244,28 @@ describe("AgentSession title fork", () => {
 		expect(target.sessionName).toBe("🧪 FLAKY: Fix flaky park tests");
 		expect(side.calls).toHaveLength(2);
 		expect(titleModel).toHaveBeenCalledTimes(1);
+	});
+
+	it("titles an agent-client session with the title model, never a fork that would start a cold client conversation", async () => {
+		const agentClient = getBundledModel("antigravity-cli", "gemini-4-neon");
+		if (!agentClient) throw new Error("Expected antigravity-cli/gemini-4-neon to be bundled");
+		const main = createMockModel({ responses: [{ content: ["Reading the park tests first."] }] });
+		const side = createMockModel({ handler: { content: [CARD_REPLY] } });
+		const target = await createSession(main, side, {}, { sessionModel: agentClient });
+		const titleInputs: string[] = [];
+		const replies = ["<title>Fix flaky park tests</title>", "<title>🧪 FLAKY</title>"];
+		vi.spyOn(ai, "completeSimple").mockImplementation(async (_model, context) => {
+			titleInputs.push(titleRequestInput(context));
+			return createAssistantMessage(replies[titleInputs.length - 1] ?? "<title/>");
+		});
+		const titled = nextTitle(target);
+
+		await target.prompt(FIRST_MESSAGE);
+		await titled;
+
+		expect(target.sessionName).toBe("🧪 FLAKY: Fix flaky park tests");
+		expect(side.calls).toHaveLength(0);
+		expect(titleInputs[0]).toContain(FIRST_MESSAGE);
 	});
 
 	it("titles with the title model alone under title.generator tiny", async () => {

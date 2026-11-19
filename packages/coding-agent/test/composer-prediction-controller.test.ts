@@ -12,6 +12,7 @@ import {
 	MeterProvider,
 	PeriodicExportingMetricReader,
 } from "@opentelemetry/sdk-metrics";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	ComposerPredictionController,
@@ -84,6 +85,8 @@ interface HarnessOptions {
 	capPreservesRequest?: boolean;
 	deadlineMs?: number;
 	meterProvider?: MeterProvider;
+	/** The session's model; defaults to {@link MODEL}. */
+	model?: Model;
 }
 
 const MODEL = { id: "claude-sonnet-4-5", provider: "anthropic", api: "anthropic-messages" } as Model;
@@ -98,7 +101,7 @@ function harness(options: HarnessOptions = {}) {
 	const firstLeafId = sessionManager.appendMessage(userMessage("fix the bug", 1));
 	const messages: AgentMessage[] = [userMessage("fix the bug", 1)];
 	const session = {
-		model: MODEL,
+		model: options.model ?? MODEL,
 		// Provider-facing id, as after `/fresh` or with an SDK `providerSessionId`: not the journal's.
 		sessionId: "provider-session",
 		isStreaming: false,
@@ -199,17 +202,21 @@ describe("ComposerPredictionController", () => {
 		expect(alternatives.controller.choices).toEqual(["run the tests", "ship it"]);
 	});
 
-	it("does not request while disabled, drafted, compacting, or viewing a subagent", () => {
+	it("does not request while disabled, drafted, compacting, viewing a subagent, or behind an agent client", () => {
+		const agentClient = getBundledModel("antigravity-cli", "gemini-4-neon");
+		if (!agentClient) throw new Error("Expected antigravity-cli/gemini-4-neon to be bundled");
 		const blocked = [
 			harness({ enabled: false }),
 			harness({ draft: "my own message" }),
 			harness({ draft: "  " }),
 			harness({ compacting: true }),
 			harness({ focusedAgentId: "0-Explore" }),
+			// Its side turn would be a separate cold client conversation, not the cached one.
+			harness({ model: agentClient }),
 		];
 		for (const { controller } of blocked) controller.request();
 
-		expect(blocked.map(h => h.turns.length)).toEqual([0, 0, 0, 0, 0]);
+		expect(blocked.map(h => h.turns.length)).toEqual([0, 0, 0, 0, 0, 0]);
 	});
 
 	it("sends the output cap only when it leaves the side request otherwise unchanged", () => {
